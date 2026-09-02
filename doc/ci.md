@@ -18,3 +18,14 @@ release packages move between jobs through runner-compatible Actions caches.
 Pull requests gate regressions against recent matching-host history, and
 successful pushes to `dev` append their p50 values under `data/`. The runners
 require the [platform prerequisites](setup.md#prerequisites).
+
+CI caches only the pinned kernel and legacy initramfs. It does not restore or
+save a broker initramfs cache, and the benchmark action does not claim to run
+the broker profile. Development release jobs build and publish only explicit
+`-legacy` packages.
+
+Broker publication fails closed. A future privileged smoke/E2E job must build
+the agent image afresh, boot that exact bundle, and supply an independently
+authenticated live-gate proof accepted by `verify-broker-live-gate`. The
+publish action rejects an unproved broker archive. Pull-request runs are
+cancel-in-progress and do not publish releases.
