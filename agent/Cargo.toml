@@ -13,3 +13,6 @@ path = "src/main.rs"
 agent-protocol = { path = "../agent-protocol" }
 libc = "0.2.186"
 serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.23"

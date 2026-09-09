@@ -3,17 +3,19 @@
 
 //! Phase-0 NVX PID-1 agent prototype.
 
+mod cgroup;
 mod config;
 mod error;
+mod isolation;
+mod mappings;
+mod mounts;
 
 #[cfg(unix)]
 use ::std::mem::MaybeUninit;
 use ::std::process::ExitCode;
 
-use ::agent_protocol::mxc_extension::{
-    MODELED_REQUIREMENTS, MXC_EXTENSION_VERSION, MxcExtensionService, MxcRequest,
-    UnsupportedAciAdapter,
-};
+use ::agent_protocol::mxc_extension::{AciAdapterStatus, UnsupportedAciAdapter};
+use ::serde_json::json;
 
 use crate::error::{AgentError, Result};
 
@@ -26,19 +28,34 @@ struct ShutdownSignalBlock {
     previous_mask: libc::sigset_t,
 }
 
-fn probe_mxc_requirements(service: &impl MxcExtensionService) -> usize {
-    let mut failures = 0;
-    for requirement in MODELED_REQUIREMENTS {
-        let response = service.call(MxcRequest {
-            version: MXC_EXTENSION_VERSION,
-            requirement,
-        });
-        if let Err(error) = response {
-            failures += 1;
-            eprintln!("NVX-AGENT: {:?}: {}", error.code, error.message);
-        }
+fn phase0_scaffold_state_json(status: AciAdapterStatus) -> Result<String> {
+    match status {
+        AciAdapterStatus::Unsupported {
+            required_revision,
+            reason,
+        } => serde_json::to_string(&json!({
+            "component": "nvx-agent",
+            "phase": "phase0",
+            "serviceReadiness": "not-ready",
+            "profile": "mxc-prototype",
+            "pid1Mode": "boot-diagnostics-wait",
+            "runtimeOperations": "not-implemented",
+            "adapter": {
+                "kind": "aci",
+                "status": "blocked",
+                "requiredRevision": required_revision,
+                "reason": reason,
+            },
+            "message": "Phase-0 image is protocol/build scaffolding only; runtime MXC operations are unavailable."
+        }))
+        .map_err(|error| AgentError::internal(format!("failed to encode phase-0 state JSON: {error}"))),
     }
-    failures
+}
+
+fn emit_phase0_scaffold_state(status: AciAdapterStatus) -> Result<()> {
+    let payload = phase0_scaffold_state_json(status)?;
+    eprintln!("NVX-AGENT-STATE: {payload}");
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -144,39 +161,52 @@ fn ensure_shutdown_signal(signal: i32) -> Result<()> {
     )))
 }
 
-fn run_service(
-    service: &impl MxcExtensionService,
-    wait: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let failures = probe_mxc_requirements(service);
-    if failures == 0 {
-        return Err(AgentError::internal(
-            "phase-0 service unexpectedly accepted all modeled operations",
-        ));
-    }
+fn run_phase0_scaffold(wait: impl FnOnce() -> Result<()>) -> Result<()> {
+    emit_phase0_scaffold_state(UnsupportedAciAdapter::status())?;
     wait()
 }
 
 #[cfg(unix)]
 fn run() -> Result<()> {
     let shutdown_signals = install_shutdown_signal_block()?;
-    let adapter = UnsupportedAciAdapter;
-    let run_result = run_service(&adapter, || {
-        wait_for_shutdown_signal(&shutdown_signals.blocked_set)
-    });
+    let run_result =
+        run_phase0_scaffold(|| wait_for_shutdown_signal(&shutdown_signals.blocked_set));
     let restore_result = restore_signal_mask(&shutdown_signals.previous_mask);
     if let Err(error) = run_result {
         restore_result?;
         return Err(error);
     }
     restore_result?;
-    Ok(())
+    deliberate_poweroff()
 }
 
 #[cfg(not(unix))]
 fn run() -> Result<()> {
-    let adapter = UnsupportedAciAdapter;
-    run_service(&adapter, wait_for_shutdown_signal)
+    run_phase0_scaffold(wait_for_shutdown_signal)?;
+    deliberate_poweroff()
+}
+
+#[cfg(unix)]
+fn deliberate_poweroff() -> Result<()> {
+    eprintln!("NVX-AGENT: initiating deliberate poweroff");
+    unsafe {
+        libc::sync();
+    }
+    let reboot_result = unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
+    if reboot_result != 0 {
+        return Err(AgentError::internal(format!(
+            "reboot(LINUX_REBOOT_CMD_POWER_OFF) failed: {}",
+            ::std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn deliberate_poweroff() -> Result<()> {
+    Err(AgentError::internal(
+        "deliberate poweroff path is supported on Unix targets only",
+    ))
 }
 
 fn main() -> ExitCode {
@@ -192,6 +222,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::serde_json::Value;
     #[cfg(unix)]
     use ::std::process::Command;
     #[cfg(unix)]
@@ -203,28 +234,10 @@ mod tests {
     const BLOCKED_SIGNAL_HELPER_TEST: &str =
         "tests::blocked_signal_during_initialization_helper_entrypoint";
 
-    struct AcceptingService;
-
-    impl MxcExtensionService for AcceptingService {
-        fn call(
-            &self,
-            request: MxcRequest,
-        ) -> ::std::result::Result<
-            ::agent_protocol::mxc_extension::MxcResponse,
-            ::agent_protocol::mxc_extension::MxcServiceError,
-        > {
-            Ok(::agent_protocol::mxc_extension::MxcResponse {
-                version: request.version,
-                requirement: request.requirement,
-                state: ::agent_protocol::mxc_extension::MxcRequirementState::Modeled,
-            })
-        }
-    }
-
     #[test]
-    fn run_service_waits_when_requirements_are_unavailable() {
+    fn run_phase0_scaffold_waits_for_shutdown_path() {
         let mut waited = false;
-        run_service(&UnsupportedAciAdapter, || {
+        run_phase0_scaffold(|| {
             waited = true;
             Ok(())
         })
@@ -233,18 +246,20 @@ mod tests {
     }
 
     #[test]
-    fn run_service_propagates_wait_failures() {
-        let error = run_service(&UnsupportedAciAdapter, || {
-            Err(AgentError::internal("shutdown wait failed"))
-        })
-        .unwrap_err();
+    fn run_phase0_scaffold_propagates_wait_failures() {
+        let error =
+            run_phase0_scaffold(|| Err(AgentError::internal("shutdown wait failed"))).unwrap_err();
         assert!(format!("{error}").contains("shutdown wait failed"));
     }
 
     #[test]
-    fn run_service_rejects_successful_phase_zero_adapter() {
-        let error = run_service(&AcceptingService, || Ok(())).unwrap_err();
-        assert!(format!("{error}").contains("unexpectedly accepted"));
+    fn phase0_state_is_machine_readable_and_not_ready() {
+        let payload = phase0_scaffold_state_json(UnsupportedAciAdapter::status()).unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["phase"], "phase0");
+        assert_eq!(value["serviceReadiness"], "not-ready");
+        assert_eq!(value["runtimeOperations"], "not-implemented");
+        assert_eq!(value["adapter"]["status"], "blocked");
     }
 
     #[cfg(unix)]
@@ -325,7 +340,7 @@ mod tests {
             "failed to send blocked thread signal: {}",
             ::std::io::Error::from_raw_os_error(kill_result)
         );
-        let _ = probe_mxc_requirements(&UnsupportedAciAdapter);
+        emit_phase0_scaffold_state(UnsupportedAciAdapter::status()).unwrap();
         wait_for_shutdown_signal(&shutdown_signals.blocked_set).unwrap();
         restore_signal_mask(&shutdown_signals.previous_mask).unwrap();
     }

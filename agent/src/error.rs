@@ -55,6 +55,8 @@ pub enum AgentError {
     CheckpointTimeout(String),
     /// The agent itself failed.
     Internal(String),
+    /// Mandatory isolation controls are unavailable.
+    Isolation(String),
 }
 
 impl AgentError {
@@ -111,10 +113,15 @@ impl AgentError {
         Self::Internal(message.into())
     }
 
+    /// Builds an isolation-contract failure.
+    pub fn isolation(message: impl Into<String>) -> Self {
+        Self::Isolation(message.into())
+    }
+
     /// The wire code the host receives for this failure.
     pub fn code(&self) -> ErrorCode {
         match self {
-            Self::Io { .. } | Self::Internal(_) => ErrorCode::Internal,
+            Self::Io { .. } | Self::Internal(_) | Self::Isolation(_) => ErrorCode::Internal,
             Self::Mount(_) => ErrorCode::MountFailed,
             Self::Config(_) => ErrorCode::MountFailed,
             Self::Exec(_) => ErrorCode::ExecFailed,
@@ -139,7 +146,8 @@ impl fmt::Display for AgentError {
             | Self::Freeze(message)
             | Self::Quiesce(message)
             | Self::CheckpointTimeout(message)
-            | Self::Internal(message) => write!(formatter, "{message}"),
+            | Self::Internal(message)
+            | Self::Isolation(message) => write!(formatter, "{message}"),
         }
     }
 }
@@ -176,6 +184,7 @@ mod tests {
             AgentError::io("reading", io::Error::other("boom")).code(),
             ErrorCode::Internal
         );
+        assert_eq!(AgentError::isolation("x").code(), ErrorCode::Internal);
     }
 
     #[test]

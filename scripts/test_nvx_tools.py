@@ -140,6 +140,14 @@ def _newc_archive(entries: list[NewcTestEntry]) -> bytes:
 def _agent_newc_entries(agent: bytes) -> list[NewcTestEntry]:
     return [
         (".", 0o040755, b""),
+        ("etc", 0o040755, b""),
+        ("etc/group", 0o100644, b"root:x:0:\nmxc:x:1000:\n"),
+        (
+            "etc/passwd",
+            0o100644,
+            b"root:x:0:0:root:/root:/sbin/nologin\n"
+            b"mxc:x:1000:1000:mxc:/nonexistent:/sbin/nologin\n",
+        ),
         ("sbin", 0o040755, b""),
         ("init", 0o120777, b"sbin/nvx-agent"),
         ("sbin/nvx-agent", 0o100755, agent),

@@ -875,6 +875,16 @@ def native_initramfs_work_directory(profile: str) -> Path:
 def _prepare_agent_root(work: Path, agent_source: Path) -> Path:
     root = Path(tempfile.mkdtemp(prefix="agent-root-", dir=work))
     root.chmod(0o755)
+    etc = root / "etc"
+    etc.mkdir(mode=0o755)
+    (etc / "group").write_text("root:x:0:\nmxc:x:1000:\n", encoding="utf-8")
+    (etc / "group").chmod(0o644)
+    (etc / "passwd").write_text(
+        "root:x:0:0:root:/root:/sbin/nologin\n"
+        "mxc:x:1000:1000:mxc:/nonexistent:/sbin/nologin\n",
+        encoding="utf-8",
+    )
+    (etc / "passwd").chmod(0o644)
     sbin = root / "sbin"
     sbin.mkdir(mode=0o755)
     agent = sbin / GUEST_AGENT_ARTIFACT_NAME
@@ -1389,7 +1399,15 @@ def _validated_initramfs_entries(
 
 def verify_agent_initramfs(path: Path, expected_sha256: str) -> None:
     entries = _validated_initramfs_entries(path, agent_profile=True)
-    expected_entries = {".", "init", "sbin", "sbin/nvx-agent"}
+    expected_entries = {
+        ".",
+        "etc",
+        "etc/group",
+        "etc/passwd",
+        "init",
+        "sbin",
+        "sbin/nvx-agent",
+    }
     if set(entries) != expected_entries:
         raise ScriptError(
             f"{path} agent profile contains unexpected entries: "
@@ -1424,6 +1442,13 @@ def verify_agent_initramfs(path: Path, expected_sha256: str) -> None:
         or any(name.startswith("init/") for name in entries)
     ):
         raise ScriptError(f"{path} does not select /sbin/nvx-agent as kernel PID 1")
+    if (
+        entries["etc/group"].data != b"root:x:0:\nmxc:x:1000:\n"
+        or entries["etc/passwd"].data
+        != b"root:x:0:0:root:/root:/sbin/nologin\n"
+        b"mxc:x:1000:1000:mxc:/nonexistent:/sbin/nologin\n"
+    ):
+        raise ScriptError(f"{path} does not contain deterministic mxc identity files")
 
 
 def verify_legacy_initramfs(path: Path) -> None:
