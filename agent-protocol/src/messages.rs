@@ -18,6 +18,76 @@ pub struct LaunchIdentity {
     pub nonce: [u8; 16],
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecDisposition {
+    ExitCode(i32),
+    Signaled(i32),
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StreamName {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowCreditRequest {
+    pub exec_id: u32,
+    pub stream: StreamName,
+    pub credits: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StdinChunkRecord {
+    pub exec_id: u32,
+    pub sequence: u64,
+    pub chunk: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StdinEofRecord {
+    pub exec_id: u32,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StdoutChunkRecord {
+    pub exec_id: u32,
+    pub sequence: u64,
+    pub chunk: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StdoutEofRecord {
+    pub exec_id: u32,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StderrChunkRecord {
+    pub exec_id: u32,
+    pub sequence: u64,
+    pub chunk: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StderrEofRecord {
+    pub exec_id: u32,
+    pub sequence: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilityProofMaterial([u8; 32]);
 
@@ -29,6 +99,7 @@ impl CapabilityProofMaterial {
 
 impl TryFrom<Vec<u8>> for CapabilityProofMaterial {
     type Error = ProtocolErrorDetail;
+
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
         let len = value.len();
         let bytes: [u8; 32] = value
@@ -82,6 +153,12 @@ pub enum HostControlMessage {
         env: Vec<String>,
         timeout_ms: Option<u64>,
     },
+    CancelExecution {
+        exec_id: u32,
+    },
+    FlowCredits(FlowCreditRequest),
+    StdinChunk(StdinChunkRecord),
+    StdinEof(StdinEofRecord),
     Health,
     Quiesce,
     Resume,
@@ -104,14 +181,21 @@ pub enum AgentControlMessage {
     Quiesced,
     Resumed,
     ShuttingDown,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum StreamName {
-    Stdin,
-    Stdout,
-    Stderr,
+    StdoutChunk(StdoutChunkRecord),
+    StdoutEof(StdoutEofRecord),
+    StderrChunk(StderrChunkRecord),
+    StderrEof(StderrEofRecord),
+    StreamDrained {
+        exec_id: u32,
+        stream: StreamName,
+    },
+    DescendantsCleaned {
+        exec_id: u32,
+    },
+    ExecTerminal {
+        exec_id: u32,
+        disposition: ExecDisposition,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -198,17 +282,26 @@ pub enum ProtocolErrorCode {
     UnsupportedService,
     UnsupportedProtocolVersion,
     CapabilityProofLength,
-    LaunchGenerationConflict,
     CleanupInProgress,
+    ActiveLaunchExists,
+    LaunchGenerationNotNewer,
+    LaunchGenerationConflict,
     ConfigureAlreadyApplied,
     ConfigureAfterExec,
+    ConfigureRequiredForExec,
+    LaunchQuiesced,
+    LaunchShuttingDown,
+    InvalidLifecycleTransition,
     InvalidMappingPath,
     MappingConflict,
     ActiveExecExists,
     ExecIdReusedInGeneration,
     UnknownExecId,
     StreamSequenceMismatch,
+    StreamSequenceExhausted,
     StreamAlreadyClosed,
+    FlowControlCreditExhausted,
+    FlowControlCreditOverflow,
     MissingTerminalPrerequisites,
     ChannelAuthenticationRequired,
 }
@@ -244,5 +337,57 @@ mod tests {
         assert_eq!(SERVICE_IDENTITY, "nvx.mxc.agent.v1");
         assert!(CapabilityProofMaterial::try_from(vec![0; 32]).is_ok());
         assert!(CapabilityProofMaterial::try_from(vec![0; 31]).is_err());
+    }
+
+    #[test]
+    fn capability_proof_serde_round_trip_preserves_exact_32_bytes() {
+        let proof = CapabilityProofMaterial::try_from(vec![7; 32]).expect("proof");
+        let encoded = serde_json::to_vec(&proof).expect("serialize");
+        let decoded: CapabilityProofMaterial = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded.to_bytes(), [7; 32]);
+    }
+
+    #[test]
+    fn host_and_agent_stream_records_are_serializable() {
+        let host = HostControlMessage::StdinChunk(StdinChunkRecord {
+            exec_id: 10,
+            sequence: 3,
+            chunk: vec![1, 2, 3],
+        });
+        let encoded_host = serde_json::to_vec(&host).expect("serialize host");
+        let decoded_host: HostControlMessage =
+            serde_json::from_slice(&encoded_host).expect("deserialize host");
+        assert_eq!(decoded_host, host);
+
+        let agent = AgentControlMessage::StdoutEof(StdoutEofRecord {
+            exec_id: 10,
+            sequence: 4,
+        });
+        let encoded_agent = serde_json::to_vec(&agent).expect("serialize agent");
+        let decoded_agent: AgentControlMessage =
+            serde_json::from_slice(&encoded_agent).expect("deserialize agent");
+        assert_eq!(decoded_agent, agent);
+    }
+
+    #[test]
+    fn flow_credit_and_terminal_messages_are_serializable() {
+        let credit = HostControlMessage::FlowCredits(FlowCreditRequest {
+            exec_id: 9,
+            stream: StreamName::Stdout,
+            credits: 4,
+        });
+        let encoded_credit = serde_json::to_vec(&credit).expect("serialize");
+        let decoded_credit: HostControlMessage =
+            serde_json::from_slice(&encoded_credit).expect("deserialize");
+        assert_eq!(decoded_credit, credit);
+
+        let terminal = AgentControlMessage::ExecTerminal {
+            exec_id: 9,
+            disposition: ExecDisposition::Cancelled,
+        };
+        let encoded_terminal = serde_json::to_vec(&terminal).expect("serialize");
+        let decoded_terminal: AgentControlMessage =
+            serde_json::from_slice(&encoded_terminal).expect("deserialize");
+        assert_eq!(decoded_terminal, terminal);
     }
 }

@@ -8,9 +8,9 @@ use crate::mapping::{
     validate_mapping_set,
 };
 use crate::messages::{
-    AgentControlMessage, BuildStatus, HealthStatus, IsolationStatus, LaunchIdentity, NetworkStatus,
-    ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, StreamName,
-    WorkloadIdentityStatus,
+    AgentControlMessage, BuildStatus, CapabilityProofMaterial, ExecDisposition, HealthStatus,
+    IsolationStatus, LaunchIdentity, NetworkStatus, ProtocolErrorCode, ProtocolErrorDetail,
+    ReadyStatus, SERVICE_IDENTITY, StreamName, WorkloadIdentityStatus,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -22,14 +22,6 @@ pub struct FlowControlWindow {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExecDisposition {
-    ExitCode(i32),
-    Signaled(i32),
-    Cancelled,
-    TimedOut,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecTerminalEvent {
     pub exec_id: u32,
     pub disposition: ExecDisposition,
@@ -37,13 +29,14 @@ pub struct ExecTerminalEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActiveExecEvent {
-    StdinFrame { sequence: u64 },
+    AddFlowCredits { stream: StreamName, credits: u32 },
+    StdinChunk { sequence: u64 },
     StdinEof { sequence: u64 },
-    StdoutFrame { sequence: u64 },
+    StdoutChunk { sequence: u64 },
     StdoutEof { sequence: u64 },
-    StderrFrame { sequence: u64 },
+    StderrChunk { sequence: u64 },
     StderrEof { sequence: u64 },
-    StreamsDrained,
+    StreamDrained { stream: StreamName },
     DescendantsCleaned,
     Disposition(ExecDisposition),
 }
@@ -51,15 +44,26 @@ pub enum ActiveExecEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupStatus {
     NotRequired,
-    InProgress { deadline_secs: u64 },
-    Completed,
+    InProgress { generation: u64, deadline_secs: u64 },
+    Completed { generation: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LaunchAdmissionError {
-    CleanupInProgress { deadline_secs: u64, now_secs: u64 },
+    CleanupInProgress {
+        generation: u64,
+        deadline_secs: u64,
+        now_secs: u64,
+    },
+    ActiveLaunchExists {
+        generation: u64,
+    },
     UnsupportedService(String),
     UnsupportedVersion(u32),
+    GenerationNotNewer {
+        latest_generation: u64,
+        attempted: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -71,6 +75,12 @@ pub enum StateError {
     },
     ConfigureAlreadyApplied,
     ConfigureAfterExec,
+    ConfigureRequiredForExec,
+    InvalidLifecycleTransition {
+        operation: &'static str,
+    },
+    LaunchQuiesced,
+    LaunchShuttingDown,
     Mapping(MappingError),
     ActiveExecExists {
         active_exec_id: u32,
@@ -86,9 +96,20 @@ pub enum StateError {
         expected: u64,
         actual: u64,
     },
+    StreamSequenceExhausted {
+        stream: StreamName,
+        last_sequence: u64,
+    },
     StreamAlreadyClosed {
         stream: StreamName,
         exec_id: u32,
+    },
+    FlowControlCreditExhausted {
+        stream: StreamName,
+        exec_id: u32,
+    },
+    FlowControlCreditOverflow {
+        stream: StreamName,
     },
     MissingTerminalPrerequisites {
         exec_id: u32,
@@ -102,15 +123,27 @@ impl StateError {
             Self::LaunchAdmission(LaunchAdmissionError::CleanupInProgress { .. }) => {
                 ProtocolErrorCode::CleanupInProgress
             }
+            Self::LaunchAdmission(LaunchAdmissionError::ActiveLaunchExists { .. }) => {
+                ProtocolErrorCode::ActiveLaunchExists
+            }
             Self::LaunchAdmission(LaunchAdmissionError::UnsupportedService(_)) => {
                 ProtocolErrorCode::UnsupportedService
             }
             Self::LaunchAdmission(LaunchAdmissionError::UnsupportedVersion(_)) => {
                 ProtocolErrorCode::UnsupportedProtocolVersion
             }
+            Self::LaunchAdmission(LaunchAdmissionError::GenerationNotNewer { .. }) => {
+                ProtocolErrorCode::LaunchGenerationNotNewer
+            }
             Self::LaunchGenerationConflict { .. } => ProtocolErrorCode::LaunchGenerationConflict,
             Self::ConfigureAlreadyApplied => ProtocolErrorCode::ConfigureAlreadyApplied,
             Self::ConfigureAfterExec => ProtocolErrorCode::ConfigureAfterExec,
+            Self::ConfigureRequiredForExec => ProtocolErrorCode::ConfigureRequiredForExec,
+            Self::InvalidLifecycleTransition { .. } => {
+                ProtocolErrorCode::InvalidLifecycleTransition
+            }
+            Self::LaunchQuiesced => ProtocolErrorCode::LaunchQuiesced,
+            Self::LaunchShuttingDown => ProtocolErrorCode::LaunchShuttingDown,
             Self::Mapping(MappingError::OverlapConflict { .. }) => {
                 ProtocolErrorCode::MappingConflict
             }
@@ -119,7 +152,12 @@ impl StateError {
             Self::ExecIdReusedInGeneration { .. } => ProtocolErrorCode::ExecIdReusedInGeneration,
             Self::UnknownExecId { .. } => ProtocolErrorCode::UnknownExecId,
             Self::StreamSequenceMismatch { .. } => ProtocolErrorCode::StreamSequenceMismatch,
+            Self::StreamSequenceExhausted { .. } => ProtocolErrorCode::StreamSequenceExhausted,
             Self::StreamAlreadyClosed { .. } => ProtocolErrorCode::StreamAlreadyClosed,
+            Self::FlowControlCreditExhausted { .. } => {
+                ProtocolErrorCode::FlowControlCreditExhausted
+            }
+            Self::FlowControlCreditOverflow { .. } => ProtocolErrorCode::FlowControlCreditOverflow,
             Self::MissingTerminalPrerequisites { .. } => {
                 ProtocolErrorCode::MissingTerminalPrerequisites
             }
@@ -151,6 +189,7 @@ pub struct ConfigureState {
 pub struct AgentProtocolState {
     launch: Option<LaunchState>,
     cleanup_status: CleanupStatus,
+    latest_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +198,7 @@ pub struct LaunchAdmissionInput {
     pub service: String,
     pub version: u32,
     pub launch: LaunchIdentity,
+    pub capability_proof: CapabilityProofMaterial,
     pub build: BuildStatus,
     pub network: NetworkStatus,
     pub isolation: IsolationStatus,
@@ -169,7 +209,12 @@ impl AgentProtocolState {
         Self {
             launch: None,
             cleanup_status: CleanupStatus::NotRequired,
+            latest_generation: None,
         }
+    }
+
+    pub fn cleanup_status(&self) -> CleanupStatus {
+        self.cleanup_status
     }
 
     pub fn admit_launch(
@@ -186,19 +231,49 @@ impl AgentProtocolState {
                 LaunchAdmissionError::UnsupportedVersion(input.version),
             ));
         }
-        if let CleanupStatus::InProgress { deadline_secs } = self.cleanup_status
-            && input.now_secs <= deadline_secs
+
+        self.progress_cleanup_if_deadline_elapsed(input.now_secs);
+        if let CleanupStatus::InProgress {
+            generation,
+            deadline_secs,
+        } = self.cleanup_status
         {
             return Err(StateError::LaunchAdmission(
                 LaunchAdmissionError::CleanupInProgress {
+                    generation,
                     deadline_secs,
                     now_secs: input.now_secs,
                 },
             ));
         }
 
-        self.launch = Some(LaunchState::new(input.launch));
-        self.cleanup_status = CleanupStatus::Completed;
+        if let Some(active) = self.launch.as_ref() {
+            return Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::ActiveLaunchExists {
+                    generation: active.identity.generation,
+                },
+            ));
+        }
+
+        if let Some(latest) = self.latest_generation
+            && input.launch.generation <= latest
+        {
+            return Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::GenerationNotNewer {
+                    latest_generation: latest,
+                    attempted: input.launch.generation,
+                },
+            ));
+        }
+
+        self.latest_generation = Some(input.launch.generation);
+        self.launch = Some(LaunchState::new(
+            input.launch,
+            input.capability_proof.to_bytes(),
+        ));
+        self.cleanup_status = CleanupStatus::Completed {
+            generation: input.launch.generation,
+        };
         Ok(AgentControlMessage::Ready {
             launch: input.launch,
             status: ReadyStatus {
@@ -226,6 +301,14 @@ impl AgentProtocolState {
                 actual: launch,
             });
         }
+        if launch_state.proof_binding.generation != launch.generation
+            || launch_state.proof_binding.nonce != launch.nonce
+        {
+            return Err(StateError::LaunchGenerationConflict {
+                expected: launch_state.identity,
+                actual: launch,
+            });
+        }
         if launch_state.configure.is_some() {
             return Err(StateError::ConfigureAlreadyApplied);
         }
@@ -242,7 +325,24 @@ impl AgentProtocolState {
     }
 
     pub fn create_exec(&mut self, exec_id: u32) -> Result<(), StateError> {
+        if let CleanupStatus::InProgress { .. } = self.cleanup_status {
+            return Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::CleanupInProgress {
+                    generation: self.cleanup_generation(),
+                    deadline_secs: self.cleanup_deadline(),
+                    now_secs: self.cleanup_deadline(),
+                },
+            ));
+        }
         let launch_state = self.launch_mut()?;
+        if launch_state.configure.is_none() {
+            return Err(StateError::ConfigureRequiredForExec);
+        }
+        match launch_state.lifecycle {
+            LaunchLifecycle::Ready => {}
+            LaunchLifecycle::Quiesced => return Err(StateError::LaunchQuiesced),
+            LaunchLifecycle::ShuttingDown => return Err(StateError::LaunchShuttingDown),
+        }
         if let Some(active) = launch_state.active_exec {
             return Err(StateError::ActiveExecExists {
                 active_exec_id: active.exec_id,
@@ -258,7 +358,10 @@ impl AgentProtocolState {
 
     pub fn health(&self) -> HealthStatus {
         let launch_admitted = self.launch.is_some();
-        let quiesced = self.launch.as_ref().is_some_and(|launch| launch.quiesced);
+        let quiesced = self
+            .launch
+            .as_ref()
+            .is_some_and(|launch| launch.lifecycle == LaunchLifecycle::Quiesced);
         HealthStatus {
             quiesced,
             launch_admitted,
@@ -267,19 +370,43 @@ impl AgentProtocolState {
 
     pub fn quiesce(&mut self) -> Result<AgentControlMessage, StateError> {
         let launch_state = self.launch_mut()?;
-        launch_state.quiesced = true;
-        Ok(AgentControlMessage::Quiesced)
+        match launch_state.lifecycle {
+            LaunchLifecycle::Ready => {
+                if launch_state.active_exec.is_some() {
+                    return Err(StateError::InvalidLifecycleTransition {
+                        operation: "quiesce",
+                    });
+                }
+                launch_state.lifecycle = LaunchLifecycle::Quiesced;
+                Ok(AgentControlMessage::Quiesced)
+            }
+            _ => Err(StateError::InvalidLifecycleTransition {
+                operation: "quiesce",
+            }),
+        }
     }
 
     pub fn resume(&mut self) -> Result<AgentControlMessage, StateError> {
         let launch_state = self.launch_mut()?;
-        launch_state.quiesced = false;
-        Ok(AgentControlMessage::Resumed)
+        match launch_state.lifecycle {
+            LaunchLifecycle::Quiesced => {
+                launch_state.lifecycle = LaunchLifecycle::Ready;
+                Ok(AgentControlMessage::Resumed)
+            }
+            _ => Err(StateError::InvalidLifecycleTransition {
+                operation: "resume",
+            }),
+        }
     }
 
     pub fn graceful_shutdown(&mut self) -> Result<AgentControlMessage, StateError> {
         let launch_state = self.launch_mut()?;
-        launch_state.shutting_down = true;
+        if launch_state.lifecycle == LaunchLifecycle::ShuttingDown {
+            return Err(StateError::InvalidLifecycleTransition {
+                operation: "shutdown",
+            });
+        }
+        launch_state.lifecycle = LaunchLifecycle::ShuttingDown;
         Ok(AgentControlMessage::ShuttingDown)
     }
 
@@ -298,7 +425,7 @@ impl AgentProtocolState {
         }
         exec.apply(event)?;
 
-        if exec.can_emit_terminal() {
+        if exec.has_required_terminal_prerequisites() && exec.can_emit_terminal() {
             let terminal = ExecTerminalEvent {
                 exec_id,
                 disposition: exec
@@ -313,14 +440,44 @@ impl AgentProtocolState {
     }
 
     pub fn begin_channel_loss_cleanup(&mut self, now_secs: u64) -> Result<(), StateError> {
-        if self.launch.is_none() {
-            return Err(StateError::ChannelAuthenticationRequired);
-        }
+        let launch = self
+            .launch
+            .take()
+            .ok_or(StateError::ChannelAuthenticationRequired)?;
+        let generation = launch.identity.generation;
+        self.latest_generation = Some(self.latest_generation.unwrap_or(generation).max(generation));
+        let deadline_secs = now_secs.saturating_add(CHANNEL_LOSS_CLEANUP_DEADLINE_SECS);
         self.cleanup_status = CleanupStatus::InProgress {
-            deadline_secs: now_secs.saturating_add(CHANNEL_LOSS_CLEANUP_DEADLINE_SECS),
+            generation,
+            deadline_secs,
         };
-        self.launch = None;
         Ok(())
+    }
+
+    fn cleanup_generation(&self) -> u64 {
+        match self.cleanup_status {
+            CleanupStatus::InProgress { generation, .. }
+            | CleanupStatus::Completed { generation } => generation,
+            CleanupStatus::NotRequired => self.latest_generation.unwrap_or(0),
+        }
+    }
+
+    fn cleanup_deadline(&self) -> u64 {
+        match self.cleanup_status {
+            CleanupStatus::InProgress { deadline_secs, .. } => deadline_secs,
+            _ => 0,
+        }
+    }
+
+    fn progress_cleanup_if_deadline_elapsed(&mut self, now_secs: u64) {
+        if let CleanupStatus::InProgress {
+            generation,
+            deadline_secs,
+        } = self.cleanup_status
+            && now_secs >= deadline_secs
+        {
+            self.cleanup_status = CleanupStatus::Completed { generation };
+        }
     }
 
     fn launch_mut(&mut self) -> Result<&mut LaunchState, StateError> {
@@ -336,25 +493,43 @@ impl Default for AgentProtocolState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchLifecycle {
+    Ready,
+    Quiesced,
+    ShuttingDown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LaunchProofBinding {
+    generation: u64,
+    nonce: [u8; 16],
+    proof: [u8; 32],
+}
+
 #[derive(Clone, Debug)]
 struct LaunchState {
     identity: LaunchIdentity,
+    proof_binding: LaunchProofBinding,
     configure: Option<ConfigureState>,
     used_exec_ids: BTreeSet<u32>,
     active_exec: Option<ExecState>,
-    quiesced: bool,
-    shutting_down: bool,
+    lifecycle: LaunchLifecycle,
 }
 
 impl LaunchState {
-    fn new(identity: LaunchIdentity) -> Self {
+    fn new(identity: LaunchIdentity, proof: [u8; 32]) -> Self {
         Self {
             identity,
+            proof_binding: LaunchProofBinding {
+                generation: identity.generation,
+                nonce: identity.nonce,
+                proof,
+            },
             configure: None,
             used_exec_ids: BTreeSet::new(),
             active_exec: None,
-            quiesced: false,
-            shutting_down: false,
+            lifecycle: LaunchLifecycle::Ready,
         }
     }
 }
@@ -368,10 +543,14 @@ struct ExecState {
     stdin_closed: bool,
     stdout_closed: bool,
     stderr_closed: bool,
-    streams_drained: bool,
+    stdout_drained: bool,
+    stderr_drained: bool,
     descendants_cleaned: bool,
     disposition: Option<ExecDisposition>,
     terminal_emitted: bool,
+    stdin_window: FlowControlWindow,
+    stdout_window: FlowControlWindow,
+    stderr_window: FlowControlWindow,
 }
 
 impl ExecState {
@@ -384,77 +563,67 @@ impl ExecState {
             stdin_closed: false,
             stdout_closed: false,
             stderr_closed: false,
-            streams_drained: false,
+            stdout_drained: false,
+            stderr_drained: false,
             descendants_cleaned: false,
             disposition: None,
             terminal_emitted: false,
+            stdin_window: FlowControlWindow {
+                available_credits: 0,
+            },
+            stdout_window: FlowControlWindow {
+                available_credits: 0,
+            },
+            stderr_window: FlowControlWindow {
+                available_credits: 0,
+            },
         }
     }
 
     fn apply(&mut self, event: ActiveExecEvent) -> Result<(), StateError> {
         match event {
-            ActiveExecEvent::StdinFrame { sequence } => {
-                if self.stdin_closed {
-                    return Err(StateError::StreamAlreadyClosed {
-                        stream: StreamName::Stdin,
-                        exec_id: self.exec_id,
-                    });
-                }
+            ActiveExecEvent::AddFlowCredits { stream, credits } => {
+                self.add_flow_credits(stream, credits)
+            }
+            ActiveExecEvent::StdinChunk { sequence } => {
+                self.ensure_open(StreamName::Stdin)?;
+                self.consume_credit(StreamName::Stdin)?;
                 expect_sequence(StreamName::Stdin, &mut self.stdin_next_seq, sequence)
             }
             ActiveExecEvent::StdinEof { sequence } => {
-                if self.stdin_closed {
-                    return Err(StateError::StreamAlreadyClosed {
-                        stream: StreamName::Stdin,
-                        exec_id: self.exec_id,
-                    });
-                }
+                self.ensure_open(StreamName::Stdin)?;
                 expect_sequence(StreamName::Stdin, &mut self.stdin_next_seq, sequence)?;
                 self.stdin_closed = true;
                 Ok(())
             }
-            ActiveExecEvent::StdoutFrame { sequence } => {
-                if self.stdout_closed {
-                    return Err(StateError::StreamAlreadyClosed {
-                        stream: StreamName::Stdout,
-                        exec_id: self.exec_id,
-                    });
-                }
+            ActiveExecEvent::StdoutChunk { sequence } => {
+                self.ensure_open(StreamName::Stdout)?;
+                self.consume_credit(StreamName::Stdout)?;
                 expect_sequence(StreamName::Stdout, &mut self.stdout_next_seq, sequence)
             }
             ActiveExecEvent::StdoutEof { sequence } => {
-                if self.stdout_closed {
-                    return Err(StateError::StreamAlreadyClosed {
-                        stream: StreamName::Stdout,
-                        exec_id: self.exec_id,
-                    });
-                }
+                self.ensure_open(StreamName::Stdout)?;
                 expect_sequence(StreamName::Stdout, &mut self.stdout_next_seq, sequence)?;
                 self.stdout_closed = true;
                 Ok(())
             }
-            ActiveExecEvent::StderrFrame { sequence } => {
-                if self.stderr_closed {
-                    return Err(StateError::StreamAlreadyClosed {
-                        stream: StreamName::Stderr,
-                        exec_id: self.exec_id,
-                    });
-                }
+            ActiveExecEvent::StderrChunk { sequence } => {
+                self.ensure_open(StreamName::Stderr)?;
+                self.consume_credit(StreamName::Stderr)?;
                 expect_sequence(StreamName::Stderr, &mut self.stderr_next_seq, sequence)
             }
             ActiveExecEvent::StderrEof { sequence } => {
-                if self.stderr_closed {
-                    return Err(StateError::StreamAlreadyClosed {
-                        stream: StreamName::Stderr,
-                        exec_id: self.exec_id,
-                    });
-                }
+                self.ensure_open(StreamName::Stderr)?;
                 expect_sequence(StreamName::Stderr, &mut self.stderr_next_seq, sequence)?;
                 self.stderr_closed = true;
                 Ok(())
             }
-            ActiveExecEvent::StreamsDrained => {
-                self.streams_drained = true;
+            ActiveExecEvent::StreamDrained { stream } => {
+                match stream {
+                    StreamName::Stdout => self.stdout_drained = true,
+                    StreamName::Stderr => self.stderr_drained = true,
+                    StreamName::Stdin => {}
+                }
                 Ok(())
             }
             ActiveExecEvent::DescendantsCleaned => {
@@ -468,13 +637,61 @@ impl ExecState {
         }
     }
 
-    fn can_emit_terminal(&self) -> bool {
-        !self.terminal_emitted
-            && self.stdout_closed
+    fn add_flow_credits(&mut self, stream: StreamName, credits: u32) -> Result<(), StateError> {
+        let window = match stream {
+            StreamName::Stdin => &mut self.stdin_window,
+            StreamName::Stdout => &mut self.stdout_window,
+            StreamName::Stderr => &mut self.stderr_window,
+        };
+        window.available_credits = window
+            .available_credits
+            .checked_add(credits)
+            .ok_or(StateError::FlowControlCreditOverflow { stream })?;
+        Ok(())
+    }
+
+    fn ensure_open(&self, stream: StreamName) -> Result<(), StateError> {
+        let closed = match stream {
+            StreamName::Stdin => self.stdin_closed,
+            StreamName::Stdout => self.stdout_closed,
+            StreamName::Stderr => self.stderr_closed,
+        };
+        if closed {
+            return Err(StateError::StreamAlreadyClosed {
+                stream,
+                exec_id: self.exec_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn consume_credit(&mut self, stream: StreamName) -> Result<(), StateError> {
+        let window = match stream {
+            StreamName::Stdin => &mut self.stdin_window,
+            StreamName::Stdout => &mut self.stdout_window,
+            StreamName::Stderr => &mut self.stderr_window,
+        };
+        if window.available_credits == 0 {
+            return Err(StateError::FlowControlCreditExhausted {
+                stream,
+                exec_id: self.exec_id,
+            });
+        }
+        window.available_credits -= 1;
+        Ok(())
+    }
+
+    fn has_required_terminal_prerequisites(&self) -> bool {
+        self.stdout_closed
             && self.stderr_closed
-            && self.streams_drained
+            && self.stdout_drained
+            && self.stderr_drained
             && self.descendants_cleaned
             && self.disposition.is_some()
+    }
+
+    fn can_emit_terminal(&self) -> bool {
+        !self.terminal_emitted && self.has_required_terminal_prerequisites()
     }
 }
 
@@ -486,7 +703,12 @@ fn expect_sequence(stream: StreamName, next: &mut u64, received: u64) -> Result<
             actual: received,
         });
     }
-    *next = next.saturating_add(1);
+    *next = next
+        .checked_add(1)
+        .ok_or(StateError::StreamSequenceExhausted {
+            stream,
+            last_sequence: *next,
+        })?;
     Ok(())
 }
 
@@ -496,51 +718,60 @@ mod tests {
     use crate::mapping::{AccessMode, RelativeChildPath, SymlinkContainmentPolicy};
     use crate::messages::NetworkMode;
 
-    fn launch_id() -> LaunchIdentity {
+    fn launch_id(generation: u64) -> LaunchIdentity {
         LaunchIdentity {
-            generation: 1,
-            nonce: [1; 16],
+            generation,
+            nonce: [generation as u8; 16],
         }
     }
 
-    fn ready_state() -> AgentProtocolState {
-        let mut state = AgentProtocolState::new();
-        state
-            .admit_launch(LaunchAdmissionInput {
-                now_secs: 1,
-                service: SERVICE_IDENTITY.to_string(),
-                version: PROTOCOL_VERSION,
-                launch: launch_id(),
-                build: BuildStatus {
-                    agent_version: "test".to_string(),
-                    kernel_release: "test".to_string(),
-                    profile: "debug".to_string(),
-                },
-                network: NetworkStatus {
-                    mode: NetworkMode::NoNic,
-                    detail: None,
-                },
-                isolation: IsolationStatus {
-                    pid_namespace: true,
-                    mount_namespace: true,
-                    uts_namespace: true,
-                    ipc_namespace: true,
-                    private_proc: true,
-                    private_dev: true,
-                    private_devpts: true,
-                    private_shm: true,
-                    read_only_sys: true,
-                    capabilities_dropped: true,
-                    no_new_privs: true,
-                    cgroup_separation: true,
-                    orphan_reaping: true,
-                },
-            })
-            .expect("admit launch");
+    fn proof(value: u8) -> CapabilityProofMaterial {
+        CapabilityProofMaterial::try_from(vec![value; 32]).expect("proof")
+    }
+
+    fn test_isolation() -> IsolationStatus {
+        IsolationStatus {
+            pid_namespace: true,
+            mount_namespace: true,
+            uts_namespace: true,
+            ipc_namespace: true,
+            private_proc: true,
+            private_dev: true,
+            private_devpts: true,
+            private_shm: true,
+            read_only_sys: true,
+            capabilities_dropped: true,
+            no_new_privs: true,
+            cgroup_separation: true,
+            orphan_reaping: true,
+        }
+    }
+
+    fn admission_input(generation: u64, now_secs: u64) -> LaunchAdmissionInput {
+        LaunchAdmissionInput {
+            now_secs,
+            service: SERVICE_IDENTITY.to_string(),
+            version: PROTOCOL_VERSION,
+            launch: launch_id(generation),
+            capability_proof: proof(generation as u8),
+            build: BuildStatus {
+                agent_version: "test".to_string(),
+                kernel_release: "test".to_string(),
+                profile: "debug".to_string(),
+            },
+            network: NetworkStatus {
+                mode: NetworkMode::NoNic,
+                detail: None,
+            },
+            isolation: test_isolation(),
+        }
+    }
+
+    fn configure_ready(state: &mut AgentProtocolState, generation: u64) {
         state
             .configure(
-                launch_id(),
-                CanonicalHostMappingRoot("/root".to_string()),
+                launch_id(generation),
+                CanonicalHostMappingRoot::parse("/root".to_string()).expect("root"),
                 vec![ChildMapping {
                     child: RelativeChildPath::parse("workspace".to_string()).expect("path"),
                     access: AccessMode::ReadWrite,
@@ -551,103 +782,464 @@ mod tests {
                 },
             )
             .expect("configure");
+    }
+
+    fn ready_state(generation: u64) -> AgentProtocolState {
+        let mut state = AgentProtocolState::new();
+        state
+            .admit_launch(admission_input(generation, 1))
+            .expect("admit launch");
+        configure_ready(&mut state, generation);
         state
     }
 
     #[test]
-    fn configure_only_once() {
-        let mut state = ready_state();
-        let second = state.configure(
-            launch_id(),
-            CanonicalHostMappingRoot("/root".to_string()),
-            vec![],
-            MappingContainmentPolicy {
-                symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
-                reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
-            },
-        );
-        assert!(matches!(second, Err(StateError::ConfigureAlreadyApplied)));
-    }
-
-    #[test]
-    fn one_active_exec_and_terminal_ordering() {
-        let mut state = ready_state();
-        state.create_exec(7).expect("start");
+    fn launch_requires_supported_service_and_version() {
+        let mut state = AgentProtocolState::new();
+        let mut input = admission_input(1, 1);
+        input.service = "wrong".to_string();
         assert!(matches!(
-            state.create_exec(8),
-            Err(StateError::ActiveExecExists { .. })
+            state.admit_launch(input),
+            Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::UnsupportedService(_)
+            ))
         ));
-        assert!(
-            state
-                .apply_exec_event(7, ActiveExecEvent::Disposition(ExecDisposition::TimedOut))
-                .expect("event")
-                .is_none()
-        );
-        assert!(
-            state
-                .apply_exec_event(7, ActiveExecEvent::StdoutEof { sequence: 0 })
-                .expect("event")
-                .is_none()
-        );
-        assert!(
-            state
-                .apply_exec_event(7, ActiveExecEvent::StderrEof { sequence: 0 })
-                .expect("event")
-                .is_none()
-        );
-        assert!(
-            state
-                .apply_exec_event(7, ActiveExecEvent::StreamsDrained)
-                .expect("event")
-                .is_none()
-        );
-        let terminal = state
-            .apply_exec_event(7, ActiveExecEvent::DescendantsCleaned)
-            .expect("event")
-            .expect("terminal");
-        assert_eq!(terminal.exec_id, 7);
-        assert!(matches!(terminal.disposition, ExecDisposition::TimedOut));
+
+        let mut input = admission_input(1, 1);
+        input.version = 99;
+        assert!(matches!(
+            state.admit_launch(input),
+            Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::UnsupportedVersion(_)
+            ))
+        ));
     }
 
     #[test]
-    fn cleanup_blocks_new_generation_until_deadline() {
-        let mut state = ready_state();
-        state.begin_channel_loss_cleanup(10).expect("cleanup");
-        let blocked = state.admit_launch(LaunchAdmissionInput {
-            now_secs: 20,
-            service: SERVICE_IDENTITY.to_string(),
-            version: PROTOCOL_VERSION,
-            launch: launch_id(),
-            build: BuildStatus {
-                agent_version: "test".to_string(),
-                kernel_release: "test".to_string(),
-                profile: "debug".to_string(),
-            },
-            network: NetworkStatus {
-                mode: NetworkMode::NoNic,
-                detail: None,
-            },
-            isolation: IsolationStatus {
-                pid_namespace: true,
-                mount_namespace: true,
-                uts_namespace: true,
-                ipc_namespace: true,
-                private_proc: true,
-                private_dev: true,
-                private_devpts: true,
-                private_shm: true,
-                read_only_sys: true,
-                capabilities_dropped: true,
-                no_new_privs: true,
-                cgroup_separation: true,
-                orphan_reaping: true,
-            },
-        });
+    fn launch_stores_capability_proof_bound_to_nonce_and_generation() {
+        let mut state = AgentProtocolState::new();
+        state
+            .admit_launch(admission_input(7, 1))
+            .expect("launch admission");
+        let launch = state.launch.as_ref().expect("active launch");
+        assert_eq!(launch.proof_binding.generation, 7);
+        assert_eq!(launch.proof_binding.nonce, [7; 16]);
+        assert_eq!(launch.proof_binding.proof, [7; 32]);
+    }
+
+    #[test]
+    fn active_launch_rejects_reconnect_attempts() {
+        let mut state = AgentProtocolState::new();
+        state
+            .admit_launch(admission_input(1, 1))
+            .expect("first launch");
         assert!(matches!(
-            blocked,
+            state.admit_launch(admission_input(2, 2)),
+            Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::ActiveLaunchExists { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn stale_or_same_generation_is_rejected() {
+        let mut state = AgentProtocolState::new();
+        state
+            .admit_launch(admission_input(2, 1))
+            .expect("first launch");
+        state.begin_channel_loss_cleanup(10).expect("cleanup start");
+        assert!(matches!(
+            state.admit_launch(admission_input(2, 45)),
+            Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::GenerationNotNewer { .. }
+            ))
+        ));
+        assert!(matches!(
+            state.admit_launch(admission_input(1, 45)),
+            Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::GenerationNotNewer { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn cleanup_blocks_launch_until_deadline_and_then_allows_newer_generation() {
+        let mut state = AgentProtocolState::new();
+        state
+            .admit_launch(admission_input(5, 1))
+            .expect("first launch");
+        state
+            .begin_channel_loss_cleanup(100)
+            .expect("cleanup start");
+        assert!(matches!(
+            state.admit_launch(admission_input(6, 120)),
             Err(StateError::LaunchAdmission(
                 LaunchAdmissionError::CleanupInProgress { .. }
             ))
         ));
+
+        state
+            .admit_launch(admission_input(6, 130))
+            .expect("new generation after cleanup");
+        assert_eq!(
+            state.cleanup_status(),
+            CleanupStatus::Completed { generation: 6 }
+        );
+    }
+
+    #[test]
+    fn configure_only_once_and_must_match_launch_identity() {
+        let mut state = ready_state(1);
+        assert!(matches!(
+            state.configure(
+                launch_id(1),
+                CanonicalHostMappingRoot::parse("/root".to_string()).expect("root"),
+                vec![],
+                MappingContainmentPolicy {
+                    symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                    reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                },
+            ),
+            Err(StateError::ConfigureAlreadyApplied)
+        ));
+        let mut state = AgentProtocolState::new();
+        state
+            .admit_launch(admission_input(3, 1))
+            .expect("launch admission");
+        assert!(matches!(
+            state.configure(
+                launch_id(4),
+                CanonicalHostMappingRoot::parse("/root".to_string()).expect("root"),
+                vec![],
+                MappingContainmentPolicy {
+                    symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                    reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                },
+            ),
+            Err(StateError::LaunchGenerationConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn no_exec_before_configure_and_exec_id_constraints_hold() {
+        let mut state = AgentProtocolState::new();
+        state
+            .admit_launch(admission_input(1, 1))
+            .expect("launch admission");
+        assert!(matches!(
+            state.create_exec(1),
+            Err(StateError::ConfigureRequiredForExec)
+        ));
+        configure_ready(&mut state, 1);
+        state.create_exec(7).expect("exec create");
+        assert!(matches!(
+            state.create_exec(8),
+            Err(StateError::ActiveExecExists { .. })
+        ));
+    }
+
+    #[test]
+    fn quiesce_resume_and_shutdown_transitions_are_gated() {
+        let mut state = ready_state(1);
+        state.quiesce().expect("quiesce");
+        assert!(matches!(
+            state.create_exec(1),
+            Err(StateError::LaunchQuiesced)
+        ));
+        state.resume().expect("resume");
+        state.create_exec(1).expect("exec");
+        assert!(matches!(
+            state.quiesce(),
+            Err(StateError::InvalidLifecycleTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn graceful_shutdown_blocks_new_execs() {
+        let mut state = ready_state(2);
+        state.graceful_shutdown().expect("shutdown");
+        assert!(matches!(
+            state.create_exec(1),
+            Err(StateError::LaunchShuttingDown)
+        ));
+    }
+
+    #[test]
+    fn channel_loss_enters_bounded_cleanup_state() {
+        let mut state = ready_state(3);
+        state.begin_channel_loss_cleanup(10).expect("cleanup");
+        assert!(matches!(
+            state.cleanup_status(),
+            CleanupStatus::InProgress {
+                generation: 3,
+                deadline_secs: 40
+            }
+        ));
+        assert!(matches!(
+            state.create_exec(1),
+            Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::CleanupInProgress { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn flow_credits_are_required_and_distinct_per_stream() {
+        let mut state = ready_state(4);
+        state.create_exec(20).expect("exec");
+        assert!(matches!(
+            state.apply_exec_event(20, ActiveExecEvent::StdoutChunk { sequence: 0 }),
+            Err(StateError::FlowControlCreditExhausted {
+                stream: StreamName::Stdout,
+                ..
+            })
+        ));
+        state
+            .apply_exec_event(
+                20,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stdout,
+                    credits: 1,
+                },
+            )
+            .expect("credit");
+        state
+            .apply_exec_event(20, ActiveExecEvent::StdoutChunk { sequence: 0 })
+            .expect("stdout chunk");
+        assert!(matches!(
+            state.apply_exec_event(20, ActiveExecEvent::StderrChunk { sequence: 0 }),
+            Err(StateError::FlowControlCreditExhausted {
+                stream: StreamName::Stderr,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn flow_credit_addition_uses_checked_arithmetic() {
+        let mut state = ready_state(5);
+        state.create_exec(21).expect("exec");
+        state
+            .apply_exec_event(
+                21,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stdout,
+                    credits: u32::MAX,
+                },
+            )
+            .expect("max credit");
+        assert!(matches!(
+            state.apply_exec_event(
+                21,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stdout,
+                    credits: 1
+                }
+            ),
+            Err(StateError::FlowControlCreditOverflow {
+                stream: StreamName::Stdout
+            })
+        ));
+    }
+
+    #[test]
+    fn sequence_gaps_and_repeated_eof_are_rejected() {
+        let mut state = ready_state(6);
+        state.create_exec(22).expect("exec");
+        state
+            .apply_exec_event(
+                22,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stdout,
+                    credits: 2,
+                },
+            )
+            .expect("credit");
+        assert!(matches!(
+            state.apply_exec_event(22, ActiveExecEvent::StdoutChunk { sequence: 1 }),
+            Err(StateError::StreamSequenceMismatch {
+                stream: StreamName::Stdout,
+                expected: 0,
+                actual: 1
+            })
+        ));
+        state
+            .apply_exec_event(22, ActiveExecEvent::StdoutChunk { sequence: 0 })
+            .expect("chunk");
+        state
+            .apply_exec_event(22, ActiveExecEvent::StdoutEof { sequence: 1 })
+            .expect("eof");
+        assert!(matches!(
+            state.apply_exec_event(22, ActiveExecEvent::StdoutEof { sequence: 2 }),
+            Err(StateError::StreamAlreadyClosed {
+                stream: StreamName::Stdout,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sequence_increment_exhaustion_returns_typed_error() {
+        let mut state = ready_state(7);
+        state.create_exec(23).expect("exec");
+        let launch = state.launch.as_mut().expect("launch");
+        let exec = launch.active_exec.as_mut().expect("active exec");
+        exec.stdin_next_seq = u64::MAX;
+        state
+            .apply_exec_event(
+                23,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stdin,
+                    credits: 1,
+                },
+            )
+            .expect("credit");
+        assert!(matches!(
+            state.apply_exec_event(23, ActiveExecEvent::StdinChunk { sequence: u64::MAX }),
+            Err(StateError::StreamSequenceExhausted {
+                stream: StreamName::Stdin,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cancellation_and_timeout_dispositions_are_preserved() {
+        let mut state = ready_state(8);
+        state.create_exec(24).expect("exec");
+        state
+            .apply_exec_event(
+                24,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stdout,
+                    credits: 1,
+                },
+            )
+            .expect("credit");
+        state
+            .apply_exec_event(
+                24,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stderr,
+                    credits: 1,
+                },
+            )
+            .expect("credit");
+        state
+            .apply_exec_event(24, ActiveExecEvent::StdoutEof { sequence: 0 })
+            .expect("stdout eof");
+        state
+            .apply_exec_event(24, ActiveExecEvent::StderrEof { sequence: 0 })
+            .expect("stderr eof");
+        state
+            .apply_exec_event(
+                24,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stdout,
+                },
+            )
+            .expect("stdout drained");
+        state
+            .apply_exec_event(
+                24,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stderr,
+                },
+            )
+            .expect("stderr drained");
+        state
+            .apply_exec_event(24, ActiveExecEvent::DescendantsCleaned)
+            .expect("cleaned");
+        let terminal = state
+            .apply_exec_event(24, ActiveExecEvent::Disposition(ExecDisposition::Cancelled))
+            .expect("disposition")
+            .expect("terminal");
+        assert_eq!(
+            terminal,
+            ExecTerminalEvent {
+                exec_id: 24,
+                disposition: ExecDisposition::Cancelled
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_event_waits_for_all_prerequisites_and_is_unique() {
+        let mut state = ready_state(9);
+        state.create_exec(25).expect("exec");
+        state
+            .apply_exec_event(
+                25,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stdout,
+                    credits: 1,
+                },
+            )
+            .expect("credit");
+        state
+            .apply_exec_event(
+                25,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stderr,
+                    credits: 1,
+                },
+            )
+            .expect("credit");
+        state
+            .apply_exec_event(25, ActiveExecEvent::Disposition(ExecDisposition::TimedOut))
+            .expect("disposition");
+        assert!(
+            state
+                .apply_exec_event(25, ActiveExecEvent::StdoutEof { sequence: 0 })
+                .expect("stdout eof")
+                .is_none()
+        );
+        assert!(
+            state
+                .apply_exec_event(25, ActiveExecEvent::StderrEof { sequence: 0 })
+                .expect("stderr eof")
+                .is_none()
+        );
+        state
+            .apply_exec_event(
+                25,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stdout,
+                },
+            )
+            .expect("stdout drained");
+        assert!(
+            state
+                .apply_exec_event(25, ActiveExecEvent::DescendantsCleaned)
+                .expect("cleaned")
+                .is_none()
+        );
+        let terminal = state
+            .apply_exec_event(
+                25,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stderr,
+                },
+            )
+            .expect("stderr drained")
+            .expect("terminal");
+        assert!(matches!(terminal.disposition, ExecDisposition::TimedOut));
+        assert!(matches!(
+            state.apply_exec_event(25, ActiveExecEvent::Disposition(ExecDisposition::TimedOut)),
+            Err(StateError::UnknownExecId { exec_id: 25 })
+        ));
+    }
+
+    #[test]
+    fn protocol_error_mapping_covers_new_state_errors() {
+        let detail = StateError::FlowControlCreditExhausted {
+            stream: StreamName::Stdout,
+            exec_id: 1,
+        }
+        .to_protocol_error_detail();
+        assert_eq!(detail.code, ProtocolErrorCode::FlowControlCreditExhausted);
+
+        let detail = StateError::ConfigureRequiredForExec.to_protocol_error_detail();
+        assert_eq!(detail.code, ProtocolErrorCode::ConfigureRequiredForExec);
     }
 }

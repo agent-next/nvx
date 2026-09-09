@@ -21,19 +21,55 @@ pub use crate::codec::{
 };
 pub use crate::mapping::{
     AccessMode, CanonicalHostMappingRoot, ChildMapping, MappingContainmentPolicy, MappingError,
-    RelativeChildPath, SymlinkContainmentPolicy,
+    RelativeChildPath, SymlinkContainmentPolicy, validate_canonical_root_path,
+    validate_mapping_set,
 };
 pub use crate::messages::{
-    AgentControlMessage, BuildStatus, CapabilityProofMaterial, HealthStatus, HostControlMessage,
-    IsolationStatus, LaunchIdentity, NetworkMode, NetworkStatus, ProtocolErrorCode,
-    ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, StreamName, WORKLOAD_GID_MXC,
-    WORKLOAD_GROUP_MXC, WORKLOAD_UID_MXC, WORKLOAD_USER_MXC, WorkloadIdentityStatus,
+    AgentControlMessage, BuildStatus, CapabilityProofMaterial, ExecDisposition, FlowCreditRequest,
+    HealthStatus, HostControlMessage, IsolationStatus, LaunchIdentity, NetworkMode, NetworkStatus,
+    ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, StderrChunkRecord,
+    StderrEofRecord, StdinChunkRecord, StdinEofRecord, StdoutChunkRecord, StdoutEofRecord,
+    StreamName, WORKLOAD_GID_MXC, WORKLOAD_GROUP_MXC, WORKLOAD_UID_MXC, WORKLOAD_USER_MXC,
+    WorkloadIdentityStatus,
 };
 pub use crate::state::{
     ActiveExecEvent, AgentProtocolState, CHANNEL_LOSS_CLEANUP_DEADLINE_SECS, CleanupStatus,
-    ExecDisposition, ExecTerminalEvent, FlowControlWindow, LaunchAdmissionError,
-    LaunchAdmissionInput, PROTOCOL_VERSION, StateError,
+    ExecTerminalEvent, FlowControlWindow, LaunchAdmissionError, LaunchAdmissionInput,
+    PROTOCOL_VERSION, StateError,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorCode {
+    Internal,
+    MountFailed,
+    ExecFailed,
+    BadRequest,
+    WorkloadBusy,
+    FreezeFailed,
+    QuiesceFailed,
+    CheckpointTimeout,
+}
+
+#[derive(Debug)]
+pub struct ProtocolError {
+    message: String,
+}
+
+impl ProtocolError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl core::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ProtocolError {}
 
 /// Adapter boundary reserved for future ACI integration.
 ///

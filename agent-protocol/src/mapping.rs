@@ -11,9 +11,30 @@ pub enum AccessMode {
     ReadWrite,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct CanonicalHostMappingRoot(pub String);
+
+impl CanonicalHostMappingRoot {
+    pub fn parse(value: String) -> Result<Self, MappingError> {
+        validate_canonical_root_path(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalHostMappingRoot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct RelativeChildPath(String);
@@ -67,6 +88,7 @@ pub struct MappingContainmentPolicy {
 pub enum MappingError {
     EmptyPath,
     AbsolutePath(String),
+    NonAbsoluteCanonicalRoot(String),
     DotSegment(String),
     DotDotSegment(String),
     EmptySegment(String),
@@ -109,20 +131,38 @@ pub fn validate_mapping_set(mappings: &[ChildMapping]) -> Result<(), MappingErro
     Ok(())
 }
 
-fn validate_relative_child_path(value: &str) -> Result<(), MappingError> {
-    if value.is_empty() {
-        return Err(MappingError::EmptyPath);
+pub fn validate_canonical_root_path(value: &str) -> Result<(), MappingError> {
+    validate_common_path_rules(value)?;
+    if !value.starts_with('/') {
+        return Err(MappingError::NonAbsoluteCanonicalRoot(value.to_string()));
     }
+    validate_components(value, true)
+}
+
+fn validate_relative_child_path(value: &str) -> Result<(), MappingError> {
+    validate_common_path_rules(value)?;
     if value.starts_with('/') {
         return Err(MappingError::AbsolutePath(value.to_string()));
+    }
+    validate_components(value, false)
+}
+
+fn validate_common_path_rules(value: &str) -> Result<(), MappingError> {
+    if value.is_empty() {
+        return Err(MappingError::EmptyPath);
     }
     if value.contains('\\') {
         return Err(MappingError::WindowsSeparator(value.to_string()));
     }
-    if has_windows_drive_prefix(value) {
-        return Err(MappingError::WindowsDrivePrefix(value.to_string()));
+    Ok(())
+}
+
+fn validate_components(value: &str, absolute: bool) -> Result<(), MappingError> {
+    let mut segments = value.split('/');
+    if absolute {
+        let _root = segments.next();
     }
-    for segment in value.split('/') {
+    for segment in segments {
         if segment.is_empty() {
             return Err(MappingError::EmptySegment(value.to_string()));
         }
@@ -131,6 +171,9 @@ fn validate_relative_child_path(value: &str) -> Result<(), MappingError> {
         }
         if segment == ".." {
             return Err(MappingError::DotDotSegment(value.to_string()));
+        }
+        if has_windows_drive_prefix(segment) {
+            return Err(MappingError::WindowsDrivePrefix(value.to_string()));
         }
     }
     Ok(())
@@ -149,4 +192,108 @@ fn is_ancestor(left: &RelativeChildPath, right: &RelativeChildPath) -> bool {
             .iter()
             .zip(right_components.iter())
             .all(|(l, r)| l == r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rw(child: &str) -> ChildMapping {
+        ChildMapping {
+            child: RelativeChildPath::parse(child.to_string()).expect("valid child path"),
+            access: AccessMode::ReadWrite,
+        }
+    }
+
+    #[test]
+    fn canonical_root_requires_absolute_clean_unix_path() {
+        assert!(CanonicalHostMappingRoot::parse("/workspace/root".to_string()).is_ok());
+        assert!(matches!(
+            CanonicalHostMappingRoot::parse("workspace/root".to_string()),
+            Err(MappingError::NonAbsoluteCanonicalRoot(_))
+        ));
+        assert!(matches!(
+            CanonicalHostMappingRoot::parse("/workspace\\root".to_string()),
+            Err(MappingError::WindowsSeparator(_))
+        ));
+    }
+
+    #[test]
+    fn child_path_rejects_empty_dot_dotdot_and_double_separator() {
+        assert!(matches!(
+            RelativeChildPath::parse("".to_string()),
+            Err(MappingError::EmptyPath)
+        ));
+        assert!(matches!(
+            RelativeChildPath::parse("./bin".to_string()),
+            Err(MappingError::DotSegment(_))
+        ));
+        assert!(matches!(
+            RelativeChildPath::parse("../bin".to_string()),
+            Err(MappingError::DotDotSegment(_))
+        ));
+        assert!(matches!(
+            RelativeChildPath::parse("bin//tool".to_string()),
+            Err(MappingError::EmptySegment(_))
+        ));
+    }
+
+    #[test]
+    fn child_path_rejects_absolute_and_windows_forms() {
+        assert!(matches!(
+            RelativeChildPath::parse("/etc/passwd".to_string()),
+            Err(MappingError::AbsolutePath(_))
+        ));
+        assert!(matches!(
+            RelativeChildPath::parse("a\\b".to_string()),
+            Err(MappingError::WindowsSeparator(_))
+        ));
+        assert!(matches!(
+            RelativeChildPath::parse("C:/temp".to_string()),
+            Err(MappingError::WindowsDrivePrefix(_))
+        ));
+    }
+
+    #[test]
+    fn drive_prefix_is_rejected_in_any_component() {
+        assert!(matches!(
+            RelativeChildPath::parse("foo/C:/bar".to_string()),
+            Err(MappingError::WindowsDrivePrefix(_))
+        ));
+        assert!(matches!(
+            CanonicalHostMappingRoot::parse("/foo/D:/bar".to_string()),
+            Err(MappingError::WindowsDrivePrefix(_))
+        ));
+    }
+
+    #[test]
+    fn mapping_set_rejects_duplicate_children() {
+        let result = validate_mapping_set(&[rw("workspace"), rw("workspace")]);
+        assert!(matches!(result, Err(MappingError::DuplicateChildPath(_))));
+    }
+
+    #[test]
+    fn mapping_set_rejects_ancestor_descendant_overlap() {
+        let result = validate_mapping_set(&[rw("workspace"), rw("workspace/bin")]);
+        assert!(matches!(result, Err(MappingError::OverlapConflict { .. })));
+
+        let reverse = validate_mapping_set(&[rw("workspace/bin"), rw("workspace")]);
+        assert!(matches!(reverse, Err(MappingError::OverlapConflict { .. })));
+    }
+
+    #[test]
+    fn mapping_set_allows_distinct_non_overlapping_children() {
+        let result = validate_mapping_set(&[rw("workspace/bin"), rw("workspace-lib")]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn containment_checks_are_schema_only_and_fs_symlink_checks_are_deferred() {
+        let result = validate_mapping_set(&[ChildMapping {
+            child: RelativeChildPath("workspace/../escape".to_string()),
+            access: AccessMode::ReadOnly,
+        }]);
+        assert!(matches!(result, Err(MappingError::DotDotSegment(_))));
+        // Symlink/reparse filesystem traversal checks are intentionally deferred.
+    }
 }

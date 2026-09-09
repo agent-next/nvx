@@ -134,4 +134,55 @@ mod tests {
                 .expect("checked arithmetic")
         );
     }
+
+    #[test]
+    fn encode_rejects_stream_chunk_larger_than_cap() {
+        let record = InnerRecord {
+            exec_id: 1,
+            kind: InnerRecordKind::Stdout,
+            end_of_stream: false,
+            sequence: 0,
+            payload: vec![0_u8; MAX_STREAM_CHUNK_BYTES + 1],
+        };
+        assert!(matches!(
+            record.encode(),
+            Err(InnerRecordEncodeError::ChunkTooLarge)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_declared_length_mismatch() {
+        let mut encoded = InnerRecord {
+            exec_id: 2,
+            kind: InnerRecordKind::Control,
+            end_of_stream: false,
+            sequence: 0,
+            payload: vec![1, 2, 3],
+        }
+        .encode()
+        .expect("encode");
+        encoded[3] = encoded[3].saturating_add(1);
+        assert!(matches!(
+            InnerRecord::decode(&encoded),
+            Err(InnerRecordDecodeError::LengthMismatch)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_record_kind() {
+        let mut encoded = InnerRecord {
+            exec_id: 3,
+            kind: InnerRecordKind::Control,
+            end_of_stream: false,
+            sequence: 10,
+            payload: vec![],
+        }
+        .encode()
+        .expect("encode");
+        encoded[8] = 99;
+        assert!(matches!(
+            InnerRecord::decode(&encoded),
+            Err(InnerRecordDecodeError::UnknownKind(99))
+        ));
+    }
 }

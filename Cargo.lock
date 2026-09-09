@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "agent-harness"
+version = "0.1.0"
+dependencies = [
+ "agent-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agent-protocol"
 version = "1.0.0"
 dependencies = [

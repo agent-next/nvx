@@ -1,5 +1,5 @@
 [workspace]
-members = ["agent-protocol", "agent"]
+members = ["agent-protocol", "agent", "tools/agent-harness"]
 exclude = ["openvmm"]
 resolver = "3"
 
