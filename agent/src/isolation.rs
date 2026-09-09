@@ -300,6 +300,80 @@ fn setup_step_sequence() -> &'static [SetupStep] {
 }
 
 #[cfg(target_os = "linux")]
+struct WorkloadSetupContext<'a> {
+    plan: &'a IsolationPlan,
+    parent_namespace: &'a NamespaceSnapshot,
+    parent_cgroup: &'a str,
+    probe: Option<IsolationProbe>,
+}
+
+#[cfg(target_os = "linux")]
+trait SetupStepExecutor {
+    fn run_step(&mut self, step: SetupStep, context: &mut WorkloadSetupContext<'_>) -> Result<()>;
+}
+
+#[cfg(target_os = "linux")]
+struct SyscallSetupExecutor;
+
+#[cfg(target_os = "linux")]
+impl SetupStepExecutor for SyscallSetupExecutor {
+    fn run_step(&mut self, step: SetupStep, context: &mut WorkloadSetupContext<'_>) -> Result<()> {
+        match step {
+            SetupStep::MoveToWorkloadCgroup => move_pid_to_cgroup(1, &context.plan.cgroup.workload),
+            SetupStep::MakeRootPrivate => make_root_private(),
+            SetupStep::MountPrivateProc => mount_call("proc", "/proc", "proc", 0, None),
+            SetupStep::MountPrivateDev => {
+                mount_call("tmpfs", "/dev", "tmpfs", 0, Some("mode=755,nosuid,nodev"))
+            }
+            SetupStep::CreatePrivateDevLayout => ensure_minimal_private_dev_layout(),
+            SetupStep::MountPrivateDevpts => mount_call(
+                "devpts",
+                "/dev/pts",
+                "devpts",
+                0,
+                Some("newinstance,ptmxmode=0666,mode=620"),
+            ),
+            SetupStep::MountPrivateShm => mount_call(
+                "tmpfs",
+                "/dev/shm",
+                "tmpfs",
+                0,
+                Some("mode=1777,nosuid,nodev"),
+            ),
+            SetupStep::BindPrivatePtmx => ensure_ptmx_binding(),
+            SetupStep::MountReadOnlySys => {
+                mount_call("sysfs", "/sys", "sysfs", libc::MS_RDONLY, None)
+            }
+            SetupStep::DropBoundingAndAmbientCaps => drop_bounding_and_ambient_capabilities(),
+            SetupStep::SwitchToMxcIdentity => switch_to_mxc_identity(),
+            SetupStep::ClearRemainingCaps => clear_remaining_capabilities(),
+            SetupStep::SetNoNewPrivs => set_no_new_privs(),
+            SetupStep::VerifyIsolation => {
+                let probe = isolated_child_probe(context.parent_namespace, context.parent_cgroup)?;
+                let _ = verify_mandatory_isolation_controls(probe)?;
+                context.probe = Some(probe);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_setup_steps_with_executor(
+    context: &mut WorkloadSetupContext<'_>,
+    executor: &mut impl SetupStepExecutor,
+) -> Result<IsolationProbe> {
+    for step in setup_step_sequence() {
+        executor.run_step(*step, context)?;
+    }
+    context.probe.ok_or_else(|| {
+        AgentError::isolation(
+            "setup step dispatch completed without isolation verification".to_string(),
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HolderReport {
     holder_pid: libc::pid_t,
@@ -344,8 +418,7 @@ pub fn apply_and_verify_workload_isolation(plan: &IsolationPlan) -> Result<Isola
     }
     close_fd(report_write);
 
-    let holder_report = read_holder_report(report_read)?;
-    wait_pid(stage_one)?;
+    let holder_report = finalize_stage_one(stage_one, report_read)?;
     let probe = decode_probe(holder_report.probe_bits);
     let status = verify_mandatory_isolation_controls(probe)?;
     Ok(IsolationSetupResult {
@@ -362,6 +435,30 @@ pub fn apply_and_verify_workload_isolation(_plan: &IsolationPlan) -> Result<Isol
 }
 
 #[cfg(target_os = "linux")]
+fn finalize_stage_one(stage_one_pid: libc::pid_t, report_read_fd: i32) -> Result<HolderReport> {
+    finalize_stage_one_with(stage_one_pid, report_read_fd, read_holder_report, wait_pid)
+}
+
+#[cfg(target_os = "linux")]
+fn finalize_stage_one_with(
+    stage_one_pid: libc::pid_t,
+    report_read_fd: i32,
+    read_report: impl FnOnce(i32) -> Result<HolderReport>,
+    wait_for_stage_one: impl FnOnce(libc::pid_t) -> Result<()>,
+) -> Result<HolderReport> {
+    let report_result = read_report(report_read_fd);
+    let wait_result = wait_for_stage_one(stage_one_pid);
+    match (report_result, wait_result) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(report_error), Ok(())) => Err(report_error),
+        (Ok(_), Err(wait_error)) => Err(wait_error),
+        (Err(report_error), Err(wait_error)) => Err(AgentError::isolation(format!(
+            "failed reading stage-1 holder report: {report_error}; additionally failed waiting for stage-1 process {stage_one_pid}: {wait_error}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn stage_one_child(
     plan: &IsolationPlan,
     parent_namespace: NamespaceSnapshot,
@@ -373,6 +470,7 @@ fn stage_one_child(
     // SAFETY: unshare called with constant namespace flags.
     if unsafe { libc::unshare(unshare_flags) } != 0 {
         write_error_report(report_fd, REPORT_ERROR_UNSHARE);
+        close_fd(report_fd);
         exit_immediately(1);
     }
 
@@ -380,6 +478,7 @@ fn stage_one_child(
     // SAFETY: child_report_pipe points to valid writable memory for two fds.
     if unsafe { libc::pipe2(child_report_pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         write_error_report(report_fd, REPORT_ERROR_FORK);
+        close_fd(report_fd);
         exit_immediately(1);
     }
     let child_report_read = child_report_pipe[0];
@@ -391,6 +490,7 @@ fn stage_one_child(
         close_fd(child_report_read);
         close_fd(child_report_write);
         write_error_report(report_fd, REPORT_ERROR_FORK);
+        close_fd(report_fd);
         exit_immediately(1);
     }
     if holder_pid > 0 {
@@ -411,22 +511,14 @@ fn stage_one_child(
         Err(_) => {
             let _ = write_all_fd(child_report_write, &[HOLDER_REPORT_ERROR, 0, 0, 0]);
             close_fd(child_report_write);
-            write_error_report(report_fd, REPORT_ERROR_VERIFY);
             close_fd(report_fd);
             exit_immediately(1);
         }
     };
     let bits = encode_probe(probe);
-    let mut payload = [0_u8; 8];
-    payload[0] = HOLDER_REPORT_READY;
-    payload[4..8].copy_from_slice(&bits.to_ne_bytes());
-    if write_all_fd(child_report_write, &payload).is_err() {
-        close_fd(child_report_write);
-        write_error_report(report_fd, REPORT_ERROR_VERIFY);
-        close_fd(report_fd);
+    if send_child_probe_and_close_report_fd(report_fd, child_report_write, bits).is_err() {
         exit_immediately(1);
     }
-    close_fd(child_report_write);
     holder_reap_loop();
 }
 
@@ -436,15 +528,14 @@ fn apply_workload_controls(
     parent_namespace: &NamespaceSnapshot,
     parent_cgroup: &str,
 ) -> Result<IsolationProbe> {
-    move_pid_to_cgroup(1, &plan.cgroup.workload)?;
-    make_root_private()?;
-    apply_private_mounts()?;
-    drop_bounding_and_ambient_capabilities()?;
-    switch_to_mxc_identity()?;
-    clear_remaining_capabilities_and_set_no_new_privs()?;
-    let probe = isolated_child_probe(parent_namespace, parent_cgroup)?;
-    let _ = verify_mandatory_isolation_controls(probe)?;
-    Ok(probe)
+    let mut context = WorkloadSetupContext {
+        plan,
+        parent_namespace,
+        parent_cgroup,
+        probe: None,
+    };
+    let mut executor = SyscallSetupExecutor;
+    execute_setup_steps_with_executor(&mut context, &mut executor)
 }
 
 #[cfg(target_os = "linux")]
@@ -545,7 +636,7 @@ fn drop_bounding_and_ambient_capabilities() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn clear_remaining_capabilities_and_set_no_new_privs() -> Result<()> {
+fn clear_remaining_capabilities() -> Result<()> {
     let cap_header = LinuxCapHeader {
         version: LINUX_CAPABILITY_VERSION_3,
         pid: 0,
@@ -570,6 +661,11 @@ fn clear_remaining_capabilities_and_set_no_new_privs() -> Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_no_new_privs() -> Result<()> {
     // SAFETY: prctl no_new_privs has no pointer args.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(AgentError::io(
@@ -616,30 +712,6 @@ fn switch_to_mxc_identity() -> Result<()> {
             ::std::io::Error::last_os_error(),
         ));
     }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn apply_private_mounts() -> Result<()> {
-    mount_call("proc", "/proc", "proc", 0, None)?;
-    mount_call("tmpfs", "/dev", "tmpfs", 0, Some("mode=755,nosuid,nodev"))?;
-    ensure_minimal_private_dev_layout()?;
-    mount_call(
-        "devpts",
-        "/dev/pts",
-        "devpts",
-        0,
-        Some("newinstance,ptmxmode=0666,mode=620"),
-    )?;
-    mount_call(
-        "tmpfs",
-        "/dev/shm",
-        "tmpfs",
-        0,
-        Some("mode=1777,nosuid,nodev"),
-    )?;
-    ensure_ptmx_binding()?;
-    mount_call("sysfs", "/sys", "sysfs", libc::MS_RDONLY, None)?;
     Ok(())
 }
 
@@ -888,6 +960,21 @@ fn write_error_report(report_fd: i32, code: u32) {
     report[0] = HOLDER_REPORT_ERROR;
     report[4..8].copy_from_slice(&code.to_ne_bytes());
     let _ = write_all_fd(report_fd, &report);
+}
+
+#[cfg(target_os = "linux")]
+fn send_child_probe_and_close_report_fd(
+    report_fd: i32,
+    child_report_write: i32,
+    probe_bits: u32,
+) -> Result<()> {
+    let mut payload = [0_u8; 8];
+    payload[0] = HOLDER_REPORT_READY;
+    payload[4..8].copy_from_slice(&probe_bits.to_ne_bytes());
+    let write_result = write_all_fd(child_report_write, &payload);
+    close_fd(child_report_write);
+    close_fd(report_fd);
+    write_result
 }
 
 #[cfg(target_os = "linux")]
@@ -1230,54 +1317,224 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn setup_step_index(step: SetupStep) -> usize {
-        setup_step_sequence()
-            .iter()
-            .position(|candidate| *candidate == step)
-            .expect("step present")
+    struct OrderingInvariantExecutor {
+        seen: Vec<SetupStep>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl OrderingInvariantExecutor {
+        fn has_seen(&self, step: SetupStep) -> bool {
+            self.seen.contains(&step)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl SetupStepExecutor for OrderingInvariantExecutor {
+        fn run_step(
+            &mut self,
+            step: SetupStep,
+            context: &mut WorkloadSetupContext<'_>,
+        ) -> Result<()> {
+            match step {
+                SetupStep::MountReadOnlySys => {
+                    assert!(
+                        self.has_seen(SetupStep::MoveToWorkloadCgroup),
+                        "workload cgroup move must happen before read-only /sys replacement"
+                    );
+                }
+                SetupStep::MountPrivateDevpts | SetupStep::MountPrivateShm => {
+                    assert!(
+                        self.has_seen(SetupStep::CreatePrivateDevLayout),
+                        "private /dev directories must exist before /dev submounts"
+                    );
+                }
+                SetupStep::SwitchToMxcIdentity => {
+                    assert!(
+                        self.has_seen(SetupStep::DropBoundingAndAmbientCaps),
+                        "bounding capabilities must be dropped before mxc identity transition"
+                    );
+                }
+                SetupStep::ClearRemainingCaps => {
+                    assert!(
+                        self.has_seen(SetupStep::SwitchToMxcIdentity),
+                        "final capability clear must follow mxc identity transition"
+                    );
+                }
+                SetupStep::SetNoNewPrivs => {
+                    assert!(
+                        self.has_seen(SetupStep::ClearRemainingCaps),
+                        "no_new_privs must be set after final capability clearing"
+                    );
+                }
+                SetupStep::VerifyIsolation => {
+                    context.probe = Some(IsolationProbe {
+                        pid_namespace: true,
+                        mount_namespace: true,
+                        uts_namespace: true,
+                        ipc_namespace: true,
+                        private_proc: true,
+                        private_dev: true,
+                        private_devpts: true,
+                        private_shm: true,
+                        read_only_sys: true,
+                        capabilities_dropped: true,
+                        no_new_privs: true,
+                        cgroup_separation: true,
+                        orphan_reaping: true,
+                        workload_identity_mxc: true,
+                    });
+                }
+                _ => {}
+            }
+            self.seen.push(step);
+            Ok(())
+        }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn setup_sequence_places_identity_switch_before_final_cap_clear() {
-        let switch_identity = setup_step_index(SetupStep::SwitchToMxcIdentity);
-        let clear_caps = setup_step_index(SetupStep::ClearRemainingCaps);
+    fn setup_dispatch_enforces_critical_ordering_invariants() {
+        let plan = default_isolation_plan();
+        let namespace = NamespaceSnapshot {
+            pid: NamespaceIdentity { dev: 1, inode: 1 },
+            mnt: NamespaceIdentity { dev: 1, inode: 2 },
+            uts: NamespaceIdentity { dev: 1, inode: 3 },
+            ipc: NamespaceIdentity { dev: 1, inode: 4 },
+        };
+        let mut context = WorkloadSetupContext {
+            plan: &plan,
+            parent_namespace: &namespace,
+            parent_cgroup: "/nvx.agent",
+            probe: None,
+        };
+        let mut executor = OrderingInvariantExecutor { seen: Vec::new() };
+        let probe = execute_setup_steps_with_executor(&mut context, &mut executor).expect("probe");
+        assert!(probe.no_new_privs);
+        assert_eq!(executor.seen.len(), setup_step_sequence().len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalize_stage_one_waits_even_if_report_read_fails() {
+        use ::std::sync::Arc;
+        use ::std::sync::atomic::{AtomicBool, Ordering};
+
+        let waited = Arc::new(AtomicBool::new(false));
+        let waited_clone = Arc::clone(&waited);
+        let result = finalize_stage_one_with(
+            1234,
+            -1,
+            |_| Err(AgentError::isolation("report read failed".to_string())),
+            |_| {
+                waited_clone.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "report failure must fail setup");
         assert!(
-            switch_identity < clear_caps,
-            "identity must be switched before final cap clear"
+            waited.load(Ordering::SeqCst),
+            "stage-one process must still be waited/reaped after report failure"
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn setup_sequence_drops_bounding_caps_before_identity_switch() {
-        let drop_bounding = setup_step_index(SetupStep::DropBoundingAndAmbientCaps);
-        let switch_identity = setup_step_index(SetupStep::SwitchToMxcIdentity);
+    fn finalize_stage_one_reports_both_report_and_wait_failures() {
+        let result = finalize_stage_one_with(
+            9876,
+            -1,
+            |_| Err(AgentError::isolation("report read failed".to_string())),
+            |_| Err(AgentError::isolation("waitpid failed".to_string())),
+        )
+        .expect_err("combined error");
+        let message = format!("{result}");
+        assert!(message.contains("report read failed"));
+        assert!(message.contains("waitpid failed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_child_probe_bits_fails_on_early_eof() {
+        let mut pipe_fds = [0_i32; 2];
+        // SAFETY: pipe_fds points to valid storage for pipe2 output.
+        let pipe_result = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(pipe_result, 0, "pipe2 failed");
+        let read_fd = pipe_fds[0];
+        let write_fd = pipe_fds[1];
+        close_fd(write_fd);
+        let result = read_child_probe_bits(read_fd);
+        close_fd(read_fd);
+        assert!(result.is_err(), "early EOF must be rejected");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_holder_report_fails_on_early_eof() {
+        let mut pipe_fds = [0_i32; 2];
+        // SAFETY: pipe_fds points to valid storage for pipe2 output.
+        let pipe_result = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(pipe_result, 0, "pipe2 failed");
+        let read_fd = pipe_fds[0];
+        let write_fd = pipe_fds[1];
+        close_fd(write_fd);
+        let result = read_holder_report(read_fd);
         assert!(
-            drop_bounding < switch_identity,
-            "bounding set drop must occur while CAP_SETPCAP is still available"
+            result.is_err(),
+            "short/empty holder report must be rejected"
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn setup_sequence_moves_cgroup_before_read_only_sys_mount() {
-        let move_cgroup = setup_step_index(SetupStep::MoveToWorkloadCgroup);
-        let mount_ro_sys = setup_step_index(SetupStep::MountReadOnlySys);
-        assert!(
-            move_cgroup < mount_ro_sys,
-            "workload cgroup move must happen before read-only /sys replacement"
+    fn sending_child_probe_closes_report_writer_and_emits_payload() {
+        let mut report_pipe = [0_i32; 2];
+        let mut child_pipe = [0_i32; 2];
+        // SAFETY: arrays point to valid storage for pipe2 output.
+        assert_eq!(
+            unsafe { libc::pipe2(report_pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
         );
-    }
+        // SAFETY: arrays point to valid storage for pipe2 output.
+        assert_eq!(
+            unsafe { libc::pipe2(child_pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let report_read = report_pipe[0];
+        let report_write = report_pipe[1];
+        let child_read = child_pipe[0];
+        let child_write = child_pipe[1];
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn setup_sequence_creates_private_dev_subdirs_before_submounts() {
-        let create_layout = setup_step_index(SetupStep::CreatePrivateDevLayout);
-        let mount_devpts = setup_step_index(SetupStep::MountPrivateDevpts);
-        let mount_shm = setup_step_index(SetupStep::MountPrivateShm);
-        assert!(create_layout < mount_devpts);
-        assert!(create_layout < mount_shm);
+        send_child_probe_and_close_report_fd(report_write, child_write, 0xAA55_AA55)
+            .expect("send child probe");
+
+        let mut report_marker = [0_u8; 1];
+        // SAFETY: report_marker points to writable buffer and read fd is valid.
+        let report_read_size =
+            unsafe { libc::read(report_read, report_marker.as_mut_ptr().cast(), 1) };
+        assert_eq!(report_read_size, 0, "report pipe should be at EOF");
+        close_fd(report_read);
+
+        let mut child_payload = [0_u8; 8];
+        // SAFETY: child_payload points to writable buffer and read fd is valid.
+        let child_read_size = unsafe {
+            libc::read(
+                child_read,
+                child_payload.as_mut_ptr().cast(),
+                child_payload.len(),
+            )
+        };
+        assert_eq!(child_read_size, 8, "child payload must contain full report");
+        assert_eq!(child_payload[0], HOLDER_REPORT_READY);
+        assert_eq!(
+            u32::from_ne_bytes([
+                child_payload[4],
+                child_payload[5],
+                child_payload[6],
+                child_payload[7],
+            ]),
+            0xAA55_AA55
+        );
+        close_fd(child_read);
     }
 
     #[cfg(target_os = "linux")]
