@@ -8,8 +8,10 @@
 //! It provides an explicit adapter boundary for future integration.
 
 pub mod codec;
+pub mod e2e_profile;
 pub mod mapping;
 pub mod messages;
+pub mod mxc_extension;
 pub mod state;
 
 pub use crate::codec::{

@@ -109,6 +109,9 @@ CONTROL_SESSION_PROTOCOL_VERSION = 1
 CONTROL_CONTRACT_REVISION = "nvx-microvm-v2-control-v1"
 OPENVMM_PROVENANCE_NAME = "openvmm.provenance.json"
 KERNEL_PROVENANCE_NAME = "vmlinux.provenance.json"
+SOURCE_REVISION_ENV = "NVX_SOURCE_REVISION"
+SOURCE_CLEAN_ENV = "NVX_SOURCE_CLEAN"
+SOURCE_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 UNSAFE_INITRAMFS_FILESYSTEMS = frozenset(
     {
         "9p",
@@ -391,19 +394,17 @@ def stage_guest_agent(source: Path, expected_sha256: str) -> Path:
 def build_mxc_prototype_guest_agent() -> tuple[Path, str, dict[str, object]]:
     """Build and stage the in-repo Rust agent used by the MXC prototype profile."""
     require_tool("cargo")
-    source_revision = run_capture(["git", "-C", REPO_ROOT, "rev-parse", "HEAD"])
-    require_success(source_revision, "querying repository revision")
-    status = run_capture(["git", "-C", REPO_ROOT, "status", "--porcelain"])
-    require_success(status, "querying repository status")
+    source_revision, source_clean = source_provenance()
     run_checked(
         [
             "cargo",
             "build",
             "--release",
+            "--locked",
+            "--manifest-path",
+            REPO_ROOT / "agent" / "Cargo.toml",
             "--target",
             GUEST_AGENT_TARGET,
-            "-p",
-            "nvx-agent",
         ],
         cwd=REPO_ROOT,
     )
@@ -430,8 +431,8 @@ def build_mxc_prototype_guest_agent() -> tuple[Path, str, dict[str, object]]:
         "format": 1,
         "profile": MXC_PROTOTYPE_TRANSPORT,
         "target": GUEST_AGENT_TARGET,
-        "source_revision": source_revision.stdout.decode("ascii").strip(),
-        "source_clean": not status.stdout.strip(),
+        "source_revision": source_revision,
+        "source_clean": source_clean,
         "sha256": sha256,
         "size": size,
     }
@@ -450,6 +451,50 @@ def build_mxc_prototype_guest_agent() -> tuple[Path, str, dict[str, object]]:
             "build_id": None,
             "origin": "in-repo-workspace",
         },
+    )
+
+
+def _validated_source_revision(value: str) -> str:
+    normalized = value.strip().lower()
+    if not SOURCE_REVISION_PATTERN.fullmatch(normalized):
+        raise ScriptError(
+            f"{SOURCE_REVISION_ENV} must be a 40-character lowercase hexadecimal revision"
+        )
+    return normalized
+
+
+def _validated_source_clean(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ScriptError(f"{SOURCE_CLEAN_ENV} must be 'true' or 'false'")
+
+
+def _source_provenance_from_git(repository: Path = REPO_ROOT) -> tuple[str, bool]:
+    source_revision = run_capture(["git", "-C", repository, "rev-parse", "HEAD"])
+    require_success(source_revision, "querying repository revision")
+    status = run_capture(["git", "-C", repository, "status", "--porcelain"])
+    require_success(status, "querying repository status")
+    return (
+        _validated_source_revision(source_revision.stdout.decode("ascii")),
+        not status.stdout.strip(),
+    )
+
+
+def source_provenance(repository: Path = REPO_ROOT) -> tuple[str, bool]:
+    source_revision = os.environ.get(SOURCE_REVISION_ENV)
+    source_clean = os.environ.get(SOURCE_CLEAN_ENV)
+    if source_revision is None and source_clean is None:
+        return _source_provenance_from_git(repository)
+    if source_revision is None or source_clean is None:
+        raise ScriptError(
+            f"{SOURCE_REVISION_ENV} and {SOURCE_CLEAN_ENV} must be set together"
+        )
+    return (
+        _validated_source_revision(source_revision),
+        _validated_source_clean(source_clean),
     )
 
 
@@ -1545,6 +1590,7 @@ def docker_build_command(config: DockerBuildConfig, target: str) -> list[str | P
             f"({DEFAULT_ALPINE_BRANCH})"
         )
     destination = _docker_destination(config.destination)
+    source_revision, source_clean = _source_provenance_from_git()
     command: list[str | Path] = [
         "docker",
         "build",
@@ -1552,6 +1598,10 @@ def docker_build_command(config: DockerBuildConfig, target: str) -> list[str | P
         REPO_ROOT / "docker" / "Dockerfile",
         "--target",
         target,
+        "--build-arg",
+        f"{SOURCE_REVISION_ENV}={source_revision}",
+        "--build-arg",
+        f"{SOURCE_CLEAN_ENV}={'true' if source_clean else 'false'}",
     ]
     command.extend(
         [

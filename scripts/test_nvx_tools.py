@@ -1652,6 +1652,7 @@ class BuildTests(unittest.TestCase):
     def test_build_mxc_prototype_guest_agent_stages_in_repo_binary(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            source_revision = "a" * 40
             built = (
                 root
                 / "target"
@@ -1665,15 +1666,21 @@ class BuildTests(unittest.TestCase):
             with (
                 patch.object(build, "REPO_ROOT", root),
                 patch.object(build, "require_tool", return_value="cargo"),
-                patch.object(build, "run_checked"),
+                patch.object(build, "run_checked") as run_checked,
                 patch.object(
                     build,
                     "run_capture",
                     side_effect=(
-                        common.CommandResult(("git",), 0, b"abc123\n", b""),
+                        common.CommandResult(
+                            ("git",),
+                            0,
+                            f"{source_revision}\n".encode("ascii"),
+                            b"",
+                        ),
                         common.CommandResult(("git",), 0, b"", b""),
                     ),
                 ),
+                patch.dict(os.environ, {}, clear=False),
             ):
                 staged, actual_sha256, guest_manifest = (
                     build.build_mxc_prototype_guest_agent()
@@ -1694,20 +1701,78 @@ class BuildTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(provenance["source_revision"], "abc123")
+            self.assertEqual(provenance["source_revision"], source_revision)
             self.assertEqual(provenance["sha256"], sha256)
             self.assertEqual(guest_manifest["sha256"], sha256)
+            self.assertIn("--locked", run_checked.call_args.args[0])
+
+    def test_build_mxc_prototype_guest_agent_accepts_host_provenance_env(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_revision = "b" * 40
+            built = (
+                root
+                / "target"
+                / build.GUEST_AGENT_TARGET
+                / "release"
+                / build.GUEST_AGENT_ARTIFACT_NAME
+            )
+            built.parent.mkdir(parents=True)
+            built.write_bytes(_static_x86_64_elf())
+            with (
+                patch.object(build, "REPO_ROOT", root),
+                patch.object(build, "require_tool", return_value="cargo"),
+                patch.object(build, "run_checked"),
+                patch.object(build, "run_capture") as run_capture,
+                patch.dict(
+                    os.environ,
+                    {
+                        build.SOURCE_REVISION_ENV: source_revision,
+                        build.SOURCE_CLEAN_ENV: "false",
+                    },
+                    clear=False,
+                ),
+            ):
+                build.build_mxc_prototype_guest_agent()
+
+            run_capture.assert_not_called()
+            provenance = json.loads(
+                (root / "build" / build.MXC_GUEST_AGENT_PROVENANCE_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(provenance["source_revision"], source_revision)
+            self.assertFalse(provenance["source_clean"])
+
+    def test_source_provenance_requires_complete_environment(self):
+        with patch.dict(
+            os.environ,
+            {build.SOURCE_REVISION_ENV: "c" * 40},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                common.ScriptError,
+                f"{build.SOURCE_REVISION_ENV} and {build.SOURCE_CLEAN_ENV} must be set together",
+            ):
+                build.source_provenance()
 
     def test_agent_docker_input_uses_sha_but_ci_does_not_cache_image(self):
-        command = [
-            str(value)
-            for value in build.docker_build_agent_initramfs_command(
-                build.DockerBuildConfig(),
-                "a" * 64,
-            )
-        ]
+        with patch.object(
+            build,
+            "_source_provenance_from_git",
+            return_value=("d" * 40, True),
+        ):
+            command = [
+                str(value)
+                for value in build.docker_build_agent_initramfs_command(
+                    build.DockerBuildConfig(),
+                    "a" * 64,
+                )
+            ]
         self.assertIn("--secret", command)
         self.assertIn(f"NVX_AGENT_SHA256={'a' * 64}", command)
+        self.assertIn(f"{build.SOURCE_REVISION_ENV}={'d' * 40}", command)
+        self.assertIn(f"{build.SOURCE_CLEAN_ENV}=true", command)
         action = (
             Path(__file__).parents[1]
             / ".github"
@@ -1746,6 +1811,27 @@ class BuildTests(unittest.TestCase):
         self.assertIn("verify-broker-live-gate", publish_action)
         self.assertIn("--archive-sha256", publish_action)
         self.assertIn("externally authenticated live-gate proof", publish_action)
+        validate_action = (
+            Path(__file__).parents[1]
+            / ".github"
+            / "actions"
+            / "validate-nvx"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("cargo test --workspace --locked", validate_action)
+        self.assertIn(
+            "cargo build --release --target x86_64-unknown-linux-musl --locked --manifest-path agent/Cargo.toml",
+            validate_action,
+        )
+        dockerfile = (Path(__file__).parents[1] / "docker" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ARG RUST_TOOLCHAIN=1.95.0", dockerfile)
+        self.assertIn("rustup target add x86_64-unknown-linux-musl", dockerfile)
+        self.assertIn(
+            "COPY Cargo.toml Cargo.lock LICENSE README.md SOURCE-MANIFEST.json THIRD_PARTY_NOTICES.md /repo/",
+            dockerfile,
+        )
 
 
 class SandboxTests(unittest.TestCase):

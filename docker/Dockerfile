@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 ARG DEBIAN_IMAGE=debian:12-slim
+ARG RUST_TOOLCHAIN=1.95.0
 
 FROM ${DEBIAN_IMAGE} AS base
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -10,7 +11,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         cpio \
-        cargo \
         curl \
         flex \
         gzip \
@@ -19,11 +19,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools \
         patch \
         python3 \
-        rustc \
         rsync \
         tar \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/opt/rustup
+ENV CARGO_HOME=/opt/cargo
+ENV PATH=/opt/cargo/bin:${PATH}
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN} \
+    && rustup target add x86_64-unknown-linux-musl
 WORKDIR /repo
 COPY alpine/ /repo/alpine/
 COPY agent/ /repo/agent/
@@ -32,7 +36,12 @@ COPY docker/ /repo/docker/
 COPY kernel/ /repo/kernel/
 COPY scripts/ /repo/scripts/
 COPY tools/ /repo/tools/
-COPY Cargo.toml LICENSE README.md SOURCE-MANIFEST.json THIRD_PARTY_NOTICES.md /repo/
+COPY Cargo.toml Cargo.lock LICENSE README.md SOURCE-MANIFEST.json THIRD_PARTY_NOTICES.md /repo/
+
+ARG NVX_SOURCE_REVISION
+ARG NVX_SOURCE_CLEAN
+ENV NVX_SOURCE_REVISION=${NVX_SOURCE_REVISION}
+ENV NVX_SOURCE_CLEAN=${NVX_SOURCE_CLEAN}
 
 FROM base AS kernel
 RUN python3 scripts/nvx.py build-kernel

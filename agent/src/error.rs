@@ -11,10 +11,21 @@
 use ::std::fmt;
 use ::std::io;
 
-use ::agent_protocol::ErrorCode;
-
 /// Result alias for agent operations.
 pub type Result<T> = ::std::result::Result<T, AgentError>;
+
+/// Stable host-facing error code set for phase-0 PID-1 failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorCode {
+    Internal,
+    MountFailed,
+    ExecFailed,
+    BadRequest,
+    WorkloadBusy,
+    FreezeFailed,
+    QuiesceFailed,
+    CheckpointTimeout,
+}
 
 /// A failure with a stable code.
 #[derive(Debug)]
@@ -138,12 +149,6 @@ impl ::std::error::Error for AgentError {}
 impl From<io::Error> for AgentError {
     fn from(source: io::Error) -> Self {
         Self::io("agent operation", source)
-    }
-}
-
-impl From<::agent_protocol::ProtocolError> for AgentError {
-    fn from(source: ::agent_protocol::ProtocolError) -> Self {
-        Self::Internal(format!("agent protocol failure: {source}"))
     }
 }
 

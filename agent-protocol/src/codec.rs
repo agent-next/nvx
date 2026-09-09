@@ -120,6 +120,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn record_cap_stays_below_openvmm_outer_limit() {
         assert!(INNER_RECORD_MAX_BYTES < OPENVMM_OUTER_RECORD_MAX_BYTES);
     }

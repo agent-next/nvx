@@ -9,6 +9,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        cargo test --workspace --locked
+        rustup target add x86_64-unknown-linux-musl
+        cargo build --release --target x86_64-unknown-linux-musl --locked --manifest-path agent/Cargo.toml
         python3 -m compileall -q scripts
         python3 -m unittest scripts/test_performance.py scripts/test_nvx_tools.py scripts/test_microvm_tests.py -v
         python3 .github/skills/nvx-host-connect/scripts/test_hosts.py -v
@@ -21,6 +24,7 @@ runs:
       if: runner.os == 'Windows'
       shell: powershell
       run: |
+        cargo test --workspace --locked
         python -m compileall -q scripts
         python -m unittest scripts/test_performance.py scripts/test_nvx_tools.py scripts/test_microvm_tests.py -v
         python .github\skills\nvx-host-connect\scripts\test_hosts.py -v
