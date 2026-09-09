@@ -93,10 +93,44 @@ pub fn is_passing_report(report: &HarnessReport) -> bool {
     if report.service_readiness != ServiceReadiness::Ready {
         return false;
     }
-    report
+
+    if report.requirements.len() != MODELED_REQUIREMENTS.len() {
+        return false;
+    }
+
+    if report
         .requirements
         .iter()
-        .all(|result| result.status == RequirementStatus::Pass)
+        .any(|result| result.status != RequirementStatus::Pass)
+    {
+        return false;
+    }
+
+    if report
+        .requirements
+        .iter()
+        .any(|result| !MODELED_REQUIREMENTS.contains(&result.requirement))
+    {
+        return false;
+    }
+
+    for requirement in MODELED_REQUIREMENTS {
+        let mut matches = report
+            .requirements
+            .iter()
+            .filter(|result| result.requirement == requirement);
+        let Some(result) = matches.next() else {
+            return false;
+        };
+        if matches.next().is_some() {
+            return false;
+        }
+        if result.name != requirement.name() {
+            return false;
+        }
+    }
+
+    true
 }
 
 pub fn report_exit_code(report: &HarnessReport) -> ExitCode {
@@ -111,6 +145,29 @@ pub fn report_exit_code(report: &HarnessReport) -> ExitCode {
 mod tests {
     use super::*;
     use ::std::collections::BTreeSet;
+
+    fn ready_report_with_all_passes() -> HarnessReport {
+        HarnessReport {
+            phase: "phaseX".to_string(),
+            service_readiness: ServiceReadiness::Ready,
+            adapter: AdapterState {
+                kind: "aci".to_string(),
+                status: RequirementStatus::Pass,
+                required_revision: "rev".to_string(),
+                reason: "ready".to_string(),
+            },
+            requirements: MODELED_REQUIREMENTS
+                .iter()
+                .copied()
+                .map(|requirement| RequirementResult {
+                    name: requirement.name().to_string(),
+                    requirement,
+                    status: RequirementStatus::Pass,
+                    reason: "ok".to_string(),
+                })
+                .collect(),
+        }
+    }
 
     #[test]
     fn phase0_report_has_exactly_twelve_named_results() {
@@ -150,29 +207,43 @@ mod tests {
     }
 
     #[test]
-    fn success_is_possible_only_with_ready_service_and_all_passes() {
-        let mut report = HarnessReport {
-            phase: "phaseX".to_string(),
-            service_readiness: ServiceReadiness::NotReady,
-            adapter: AdapterState {
-                kind: "aci".to_string(),
-                status: RequirementStatus::Pass,
-                required_revision: "rev".to_string(),
-                reason: "ready".to_string(),
-            },
-            requirements: vec![RequirementResult {
-                name: "ready".to_string(),
-                requirement: MxcRequirement::Ready,
-                status: RequirementStatus::Pass,
-                reason: "ok".to_string(),
-            }],
-        };
+    fn success_gate_rejects_empty_requirements() {
+        let mut report = ready_report_with_all_passes();
+        report.requirements.clear();
         assert_eq!(report_exit_code(&report), ExitCode::FAILURE);
+    }
 
-        report.service_readiness = ServiceReadiness::Ready;
+    #[test]
+    fn success_gate_rejects_subset_requirements() {
+        let mut report = ready_report_with_all_passes();
+        report.requirements.truncate(3);
+        assert_eq!(report_exit_code(&report), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn success_gate_rejects_duplicate_requirement_identity() {
+        let mut report = ready_report_with_all_passes();
+        report.requirements[1] = report.requirements[0].clone();
+        assert_eq!(report_exit_code(&report), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn success_gate_rejects_missing_one_requirement() {
+        let mut report = ready_report_with_all_passes();
+        report.requirements.pop();
+        assert_eq!(report_exit_code(&report), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn success_gate_rejects_name_mismatch() {
+        let mut report = ready_report_with_all_passes();
+        report.requirements[0].name = "wrong-stable-name".to_string();
+        assert_eq!(report_exit_code(&report), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn success_gate_accepts_exactly_all_modeled_passes() {
+        let report = ready_report_with_all_passes();
         assert_eq!(report_exit_code(&report), ExitCode::SUCCESS);
-
-        report.requirements[0].status = RequirementStatus::Fail;
-        assert_eq!(report_exit_code(&report), ExitCode::FAILURE);
     }
 }
