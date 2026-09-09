@@ -39,6 +39,14 @@ pub struct InnerRecord {
 }
 
 impl InnerRecord {
+    fn decode_end_of_stream_flag(value: u8) -> Result<bool, InnerRecordDecodeError> {
+        match value {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(InnerRecordDecodeError::InvalidEndOfStreamFlag(other)),
+        }
+    }
+
     pub fn control<T: Serialize>(message: &T) -> Result<Self, InnerRecordEncodeError> {
         let payload =
             serde_json::to_vec(message).map_err(InnerRecordEncodeError::ControlSerialization)?;
@@ -86,7 +94,7 @@ impl InnerRecord {
         Ok(Self {
             exec_id: u32::from_be_bytes(encoded[4..8].try_into().expect("exec id")),
             kind: InnerRecordKind::from_u8(encoded[8])?,
-            end_of_stream: encoded[9] == 1,
+            end_of_stream: Self::decode_end_of_stream_flag(encoded[9])?,
             sequence: u64::from_be_bytes(encoded[12..20].try_into().expect("sequence")),
             payload: encoded[INNER_RECORD_HEADER_BYTES..].to_vec(),
         })
@@ -106,6 +114,7 @@ pub enum InnerRecordDecodeError {
     Truncated,
     LengthMismatch,
     UnknownKind(u8),
+    InvalidEndOfStreamFlag(u8),
     RecordTooLarge,
 }
 
@@ -184,5 +193,25 @@ mod tests {
             InnerRecord::decode(&encoded),
             Err(InnerRecordDecodeError::UnknownKind(99))
         ));
+    }
+
+    #[test]
+    fn decode_rejects_non_boolean_end_of_stream_flag_values() {
+        for invalid_flag in [2_u8, u8::MAX] {
+            let mut encoded = InnerRecord {
+                exec_id: 4,
+                kind: InnerRecordKind::Stdout,
+                end_of_stream: false,
+                sequence: 11,
+                payload: vec![8, 9],
+            }
+            .encode()
+            .expect("encode");
+            encoded[9] = invalid_flag;
+            assert!(matches!(
+                InnerRecord::decode(&encoded),
+                Err(InnerRecordDecodeError::InvalidEndOfStreamFlag(flag)) if flag == invalid_flag
+            ));
+        }
     }
 }
