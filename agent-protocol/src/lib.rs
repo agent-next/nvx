@@ -12,6 +12,7 @@ pub mod e2e_profile;
 pub mod mapping;
 pub mod messages;
 pub mod mxc_extension;
+pub mod service;
 pub mod state;
 
 pub use crate::codec::{
@@ -31,6 +32,15 @@ pub use crate::messages::{
     StderrEofRecord, StdinChunkRecord, StdinEofRecord, StdoutChunkRecord, StdoutEofRecord,
     StreamName, WORKLOAD_GID_MXC, WORKLOAD_GROUP_MXC, WORKLOAD_UID_MXC, WORKLOAD_USER_MXC,
     WorkloadIdentityStatus,
+};
+pub use crate::service::{
+    AuthenticateChannelRequest, CancelReason, ConfigureSessionRequest, CreateProcessRequest,
+    DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES, DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_RECORDS,
+    DEFAULT_STDIN_QUEUE_LIMIT_BYTES, FilesystemStatus, HVC1_DEVICE_PATH, HealthSnapshot,
+    HvcFramedChannel, LaunchBinding, MAX_INNER_RECORD_BYTES_FOR_OPENVMM, MAX_LABEL_COUNT,
+    MAX_MAP_ENTRIES, MAX_REQUEST_BODY_BYTES, MAX_STRING_BYTES, MxcCapabilities, MxcControlService,
+    OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, ProcessSupervisor, ReadySnapshot, ServiceError,
+    ServiceErrorCode, SessionConfiguration, SupervisorEvent, WaitReadyRequest,
 };
 pub use crate::state::{
     ActiveExecEvent, AgentProtocolState, CHANNEL_LOSS_CLEANUP_DEADLINE_SECS, CleanupStatus,
