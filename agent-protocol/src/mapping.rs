@@ -13,7 +13,17 @@ pub enum AccessMode {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
-pub struct CanonicalHostMappingRoot(pub String);
+/// Canonical absolute UNIX host root path for mapping declarations.
+///
+/// Construction is intentionally validation-gated through [`Self::parse`].
+///
+/// ```compile_fail
+/// use agent_protocol::CanonicalHostMappingRoot;
+///
+/// // Tuple field is private: external callers must use CanonicalHostMappingRoot::parse.
+/// let _root = CanonicalHostMappingRoot("/workspace".to_string());
+/// ```
+pub struct CanonicalHostMappingRoot(String);
 
 impl CanonicalHostMappingRoot {
     pub fn parse(value: String) -> Result<Self, MappingError> {
@@ -264,6 +274,23 @@ mod tests {
             CanonicalHostMappingRoot::parse("/foo/D:/bar".to_string()),
             Err(MappingError::WindowsDrivePrefix(_))
         ));
+    }
+
+    #[test]
+    fn canonical_root_serde_round_trip_uses_validated_deserialization() {
+        let root = CanonicalHostMappingRoot::parse("/workspace/root".to_string()).expect("root");
+        let encoded = serde_json::to_string(&root).expect("serialize root");
+        assert_eq!(encoded, "\"/workspace/root\"");
+        let decoded: CanonicalHostMappingRoot =
+            serde_json::from_str(&encoded).expect("deserialize root");
+        assert_eq!(decoded, root);
+    }
+
+    #[test]
+    fn canonical_root_deserialization_rejects_unchecked_values() {
+        let err = serde_json::from_str::<CanonicalHostMappingRoot>("\"workspace/root\"")
+            .expect_err("relative path must fail");
+        assert!(err.to_string().contains("NonAbsoluteCanonicalRoot"));
     }
 
     #[test]

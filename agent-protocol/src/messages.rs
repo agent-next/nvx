@@ -302,6 +302,12 @@ pub enum ProtocolErrorCode {
     StreamAlreadyClosed,
     FlowControlCreditExhausted,
     FlowControlCreditOverflow,
+    InvalidDrainStream,
+    StreamDrainBeforeEof,
+    StreamAlreadyDrained,
+    DescendantsAlreadyCleaned,
+    DispositionAlreadySet,
+    IsolationContractViolation,
     MissingTerminalPrerequisites,
     ChannelAuthenticationRequired,
 }

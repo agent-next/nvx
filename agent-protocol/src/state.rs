@@ -64,6 +64,27 @@ pub enum LaunchAdmissionError {
         latest_generation: u64,
         attempted: u64,
     },
+    IsolationContractViolation {
+        missing: Vec<IsolationContractProperty>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IsolationContractProperty {
+    PidNamespace,
+    MountNamespace,
+    UtsNamespace,
+    IpcNamespace,
+    PrivateProc,
+    PrivateDev,
+    PrivateDevpts,
+    PrivateShm,
+    ReadOnlySys,
+    CapabilitiesDropped,
+    NoNewPrivs,
+    CgroupSeparation,
+    OrphanReaping,
+    FixedMxcIdentity,
 }
 
 #[derive(Debug)]
@@ -111,6 +132,26 @@ pub enum StateError {
     FlowControlCreditOverflow {
         stream: StreamName,
     },
+    InvalidDrainStream {
+        stream: StreamName,
+        exec_id: u32,
+    },
+    StreamDrainBeforeEof {
+        stream: StreamName,
+        exec_id: u32,
+    },
+    StreamAlreadyDrained {
+        stream: StreamName,
+        exec_id: u32,
+    },
+    DescendantsAlreadyCleaned {
+        exec_id: u32,
+    },
+    DispositionAlreadySet {
+        exec_id: u32,
+        current: ExecDisposition,
+        attempted: ExecDisposition,
+    },
     MissingTerminalPrerequisites {
         exec_id: u32,
     },
@@ -135,6 +176,9 @@ impl StateError {
             Self::LaunchAdmission(LaunchAdmissionError::GenerationNotNewer { .. }) => {
                 ProtocolErrorCode::LaunchGenerationNotNewer
             }
+            Self::LaunchAdmission(LaunchAdmissionError::IsolationContractViolation { .. }) => {
+                ProtocolErrorCode::IsolationContractViolation
+            }
             Self::LaunchGenerationConflict { .. } => ProtocolErrorCode::LaunchGenerationConflict,
             Self::ConfigureAlreadyApplied => ProtocolErrorCode::ConfigureAlreadyApplied,
             Self::ConfigureAfterExec => ProtocolErrorCode::ConfigureAfterExec,
@@ -158,6 +202,11 @@ impl StateError {
                 ProtocolErrorCode::FlowControlCreditExhausted
             }
             Self::FlowControlCreditOverflow { .. } => ProtocolErrorCode::FlowControlCreditOverflow,
+            Self::InvalidDrainStream { .. } => ProtocolErrorCode::InvalidDrainStream,
+            Self::StreamDrainBeforeEof { .. } => ProtocolErrorCode::StreamDrainBeforeEof,
+            Self::StreamAlreadyDrained { .. } => ProtocolErrorCode::StreamAlreadyDrained,
+            Self::DescendantsAlreadyCleaned { .. } => ProtocolErrorCode::DescendantsAlreadyCleaned,
+            Self::DispositionAlreadySet { .. } => ProtocolErrorCode::DispositionAlreadySet,
             Self::MissingTerminalPrerequisites { .. } => {
                 ProtocolErrorCode::MissingTerminalPrerequisites
             }
@@ -202,6 +251,7 @@ pub struct LaunchAdmissionInput {
     pub build: BuildStatus,
     pub network: NetworkStatus,
     pub isolation: IsolationStatus,
+    pub workload_identity: WorkloadIdentityStatus,
 }
 
 impl AgentProtocolState {
@@ -221,18 +271,32 @@ impl AgentProtocolState {
         &mut self,
         input: LaunchAdmissionInput,
     ) -> Result<AgentControlMessage, StateError> {
-        if input.service != SERVICE_IDENTITY {
-            return Err(StateError::LaunchAdmission(
-                LaunchAdmissionError::UnsupportedService(input.service),
-            ));
-        }
-        if input.version != PROTOCOL_VERSION {
-            return Err(StateError::LaunchAdmission(
-                LaunchAdmissionError::UnsupportedVersion(input.version),
-            ));
-        }
+        let LaunchAdmissionInput {
+            now_secs,
+            service,
+            version,
+            launch,
+            capability_proof,
+            build,
+            network,
+            isolation,
+            workload_identity,
+        } = input;
 
-        self.progress_cleanup_if_deadline_elapsed(input.now_secs);
+        if service != SERVICE_IDENTITY {
+            return Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::UnsupportedService(service),
+            ));
+        }
+        if version != PROTOCOL_VERSION {
+            return Err(StateError::LaunchAdmission(
+                LaunchAdmissionError::UnsupportedVersion(version),
+            ));
+        }
+        validate_prototype_launch_contract(&isolation, &workload_identity)
+            .map_err(StateError::LaunchAdmission)?;
+
+        self.progress_cleanup_if_deadline_elapsed(now_secs);
         if let CleanupStatus::InProgress {
             generation,
             deadline_secs,
@@ -242,7 +306,7 @@ impl AgentProtocolState {
                 LaunchAdmissionError::CleanupInProgress {
                     generation,
                     deadline_secs,
-                    now_secs: input.now_secs,
+                    now_secs,
                 },
             ));
         }
@@ -256,33 +320,30 @@ impl AgentProtocolState {
         }
 
         if let Some(latest) = self.latest_generation
-            && input.launch.generation <= latest
+            && launch.generation <= latest
         {
             return Err(StateError::LaunchAdmission(
                 LaunchAdmissionError::GenerationNotNewer {
                     latest_generation: latest,
-                    attempted: input.launch.generation,
+                    attempted: launch.generation,
                 },
             ));
         }
 
-        self.latest_generation = Some(input.launch.generation);
-        self.launch = Some(LaunchState::new(
-            input.launch,
-            input.capability_proof.to_bytes(),
-        ));
+        self.latest_generation = Some(launch.generation);
+        self.launch = Some(LaunchState::new(launch, capability_proof.to_bytes()));
         self.cleanup_status = CleanupStatus::Completed {
-            generation: input.launch.generation,
+            generation: launch.generation,
         };
         Ok(AgentControlMessage::Ready {
-            launch: input.launch,
+            launch,
             status: ReadyStatus {
                 service: SERVICE_IDENTITY.to_string(),
                 protocol_version: PROTOCOL_VERSION,
-                build: input.build,
-                network: input.network,
-                isolation: input.isolation,
-                workload_identity: WorkloadIdentityStatus::mxc_fixed(),
+                build,
+                network,
+                isolation,
+                workload_identity,
             },
         })
     }
@@ -487,6 +548,60 @@ impl AgentProtocolState {
     }
 }
 
+fn validate_prototype_launch_contract(
+    isolation: &IsolationStatus,
+    workload_identity: &WorkloadIdentityStatus,
+) -> Result<(), LaunchAdmissionError> {
+    let mut missing = Vec::new();
+    if !isolation.pid_namespace {
+        missing.push(IsolationContractProperty::PidNamespace);
+    }
+    if !isolation.mount_namespace {
+        missing.push(IsolationContractProperty::MountNamespace);
+    }
+    if !isolation.uts_namespace {
+        missing.push(IsolationContractProperty::UtsNamespace);
+    }
+    if !isolation.ipc_namespace {
+        missing.push(IsolationContractProperty::IpcNamespace);
+    }
+    if !isolation.private_proc {
+        missing.push(IsolationContractProperty::PrivateProc);
+    }
+    if !isolation.private_dev {
+        missing.push(IsolationContractProperty::PrivateDev);
+    }
+    if !isolation.private_devpts {
+        missing.push(IsolationContractProperty::PrivateDevpts);
+    }
+    if !isolation.private_shm {
+        missing.push(IsolationContractProperty::PrivateShm);
+    }
+    if !isolation.read_only_sys {
+        missing.push(IsolationContractProperty::ReadOnlySys);
+    }
+    if !isolation.capabilities_dropped {
+        missing.push(IsolationContractProperty::CapabilitiesDropped);
+    }
+    if !isolation.no_new_privs {
+        missing.push(IsolationContractProperty::NoNewPrivs);
+    }
+    if !isolation.cgroup_separation {
+        missing.push(IsolationContractProperty::CgroupSeparation);
+    }
+    if !isolation.orphan_reaping {
+        missing.push(IsolationContractProperty::OrphanReaping);
+    }
+    if workload_identity != &WorkloadIdentityStatus::mxc_fixed() {
+        missing.push(IsolationContractProperty::FixedMxcIdentity);
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(LaunchAdmissionError::IsolationContractViolation { missing })
+    }
+}
+
 impl Default for AgentProtocolState {
     fn default() -> Self {
         Self::new()
@@ -586,55 +701,88 @@ impl ExecState {
                 self.add_flow_credits(stream, credits)
             }
             ActiveExecEvent::StdinChunk { sequence } => {
-                self.ensure_open(StreamName::Stdin)?;
-                self.consume_credit(StreamName::Stdin)?;
-                expect_sequence(StreamName::Stdin, &mut self.stdin_next_seq, sequence)
+                self.apply_chunk(StreamName::Stdin, sequence)
             }
-            ActiveExecEvent::StdinEof { sequence } => {
-                self.ensure_open(StreamName::Stdin)?;
-                expect_sequence(StreamName::Stdin, &mut self.stdin_next_seq, sequence)?;
-                self.stdin_closed = true;
-                Ok(())
-            }
+            ActiveExecEvent::StdinEof { sequence } => self.apply_eof(StreamName::Stdin, sequence),
             ActiveExecEvent::StdoutChunk { sequence } => {
-                self.ensure_open(StreamName::Stdout)?;
-                self.consume_credit(StreamName::Stdout)?;
-                expect_sequence(StreamName::Stdout, &mut self.stdout_next_seq, sequence)
+                self.apply_chunk(StreamName::Stdout, sequence)
             }
-            ActiveExecEvent::StdoutEof { sequence } => {
-                self.ensure_open(StreamName::Stdout)?;
-                expect_sequence(StreamName::Stdout, &mut self.stdout_next_seq, sequence)?;
-                self.stdout_closed = true;
-                Ok(())
-            }
+            ActiveExecEvent::StdoutEof { sequence } => self.apply_eof(StreamName::Stdout, sequence),
             ActiveExecEvent::StderrChunk { sequence } => {
-                self.ensure_open(StreamName::Stderr)?;
-                self.consume_credit(StreamName::Stderr)?;
-                expect_sequence(StreamName::Stderr, &mut self.stderr_next_seq, sequence)
+                self.apply_chunk(StreamName::Stderr, sequence)
             }
-            ActiveExecEvent::StderrEof { sequence } => {
-                self.ensure_open(StreamName::Stderr)?;
-                expect_sequence(StreamName::Stderr, &mut self.stderr_next_seq, sequence)?;
-                self.stderr_closed = true;
-                Ok(())
-            }
-            ActiveExecEvent::StreamDrained { stream } => {
-                match stream {
-                    StreamName::Stdout => self.stdout_drained = true,
-                    StreamName::Stderr => self.stderr_drained = true,
-                    StreamName::Stdin => {}
-                }
-                Ok(())
-            }
-            ActiveExecEvent::DescendantsCleaned => {
-                self.descendants_cleaned = true;
-                Ok(())
-            }
-            ActiveExecEvent::Disposition(disposition) => {
-                self.disposition = Some(disposition);
-                Ok(())
-            }
+            ActiveExecEvent::StderrEof { sequence } => self.apply_eof(StreamName::Stderr, sequence),
+            ActiveExecEvent::StreamDrained { stream } => self.apply_stream_drained(stream),
+            ActiveExecEvent::DescendantsCleaned => self.apply_descendants_cleaned(),
+            ActiveExecEvent::Disposition(disposition) => self.apply_disposition(disposition),
         }
+    }
+
+    fn apply_chunk(&mut self, stream: StreamName, sequence: u64) -> Result<(), StateError> {
+        self.ensure_open(stream)?;
+        let next = checked_next_sequence(stream, self.next_sequence(stream), sequence)?;
+        self.consume_credit(stream)?;
+        self.set_next_sequence(stream, next);
+        Ok(())
+    }
+
+    fn apply_eof(&mut self, stream: StreamName, sequence: u64) -> Result<(), StateError> {
+        self.ensure_open(stream)?;
+        let next = checked_next_sequence(stream, self.next_sequence(stream), sequence)?;
+        self.set_next_sequence(stream, next);
+        self.set_closed(stream);
+        Ok(())
+    }
+
+    fn apply_stream_drained(&mut self, stream: StreamName) -> Result<(), StateError> {
+        if stream == StreamName::Stdin {
+            return Err(StateError::InvalidDrainStream {
+                stream,
+                exec_id: self.exec_id,
+            });
+        }
+        if !self.is_closed(stream) {
+            return Err(StateError::StreamDrainBeforeEof {
+                stream,
+                exec_id: self.exec_id,
+            });
+        }
+        if self.is_drained(stream) {
+            return Err(StateError::StreamAlreadyDrained {
+                stream,
+                exec_id: self.exec_id,
+            });
+        }
+        self.set_drained(stream);
+        Ok(())
+    }
+
+    fn apply_descendants_cleaned(&mut self) -> Result<(), StateError> {
+        if self.descendants_cleaned {
+            return Err(StateError::DescendantsAlreadyCleaned {
+                exec_id: self.exec_id,
+            });
+        }
+        self.descendants_cleaned = true;
+        Ok(())
+    }
+
+    fn apply_disposition(&mut self, disposition: ExecDisposition) -> Result<(), StateError> {
+        if let Some(current) = self.disposition {
+            return Err(StateError::DispositionAlreadySet {
+                exec_id: self.exec_id,
+                current,
+                attempted: disposition,
+            });
+        }
+        if matches!(
+            disposition,
+            ExecDisposition::Cancelled | ExecDisposition::TimedOut
+        ) {
+            self.stdin_closed = true;
+        }
+        self.disposition = Some(disposition);
+        Ok(())
     }
 
     fn add_flow_credits(&mut self, stream: StreamName, credits: u32) -> Result<(), StateError> {
@@ -681,6 +829,54 @@ impl ExecState {
         Ok(())
     }
 
+    fn next_sequence(&self, stream: StreamName) -> u64 {
+        match stream {
+            StreamName::Stdin => self.stdin_next_seq,
+            StreamName::Stdout => self.stdout_next_seq,
+            StreamName::Stderr => self.stderr_next_seq,
+        }
+    }
+
+    fn set_next_sequence(&mut self, stream: StreamName, value: u64) {
+        match stream {
+            StreamName::Stdin => self.stdin_next_seq = value,
+            StreamName::Stdout => self.stdout_next_seq = value,
+            StreamName::Stderr => self.stderr_next_seq = value,
+        }
+    }
+
+    fn is_closed(&self, stream: StreamName) -> bool {
+        match stream {
+            StreamName::Stdin => self.stdin_closed,
+            StreamName::Stdout => self.stdout_closed,
+            StreamName::Stderr => self.stderr_closed,
+        }
+    }
+
+    fn set_closed(&mut self, stream: StreamName) {
+        match stream {
+            StreamName::Stdin => self.stdin_closed = true,
+            StreamName::Stdout => self.stdout_closed = true,
+            StreamName::Stderr => self.stderr_closed = true,
+        }
+    }
+
+    fn is_drained(&self, stream: StreamName) -> bool {
+        match stream {
+            StreamName::Stdin => false,
+            StreamName::Stdout => self.stdout_drained,
+            StreamName::Stderr => self.stderr_drained,
+        }
+    }
+
+    fn set_drained(&mut self, stream: StreamName) {
+        match stream {
+            StreamName::Stdin => {}
+            StreamName::Stdout => self.stdout_drained = true,
+            StreamName::Stderr => self.stderr_drained = true,
+        }
+    }
+
     fn has_required_terminal_prerequisites(&self) -> bool {
         self.stdout_closed
             && self.stderr_closed
@@ -695,21 +891,19 @@ impl ExecState {
     }
 }
 
-fn expect_sequence(stream: StreamName, next: &mut u64, received: u64) -> Result<(), StateError> {
-    if *next != received {
+fn checked_next_sequence(stream: StreamName, next: u64, received: u64) -> Result<u64, StateError> {
+    if next != received {
         return Err(StateError::StreamSequenceMismatch {
             stream,
-            expected: *next,
+            expected: next,
             actual: received,
         });
     }
-    *next = next
-        .checked_add(1)
+    next.checked_add(1)
         .ok_or(StateError::StreamSequenceExhausted {
             stream,
-            last_sequence: *next,
-        })?;
-    Ok(())
+            last_sequence: next,
+        })
 }
 
 #[cfg(test)]
@@ -764,6 +958,7 @@ mod tests {
                 detail: None,
             },
             isolation: test_isolation(),
+            workload_identity: WorkloadIdentityStatus::mxc_fixed(),
         }
     }
 
@@ -813,6 +1008,79 @@ mod tests {
                 LaunchAdmissionError::UnsupportedVersion(_)
             ))
         ));
+    }
+
+    #[test]
+    fn launch_enforces_required_isolation_contract_properties() {
+        let mut state = AgentProtocolState::new();
+        state
+            .admit_launch(admission_input(1, 1))
+            .expect("fully compliant isolation launch");
+
+        let make_input = |property: IsolationContractProperty| {
+            let mut input = admission_input(2, 2);
+            match property {
+                IsolationContractProperty::PidNamespace => input.isolation.pid_namespace = false,
+                IsolationContractProperty::MountNamespace => {
+                    input.isolation.mount_namespace = false
+                }
+                IsolationContractProperty::UtsNamespace => input.isolation.uts_namespace = false,
+                IsolationContractProperty::IpcNamespace => input.isolation.ipc_namespace = false,
+                IsolationContractProperty::PrivateProc => input.isolation.private_proc = false,
+                IsolationContractProperty::PrivateDev => input.isolation.private_dev = false,
+                IsolationContractProperty::PrivateDevpts => input.isolation.private_devpts = false,
+                IsolationContractProperty::PrivateShm => input.isolation.private_shm = false,
+                IsolationContractProperty::ReadOnlySys => input.isolation.read_only_sys = false,
+                IsolationContractProperty::CapabilitiesDropped => {
+                    input.isolation.capabilities_dropped = false
+                }
+                IsolationContractProperty::NoNewPrivs => input.isolation.no_new_privs = false,
+                IsolationContractProperty::CgroupSeparation => {
+                    input.isolation.cgroup_separation = false
+                }
+                IsolationContractProperty::OrphanReaping => input.isolation.orphan_reaping = false,
+                IsolationContractProperty::FixedMxcIdentity => {
+                    input.workload_identity = WorkloadIdentityStatus {
+                        user: "root".to_string(),
+                        group: "root".to_string(),
+                        uid: 0,
+                        gid: 0,
+                    }
+                }
+            }
+            input
+        };
+
+        let properties = [
+            IsolationContractProperty::PidNamespace,
+            IsolationContractProperty::MountNamespace,
+            IsolationContractProperty::UtsNamespace,
+            IsolationContractProperty::IpcNamespace,
+            IsolationContractProperty::PrivateProc,
+            IsolationContractProperty::PrivateDev,
+            IsolationContractProperty::PrivateDevpts,
+            IsolationContractProperty::PrivateShm,
+            IsolationContractProperty::ReadOnlySys,
+            IsolationContractProperty::CapabilitiesDropped,
+            IsolationContractProperty::NoNewPrivs,
+            IsolationContractProperty::CgroupSeparation,
+            IsolationContractProperty::OrphanReaping,
+            IsolationContractProperty::FixedMxcIdentity,
+        ];
+
+        for property in properties {
+            let mut per_case = AgentProtocolState::new();
+            let input = make_input(property);
+            let error = per_case.admit_launch(input).expect_err("must reject");
+            match error {
+                StateError::LaunchAdmission(LaunchAdmissionError::IsolationContractViolation {
+                    missing,
+                }) => {
+                    assert_eq!(missing, vec![property]);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1013,6 +1281,178 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn sequence_mismatch_is_transactional_for_credit_and_sequence_state() {
+        let mut state = ready_state(10);
+        state.create_exec(26).expect("exec");
+        state
+            .apply_exec_event(
+                26,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stdout,
+                    credits: 1,
+                },
+            )
+            .expect("credit");
+        assert!(matches!(
+            state.apply_exec_event(26, ActiveExecEvent::StdoutChunk { sequence: 1 }),
+            Err(StateError::StreamSequenceMismatch {
+                stream: StreamName::Stdout,
+                expected: 0,
+                actual: 1
+            })
+        ));
+
+        let launch = state.launch.as_ref().expect("launch");
+        let exec = launch.active_exec.as_ref().expect("active exec");
+        assert_eq!(exec.stdout_window.available_credits, 1);
+        assert_eq!(exec.stdout_next_seq, 0);
+
+        state
+            .apply_exec_event(26, ActiveExecEvent::StdoutChunk { sequence: 0 })
+            .expect("correct chunk after mismatch");
+        let launch = state.launch.as_ref().expect("launch");
+        let exec = launch.active_exec.as_ref().expect("active exec");
+        assert_eq!(exec.stdout_window.available_credits, 0);
+        assert_eq!(exec.stdout_next_seq, 1);
+    }
+
+    #[test]
+    fn invalid_or_duplicate_exec_transitions_are_typed_errors() {
+        let mut state = ready_state(11);
+        state.create_exec(27).expect("exec");
+
+        assert!(matches!(
+            state.apply_exec_event(
+                27,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stdin
+                }
+            ),
+            Err(StateError::InvalidDrainStream {
+                stream: StreamName::Stdin,
+                exec_id: 27
+            })
+        ));
+
+        assert!(matches!(
+            state.apply_exec_event(
+                27,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stdout
+                }
+            ),
+            Err(StateError::StreamDrainBeforeEof {
+                stream: StreamName::Stdout,
+                exec_id: 27
+            })
+        ));
+
+        state
+            .apply_exec_event(27, ActiveExecEvent::StdoutEof { sequence: 0 })
+            .expect("stdout eof");
+        state
+            .apply_exec_event(
+                27,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stdout,
+                },
+            )
+            .expect("stdout drained");
+        assert!(matches!(
+            state.apply_exec_event(
+                27,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stdout
+                }
+            ),
+            Err(StateError::StreamAlreadyDrained {
+                stream: StreamName::Stdout,
+                exec_id: 27
+            })
+        ));
+
+        state
+            .apply_exec_event(27, ActiveExecEvent::DescendantsCleaned)
+            .expect("descendants cleaned");
+        assert!(matches!(
+            state.apply_exec_event(27, ActiveExecEvent::DescendantsCleaned),
+            Err(StateError::DescendantsAlreadyCleaned { exec_id: 27 })
+        ));
+
+        state
+            .apply_exec_event(
+                27,
+                ActiveExecEvent::Disposition(ExecDisposition::ExitCode(0)),
+            )
+            .expect("disposition");
+        assert!(matches!(
+            state.apply_exec_event(27, ActiveExecEvent::Disposition(ExecDisposition::TimedOut)),
+            Err(StateError::DispositionAlreadySet {
+                exec_id: 27,
+                current: ExecDisposition::ExitCode(0),
+                attempted: ExecDisposition::TimedOut
+            })
+        ));
+    }
+
+    #[test]
+    fn cancellation_disposition_closes_stdin_before_terminal_prerequisites() {
+        let mut state = ready_state(12);
+        state.create_exec(28).expect("exec");
+        state
+            .apply_exec_event(
+                28,
+                ActiveExecEvent::AddFlowCredits {
+                    stream: StreamName::Stdin,
+                    credits: 1,
+                },
+            )
+            .expect("stdin credit");
+        state
+            .apply_exec_event(28, ActiveExecEvent::Disposition(ExecDisposition::Cancelled))
+            .expect("cancelled disposition");
+
+        assert!(matches!(
+            state.apply_exec_event(28, ActiveExecEvent::StdinChunk { sequence: 0 }),
+            Err(StateError::StreamAlreadyClosed {
+                stream: StreamName::Stdin,
+                exec_id: 28
+            })
+        ));
+        let launch = state.launch.as_ref().expect("launch");
+        let exec = launch.active_exec.as_ref().expect("active exec");
+        assert_eq!(exec.stdin_window.available_credits, 1);
+
+        state
+            .apply_exec_event(28, ActiveExecEvent::StdoutEof { sequence: 0 })
+            .expect("stdout eof");
+        state
+            .apply_exec_event(28, ActiveExecEvent::StderrEof { sequence: 0 })
+            .expect("stderr eof");
+        state
+            .apply_exec_event(
+                28,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stdout,
+                },
+            )
+            .expect("stdout drained");
+        state
+            .apply_exec_event(
+                28,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stderr,
+                },
+            )
+            .expect("stderr drained");
+        let terminal = state
+            .apply_exec_event(28, ActiveExecEvent::DescendantsCleaned)
+            .expect("descendants cleaned")
+            .expect("terminal");
+        assert_eq!(terminal.disposition, ExecDisposition::Cancelled);
     }
 
     #[test]
