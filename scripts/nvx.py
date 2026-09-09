@@ -15,6 +15,8 @@ from pathlib import Path
 from nvx_tools.benchmark import configure_parser as configure_benchmark_parser
 from nvx_tools.build import (
     AGENT_INITRAMFS_NAME,
+    INTERNAL_GITLESS_ENV_PROVENANCE_MODE,
+    INTERNAL_GITLESS_ENV_PROVENANCE_MODE_ENV,
     MXC_PROTOTYPE_INITRAMFS_NAME,
     MXC_PROTOTYPE_TRANSPORT,
     AlpineBuildConfig,
@@ -109,8 +111,6 @@ def _native_agent_initramfs() -> None:
 
 
 def _native_mxc_prototype_initramfs(
-    *,
-    allow_gitless_env_provenance: bool = False,
 ) -> None:
     build_initramfs(
         AlpineBuildConfig(
@@ -118,9 +118,20 @@ def _native_mxc_prototype_initramfs(
             output=artifact_path(MXC_PROTOTYPE_INITRAMFS_NAME),
             profile=MXC_PROTOTYPE_TRANSPORT,
             agent_enabled=True,
-            allow_gitless_env_provenance=allow_gitless_env_provenance,
+            allow_gitless_env_provenance=_allow_internal_gitless_source_provenance(),
         )
     )
+
+def _allow_internal_gitless_source_provenance() -> bool:
+    mode = os.environ.get(INTERNAL_GITLESS_ENV_PROVENANCE_MODE_ENV)
+    if mode is None:
+        return False
+    if mode != INTERNAL_GITLESS_ENV_PROVENANCE_MODE:
+        raise ScriptError(
+            f"{INTERNAL_GITLESS_ENV_PROVENANCE_MODE_ENV} must be "
+            f"{INTERNAL_GITLESS_ENV_PROVENANCE_MODE!r} when set"
+        )
+    return True
 
 
 def command_build_guest(args: argparse.Namespace) -> None:
@@ -130,9 +141,7 @@ def command_build_guest(args: argparse.Namespace) -> None:
         if args.with_agent:
             _native_agent_initramfs()
         if args.with_mxc_prototype:
-            _native_mxc_prototype_initramfs(
-                allow_gitless_env_provenance=args.allow_gitless_source_provenance
-            )
+            _native_mxc_prototype_initramfs()
         return
 
     config = DockerBuildConfig(destination=BUILD_DIR)
@@ -153,7 +162,7 @@ def command_build_initramfs(_: argparse.Namespace) -> None:
 
 def command_build_mxc_prototype_agent(args: argparse.Namespace) -> None:
     build_mxc_prototype_guest_agent(
-        allow_gitless_env_provenance=args.allow_gitless_source_provenance
+        allow_gitless_env_provenance=_allow_internal_gitless_source_provenance()
     )
 
 
@@ -166,9 +175,7 @@ def command_build_agent_initramfs(args: argparse.Namespace) -> None:
 
 def command_build_mxc_prototype_initramfs(args: argparse.Namespace) -> None:
     if args.native:
-        _native_mxc_prototype_initramfs(
-            allow_gitless_env_provenance=args.allow_gitless_source_provenance
-        )
+        _native_mxc_prototype_initramfs()
     else:
         build_docker_mxc_prototype_initramfs(DockerBuildConfig(destination=BUILD_DIR))
 
@@ -434,15 +441,6 @@ def _add_guest_options(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="also build the in-repo mxc-prototype PID-1 initramfs",
     )
-    parser.add_argument(
-        "--allow-gitless-source-provenance",
-        action="store_true",
-        help=(
-            "allow NVX_SOURCE_REVISION/NVX_SOURCE_CLEAN only when building native "
-            "mxc-prototype artifacts without .git metadata (for container builds)"
-        ),
-    )
-
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -471,14 +469,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "build-mxc-prototype-agent",
         help="build and stage the in-repo mxc-prototype Rust agent",
     )
-    mxc_agent.add_argument(
-        "--allow-gitless-source-provenance",
-        action="store_true",
-        help=(
-            "allow NVX_SOURCE_REVISION/NVX_SOURCE_CLEAN only when .git metadata is "
-            "unavailable (for container builds)"
-        ),
-    )
     mxc_agent.set_defaults(handler=command_build_mxc_prototype_agent)
 
     agent_initramfs = subparsers.add_parser(
@@ -500,14 +490,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--native",
         action="store_true",
         help="build directly on Linux instead of using Docker",
-    )
-    mxc_initramfs.add_argument(
-        "--allow-gitless-source-provenance",
-        action="store_true",
-        help=(
-            "allow NVX_SOURCE_REVISION/NVX_SOURCE_CLEAN only when .git metadata is "
-            "unavailable (for container builds)"
-        ),
     )
     mxc_initramfs.set_defaults(handler=command_build_mxc_prototype_initramfs)
 

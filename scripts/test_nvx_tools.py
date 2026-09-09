@@ -877,20 +877,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(verify_agent.input, Path("initramfs-agent.cpio.gz"))
         self.assertIs(verify_agent.handler, nvx.command_verify_agent_initramfs)
 
-        mxc_agent = nvx.parse_args(
-            ["build-mxc-prototype-agent", "--allow-gitless-source-provenance"]
-        )
-        self.assertTrue(mxc_agent.allow_gitless_source_provenance)
+        mxc_agent = nvx.parse_args(["build-mxc-prototype-agent"])
         self.assertIs(mxc_agent.handler, nvx.command_build_mxc_prototype_agent)
         mxc_initramfs = nvx.parse_args(
             ["build-mxc-prototype-initramfs", "--native"]
         )
         self.assertTrue(mxc_initramfs.native)
-        self.assertFalse(mxc_initramfs.allow_gitless_source_provenance)
         self.assertIs(
             mxc_initramfs.handler,
             nvx.command_build_mxc_prototype_initramfs,
         )
+
+    def test_public_cli_help_omits_gitless_source_provenance_override(self):
+        help_output = io.StringIO()
+        with (
+            patch.object(sys, "argv", ["nvx.py", "--help"]),
+            patch("sys.stdout", help_output),
+            self.assertRaises(SystemExit),
+        ):
+            nvx.parse_args()
+        self.assertNotIn("--allow-gitless-source-provenance", help_output.getvalue())
+        with self.assertRaises(SystemExit):
+            nvx.parse_args(
+                ["build-mxc-prototype-initramfs", "--allow-gitless-source-provenance"]
+            )
 
 
 class CiTests(unittest.TestCase):
@@ -1706,8 +1716,15 @@ class BuildTests(unittest.TestCase):
                 )
             )
             self.assertEqual(provenance["source_revision"], source_revision)
+            self.assertEqual(
+                provenance["source_authority"], build.SOURCE_AUTHORITY_VERIFIED_GIT
+            )
             self.assertEqual(provenance["sha256"], sha256)
             self.assertEqual(guest_manifest["sha256"], sha256)
+            self.assertEqual(
+                guest_manifest["source_authority"],
+                build.SOURCE_AUTHORITY_VERIFIED_GIT,
+            )
             self.assertIn("--locked", run_checked.call_args.args[0])
 
     def test_build_mxc_prototype_guest_agent_rejects_spoofed_host_provenance_env(self):
@@ -1751,7 +1768,7 @@ class BuildTests(unittest.TestCase):
                     build.build_mxc_prototype_guest_agent()
             self.assertEqual(run_capture.call_count, 2)
 
-    def test_build_mxc_prototype_guest_agent_accepts_explicit_gitless_env_mode(self):
+    def test_build_mxc_prototype_guest_agent_marks_internal_gitless_mode_as_declared(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source_revision = "b" * 40
@@ -1778,13 +1795,14 @@ class BuildTests(unittest.TestCase):
                     {
                         build.SOURCE_REVISION_ENV: source_revision,
                         build.SOURCE_CLEAN_ENV: "false",
+                        build.INTERNAL_GITLESS_ENV_PROVENANCE_MODE_ENV: (
+                            build.INTERNAL_GITLESS_ENV_PROVENANCE_MODE
+                        ),
                     },
                     clear=False,
                 ),
             ):
-                build.build_mxc_prototype_guest_agent(
-                    allow_gitless_env_provenance=True
-                )
+                build.build_mxc_prototype_guest_agent(allow_gitless_env_provenance=True)
             provenance = json.loads(
                 (root / "build" / build.MXC_GUEST_AGENT_PROVENANCE_NAME).read_text(
                     encoding="utf-8"
@@ -1792,6 +1810,10 @@ class BuildTests(unittest.TestCase):
             )
             self.assertEqual(provenance["source_revision"], source_revision)
             self.assertFalse(provenance["source_clean"])
+            self.assertEqual(
+                provenance["source_authority"],
+                build.SOURCE_AUTHORITY_DECLARED_CONTAINER_INPUT,
+            )
 
     def test_source_provenance_requires_complete_environment(self):
         with patch.dict(
@@ -1823,7 +1845,7 @@ class BuildTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 common.ScriptError,
-                "only allowed for explicit git-less container builds",
+                "only allowed for explicit internal git-less container mode",
             ):
                 build.source_provenance()
 
@@ -1831,7 +1853,11 @@ class BuildTests(unittest.TestCase):
         with patch.object(
             build,
             "_source_provenance_from_git",
-            return_value=("d" * 40, True),
+            return_value=build.SourceProvenance(
+                revision="d" * 40,
+                clean=True,
+                authority=build.SOURCE_AUTHORITY_VERIFIED_GIT,
+            ),
         ):
             command = [
                 str(value)
@@ -1915,12 +1941,47 @@ class BuildTests(unittest.TestCase):
         )
         self.assertIn("rustup target add x86_64-unknown-linux-musl", dockerfile)
         self.assertIn(
-            "build-mxc-prototype-initramfs --native --allow-gitless-source-provenance",
+            "build-mxc-prototype-initramfs --native",
             dockerfile,
         )
+        self.assertIn("ARG NVX_INTERNAL_GITLESS_SOURCE_PROVENANCE", dockerfile)
         self.assertIn(
             "COPY Cargo.toml Cargo.lock LICENSE README.md SOURCE-MANIFEST.json THIRD_PARTY_NOTICES.md /repo/",
             dockerfile,
+        )
+
+    def test_mxc_docker_build_uses_internal_declared_provenance_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "build" / build.MXC_PROTOTYPE_INITRAMFS_NAME
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"initramfs")
+            output.with_name(f"{output.name}.packages.json").write_text(
+                json.dumps({"guest_agent": {"sha256": "a" * 64}}),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(build, "REPO_ROOT", root),
+                patch.object(build, "require_tool", return_value="docker"),
+                patch.object(build, "verify_agent_initramfs"),
+                patch.object(
+                    build,
+                    "_source_provenance_from_git",
+                    return_value=build.SourceProvenance(
+                        revision="d" * 40,
+                        clean=True,
+                        authority=build.SOURCE_AUTHORITY_VERIFIED_GIT,
+                    ),
+                ),
+                patch.object(build, "run_checked") as run_checked,
+            ):
+                build.build_docker_mxc_prototype_initramfs(build.DockerBuildConfig())
+        command = [str(value) for value in run_checked.call_args.args[0]]
+        self.assertIn("--build-arg", command)
+        self.assertIn(
+            f"{build.INTERNAL_GITLESS_ENV_PROVENANCE_MODE_ENV}="
+            f"{build.INTERNAL_GITLESS_ENV_PROVENANCE_MODE}",
+            command,
         )
 
 

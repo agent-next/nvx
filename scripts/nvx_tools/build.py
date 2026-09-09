@@ -111,7 +111,10 @@ OPENVMM_PROVENANCE_NAME = "openvmm.provenance.json"
 KERNEL_PROVENANCE_NAME = "vmlinux.provenance.json"
 SOURCE_REVISION_ENV = "NVX_SOURCE_REVISION"
 SOURCE_CLEAN_ENV = "NVX_SOURCE_CLEAN"
-ALLOW_GITLESS_ENV_PROVENANCE_FLAG = "--allow-gitless-source-provenance"
+INTERNAL_GITLESS_ENV_PROVENANCE_MODE_ENV = "NVX_INTERNAL_GITLESS_SOURCE_PROVENANCE"
+INTERNAL_GITLESS_ENV_PROVENANCE_MODE = "container-declared"
+SOURCE_AUTHORITY_VERIFIED_GIT = "verified-git"
+SOURCE_AUTHORITY_DECLARED_CONTAINER_INPUT = "declared-container-input"
 SOURCE_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 UNSAFE_INITRAMFS_FILESYSTEMS = frozenset(
     {
@@ -181,6 +184,13 @@ class ApkPackage(TypedDict):
     description: str | None
     aports_commit: str | None
     build_time: str | None
+
+
+@dataclass(frozen=True)
+class SourceProvenance:
+    revision: str
+    clean: bool
+    authority: str
 
 
 @dataclass(frozen=True)
@@ -398,7 +408,7 @@ def build_mxc_prototype_guest_agent(
 ) -> tuple[Path, str, dict[str, object]]:
     """Build and stage the in-repo Rust agent used by the MXC prototype profile."""
     require_tool("cargo")
-    source_revision, source_clean = source_provenance(
+    source = source_provenance(
         allow_environment_without_git=allow_gitless_env_provenance
     )
     run_checked(
@@ -437,8 +447,9 @@ def build_mxc_prototype_guest_agent(
         "format": 1,
         "profile": MXC_PROTOTYPE_TRANSPORT,
         "target": GUEST_AGENT_TARGET,
-        "source_revision": source_revision,
-        "source_clean": source_clean,
+        "source_revision": source.revision,
+        "source_clean": source.clean,
+        "source_authority": source.authority,
         "sha256": sha256,
         "size": size,
     }
@@ -454,6 +465,7 @@ def build_mxc_prototype_guest_agent(
             "sha256": sha256,
             "size": size,
             "source_revision": provenance["source_revision"],
+            "source_authority": provenance["source_authority"],
             "build_id": None,
             "origin": "in-repo-workspace",
         },
@@ -478,18 +490,19 @@ def _validated_source_clean(value: str) -> bool:
     raise ScriptError(f"{SOURCE_CLEAN_ENV} must be 'true' or 'false'")
 
 
-def _source_provenance_from_git(repository: Path = REPO_ROOT) -> tuple[str, bool]:
+def _source_provenance_from_git(repository: Path = REPO_ROOT) -> SourceProvenance:
     source_revision = run_capture(["git", "-C", repository, "rev-parse", "HEAD"])
     require_success(source_revision, "querying repository revision")
     status = run_capture(["git", "-C", repository, "status", "--porcelain"])
     require_success(status, "querying repository status")
-    return (
-        _validated_source_revision(source_revision.stdout.decode("ascii")),
-        not status.stdout.strip(),
+    return SourceProvenance(
+        revision=_validated_source_revision(source_revision.stdout.decode("ascii")),
+        clean=not status.stdout.strip(),
+        authority=SOURCE_AUTHORITY_VERIFIED_GIT,
     )
 
 
-def _source_provenance_from_environment() -> tuple[str, bool] | None:
+def _source_provenance_from_environment() -> SourceProvenance | None:
     source_revision = os.environ.get(SOURCE_REVISION_ENV)
     source_clean = os.environ.get(SOURCE_CLEAN_ENV)
     if source_revision is None and source_clean is None:
@@ -498,9 +511,10 @@ def _source_provenance_from_environment() -> tuple[str, bool] | None:
         raise ScriptError(
             f"{SOURCE_REVISION_ENV} and {SOURCE_CLEAN_ENV} must be set together"
         )
-    return (
-        _validated_source_revision(source_revision),
-        _validated_source_clean(source_clean),
+    return SourceProvenance(
+        revision=_validated_source_revision(source_revision),
+        clean=_validated_source_clean(source_clean),
+        authority=SOURCE_AUTHORITY_DECLARED_CONTAINER_INPUT,
     )
 
 
@@ -508,7 +522,7 @@ def source_provenance(
     repository: Path = REPO_ROOT,
     *,
     allow_environment_without_git: bool = False,
-) -> tuple[str, bool]:
+) -> SourceProvenance:
     environment_provenance = _source_provenance_from_environment()
     try:
         git_provenance = _source_provenance_from_git(repository)
@@ -517,13 +531,17 @@ def source_provenance(
             raise
         if not allow_environment_without_git:
             raise ScriptError(
-                "environment source provenance is only allowed for explicit git-less "
-                f"container builds via {ALLOW_GITLESS_ENV_PROVENANCE_FLAG}"
+                "environment source provenance is only allowed for explicit internal "
+                f"git-less container mode ({INTERNAL_GITLESS_ENV_PROVENANCE_MODE_ENV}="
+                f"{INTERNAL_GITLESS_ENV_PROVENANCE_MODE})"
             ) from git_error
         return environment_provenance
     if environment_provenance is None:
         return git_provenance
-    if environment_provenance != git_provenance:
+    if (
+        environment_provenance.revision != git_provenance.revision
+        or environment_provenance.clean != git_provenance.clean
+    ):
         raise ScriptError(
             "environment source provenance does not match repository metadata"
         )
@@ -1625,7 +1643,7 @@ def docker_build_command(config: DockerBuildConfig, target: str) -> list[str | P
             f"({DEFAULT_ALPINE_BRANCH})"
         )
     destination = _docker_destination(config.destination)
-    source_revision, source_clean = _source_provenance_from_git()
+    source = _source_provenance_from_git()
     command: list[str | Path] = [
         "docker",
         "build",
@@ -1634,9 +1652,9 @@ def docker_build_command(config: DockerBuildConfig, target: str) -> list[str | P
         "--target",
         target,
         "--build-arg",
-        f"{SOURCE_REVISION_ENV}={source_revision}",
+        f"{SOURCE_REVISION_ENV}={source.revision}",
         "--build-arg",
-        f"{SOURCE_CLEAN_ENV}={'true' if source_clean else 'false'}",
+        f"{SOURCE_CLEAN_ENV}={'true' if source.clean else 'false'}",
     ]
     command.extend(
         [
@@ -1654,8 +1672,15 @@ def build_docker_mxc_prototype_initramfs(config: DockerBuildConfig) -> Path:
         "docker was not found on PATH; install Docker with the Linux engine first",
     )
     destination = _docker_destination(config.destination)
+    command = docker_build_command(config, "mxc-prototype-initramfs-artifacts")
+    insert_at = len(command) - 3
+    command[insert_at:insert_at] = [
+        "--build-arg",
+        f"{INTERNAL_GITLESS_ENV_PROVENANCE_MODE_ENV}="
+        f"{INTERNAL_GITLESS_ENV_PROVENANCE_MODE}",
+    ]
     run_checked(
-        docker_build_command(config, "mxc-prototype-initramfs-artifacts"),
+        command,
         cwd=REPO_ROOT,
     )
     output = destination / MXC_PROTOTYPE_INITRAMFS_NAME

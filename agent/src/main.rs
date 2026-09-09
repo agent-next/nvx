@@ -20,6 +20,12 @@ use crate::error::{AgentError, Result};
 #[cfg(unix)]
 const SHUTDOWN_SIGNALS: [i32; 2] = [libc::SIGINT, libc::SIGTERM];
 
+#[cfg(unix)]
+struct ShutdownSignalBlock {
+    blocked_set: libc::sigset_t,
+    previous_mask: libc::sigset_t,
+}
+
 fn probe_mxc_requirements(service: &impl MxcExtensionService) -> usize {
     let mut failures = 0;
     for requirement in MODELED_REQUIREMENTS {
@@ -36,20 +42,12 @@ fn probe_mxc_requirements(service: &impl MxcExtensionService) -> usize {
 }
 
 #[cfg(unix)]
-fn wait_for_shutdown_signal() -> Result<()> {
-    let shutdown_mask = blocked_shutdown_signal_mask()?;
-    let previous_mask = block_signals(&shutdown_mask)?;
+fn wait_for_shutdown_signal(shutdown_mask: &libc::sigset_t) -> Result<()> {
     eprintln!("NVX-AGENT: waiting for host control integration or termination signal");
     let wait_result = wait_for_blocked_shutdown_signal(&shutdown_mask, |set, signal| unsafe {
         libc::sigwait(set, signal)
     });
-    let restore_result = restore_signal_mask(&previous_mask);
-    if let Err(error) = wait_result {
-        restore_result?;
-        return Err(error);
-    }
     let signal = wait_result?;
-    restore_result?;
     ensure_shutdown_signal(signal)?;
     eprintln!("NVX-AGENT: received termination signal");
     Ok(())
@@ -95,6 +93,16 @@ fn block_signals(blocked_set: &libc::sigset_t) -> Result<libc::sigset_t> {
         )));
     }
     Ok(unsafe { previous.assume_init() })
+}
+
+#[cfg(unix)]
+fn install_shutdown_signal_block() -> Result<ShutdownSignalBlock> {
+    let blocked_set = blocked_shutdown_signal_mask()?;
+    let previous_mask = block_signals(&blocked_set)?;
+    Ok(ShutdownSignalBlock {
+        blocked_set,
+        previous_mask,
+    })
 }
 
 #[cfg(unix)]
@@ -150,6 +158,23 @@ fn run_service(
 }
 
 fn run() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let shutdown_signals = install_shutdown_signal_block()?;
+        let adapter = UnsupportedAciAdapter;
+        let run_result = run_service(&adapter, || {
+            wait_for_shutdown_signal(&shutdown_signals.blocked_set)
+        });
+        let restore_result = restore_signal_mask(&shutdown_signals.previous_mask);
+        if let Err(error) = run_result {
+            restore_result?;
+            return Err(error);
+        }
+        restore_result?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
     let adapter = UnsupportedAciAdapter;
     run_service(&adapter, wait_for_shutdown_signal)
 }
@@ -237,5 +262,82 @@ mod tests {
     fn ensure_shutdown_signal_rejects_unexpected_signal() {
         let error = ensure_shutdown_signal(libc::SIGUSR1).unwrap_err();
         assert!(format!("{error}").contains("unexpected signal"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_signal_during_initialization_is_consumed_by_wait() {
+        let mut pipefds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipefds.as_mut_ptr()) }, 0);
+        let child_pid = unsafe { libc::fork() };
+        assert!(
+            child_pid >= 0,
+            "fork failed: {}",
+            ::std::io::Error::last_os_error()
+        );
+        if child_pid == 0 {
+            unsafe {
+                libc::close(pipefds[0]);
+            }
+            let child_exit = match install_shutdown_signal_block() {
+                Ok(shutdown_signals) => {
+                    let ready: [u8; 1] = [1];
+                    let wrote =
+                        unsafe { libc::write(pipefds[1], ready.as_ptr().cast(), ready.len()) };
+                    if wrote != 1 {
+                        2
+                    } else {
+                        ::std::thread::sleep(::std::time::Duration::from_millis(100));
+                        match wait_for_shutdown_signal(&shutdown_signals.blocked_set) {
+                            Ok(()) => 0,
+                            Err(_) => 3,
+                        }
+                    }
+                }
+                Err(_) => 4,
+            };
+            unsafe {
+                libc::close(pipefds[1]);
+                libc::_exit(child_exit);
+            }
+        }
+        unsafe {
+            libc::close(pipefds[1]);
+        }
+
+        let mut ready = [0_u8; 1];
+        let read_result = unsafe { libc::read(pipefds[0], ready.as_mut_ptr().cast(), ready.len()) };
+        assert_eq!(read_result, 1);
+        assert_eq!(ready[0], 1);
+        assert_eq!(unsafe { libc::kill(child_pid, libc::SIGTERM) }, 0);
+
+        let mut status = 0;
+        let mut child_exited = false;
+        for _ in 0..100 {
+            let waited = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+            assert_ne!(
+                waited,
+                -1,
+                "waitpid failed: {}",
+                ::std::io::Error::last_os_error()
+            );
+            if waited == child_pid {
+                child_exited = true;
+                break;
+            }
+            ::std::thread::sleep(::std::time::Duration::from_millis(20));
+        }
+        if !child_exited {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+                libc::waitpid(child_pid, &mut status, 0);
+            }
+            panic!("timed out waiting for child to consume pending signal");
+        }
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        unsafe {
+            libc::close(pipefds[0]);
+        }
     }
 }

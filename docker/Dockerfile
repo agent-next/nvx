@@ -41,8 +41,10 @@ COPY Cargo.toml Cargo.lock LICENSE README.md SOURCE-MANIFEST.json THIRD_PARTY_NO
 
 ARG NVX_SOURCE_REVISION
 ARG NVX_SOURCE_CLEAN
+ARG NVX_INTERNAL_GITLESS_SOURCE_PROVENANCE
 ENV NVX_SOURCE_REVISION=${NVX_SOURCE_REVISION}
 ENV NVX_SOURCE_CLEAN=${NVX_SOURCE_CLEAN}
+ENV NVX_INTERNAL_GITLESS_SOURCE_PROVENANCE=${NVX_INTERNAL_GITLESS_SOURCE_PROVENANCE}
 
 FROM base AS kernel
 RUN python3 scripts/nvx.py build-kernel
@@ -60,7 +62,7 @@ RUN --mount=type=secret,id=nvx-agent,required=true \
     && python3 scripts/nvx.py build-agent-initramfs --native
 
 FROM base AS mxc-prototype-initramfs
-RUN python3 scripts/nvx.py build-mxc-prototype-initramfs --native --allow-gitless-source-provenance
+RUN python3 scripts/nvx.py build-mxc-prototype-initramfs --native
 
 FROM scratch AS kernel-artifacts
 COPY --from=kernel /repo/build/vmlinux /vmlinux

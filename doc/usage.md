@@ -138,7 +138,10 @@ python3 scripts/nvx.py build-mxc-prototype-initramfs [--native]
 Builds `build/initramfs-mxc-agent.cpio.gz` through Docker, or directly on
 Linux with `--native`. The profile compiles the in-repo Rust `nvx-agent`,
 verifies static x86-64 ELF properties, then packages a PID-1 image with
-`/init -> sbin/nvx-agent`.
+`/init -> sbin/nvx-agent`. Git-derived builds record
+`source_authority: "verified-git"`. Docker Git-less builds keep
+`NVX_SOURCE_REVISION` / `NVX_SOURCE_CLEAN` as declared inputs and record
+`source_authority: "declared-container-input"`.
 
 ### `build-openvmm`
 

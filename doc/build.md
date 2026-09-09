@@ -130,6 +130,14 @@ The output path is `build/initramfs-mxc-agent.cpio.gz` with `/init` linked to
 `/sbin/nvx-agent`. This profile remains separate from both `legacy` and
 `broker-ttrpc`.
 
+Source provenance authority is explicit for this profile. If the build reads
+Git metadata in the current workspace, the agent provenance records
+`source_authority: "verified-git"`. If the build runs in a Git-less container
+and consumes `NVX_SOURCE_REVISION` / `NVX_SOURCE_CLEAN` declarations from the
+host wrapper, the same metadata is recorded as
+`source_authority: "declared-container-input"` to reflect weaker, in-container
+unverified authority.
+
 The matching kernel assertions cover cgroup-v2 memory, pids, CPU weight,
 freezer and BPF; BPF and seccomp syscalls/filters; EROFS, overlay, ext4 and GPT; virtio block/console/MMIO;
 devtmpfs, PTYs, proc/sysfs/tmpfs; and mount, PID, UTS, and IPC namespaces.
