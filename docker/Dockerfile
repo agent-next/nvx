@@ -4,6 +4,7 @@ ARG DEBIAN_IMAGE=debian:12-slim
 ARG RUST_TOOLCHAIN=1.95.0
 
 FROM ${DEBIAN_IMAGE} AS base
+ARG RUST_TOOLCHAIN=1.95.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bc \
         binutils \
@@ -59,7 +60,7 @@ RUN --mount=type=secret,id=nvx-agent,required=true \
     && python3 scripts/nvx.py build-agent-initramfs --native
 
 FROM base AS mxc-prototype-initramfs
-RUN python3 scripts/nvx.py build-mxc-prototype-initramfs --native
+RUN python3 scripts/nvx.py build-mxc-prototype-initramfs --native --allow-gitless-source-provenance
 
 FROM scratch AS kernel-artifacts
 COPY --from=kernel /repo/build/vmlinux /vmlinux

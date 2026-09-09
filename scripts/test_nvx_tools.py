@@ -877,12 +877,16 @@ class CliTests(unittest.TestCase):
         self.assertEqual(verify_agent.input, Path("initramfs-agent.cpio.gz"))
         self.assertIs(verify_agent.handler, nvx.command_verify_agent_initramfs)
 
-        mxc_agent = nvx.parse_args(["build-mxc-prototype-agent"])
+        mxc_agent = nvx.parse_args(
+            ["build-mxc-prototype-agent", "--allow-gitless-source-provenance"]
+        )
+        self.assertTrue(mxc_agent.allow_gitless_source_provenance)
         self.assertIs(mxc_agent.handler, nvx.command_build_mxc_prototype_agent)
         mxc_initramfs = nvx.parse_args(
             ["build-mxc-prototype-initramfs", "--native"]
         )
         self.assertTrue(mxc_initramfs.native)
+        self.assertFalse(mxc_initramfs.allow_gitless_source_provenance)
         self.assertIs(
             mxc_initramfs.handler,
             nvx.command_build_mxc_prototype_initramfs,
@@ -1706,7 +1710,48 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(guest_manifest["sha256"], sha256)
             self.assertIn("--locked", run_checked.call_args.args[0])
 
-    def test_build_mxc_prototype_guest_agent_accepts_host_provenance_env(self):
+    def test_build_mxc_prototype_guest_agent_rejects_spoofed_host_provenance_env(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_revision = "a" * 40
+            built = (
+                root
+                / "target"
+                / build.GUEST_AGENT_TARGET
+                / "release"
+                / build.GUEST_AGENT_ARTIFACT_NAME
+            )
+            built.parent.mkdir(parents=True)
+            built.write_bytes(_static_x86_64_elf())
+            with (
+                patch.object(build, "REPO_ROOT", root),
+                patch.object(build, "require_tool", return_value="cargo"),
+                patch.object(build, "run_checked"),
+                patch.object(
+                    build,
+                    "run_capture",
+                    side_effect=(
+                        common.CommandResult(("git",), 0, f"{source_revision}\n".encode(), b""),
+                        common.CommandResult(("git",), 0, b"", b""),
+                    ),
+                ) as run_capture,
+                patch.dict(
+                    os.environ,
+                    {
+                        build.SOURCE_REVISION_ENV: "b" * 40,
+                        build.SOURCE_CLEAN_ENV: "false",
+                    },
+                    clear=False,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    common.ScriptError,
+                    "environment source provenance does not match repository metadata",
+                ):
+                    build.build_mxc_prototype_guest_agent()
+            self.assertEqual(run_capture.call_count, 2)
+
+    def test_build_mxc_prototype_guest_agent_accepts_explicit_gitless_env_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source_revision = "b" * 40
@@ -1723,7 +1768,11 @@ class BuildTests(unittest.TestCase):
                 patch.object(build, "REPO_ROOT", root),
                 patch.object(build, "require_tool", return_value="cargo"),
                 patch.object(build, "run_checked"),
-                patch.object(build, "run_capture") as run_capture,
+                patch.object(
+                    build,
+                    "run_capture",
+                    return_value=common.CommandResult(("git",), 1, b"", b"fatal"),
+                ),
                 patch.dict(
                     os.environ,
                     {
@@ -1733,9 +1782,9 @@ class BuildTests(unittest.TestCase):
                     clear=False,
                 ),
             ):
-                build.build_mxc_prototype_guest_agent()
-
-            run_capture.assert_not_called()
+                build.build_mxc_prototype_guest_agent(
+                    allow_gitless_env_provenance=True
+                )
             provenance = json.loads(
                 (root / "build" / build.MXC_GUEST_AGENT_PROVENANCE_NAME).read_text(
                     encoding="utf-8"
@@ -1753,6 +1802,28 @@ class BuildTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 common.ScriptError,
                 f"{build.SOURCE_REVISION_ENV} and {build.SOURCE_CLEAN_ENV} must be set together",
+            ):
+                build.source_provenance()
+
+    def test_source_provenance_rejects_gitless_environment_without_explicit_mode(self):
+        with (
+            patch.object(
+                build,
+                "run_capture",
+                return_value=common.CommandResult(("git",), 1, b"", b"fatal"),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    build.SOURCE_REVISION_ENV: "d" * 40,
+                    build.SOURCE_CLEAN_ENV: "true",
+                },
+                clear=False,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                common.ScriptError,
+                "only allowed for explicit git-less container builds",
             ):
                 build.source_provenance()
 
@@ -1827,7 +1898,26 @@ class BuildTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("ARG RUST_TOOLCHAIN=1.95.0", dockerfile)
+        lines = dockerfile.splitlines()
+        from_index = lines.index("FROM ${DEBIAN_IMAGE} AS base")
+        rustup_index = next(
+            index
+            for index, line in enumerate(lines)
+            if "--default-toolchain ${RUST_TOOLCHAIN}" in line
+        )
+        arg_indices = [
+            index for index, line in enumerate(lines) if line.startswith("ARG RUST_TOOLCHAIN")
+        ]
+        self.assertGreaterEqual(len(arg_indices), 2)
+        self.assertTrue(
+            any(from_index < index < rustup_index for index in arg_indices),
+            "RUST_TOOLCHAIN must be redeclared in-stage before it is used",
+        )
         self.assertIn("rustup target add x86_64-unknown-linux-musl", dockerfile)
+        self.assertIn(
+            "build-mxc-prototype-initramfs --native --allow-gitless-source-provenance",
+            dockerfile,
+        )
         self.assertIn(
             "COPY Cargo.toml Cargo.lock LICENSE README.md SOURCE-MANIFEST.json THIRD_PARTY_NOTICES.md /repo/",
             dockerfile,

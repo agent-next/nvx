@@ -111,6 +111,7 @@ OPENVMM_PROVENANCE_NAME = "openvmm.provenance.json"
 KERNEL_PROVENANCE_NAME = "vmlinux.provenance.json"
 SOURCE_REVISION_ENV = "NVX_SOURCE_REVISION"
 SOURCE_CLEAN_ENV = "NVX_SOURCE_CLEAN"
+ALLOW_GITLESS_ENV_PROVENANCE_FLAG = "--allow-gitless-source-provenance"
 SOURCE_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 UNSAFE_INITRAMFS_FILESYSTEMS = frozenset(
     {
@@ -391,10 +392,15 @@ def stage_guest_agent(source: Path, expected_sha256: str) -> Path:
     return destination
 
 
-def build_mxc_prototype_guest_agent() -> tuple[Path, str, dict[str, object]]:
+def build_mxc_prototype_guest_agent(
+    *,
+    allow_gitless_env_provenance: bool = False,
+) -> tuple[Path, str, dict[str, object]]:
     """Build and stage the in-repo Rust agent used by the MXC prototype profile."""
     require_tool("cargo")
-    source_revision, source_clean = source_provenance()
+    source_revision, source_clean = source_provenance(
+        allow_environment_without_git=allow_gitless_env_provenance
+    )
     run_checked(
         [
             "cargo",
@@ -483,11 +489,11 @@ def _source_provenance_from_git(repository: Path = REPO_ROOT) -> tuple[str, bool
     )
 
 
-def source_provenance(repository: Path = REPO_ROOT) -> tuple[str, bool]:
+def _source_provenance_from_environment() -> tuple[str, bool] | None:
     source_revision = os.environ.get(SOURCE_REVISION_ENV)
     source_clean = os.environ.get(SOURCE_CLEAN_ENV)
     if source_revision is None and source_clean is None:
-        return _source_provenance_from_git(repository)
+        return None
     if source_revision is None or source_clean is None:
         raise ScriptError(
             f"{SOURCE_REVISION_ENV} and {SOURCE_CLEAN_ENV} must be set together"
@@ -496,6 +502,32 @@ def source_provenance(repository: Path = REPO_ROOT) -> tuple[str, bool]:
         _validated_source_revision(source_revision),
         _validated_source_clean(source_clean),
     )
+
+
+def source_provenance(
+    repository: Path = REPO_ROOT,
+    *,
+    allow_environment_without_git: bool = False,
+) -> tuple[str, bool]:
+    environment_provenance = _source_provenance_from_environment()
+    try:
+        git_provenance = _source_provenance_from_git(repository)
+    except ScriptError as git_error:
+        if environment_provenance is None:
+            raise
+        if not allow_environment_without_git:
+            raise ScriptError(
+                "environment source provenance is only allowed for explicit git-less "
+                f"container builds via {ALLOW_GITLESS_ENV_PROVENANCE_FLAG}"
+            ) from git_error
+        return environment_provenance
+    if environment_provenance is None:
+        return git_provenance
+    if environment_provenance != git_provenance:
+        raise ScriptError(
+            "environment source provenance does not match repository metadata"
+        )
+    return git_provenance
 
 
 def verified_staged_guest_agent() -> tuple[Path, str]:
@@ -570,6 +602,7 @@ class AlpineBuildConfig:
     output: Path = Path.home() / "build" / "initramfs.cpio.gz"
     profile: str = "legacy"
     agent_enabled: bool = False
+    allow_gitless_env_provenance: bool = False
 
 
 @dataclass(frozen=True)
@@ -1419,7 +1452,9 @@ def build_initramfs(config: AlpineBuildConfig) -> None:
             agent_source,
             agent_sha256,
             guest_agent_manifest,
-        ) = build_mxc_prototype_guest_agent()
+        ) = build_mxc_prototype_guest_agent(
+            allow_gitless_env_provenance=config.allow_gitless_env_provenance
+        )
     elif config.agent_enabled:
         agent_source, agent_sha256 = verified_staged_guest_agent()
         guest_agent_manifest = {

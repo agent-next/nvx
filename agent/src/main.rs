@@ -6,9 +6,9 @@
 mod config;
 mod error;
 
-use ::std::process::ExitCode;
 #[cfg(unix)]
-use ::std::sync::atomic::{AtomicBool, Ordering};
+use ::std::mem::MaybeUninit;
+use ::std::process::ExitCode;
 
 use ::agent_protocol::mxc_extension::{
     MODELED_REQUIREMENTS, MXC_EXTENSION_VERSION, MxcExtensionService, MxcRequest,
@@ -18,33 +18,7 @@ use ::agent_protocol::mxc_extension::{
 use crate::error::{AgentError, Result};
 
 #[cfg(unix)]
-static TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(unix)]
-extern "C" fn handle_shutdown_signal(_: i32) {
-    TERMINATION_REQUESTED.store(true, Ordering::SeqCst);
-}
-
-#[cfg(unix)]
-fn install_shutdown_handlers() -> Result<()> {
-    for signal in [libc::SIGINT, libc::SIGTERM] {
-        let handler = handle_shutdown_signal as *const () as libc::sighandler_t;
-        let previous = unsafe { libc::signal(signal, handler) };
-        if previous == libc::SIG_ERR {
-            return Err(AgentError::internal(format!(
-                "failed to install handler for signal {signal}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn install_shutdown_handlers() -> Result<()> {
-    Err(AgentError::internal(
-        "phase-0 PID-1 wait loop is supported on Unix targets only",
-    ))
-}
+const SHUTDOWN_SIGNALS: [i32; 2] = [libc::SIGINT, libc::SIGTERM];
 
 fn probe_mxc_requirements(service: &impl MxcExtensionService) -> usize {
     let mut failures = 0;
@@ -63,27 +37,103 @@ fn probe_mxc_requirements(service: &impl MxcExtensionService) -> usize {
 
 #[cfg(unix)]
 fn wait_for_shutdown_signal() -> Result<()> {
-    TERMINATION_REQUESTED.store(false, Ordering::SeqCst);
-    install_shutdown_handlers()?;
+    let shutdown_mask = blocked_shutdown_signal_mask()?;
+    let previous_mask = block_signals(&shutdown_mask)?;
     eprintln!("NVX-AGENT: waiting for host control integration or termination signal");
-    while !TERMINATION_REQUESTED.load(Ordering::SeqCst) {
-        let pause_result = unsafe { libc::pause() };
-        if pause_result == -1 && !TERMINATION_REQUESTED.load(Ordering::SeqCst) {
-            let os_error = ::std::io::Error::last_os_error();
-            if os_error.raw_os_error() != Some(libc::EINTR) {
-                return Err(AgentError::internal(format!(
-                    "pause failed while waiting for termination: {os_error}"
-                )));
-            }
-        }
+    let wait_result = wait_for_blocked_shutdown_signal(&shutdown_mask, |set, signal| unsafe {
+        libc::sigwait(set, signal)
+    });
+    let restore_result = restore_signal_mask(&previous_mask);
+    if let Err(error) = wait_result {
+        restore_result?;
+        return Err(error);
     }
+    let signal = wait_result?;
+    restore_result?;
+    ensure_shutdown_signal(signal)?;
     eprintln!("NVX-AGENT: received termination signal");
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn wait_for_shutdown_signal() -> Result<()> {
-    install_shutdown_handlers()
+    Err(AgentError::internal(
+        "phase-0 PID-1 wait loop is supported on Unix targets only",
+    ))
+}
+
+#[cfg(unix)]
+fn blocked_shutdown_signal_mask() -> Result<libc::sigset_t> {
+    let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+    if unsafe { libc::sigemptyset(set.as_mut_ptr()) } != 0 {
+        return Err(AgentError::internal(format!(
+            "sigemptyset failed: {}",
+            ::std::io::Error::last_os_error()
+        )));
+    }
+    let mut set = unsafe { set.assume_init() };
+    for signal in SHUTDOWN_SIGNALS {
+        if unsafe { libc::sigaddset(&mut set, signal) } != 0 {
+            return Err(AgentError::internal(format!(
+                "sigaddset failed for signal {signal}: {}",
+                ::std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(set)
+}
+
+#[cfg(unix)]
+fn block_signals(blocked_set: &libc::sigset_t) -> Result<libc::sigset_t> {
+    let mut previous = MaybeUninit::<libc::sigset_t>::uninit();
+    let mask_result =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, blocked_set, previous.as_mut_ptr()) };
+    if mask_result != 0 {
+        return Err(AgentError::internal(format!(
+            "pthread_sigmask(SIG_BLOCK) failed: {}",
+            ::std::io::Error::from_raw_os_error(mask_result)
+        )));
+    }
+    Ok(unsafe { previous.assume_init() })
+}
+
+#[cfg(unix)]
+fn restore_signal_mask(previous_mask: &libc::sigset_t) -> Result<()> {
+    let mask_result =
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, previous_mask, ::std::ptr::null_mut()) };
+    if mask_result != 0 {
+        return Err(AgentError::internal(format!(
+            "pthread_sigmask(SIG_SETMASK) failed: {}",
+            ::std::io::Error::from_raw_os_error(mask_result)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_blocked_shutdown_signal(
+    blocked_set: &libc::sigset_t,
+    wait: impl FnOnce(*const libc::sigset_t, *mut libc::c_int) -> libc::c_int,
+) -> Result<i32> {
+    let mut signal = 0;
+    let wait_result = wait(blocked_set, &mut signal);
+    if wait_result != 0 {
+        return Err(AgentError::internal(format!(
+            "sigwait failed: {}",
+            ::std::io::Error::from_raw_os_error(wait_result)
+        )));
+    }
+    Ok(signal)
+}
+
+#[cfg(unix)]
+fn ensure_shutdown_signal(signal: i32) -> Result<()> {
+    if SHUTDOWN_SIGNALS.contains(&signal) {
+        return Ok(());
+    }
+    Err(AgentError::internal(format!(
+        "sigwait returned unexpected signal {signal}"
+    )))
 }
 
 fn run_service(
@@ -160,5 +210,32 @@ mod tests {
     fn run_service_rejects_successful_phase_zero_adapter() {
         let error = run_service(&AcceptingService, || Ok(())).unwrap_err();
         assert!(format!("{error}").contains("unexpectedly accepted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_blocked_shutdown_signal_returns_received_signal() {
+        let set = blocked_shutdown_signal_mask().unwrap();
+        let signal = wait_for_blocked_shutdown_signal(&set, |_, output| {
+            unsafe { *output = libc::SIGTERM };
+            0
+        })
+        .unwrap();
+        assert_eq!(signal, libc::SIGTERM);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_blocked_shutdown_signal_reports_wait_error() {
+        let set = blocked_shutdown_signal_mask().unwrap();
+        let error = wait_for_blocked_shutdown_signal(&set, |_, _| libc::EINVAL).unwrap_err();
+        assert!(format!("{error}").contains("sigwait failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_shutdown_signal_rejects_unexpected_signal() {
+        let error = ensure_shutdown_signal(libc::SIGUSR1).unwrap_err();
+        assert!(format!("{error}").contains("unexpected signal"));
     }
 }
