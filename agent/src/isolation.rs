@@ -238,6 +238,66 @@ const REPORT_ERROR_IDENTITY: u32 = 7;
 const REPORT_ERROR_VERIFY: u32 = 8;
 #[cfg(target_os = "linux")]
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+#[cfg(target_os = "linux")]
+const DEV_PTS_MODE: libc::mode_t = 0o755;
+#[cfg(target_os = "linux")]
+const DEV_SHM_MODE: libc::mode_t = 0o1777;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxCapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxCapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SetupStep {
+    MoveToWorkloadCgroup,
+    MakeRootPrivate,
+    MountPrivateProc,
+    MountPrivateDev,
+    CreatePrivateDevLayout,
+    MountPrivateDevpts,
+    MountPrivateShm,
+    BindPrivatePtmx,
+    MountReadOnlySys,
+    DropBoundingAndAmbientCaps,
+    SwitchToMxcIdentity,
+    ClearRemainingCaps,
+    SetNoNewPrivs,
+    VerifyIsolation,
+}
+
+#[cfg(target_os = "linux")]
+fn setup_step_sequence() -> &'static [SetupStep] {
+    &[
+        SetupStep::MoveToWorkloadCgroup,
+        SetupStep::MakeRootPrivate,
+        SetupStep::MountPrivateProc,
+        SetupStep::MountPrivateDev,
+        SetupStep::CreatePrivateDevLayout,
+        SetupStep::MountPrivateDevpts,
+        SetupStep::MountPrivateShm,
+        SetupStep::BindPrivatePtmx,
+        SetupStep::MountReadOnlySys,
+        SetupStep::DropBoundingAndAmbientCaps,
+        SetupStep::SwitchToMxcIdentity,
+        SetupStep::ClearRemainingCaps,
+        SetupStep::SetNoNewPrivs,
+        SetupStep::VerifyIsolation,
+    ]
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -376,11 +436,12 @@ fn apply_workload_controls(
     parent_namespace: &NamespaceSnapshot,
     parent_cgroup: &str,
 ) -> Result<IsolationProbe> {
+    move_pid_to_cgroup(1, &plan.cgroup.workload)?;
     make_root_private()?;
     apply_private_mounts()?;
-    move_pid_to_cgroup(1, &plan.cgroup.workload)?;
-    clear_capabilities_and_set_no_new_privs()?;
+    drop_bounding_and_ambient_capabilities()?;
     switch_to_mxc_identity()?;
+    clear_remaining_capabilities_and_set_no_new_privs()?;
     let probe = isolated_child_probe(parent_namespace, parent_cgroup)?;
     let _ = verify_mandatory_isolation_controls(probe)?;
     Ok(probe)
@@ -448,7 +509,7 @@ pub fn query_subreaper() -> Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn clear_capabilities_and_set_no_new_privs() -> Result<()> {
+fn drop_bounding_and_ambient_capabilities() -> Result<()> {
     // SAFETY: prctl ambient clear has no pointer args.
     if unsafe {
         libc::prctl(
@@ -480,6 +541,11 @@ fn clear_capabilities_and_set_no_new_privs() -> Result<()> {
         cap += 1;
     }
 
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_remaining_capabilities_and_set_no_new_privs() -> Result<()> {
     let cap_header = LinuxCapHeader {
         version: LINUX_CAPABILITY_VERSION_3,
         pid: 0,
@@ -499,7 +565,7 @@ fn clear_capabilities_and_set_no_new_privs() -> Result<()> {
     };
     if capset_result != 0 {
         return Err(AgentError::io(
-            "clearing effective/permitted/inheritable capabilities",
+            "clearing effective/permitted/inheritable capabilities after mxc identity switch",
             ::std::io::Error::last_os_error(),
         ));
     }
@@ -511,38 +577,20 @@ fn clear_capabilities_and_set_no_new_privs() -> Result<()> {
             ::std::io::Error::last_os_error(),
         ));
     }
-
-    #[cfg(target_os = "linux")]
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct LinuxCapHeader {
-        version: u32,
-        pid: i32,
-    }
-
-    #[cfg(target_os = "linux")]
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct LinuxCapData {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-
-    #[cfg(target_os = "linux")]
-    fn read_last_capability_index() -> Result<i32> {
-        let raw = read_to_string(
-            "/proc/sys/kernel/cap_last_cap",
-            "reading /proc/sys/kernel/cap_last_cap",
-        )?;
-        raw.trim().parse::<i32>().map_err(|error| {
-            AgentError::isolation(format!(
-                "failed to parse cap_last_cap value {raw:?}: {error}"
-            ))
-        })
-    }
-
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_last_capability_index() -> Result<i32> {
+    let raw = read_to_string(
+        "/proc/sys/kernel/cap_last_cap",
+        "reading /proc/sys/kernel/cap_last_cap",
+    )?;
+    raw.trim().parse::<i32>().map_err(|error| {
+        AgentError::isolation(format!(
+            "failed to parse cap_last_cap value {raw:?}: {error}"
+        ))
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -575,6 +623,7 @@ fn switch_to_mxc_identity() -> Result<()> {
 fn apply_private_mounts() -> Result<()> {
     mount_call("proc", "/proc", "proc", 0, None)?;
     mount_call("tmpfs", "/dev", "tmpfs", 0, Some("mode=755,nosuid,nodev"))?;
+    ensure_minimal_private_dev_layout()?;
     mount_call(
         "devpts",
         "/dev/pts",
@@ -589,8 +638,49 @@ fn apply_private_mounts() -> Result<()> {
         0,
         Some("mode=1777,nosuid,nodev"),
     )?;
+    ensure_ptmx_binding()?;
     mount_call("sysfs", "/sys", "sysfs", libc::MS_RDONLY, None)?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_minimal_private_dev_layout() -> Result<()> {
+    mkdir_if_missing("/dev/pts", DEV_PTS_MODE)?;
+    mkdir_if_missing("/dev/shm", DEV_SHM_MODE)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_ptmx_binding() -> Result<()> {
+    let _ = ::std::fs::remove_file("/dev/ptmx");
+    let link_target = to_cstring("pts/ptmx", "ptmx symlink target")?;
+    let link_name = to_cstring("/dev/ptmx", "ptmx symlink path")?;
+    // SAFETY: both pointers are valid NUL-terminated paths.
+    if unsafe { libc::symlink(link_target.as_ptr(), link_name.as_ptr()) } != 0 {
+        return Err(AgentError::io(
+            "creating /dev/ptmx -> pts/ptmx symlink in private /dev",
+            ::std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mkdir_if_missing(path: &str, mode: libc::mode_t) -> Result<()> {
+    let c_path = to_cstring(path, "mkdir path")?;
+    // SAFETY: c_path is a valid NUL-terminated path string.
+    let mkdir_result = unsafe { libc::mkdir(c_path.as_ptr(), mode) };
+    if mkdir_result == 0 {
+        return Ok(());
+    }
+    let error = ::std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(());
+    }
+    Err(AgentError::io(
+        format!("creating required directory {path}"),
+        error,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1140,6 +1230,57 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn setup_step_index(step: SetupStep) -> usize {
+        setup_step_sequence()
+            .iter()
+            .position(|candidate| *candidate == step)
+            .expect("step present")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_sequence_places_identity_switch_before_final_cap_clear() {
+        let switch_identity = setup_step_index(SetupStep::SwitchToMxcIdentity);
+        let clear_caps = setup_step_index(SetupStep::ClearRemainingCaps);
+        assert!(
+            switch_identity < clear_caps,
+            "identity must be switched before final cap clear"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_sequence_drops_bounding_caps_before_identity_switch() {
+        let drop_bounding = setup_step_index(SetupStep::DropBoundingAndAmbientCaps);
+        let switch_identity = setup_step_index(SetupStep::SwitchToMxcIdentity);
+        assert!(
+            drop_bounding < switch_identity,
+            "bounding set drop must occur while CAP_SETPCAP is still available"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_sequence_moves_cgroup_before_read_only_sys_mount() {
+        let move_cgroup = setup_step_index(SetupStep::MoveToWorkloadCgroup);
+        let mount_ro_sys = setup_step_index(SetupStep::MountReadOnlySys);
+        assert!(
+            move_cgroup < mount_ro_sys,
+            "workload cgroup move must happen before read-only /sys replacement"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_sequence_creates_private_dev_subdirs_before_submounts() {
+        let create_layout = setup_step_index(SetupStep::CreatePrivateDevLayout);
+        let mount_devpts = setup_step_index(SetupStep::MountPrivateDevpts);
+        let mount_shm = setup_step_index(SetupStep::MountPrivateShm);
+        assert!(create_layout < mount_devpts);
+        assert!(create_layout < mount_shm);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires Linux root privileges and cgroup v2 write access in disposable helper process"]
     fn linux_isolation_setup_runs_in_disposable_helper_process() {
@@ -1171,10 +1312,38 @@ mod tests {
             return;
         }
         let plan = default_isolation_plan();
-        let result = apply_and_verify_workload_isolation(&plan);
+        let result = apply_and_verify_workload_isolation(&plan).expect("isolation setup");
+        assert!(result.holder_pid > 0, "holder pid must be positive");
         assert!(
-            result.is_ok(),
-            "isolation setup failed in helper process: {result:?}"
+            result.status.pid_namespace,
+            "pid namespace isolation missing"
         );
+        assert!(
+            result.status.mount_namespace,
+            "mount namespace isolation missing"
+        );
+        assert!(
+            result.status.uts_namespace,
+            "uts namespace isolation missing"
+        );
+        assert!(
+            result.status.ipc_namespace,
+            "ipc namespace isolation missing"
+        );
+        assert!(result.status.private_proc, "private /proc missing");
+        assert!(result.status.private_dev, "private /dev missing");
+        assert!(result.status.private_devpts, "private /dev/pts missing");
+        assert!(result.status.private_shm, "private /dev/shm missing");
+        assert!(result.status.read_only_sys, "read-only /sys missing");
+        assert!(
+            result.status.capabilities_dropped,
+            "capability clearing missing"
+        );
+        assert!(result.status.no_new_privs, "no_new_privs missing");
+        assert!(
+            result.status.cgroup_separation,
+            "cgroup separation not verified"
+        );
+        assert!(result.status.orphan_reaping, "orphan reaping not enabled");
     }
 }
