@@ -83,13 +83,13 @@ impl MappingResolver {
         {
             let guest_fd = resolve_under_root(self.root_fd.as_raw_fd(), requested.as_str())?;
             let entry_kind = mapping_kind(guest_fd.as_raw_fd())?;
-            return Ok(ResolvedMapping {
+            Ok(ResolvedMapping {
                 child: requested.clone(),
                 access,
                 guest_path: self.guest_root.join(requested.as_str()),
                 entry_kind,
                 guest_fd,
-            });
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -384,5 +384,17 @@ mod tests {
             .resolve_declared_raw("safe/../escape")
             .expect_err("dot-dot must fail");
         assert!(format!("{error}").contains("invalid mapping path"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn declared_mapping_resolution_is_explicitly_unsupported_off_linux() {
+        let root = ::std::env::temp_dir();
+        let resolver = MappingResolver::new(root, vec![mapping("safe", AccessMode::ReadOnly)])
+            .expect("resolver");
+        let error = resolver
+            .resolve_declared_raw("safe")
+            .expect_err("non-linux must fail closed");
+        assert!(format!("{error}").contains("unsupported on non-Linux"));
     }
 }

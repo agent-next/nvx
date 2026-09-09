@@ -1054,10 +1054,10 @@ fn root_propagation_private(mountinfo: &str) -> bool {
         let mut parts = line.split(" - ");
         let pre = parts.next().unwrap_or_default();
         let fields: Vec<&str> = pre.split_whitespace().collect();
-        if fields.len() < 7 || fields[4] != "/" {
+        if fields.len() < 6 || fields[4] != "/" {
             return false;
         }
-        let optional = &fields[6..];
+        let optional = if fields.len() > 6 { &fields[6..] } else { &[] };
         !optional
             .iter()
             .any(|value| value.starts_with("shared:") || value.starts_with("master:"))
