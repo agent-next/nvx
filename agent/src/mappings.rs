@@ -11,19 +11,33 @@ use ::std::ffi::CString;
 use ::std::mem::size_of;
 #[cfg(target_os = "linux")]
 use ::std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-#[cfg(target_os = "linux")]
-use ::std::path::Path;
 use ::std::path::PathBuf;
 
 use ::agent_protocol::{AccessMode, ChildMapping, RelativeChildPath, validate_mapping_set};
 
 use crate::error::{AgentError, Result};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingEntryKind {
+    File,
+    Directory,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingEntryKind {
+    Unsupported,
+}
+
+#[derive(Debug)]
 pub struct ResolvedMapping {
     pub child: RelativeChildPath,
     pub access: AccessMode,
     pub guest_path: PathBuf,
+    pub entry_kind: MappingEntryKind,
+    #[cfg(target_os = "linux")]
+    pub guest_fd: OwnedFd,
 }
 
 #[derive(Debug)]
@@ -65,12 +79,26 @@ impl MappingResolver {
         let access = self.declared.get(requested).copied().ok_or_else(|| {
             AgentError::config(format!("undeclared mapping path: {}", requested.as_str()))
         })?;
-        self.resolve_verified_path(requested)?;
-        Ok(ResolvedMapping {
-            child: requested.clone(),
-            access,
-            guest_path: self.guest_root.join(requested.as_str()),
-        })
+        #[cfg(target_os = "linux")]
+        {
+            let guest_fd = resolve_under_root(self.root_fd.as_raw_fd(), requested.as_str())?;
+            let entry_kind = mapping_kind(guest_fd.as_raw_fd())?;
+            return Ok(ResolvedMapping {
+                child: requested.clone(),
+                access,
+                guest_path: self.guest_root.join(requested.as_str()),
+                entry_kind,
+                guest_fd,
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = access;
+            let _ = requested;
+            Err(AgentError::config(
+                "secure mapping resolution is unsupported on non-Linux targets",
+            ))
+        }
     }
 
     pub fn resolve_declared_raw(&self, requested: &str) -> Result<ResolvedMapping> {
@@ -78,29 +106,20 @@ impl MappingResolver {
             .map_err(|error| AgentError::config(format!("invalid mapping path: {error}")))?;
         self.resolve_declared(&child)
     }
-
-    fn resolve_verified_path(&self, requested: &RelativeChildPath) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            resolve_under_root(self.root_fd.as_raw_fd(), requested.as_str())
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = requested;
-            Err(AgentError::config(
-                "secure mapping resolution is only implemented for Linux guests",
-            ))
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
-fn open_root_directory(path: &Path) -> Result<OwnedFd> {
+pub fn procfd_mount_source(fd: &OwnedFd) -> String {
+    format!("/proc/self/fd/{}", fd.as_raw_fd())
+}
+
+#[cfg(target_os = "linux")]
+fn open_root_directory(path: &::std::path::Path) -> Result<OwnedFd> {
     let bytes = path.to_string_lossy();
     let c_path = CString::new(bytes.as_bytes())
         .map_err(|_| AgentError::config("guest mapping root contains NUL byte"))?;
     let flags = libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC;
+    // SAFETY: c_path points to a valid C string and flags request readonly dir open.
     let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
     if fd < 0 {
         return Err(AgentError::io(
@@ -108,32 +127,34 @@ fn open_root_directory(path: &Path) -> Result<OwnedFd> {
             ::std::io::Error::last_os_error(),
         ));
     }
+    // SAFETY: fd is newly returned by open and owned by this function.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_under_root(root_fd: RawFd, relative: &str) -> Result<()> {
-    if try_openat2(root_fd, relative)? {
-        return Ok(());
+fn resolve_under_root(root_fd: RawFd, relative: &str) -> Result<OwnedFd> {
+    if let Some(fd) = try_openat2(root_fd, relative)? {
+        return Ok(fd);
     }
     openat_no_symlink_fallback(root_fd, relative)
 }
 
 #[cfg(target_os = "linux")]
-fn try_openat2(root_fd: RawFd, relative: &str) -> Result<bool> {
+fn try_openat2(root_fd: RawFd, relative: &str) -> Result<Option<OwnedFd>> {
     let path = CString::new(relative)
         .map_err(|_| AgentError::config("mapping path contains interior NUL byte"))?;
     let mut attempts = 0_u8;
     loop {
         attempts = attempts.saturating_add(1);
         match openat2_fd(root_fd, &path) {
-            Ok(fd) => {
-                drop(fd);
-                return Ok(true);
-            }
-            Err(error) if matches!(error.raw_os_error(), Some(code) if code == libc::ENOSYS || code == libc::EINVAL || code == libc::E2BIG) =>
+            Ok(fd) => return Ok(Some(fd)),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::ENOSYS || code == libc::EINVAL || code == libc::E2BIG
+                ) =>
             {
-                return Ok(false);
+                return Ok(None);
             }
             Err(error) if error.raw_os_error() == Some(libc::EAGAIN) && attempts < 4 => continue,
             Err(error) => {
@@ -146,7 +167,7 @@ fn try_openat2(root_fd: RawFd, relative: &str) -> Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn openat_no_symlink_fallback(root_fd: RawFd, relative: &str) -> Result<()> {
+fn openat_no_symlink_fallback(root_fd: RawFd, relative: &str) -> Result<OwnedFd> {
     let mut current = dup_fd(root_fd)?;
     let segments: Vec<&str> = relative.split('/').collect();
     for (index, segment) in segments.iter().enumerate() {
@@ -157,6 +178,7 @@ fn openat_no_symlink_fallback(root_fd: RawFd, relative: &str) -> Result<()> {
             | libc::O_NOFOLLOW
             | libc::O_RDONLY
             | if is_last { 0 } else { libc::O_DIRECTORY };
+        // SAFETY: current fd and component pointer are valid for openat syscall.
         let next_fd = unsafe { libc::openat(current.as_raw_fd(), component.as_ptr(), flags) };
         if next_fd < 0 {
             return Err(AgentError::config(format!(
@@ -164,22 +186,25 @@ fn openat_no_symlink_fallback(root_fd: RawFd, relative: &str) -> Result<()> {
                 ::std::io::Error::last_os_error()
             )));
         }
+        // SAFETY: next_fd is a newly opened descriptor.
         let next = unsafe { OwnedFd::from_raw_fd(next_fd) };
         verify_not_symlink(relative, next.as_raw_fd())?;
         current = next;
     }
-    Ok(())
+    Ok(current)
 }
 
 #[cfg(target_os = "linux")]
 fn verify_not_symlink(relative: &str, fd: RawFd) -> Result<()> {
     let mut stat_buffer = ::std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: stat_buffer is valid writable storage for fstat result.
     if unsafe { libc::fstat(fd, stat_buffer.as_mut_ptr()) } != 0 {
         return Err(AgentError::config(format!(
             "fstat failed while validating mapping path {relative}: {}",
             ::std::io::Error::last_os_error()
         )));
     }
+    // SAFETY: fstat succeeded and initialized stat_buffer.
     let mode = unsafe { stat_buffer.assume_init().st_mode };
     if (mode & libc::S_IFMT) == libc::S_IFLNK {
         return Err(AgentError::config(format!(
@@ -190,7 +215,32 @@ fn verify_not_symlink(relative: &str, fd: RawFd) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn mapping_kind(fd: RawFd) -> Result<MappingEntryKind> {
+    let mut stat_buffer = ::std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: stat_buffer is valid writable storage for fstat result.
+    if unsafe { libc::fstat(fd, stat_buffer.as_mut_ptr()) } != 0 {
+        return Err(AgentError::io(
+            "fstat for mapping entry kind",
+            ::std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: fstat succeeded and initialized stat_buffer.
+    let mode = unsafe { stat_buffer.assume_init().st_mode };
+    let file_type = mode & libc::S_IFMT;
+    if file_type == libc::S_IFDIR {
+        return Ok(MappingEntryKind::Directory);
+    }
+    if file_type == libc::S_IFREG {
+        return Ok(MappingEntryKind::File);
+    }
+    Err(AgentError::config(
+        "mapping target must resolve to a regular file or directory",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn dup_fd(fd: RawFd) -> Result<OwnedFd> {
+    // SAFETY: fcntl duplicates the provided valid descriptor.
     let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicated < 0 {
         return Err(AgentError::io(
@@ -198,6 +248,7 @@ fn dup_fd(fd: RawFd) -> Result<OwnedFd> {
             ::std::io::Error::last_os_error(),
         ));
     }
+    // SAFETY: duplicated fd is newly owned by this function.
     Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
@@ -220,6 +271,7 @@ fn openat2_fd(root_fd: RawFd, path: &CString) -> ::std::io::Result<OwnedFd> {
         resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
     };
 
+    // SAFETY: openat2 syscall arguments point to valid immutable structs/strings.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
@@ -232,6 +284,7 @@ fn openat2_fd(root_fd: RawFd, path: &CString) -> ::std::io::Result<OwnedFd> {
     if fd < 0 {
         return Err(::std::io::Error::last_os_error());
     }
+    // SAFETY: fd is owned by caller after successful syscall.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -277,6 +330,45 @@ mod tests {
             .resolve_declared_raw("safe/jump")
             .expect_err("symlink must be rejected");
         assert!(format!("{error}").contains("symlink"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn returns_descriptor_that_is_not_redirected_by_path_swap() {
+        use ::std::io::Read;
+        use ::std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        ::std::fs::create_dir_all(root.join("safe")).expect("root");
+        ::std::fs::create_dir_all(&outside).expect("outside");
+        let inside_file = root.join("safe").join("payload.txt");
+        let outside_file = outside.join("payload.txt");
+        ::std::fs::write(&inside_file, "inside").expect("inside");
+        ::std::fs::write(&outside_file, "outside").expect("outside");
+
+        let resolver = MappingResolver::new(
+            root.clone(),
+            vec![mapping("safe/payload.txt", AccessMode::ReadOnly)],
+        )
+        .expect("resolver");
+        let resolved = resolver
+            .resolve_declared_raw("safe/payload.txt")
+            .expect("resolved");
+        assert_eq!(resolved.entry_kind, MappingEntryKind::File);
+
+        ::std::fs::remove_file(&inside_file).expect("remove inside");
+        symlink(&outside_file, &inside_file).expect("replace with symlink");
+
+        let mut text = String::new();
+        let mut file: ::std::fs::File = resolved.guest_fd.try_clone().expect("clone").into();
+        file.read_to_string(&mut text).expect("read held fd");
+        assert_eq!(text, "inside");
+        assert_eq!(
+            ::std::fs::read_to_string(&inside_file).expect("path"),
+            "outside"
+        );
     }
 
     #[cfg(target_os = "linux")]

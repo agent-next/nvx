@@ -21,6 +21,8 @@ use crate::error::{AgentError, Result};
 
 #[cfg(unix)]
 const SHUTDOWN_SIGNALS: [i32; 2] = [libc::SIGINT, libc::SIGTERM];
+#[cfg(unix)]
+const WAIT_LOOP_SIGNALS: [i32; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGCHLD];
 
 #[cfg(unix)]
 struct ShutdownSignalBlock {
@@ -61,13 +63,19 @@ fn emit_phase0_scaffold_state(status: AciAdapterStatus) -> Result<()> {
 #[cfg(unix)]
 fn wait_for_shutdown_signal(shutdown_mask: &libc::sigset_t) -> Result<()> {
     eprintln!("NVX-AGENT: waiting for host control integration or termination signal");
-    let wait_result = wait_for_blocked_shutdown_signal(shutdown_mask, |set, signal| unsafe {
-        libc::sigwait(set, signal)
-    });
-    let signal = wait_result?;
-    ensure_shutdown_signal(signal)?;
-    eprintln!("NVX-AGENT: received termination signal");
-    Ok(())
+    loop {
+        let signal = wait_for_blocked_shutdown_signal(shutdown_mask, |set, signal| unsafe {
+            libc::sigwait(set, signal)
+        })?;
+        if signal == libc::SIGCHLD {
+            #[cfg(target_os = "linux")]
+            isolation::reap_all_children();
+            continue;
+        }
+        ensure_shutdown_signal(signal)?;
+        eprintln!("NVX-AGENT: received termination signal");
+        return Ok(());
+    }
 }
 
 #[cfg(not(unix))]
@@ -87,7 +95,7 @@ fn blocked_shutdown_signal_mask() -> Result<libc::sigset_t> {
         )));
     }
     let mut set = unsafe { set.assume_init() };
-    for signal in SHUTDOWN_SIGNALS {
+    for signal in WAIT_LOOP_SIGNALS {
         if unsafe { libc::sigaddset(&mut set, signal) } != 0 {
             return Err(AgentError::internal(format!(
                 "sigaddset failed for signal {signal}: {}",
@@ -168,6 +176,19 @@ fn run_phase0_scaffold(wait: impl FnOnce() -> Result<()>) -> Result<()> {
 
 #[cfg(unix)]
 fn run() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let is_subreaper = isolation::query_subreaper()?;
+        if !is_subreaper {
+            let set_result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+            if set_result != 0 {
+                return Err(AgentError::io(
+                    "setting PR_SET_CHILD_SUBREAPER in PID1",
+                    ::std::io::Error::last_os_error(),
+                ));
+            }
+        }
+    }
     let shutdown_signals = install_shutdown_signal_block()?;
     let run_result =
         run_phase0_scaffold(|| wait_for_shutdown_signal(&shutdown_signals.blocked_set));
