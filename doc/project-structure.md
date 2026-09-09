@@ -153,6 +153,7 @@ Alpine. Performance scripts analyze benchmark outputs, with adjacent
 | `README.md` | Project overview and documentation index |
 | `pyproject.toml` | Strict Pyright policy plus Ruff lint and format settings |
 | `requirements-dev.txt` | Pinned Python tools used by contributors and CI |
+| `Cargo.toml` | Root Rust workspace for the Phase-0 MXC prototype agent crates |
 | `SOURCE-MANIFEST.json` | Exact Linux and Alpine source identities and output locations |
 | `VERSION` | Distribution version consumed by packaging tools |
 | `.gitmodules` | OpenVMM repository URL, path, and tracking branch |
@@ -168,6 +169,7 @@ Alpine. Performance scripts analyze benchmark outputs, with adjacent
 | --- | --- |
 | `.cache/` | Downloaded, verified, and patched upstream source trees |
 | `build/` | Kernels, initramfs images, package manifests, and collected sources |
+| `target/` | Rust workspace build outputs (ignored) |
 | `data/baseline/` | Base-branch histories staged by the performance gate |
 | `data/results/` | Collected p50 results for the current commit |
 | `data/runs/` | Raw benchmark logs and per-platform artifacts |

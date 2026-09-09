@@ -47,5 +47,26 @@
     "external_input_size_bytes": 1901440,
     "protocol_schema_version": 1,
     "transport": "broker-ttrpc"
+  },
+  "mxc_prototype": {
+    "phase": 0,
+    "transport": "mxc-prototype",
+    "workspace_members": [
+      "agent-protocol",
+      "agent",
+      "tools/agent-harness"
+    ],
+    "initramfs_artifact": "guest/initramfs-mxc-agent.cpio.gz",
+    "pid1_path": "/sbin/nvx-agent",
+    "protocol": {
+      "format": "mxc-extension-v1",
+      "version": 1,
+      "modeled_requirement_count": 12
+    },
+    "aci_adapter": {
+      "status": "unsupported",
+      "required_source_revision": "cbd276763e099aa17b3d10addcce8dc23800c9e2",
+      "reason": "blocked pending exact schema and fixture integration"
+    }
   }
 }

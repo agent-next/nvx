@@ -1,0 +1,8 @@
+[workspace]
+members = ["agent-protocol", "agent", "tools/agent-harness"]
+exclude = ["openvmm"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true

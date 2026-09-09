@@ -15,13 +15,17 @@ from pathlib import Path
 from nvx_tools.benchmark import configure_parser as configure_benchmark_parser
 from nvx_tools.build import (
     AGENT_INITRAMFS_NAME,
+    MXC_PROTOTYPE_INITRAMFS_NAME,
+    MXC_PROTOTYPE_TRANSPORT,
     AlpineBuildConfig,
     DockerBuildConfig,
     KernelBuildConfig,
     build_docker_agent_initramfs,
+    build_docker_mxc_prototype_initramfs,
     build_docker_artifacts,
     build_initramfs,
     build_kernel,
+    build_mxc_prototype_guest_agent,
     native_initramfs_work_directory,
     record_openvmm_provenance,
     stage_guest_agent,
@@ -98,6 +102,18 @@ def _native_agent_initramfs() -> None:
         AlpineBuildConfig(
             work=native_initramfs_work_directory("broker-ttrpc"),
             output=artifact_path(AGENT_INITRAMFS_NAME),
+            profile="broker-ttrpc",
+            agent_enabled=True,
+        )
+    )
+
+
+def _native_mxc_prototype_initramfs() -> None:
+    build_initramfs(
+        AlpineBuildConfig(
+            work=native_initramfs_work_directory(MXC_PROTOTYPE_TRANSPORT),
+            output=artifact_path(MXC_PROTOTYPE_INITRAMFS_NAME),
+            profile=MXC_PROTOTYPE_TRANSPORT,
             agent_enabled=True,
         )
     )
@@ -109,12 +125,16 @@ def command_build_guest(args: argparse.Namespace) -> None:
         _native_initramfs()
         if args.with_agent:
             _native_agent_initramfs()
+        if args.with_mxc_prototype:
+            _native_mxc_prototype_initramfs()
         return
 
     config = DockerBuildConfig(destination=BUILD_DIR)
     build_docker_artifacts(config)
     if args.with_agent:
         build_docker_agent_initramfs(config)
+    if args.with_mxc_prototype:
+        build_docker_mxc_prototype_initramfs(config)
 
 
 def command_build_kernel(_: argparse.Namespace) -> None:
@@ -125,11 +145,22 @@ def command_build_initramfs(_: argparse.Namespace) -> None:
     _native_initramfs()
 
 
+def command_build_mxc_prototype_agent(_: argparse.Namespace) -> None:
+    build_mxc_prototype_guest_agent()
+
+
 def command_build_agent_initramfs(args: argparse.Namespace) -> None:
     if args.native:
         _native_agent_initramfs()
     else:
         build_docker_agent_initramfs(DockerBuildConfig(destination=BUILD_DIR))
+
+
+def command_build_mxc_prototype_initramfs(args: argparse.Namespace) -> None:
+    if args.native:
+        _native_mxc_prototype_initramfs()
+    else:
+        build_docker_mxc_prototype_initramfs(DockerBuildConfig(destination=BUILD_DIR))
 
 
 def command_stage_agent(args: argparse.Namespace) -> None:
@@ -286,8 +317,8 @@ def command_run(args: argparse.Namespace) -> None:
 
 
 def command_sandbox(args: argparse.Namespace) -> None:
-    if args.transport != "broker-ttrpc":
-        raise ScriptError("--transport broker-ttrpc must be selected explicitly")
+    if args.transport not in ("broker-ttrpc", MXC_PROTOTYPE_TRANSPORT):
+        raise ScriptError("--transport must be broker-ttrpc or mxc-prototype")
     if (args.net is None) != (args.network_profile is None):
         raise ScriptError("--net and --network-profile must be specified together")
     launch = SandboxLaunch(
@@ -296,10 +327,12 @@ def command_sandbox(args: argparse.Namespace) -> None:
     ).validated()
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
     kernel = require_file(artifact_path("vmlinux"), "PVH kernel")
-    initrd = require_file(
-        artifact_path(AGENT_INITRAMFS_NAME),
-        "broker-ttrpc agent initramfs",
+    initramfs_name = (
+        AGENT_INITRAMFS_NAME
+        if args.transport == "broker-ttrpc"
+        else MXC_PROTOTYPE_INITRAMFS_NAME
     )
+    initrd = require_file(artifact_path(initramfs_name), f"{args.transport} initramfs")
     command = [
         str(executable),
         *launch.openvmm_arguments(
@@ -386,6 +419,11 @@ def _add_guest_options(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="also build the staged broker-ttrpc agent initramfs",
     )
+    parser.add_argument(
+        "--with-mxc-prototype",
+        action="store_true",
+        help="also build the in-repo mxc-prototype PID-1 initramfs",
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -411,6 +449,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     initramfs.set_defaults(handler=command_build_initramfs)
 
+    mxc_agent = subparsers.add_parser(
+        "build-mxc-prototype-agent",
+        help="build and stage the in-repo mxc-prototype Rust agent",
+    )
+    mxc_agent.set_defaults(handler=command_build_mxc_prototype_agent)
+
     agent_initramfs = subparsers.add_parser(
         "build-agent-initramfs",
         help="build the explicit broker-ttrpc agent initramfs",
@@ -421,6 +465,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="build directly on Linux instead of using Docker",
     )
     agent_initramfs.set_defaults(handler=command_build_agent_initramfs)
+
+    mxc_initramfs = subparsers.add_parser(
+        "build-mxc-prototype-initramfs",
+        help="build the explicit mxc-prototype PID-1 initramfs",
+    )
+    mxc_initramfs.add_argument(
+        "--native",
+        action="store_true",
+        help="build directly on Linux instead of using Docker",
+    )
+    mxc_initramfs.set_defaults(handler=command_build_mxc_prototype_initramfs)
 
     agent = subparsers.add_parser(
         "stage-agent",
@@ -544,7 +599,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument("--cmdline", default="")
     sandbox.add_argument(
         "--transport",
-        choices=("broker-ttrpc",),
+        choices=("broker-ttrpc", MXC_PROTOTYPE_TRANSPORT),
         required=True,
     )
     sandbox.add_argument("--control-socket", required=True, type=Path)

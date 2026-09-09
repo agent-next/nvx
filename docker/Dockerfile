@@ -10,23 +10,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         cpio \
+        cargo \
         curl \
         flex \
         gzip \
         libelf-dev \
         libssl-dev \
+        musl-tools \
         patch \
         python3 \
+        rustc \
         rsync \
         tar \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
 COPY alpine/ /repo/alpine/
+COPY agent/ /repo/agent/
+COPY agent-protocol/ /repo/agent-protocol/
 COPY docker/ /repo/docker/
 COPY kernel/ /repo/kernel/
 COPY scripts/ /repo/scripts/
-COPY LICENSE README.md SOURCE-MANIFEST.json THIRD_PARTY_NOTICES.md /repo/
+COPY tools/ /repo/tools/
+COPY Cargo.toml LICENSE README.md SOURCE-MANIFEST.json THIRD_PARTY_NOTICES.md /repo/
 
 FROM base AS kernel
 RUN python3 scripts/nvx.py build-kernel
@@ -43,6 +49,9 @@ RUN --mount=type=secret,id=nvx-agent,required=true \
         --sha256 "${NVX_AGENT_SHA256}" \
     && python3 scripts/nvx.py build-agent-initramfs --native
 
+FROM base AS mxc-prototype-initramfs
+RUN python3 scripts/nvx.py build-mxc-prototype-initramfs --native
+
 FROM scratch AS kernel-artifacts
 COPY --from=kernel /repo/build/vmlinux /vmlinux
 COPY --from=kernel /repo/build/vmlinux.config /vmlinux.config
@@ -55,6 +64,10 @@ COPY --from=initramfs /repo/build/initramfs.cpio.gz.packages.json /initramfs.cpi
 FROM scratch AS agent-initramfs-artifacts
 COPY --from=agent-initramfs /repo/build/initramfs-agent.cpio.gz /initramfs-agent.cpio.gz
 COPY --from=agent-initramfs /repo/build/initramfs-agent.cpio.gz.packages.json /initramfs-agent.cpio.gz.packages.json
+
+FROM scratch AS mxc-prototype-initramfs-artifacts
+COPY --from=mxc-prototype-initramfs /repo/build/initramfs-mxc-agent.cpio.gz /initramfs-mxc-agent.cpio.gz
+COPY --from=mxc-prototype-initramfs /repo/build/initramfs-mxc-agent.cpio.gz.packages.json /initramfs-mxc-agent.cpio.gz.packages.json
 
 FROM kernel AS linux-source-archive
 RUN mkdir -p /out \

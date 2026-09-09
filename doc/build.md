@@ -117,6 +117,19 @@ ownership, repeated inode identities, hardlinks, escaping symlinks, and a
 wrong agent or PID-1 identity. The legacy shell image remains an independent
 Alpine profile with its existing utilities and validation.
 
+For the in-repo Phase-0 MXC prototype profile, build and package a distinct
+PID-1 image:
+
+```bash
+python3 scripts/nvx.py build-mxc-prototype-initramfs       # Docker
+# or on Linux:
+python3 scripts/nvx.py build-mxc-prototype-initramfs --native
+```
+
+The output path is `build/initramfs-mxc-agent.cpio.gz` with `/init` linked to
+`/sbin/nvx-agent`. This profile remains separate from both `legacy` and
+`broker-ttrpc`.
+
 The matching kernel assertions cover cgroup-v2 memory, pids, CPU weight,
 freezer and BPF; BPF and seccomp syscalls/filters; EROFS, overlay, ext4 and GPT; virtio block/console/MMIO;
 devtmpfs, PTYs, proc/sysfs/tmpfs; and mount, PID, UTS, and IPC namespaces.

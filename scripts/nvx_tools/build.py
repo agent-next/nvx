@@ -88,9 +88,13 @@ REQUIRED_SANDBOX_KERNEL_CONFIG = (
 GUEST_AGENT_ARTIFACT_NAME = "nvx-agent"
 GUEST_AGENT_SHA256_NAME = f"{GUEST_AGENT_ARTIFACT_NAME}.sha256"
 AGENT_INITRAMFS_NAME = "initramfs-agent.cpio.gz"
+MXC_PROTOTYPE_INITRAMFS_NAME = "initramfs-mxc-agent.cpio.gz"
 GUEST_AGENT_ARTIFACT_PATH = f"guest/{GUEST_AGENT_ARTIFACT_NAME}"
 GUEST_AGENT_INITRAMFS_ARTIFACT_PATH = f"guest/{AGENT_INITRAMFS_NAME}"
 GUEST_AGENT_INSTALLED_PATH = f"/sbin/{GUEST_AGENT_ARTIFACT_NAME}"
+MXC_GUEST_AGENT_ARTIFACT_NAME = "nvx-agent-mxc-prototype"
+MXC_GUEST_AGENT_SHA256_NAME = f"{MXC_GUEST_AGENT_ARTIFACT_NAME}.sha256"
+MXC_GUEST_AGENT_PROVENANCE_NAME = f"{MXC_GUEST_AGENT_ARTIFACT_NAME}.provenance.json"
 GUEST_AGENT_TARGET = "x86_64-unknown-linux-musl"
 GUEST_AGENT_MAXIMUM_BYTES = 16 * 1024 * 1024
 GUEST_AGENT_SOURCE_REVISION = "865984883584ae5569b1936981921fbe59c1f6e8"
@@ -98,6 +102,7 @@ GUEST_AGENT_SHA256 = "be0083fc1b7d77df7f14db705bf74ab52d173f029863643c6d3535307a
 GUEST_AGENT_SIZE_BYTES = 1_901_440
 GUEST_AGENT_BUILD_ID = "d7dd52b0b0cd298dbe69268f4347d026b117fb48"
 BROKER_TRANSPORT = "broker-ttrpc"
+MXC_PROTOTYPE_TRANSPORT = "mxc-prototype"
 GUEST_AGENT_PROTOCOL_SCHEMA_VERSION = 1
 MICROVM_ABI_VERSION = 2
 CONTROL_SESSION_PROTOCOL_VERSION = 1
@@ -383,6 +388,71 @@ def stage_guest_agent(source: Path, expected_sha256: str) -> Path:
     return destination
 
 
+def build_mxc_prototype_guest_agent() -> tuple[Path, str, dict[str, object]]:
+    """Build and stage the in-repo Rust agent used by the MXC prototype profile."""
+    require_tool("cargo")
+    source_revision = run_capture(["git", "-C", REPO_ROOT, "rev-parse", "HEAD"])
+    require_success(source_revision, "querying repository revision")
+    status = run_capture(["git", "-C", REPO_ROOT, "status", "--porcelain"])
+    require_success(status, "querying repository status")
+    run_checked(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--target",
+            GUEST_AGENT_TARGET,
+            "-p",
+            "nvx-agent",
+        ],
+        cwd=REPO_ROOT,
+    )
+    built_agent = require_file(
+        REPO_ROOT / "target" / GUEST_AGENT_TARGET / "release" / GUEST_AGENT_ARTIFACT_NAME,
+        "built in-repo MXC prototype agent",
+    )
+    validate_static_x86_64_elf(built_agent)
+    size = built_agent.stat().st_size
+    if size > GUEST_AGENT_MAXIMUM_BYTES:
+        raise ScriptError(
+            f"in-repo MXC prototype agent exceeds the 16-MiB release limit: {size} bytes"
+        )
+    destination = REPO_ROOT / "build" / MXC_GUEST_AGENT_ARTIFACT_NAME
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(built_agent, destination)
+    destination.chmod(0o755)
+    sha256 = sha256_file(destination)
+    (REPO_ROOT / "build" / MXC_GUEST_AGENT_SHA256_NAME).write_text(
+        f"{sha256}\n",
+        encoding="ascii",
+    )
+    provenance = {
+        "format": 1,
+        "profile": MXC_PROTOTYPE_TRANSPORT,
+        "target": GUEST_AGENT_TARGET,
+        "source_revision": source_revision.stdout.decode("ascii").strip(),
+        "source_clean": not status.stdout.strip(),
+        "sha256": sha256,
+        "size": size,
+    }
+    (REPO_ROOT / "build" / MXC_GUEST_AGENT_PROVENANCE_NAME).write_text(
+        json.dumps(provenance, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return (
+        destination,
+        sha256,
+        {
+            "path": GUEST_AGENT_INSTALLED_PATH,
+            "sha256": sha256,
+            "size": size,
+            "source_revision": provenance["source_revision"],
+            "build_id": None,
+            "origin": "in-repo-workspace",
+        },
+    )
+
+
 def verified_staged_guest_agent() -> tuple[Path, str]:
     source = require_file(
         REPO_ROOT / "build" / GUEST_AGENT_ARTIFACT_NAME,
@@ -453,6 +523,7 @@ class AlpineBuildConfig:
     branch: str = DEFAULT_ALPINE_BRANCH
     work: Path = Path.home() / "build" / "initramfs"
     output: Path = Path.home() / "build" / "initramfs.cpio.gz"
+    profile: str = "legacy"
     agent_enabled: bool = False
 
 
@@ -882,7 +953,7 @@ def _write_apk_manifest(
     output: Path,
     config: AlpineBuildConfig,
     helpers: dict[str, dict[str, str]],
-    agent_sha256: str | None,
+    guest_agent: dict[str, object] | None,
 ) -> None:
     packages: list[ApkPackage] = []
     installed = root / "lib" / "apk" / "db" / "installed"
@@ -907,7 +978,7 @@ def _write_apk_manifest(
                     "build_time": fields.get("t"),
                 }
             )
-    elif not config.agent_enabled:
+    elif not config.agent_enabled and config.profile != MXC_PROTOTYPE_TRANSPORT:
         raise ScriptError(f"legacy initramfs root lacks APK metadata: {installed}")
     packages.sort(key=lambda package: package["name"])
     manifest = output.with_name(f"{output.name}.packages.json")
@@ -918,18 +989,8 @@ def _write_apk_manifest(
                 "alpine_version": config.version,
                 "alpine_branch": config.branch,
                 "architecture": "x86_64",
-                "profile": "broker-ttrpc" if config.agent_enabled else "legacy",
-                "guest_agent": (
-                    {
-                        "path": GUEST_AGENT_INSTALLED_PATH,
-                        "sha256": agent_sha256,
-                        "size": GUEST_AGENT_SIZE_BYTES,
-                        "source_revision": GUEST_AGENT_SOURCE_REVISION,
-                        "build_id": GUEST_AGENT_BUILD_ID,
-                    }
-                    if agent_sha256 is not None
-                    else None
-                ),
+                "profile": config.profile,
+                "guest_agent": guest_agent,
                 "packages": packages,
                 "helpers": helpers,
             },
@@ -1307,9 +1368,23 @@ def build_initramfs(config: AlpineBuildConfig) -> None:
     metadata_probe = _require_metadata_preserving_work_directory(config.work)
     agent_source: Path | None = None
     agent_sha256: str | None = None
-    if config.agent_enabled:
+    guest_agent_manifest: dict[str, object] | None = None
+    if config.profile == MXC_PROTOTYPE_TRANSPORT:
+        (
+            agent_source,
+            agent_sha256,
+            guest_agent_manifest,
+        ) = build_mxc_prototype_guest_agent()
+    elif config.agent_enabled:
         agent_source, agent_sha256 = verified_staged_guest_agent()
-    if config.agent_enabled:
+        guest_agent_manifest = {
+            "path": GUEST_AGENT_INSTALLED_PATH,
+            "sha256": agent_sha256,
+            "size": GUEST_AGENT_SIZE_BYTES,
+            "source_revision": GUEST_AGENT_SOURCE_REVISION,
+            "build_id": GUEST_AGENT_BUILD_ID,
+        }
+    if config.agent_enabled or config.profile == MXC_PROTOTYPE_TRANSPORT:
         assert agent_source is not None
         root = _prepare_agent_root(config.work, agent_source)
         helpers: dict[str, dict[str, str]] = {}
@@ -1387,7 +1462,7 @@ def build_initramfs(config: AlpineBuildConfig) -> None:
         native_output,
         config,
         helpers,
-        agent_sha256,
+        guest_agent_manifest,
     )
     _pack_initramfs(root, native_output, trusted_owners)
     _bind_apk_manifest_to_initramfs(native_output)
@@ -1486,6 +1561,31 @@ def docker_build_command(config: DockerBuildConfig, target: str) -> list[str | P
         ]
     )
     return command
+
+
+def build_docker_mxc_prototype_initramfs(config: DockerBuildConfig) -> Path:
+    require_tool(
+        "docker",
+        "docker was not found on PATH; install Docker with the Linux engine first",
+    )
+    destination = _docker_destination(config.destination)
+    run_checked(
+        docker_build_command(config, "mxc-prototype-initramfs-artifacts"),
+        cwd=REPO_ROOT,
+    )
+    output = destination / MXC_PROTOTYPE_INITRAMFS_NAME
+    require_file(output, "Docker MXC prototype initramfs output")
+    package_manifest = json.loads(
+        output.with_name(f"{output.name}.packages.json").read_text(encoding="utf-8")
+    )
+    guest_agent = package_manifest.get("guest_agent")
+    if not isinstance(guest_agent, dict) or not isinstance(
+        guest_agent.get("sha256"), str
+    ):
+        raise ScriptError("MXC prototype package manifest lacks guest-agent identity")
+    verify_agent_initramfs(output, guest_agent["sha256"])
+    print(f">> built {output} ({format_size(output.stat().st_size)})")
+    return output
 
 
 def docker_build_agent_initramfs_command(

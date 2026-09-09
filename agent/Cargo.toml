@@ -1,0 +1,15 @@
+[package]
+name = "nvx-agent"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "NVX guest init agent: assembles the sandbox filesystem and serves the host control channel as PID 1."
+
+[[bin]]
+name = "nvx-agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+libc = "0.2.186"
+serde_json = "1.0"

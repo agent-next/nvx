@@ -186,13 +186,19 @@ def _initramfs_package_manifest(
             "name": (
                 build.AGENT_INITRAMFS_NAME
                 if profile == "broker-ttrpc"
+                else build.MXC_PROTOTYPE_INITRAMFS_NAME
+                if profile == build.MXC_PROTOTYPE_TRANSPORT
                 else "initramfs.cpio.gz"
             ),
             "sha256": hashlib.sha256(image).hexdigest(),
             "size": len(image),
         },
         "guest_agent": None,
-        "packages": [] if profile == "broker-ttrpc" else [{"name": "busybox"}],
+        "packages": (
+            []
+            if profile in ("broker-ttrpc", build.MXC_PROTOTYPE_TRANSPORT)
+            else [{"name": "busybox"}]
+        ),
     }
     if agent is not None:
         value["guest_agent"] = {
@@ -565,6 +571,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.control_auth_handle, 9)
         self.assertIs(args.handler, nvx.command_sandbox)
 
+    def test_build_guest_supports_mxc_prototype_profile(self):
+        args = nvx.parse_args(["build-guest", "--with-mxc-prototype"])
+        self.assertTrue(args.with_mxc_prototype)
+        with (
+            patch.object(nvx, "build_docker_artifacts"),
+            patch.object(nvx, "build_docker_agent_initramfs"),
+            patch.object(nvx, "build_docker_mxc_prototype_initramfs") as build_mxc,
+        ):
+            nvx.command_build_guest(args)
+        build_mxc.assert_called_once()
+
     def test_sandbox_selects_agent_initramfs_and_dual_consoles(self):
         root = Path.cwd()
         args = nvx.parse_args(
@@ -604,6 +621,40 @@ class CliTests(unittest.TestCase):
         self.assertIn(f"listen={root / 'control.sock'}", command)
         self.assertIn("--microvm-control-auth-handle", command)
         self.assertIn("9", command)
+
+    def test_sandbox_selects_mxc_prototype_initramfs(self):
+        root = Path.cwd()
+        args = nvx.parse_args(
+            [
+                "sandbox",
+                "--layer",
+                f"distro,{root / 'distro.erofs'}",
+                "--scratch",
+                str(root / "scratch.ext4"),
+                "--transport",
+                build.MXC_PROTOTYPE_TRANSPORT,
+                "--control-socket",
+                str(root / "control.sock"),
+                "--boot-console-socket",
+                str(root / "boot.sock"),
+                "--control-auth-handle",
+                "9",
+                "--dry-run",
+            ]
+        )
+
+        with (
+            patch.object(sandbox, "require_file"),
+            patch.object(nvx, "require_file", side_effect=lambda path, _label: path),
+            patch.object(nvx, "_format_command", return_value="formatted") as formatted,
+        ):
+            nvx.command_sandbox(args)
+
+        command = [str(value) for value in formatted.call_args.args[0]]
+        self.assertIn(
+            str(common.BUILD_DIR / build.MXC_PROTOTYPE_INITRAMFS_NAME),
+            command,
+        )
 
     def test_network_requires_explicit_portable_profile(self):
         args = nvx.parse_args(
@@ -825,6 +876,17 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(verify_agent.input, Path("initramfs-agent.cpio.gz"))
         self.assertIs(verify_agent.handler, nvx.command_verify_agent_initramfs)
+
+        mxc_agent = nvx.parse_args(["build-mxc-prototype-agent"])
+        self.assertIs(mxc_agent.handler, nvx.command_build_mxc_prototype_agent)
+        mxc_initramfs = nvx.parse_args(
+            ["build-mxc-prototype-initramfs", "--native"]
+        )
+        self.assertTrue(mxc_initramfs.native)
+        self.assertIs(
+            mxc_initramfs.handler,
+            nvx.command_build_mxc_prototype_initramfs,
+        )
 
 
 class CiTests(unittest.TestCase):
@@ -1518,11 +1580,12 @@ class BuildTests(unittest.TestCase):
                     with self.assertRaisesRegex(common.ScriptError, error):
                         build.verify_agent_initramfs(path, expected)
 
-    def test_legacy_and_broker_initramfs_profiles_are_structurally_distinct(self):
+    def test_legacy_broker_and_mxc_initramfs_profiles_are_structurally_distinct(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             legacy = root / "initramfs.cpio.gz"
             broker = root / build.AGENT_INITRAMFS_NAME
+            mxc = root / build.MXC_PROTOTYPE_INITRAMFS_NAME
             legacy.write_bytes(
                 _legacy_newc_archive(
                     (common.REPO_ROOT / "alpine" / "init").read_bytes()
@@ -1530,10 +1593,15 @@ class BuildTests(unittest.TestCase):
             )
             agent = _static_x86_64_elf()
             broker.write_bytes(_agent_newc_archive(agent))
+            mxc.write_bytes(_agent_newc_archive(agent))
 
             build.verify_legacy_initramfs(legacy)
             build.verify_agent_initramfs(
                 broker,
+                hashlib.sha256(agent).hexdigest(),
+            )
+            build.verify_agent_initramfs(
+                mxc,
                 hashlib.sha256(agent).hexdigest(),
             )
             with self.assertRaisesRegex(
@@ -1580,6 +1648,55 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(legacy.output.name, "initramfs.cpio.gz")
             self.assertTrue(agent.agent_enabled)
             self.assertEqual(agent.output.name, build.AGENT_INITRAMFS_NAME)
+
+    def test_build_mxc_prototype_guest_agent_stages_in_repo_binary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            built = (
+                root
+                / "target"
+                / build.GUEST_AGENT_TARGET
+                / "release"
+                / build.GUEST_AGENT_ARTIFACT_NAME
+            )
+            built.parent.mkdir(parents=True)
+            built.write_bytes(_static_x86_64_elf())
+            sha256 = hashlib.sha256(built.read_bytes()).hexdigest()
+            with (
+                patch.object(build, "REPO_ROOT", root),
+                patch.object(build, "require_tool", return_value="cargo"),
+                patch.object(build, "run_checked"),
+                patch.object(
+                    build,
+                    "run_capture",
+                    side_effect=(
+                        common.CommandResult(("git",), 0, b"abc123\n", b""),
+                        common.CommandResult(("git",), 0, b"", b""),
+                    ),
+                ),
+            ):
+                staged, actual_sha256, guest_manifest = (
+                    build.build_mxc_prototype_guest_agent()
+                )
+
+            self.assertEqual(actual_sha256, sha256)
+            self.assertEqual(staged, root / "build" / build.MXC_GUEST_AGENT_ARTIFACT_NAME)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o755)
+            self.assertEqual(
+                (root / "build" / build.MXC_GUEST_AGENT_SHA256_NAME)
+                .read_text(encoding="ascii")
+                .strip(),
+                sha256,
+            )
+            provenance = json.loads(
+                (root / "build" / build.MXC_GUEST_AGENT_PROVENANCE_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(provenance["source_revision"], "abc123")
+            self.assertEqual(provenance["sha256"], sha256)
+            self.assertEqual(guest_manifest["sha256"], sha256)
 
     def test_agent_docker_input_uses_sha_but_ci_does_not_cache_image(self):
         command = [

@@ -26,7 +26,9 @@ python3 scripts/nvx.py performance gate --help
 | `build-guest` | Build the Linux kernel and Alpine initramfs. |
 | `build-kernel` | Build the pinned and patched Linux kernel natively. |
 | `build-initramfs` | Build the Alpine initramfs natively. |
+| `build-mxc-prototype-agent` | Build and stage the in-repo Rust PID-1 agent for `mxc-prototype`. |
 | `build-agent-initramfs` | Build the explicit broker-ttrpc PID-1 initramfs. |
+| `build-mxc-prototype-initramfs` | Build the explicit mxc-prototype PID-1 initramfs. |
 | `stage-agent` | Verify and stage a pinned static NVX agent input. |
 | `verify-agent-initramfs` | Recheck a broker image, full-rootfs metadata, and embedded agent identity. |
 | `build-openvmm` | Build the OpenVMM release binary. |
@@ -80,12 +82,24 @@ See [Setup](setup.md) for host prerequisites.
 ### `build-guest`
 
 ```text
-python3 scripts/nvx.py build-guest [--native] [--with-agent]
+python3 scripts/nvx.py build-guest [--native] [--with-agent] [--with-mxc-prototype]
 ```
 
 By default, builds the guest kernel and initramfs with Docker. `--native`
 builds both legacy artifacts directly on Linux. `--with-agent` additionally
-requires the staged agent and produces the separate agent initramfs.
+requires the staged broker input and produces the separate broker PID-1 image.
+`--with-mxc-prototype` builds the in-repo Rust PID-1 image
+`build/initramfs-mxc-agent.cpio.gz`.
+
+### `build-mxc-prototype-agent`
+
+```console
+python3 scripts/nvx.py build-mxc-prototype-agent
+```
+
+Builds `nvx-agent` from the repository workspace as static
+`x86_64-unknown-linux-musl` when the toolchain is available, then stages
+`build/nvx-agent-mxc-prototype` plus SHA-256/provenance sidecars.
 
 ### `build-kernel`
 
@@ -114,6 +128,17 @@ with `--native`. The command requires a previously verified `stage-agent`
 input. Native construction uses `~/.cache/nvx/native-work/broker-ttrpc` by
 default; set `NVX_NATIVE_WORK_DIR` to another native Linux filesystem. DrvFS
 and other mode-losing work roots are rejected before extraction.
+
+### `build-mxc-prototype-initramfs`
+
+```text
+python3 scripts/nvx.py build-mxc-prototype-initramfs [--native]
+```
+
+Builds `build/initramfs-mxc-agent.cpio.gz` through Docker, or directly on
+Linux with `--native`. The profile compiles the in-repo Rust `nvx-agent`,
+verifies static x86-64 ELF properties, then packages a PID-1 image with
+`/init -> sbin/nvx-agent`.
 
 ### `build-openvmm`
 
