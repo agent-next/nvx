@@ -35,6 +35,26 @@ pub enum MxcRequirement {
     Shutdown,
 }
 
+impl MxcRequirement {
+    /// Stable requirement name used by phase reports.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Bootstrap => "bootstrap",
+            Self::ExecuteCommand => "execute-command",
+            Self::InteractiveShell => "interactive-shell",
+            Self::StreamLogs => "stream-logs",
+            Self::Signal => "signal",
+            Self::WaitContainerExited => "wait-container-exited",
+            Self::Probe => "probe",
+            Self::PrepareSnapshot => "prepare-snapshot",
+            Self::PostRestore => "post-restore",
+            Self::Checkpoint => "checkpoint",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
 /// Stable list of modeled requirements for deterministic harness assertions.
 pub const MODELED_REQUIREMENTS: [MxcRequirement; 12] = [
     MxcRequirement::Ready,
@@ -142,6 +162,17 @@ mod tests {
     #[test]
     fn models_exactly_twelve_requirements() {
         assert_eq!(MODELED_REQUIREMENTS.len(), 12);
+    }
+
+    #[test]
+    fn modeled_requirement_names_are_unique() {
+        let mut names = MODELED_REQUIREMENTS
+            .into_iter()
+            .map(MxcRequirement::name)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 12);
     }
 
     #[test]

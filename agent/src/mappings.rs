@@ -82,7 +82,7 @@ impl MappingResolver {
     fn resolve_verified_path(&self, requested: &RelativeChildPath) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
-            return resolve_under_root(self.root_fd.as_raw_fd(), requested.as_str());
+            resolve_under_root(self.root_fd.as_raw_fd(), requested.as_str())
         }
 
         #[cfg(not(target_os = "linux"))]

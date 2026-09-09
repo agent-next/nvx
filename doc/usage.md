@@ -26,9 +26,9 @@ python3 scripts/nvx.py performance gate --help
 | `build-guest` | Build the Linux kernel and Alpine initramfs. |
 | `build-kernel` | Build the pinned and patched Linux kernel natively. |
 | `build-initramfs` | Build the Alpine initramfs natively. |
-| `build-mxc-prototype-agent` | Build and stage the in-repo Rust PID-1 agent for `mxc-prototype`. |
+| `build-mxc-prototype-agent` | Build and stage the in-repo Rust PID-1 Phase-0 scaffolding agent for `mxc-prototype`. |
 | `build-agent-initramfs` | Build the explicit broker-ttrpc PID-1 initramfs. |
-| `build-mxc-prototype-initramfs` | Build the explicit mxc-prototype PID-1 initramfs. |
+| `build-mxc-prototype-initramfs` | Build the explicit mxc-prototype Phase-0 scaffolding PID-1 initramfs. |
 | `stage-agent` | Verify and stage a pinned static NVX agent input. |
 | `verify-agent-initramfs` | Recheck a broker image, full-rootfs metadata, and embedded agent identity. |
 | `build-openvmm` | Build the OpenVMM release binary. |
@@ -88,8 +88,8 @@ python3 scripts/nvx.py build-guest [--native] [--with-agent] [--with-mxc-prototy
 By default, builds the guest kernel and initramfs with Docker. `--native`
 builds both legacy artifacts directly on Linux. `--with-agent` additionally
 requires the staged broker input and produces the separate broker PID-1 image.
-`--with-mxc-prototype` builds the in-repo Rust PID-1 image
-`build/initramfs-mxc-agent.cpio.gz`.
+`--with-mxc-prototype` builds the in-repo Rust PID-1 Phase-0 scaffolding image
+`build/initramfs-mxc-agent.cpio.gz` (not an operational MXC runtime service).
 
 ### `build-mxc-prototype-agent`
 
@@ -97,7 +97,7 @@ requires the staged broker input and produces the separate broker PID-1 image.
 python3 scripts/nvx.py build-mxc-prototype-agent
 ```
 
-Builds `nvx-agent` from the repository workspace as static
+Builds the Phase-0 scaffolding `nvx-agent` from the repository workspace as static
 `x86_64-unknown-linux-musl` when the toolchain is available, then stages
 `build/nvx-agent-mxc-prototype` plus SHA-256/provenance sidecars.
 
@@ -142,6 +142,10 @@ verifies static x86-64 ELF properties, then packages a PID-1 image with
 `source_authority: "verified-git"`. Docker Git-less builds keep
 `NVX_SOURCE_REVISION` / `NVX_SOURCE_CLEAN` as declared inputs and record
 `source_authority: "declared-container-input"`.
+
+The resulting image is intentionally Phase-0 scaffolding: PID 1 reports
+`serviceReadiness=not-ready` and waits for termination. Runtime MXC operations
+remain blocked/not-implemented until later transport/service phases.
 
 ### `build-openvmm`
 

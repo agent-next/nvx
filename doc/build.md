@@ -118,7 +118,7 @@ wrong agent or PID-1 identity. The legacy shell image remains an independent
 Alpine profile with its existing utilities and validation.
 
 For the in-repo Phase-0 MXC prototype profile, build and package a distinct
-PID-1 image:
+PID-1 scaffolding image:
 
 ```bash
 python3 scripts/nvx.py build-mxc-prototype-initramfs       # Docker
@@ -128,7 +128,8 @@ python3 scripts/nvx.py build-mxc-prototype-initramfs --native
 
 The output path is `build/initramfs-mxc-agent.cpio.gz` with `/init` linked to
 `/sbin/nvx-agent`. This profile remains separate from both `legacy` and
-`broker-ttrpc`.
+`broker-ttrpc`, and is intentionally not an operational MXC runtime agent in
+Phase 0.
 
 Source provenance authority is explicit for this profile. If the build reads
 Git metadata in the current workspace, the agent provenance records
@@ -137,6 +138,11 @@ and consumes `NVX_SOURCE_REVISION` / `NVX_SOURCE_CLEAN` declarations from the
 host wrapper, the same metadata is recorded as
 `source_authority: "declared-container-input"` to reflect weaker, in-container
 unverified authority.
+
+At runtime, this PID-1 scaffold reports `serviceReadiness=not-ready` with an
+explicit blocked ACI adapter reason and then waits for shutdown signals. Later
+phases are responsible for wiring full transport/service behavior and real
+pass/fail execution of the 12 runtime requirements.
 
 The matching kernel assertions cover cgroup-v2 memory, pids, CPU weight,
 freezer and BPF; BPF and seccomp syscalls/filters; EROFS, overlay, ext4 and GPT; virtio block/console/MMIO;
