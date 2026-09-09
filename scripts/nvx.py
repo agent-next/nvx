@@ -373,22 +373,45 @@ def command_sandbox(args: argparse.Namespace) -> None:
         command.extend(["--net", args.net, "--network-profile", args.network_profile])
     print(f">> {_format_command(command)}")
     if not args.dry_run:
-        if os.name == "nt":
-            raise ScriptError("broker-ttrpc sandbox launch requires Linux")
+        raise SystemExit(
+            _run_openvmm_with_inherited_auth_handle(command, args.control_auth_handle)
+        )
+
+
+def _run_openvmm_with_inherited_auth_handle(
+    command: list[str], control_auth_handle: int
+) -> int:
+    if control_auth_handle <= 0:
+        raise ScriptError("control authentication handle must be nonzero")
+
+    if os.name == "nt":
+        startup_info = subprocess.STARTUPINFO(
+            lpAttributeList={"handle_list": [control_auth_handle]}
+        )
         try:
-            auth_handle = os.fstat(args.control_auth_handle)
+            os.set_handle_inheritable(control_auth_handle, True)
         except OSError as error:
             raise ScriptError(
                 "control authentication handle is not open in this process"
             ) from error
-        if not stat.S_ISFIFO(auth_handle.st_mode):
-            raise ScriptError("control authentication handle must be a pipe")
-        raise SystemExit(
-            subprocess.run(
+        try:
+            return subprocess.run(
                 command,
-                pass_fds=(args.control_auth_handle,),
+                close_fds=True,
+                startupinfo=startup_info,
             ).returncode
-        )
+        finally:
+            os.set_handle_inheritable(control_auth_handle, False)
+
+    try:
+        auth_handle = os.fstat(control_auth_handle)
+    except OSError as error:
+        raise ScriptError(
+            "control authentication handle is not open in this process"
+        ) from error
+    if not stat.S_ISFIFO(auth_handle.st_mode):
+        raise ScriptError("control authentication handle must be a pipe")
+    return subprocess.run(command, pass_fds=(control_auth_handle,)).returncode
 
 
 def command_collect_sources(args: argparse.Namespace) -> None:

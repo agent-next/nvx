@@ -2068,6 +2068,39 @@ class SandboxTests(unittest.TestCase):
         with self.assertRaisesRegex(common.ScriptError, "1024-byte"):
             launch.kernel_command_line("x" * sandbox.SANDBOX_COMMAND_LINE_MAX_SIZE)
 
+    def test_windows_launch_uses_explicit_handle_allowlist(self):
+        command = ["openvmm", "--machine", "microvm"]
+        completed = subprocess.CompletedProcess(command, 17)
+        with (
+            patch.object(nvx.os, "name", "nt"),
+            patch.object(
+                nvx.os, "set_handle_inheritable", autospec=True
+            ) as set_inheritable,
+            patch.object(nvx.subprocess, "run", return_value=completed) as run,
+        ):
+            return_code = nvx._run_openvmm_with_inherited_auth_handle(command, 99)
+        self.assertEqual(return_code, 17)
+        run.assert_called_once()
+        _, kwargs = run.call_args
+        self.assertTrue(kwargs["close_fds"])
+        self.assertIn("startupinfo", kwargs)
+        startup_info = kwargs["startupinfo"]
+        self.assertEqual(startup_info.lpAttributeList["handle_list"], [99])
+        self.assertEqual(set_inheritable.call_count, 2)
+
+    def test_windows_launch_rejects_missing_handle(self):
+        command = ["openvmm", "--machine", "microvm"]
+        with (
+            patch.object(nvx.os, "name", "nt"),
+            patch.object(
+                nvx.os,
+                "set_handle_inheritable",
+                side_effect=OSError("bad handle"),
+            ),
+        ):
+            with self.assertRaisesRegex(common.ScriptError, "not open"):
+                nvx._run_openvmm_with_inherited_auth_handle(command, 99)
+
     def test_layer_parser_rejects_invalid_role_and_shape(self):
         with self.assertRaisesRegex(common.ScriptError, "unsupported layer role"):
             sandbox.SandboxLayer.parse("unknown,layer.erofs")
