@@ -44,7 +44,7 @@ fn probe_mxc_requirements(service: &impl MxcExtensionService) -> usize {
 #[cfg(unix)]
 fn wait_for_shutdown_signal(shutdown_mask: &libc::sigset_t) -> Result<()> {
     eprintln!("NVX-AGENT: waiting for host control integration or termination signal");
-    let wait_result = wait_for_blocked_shutdown_signal(&shutdown_mask, |set, signal| unsafe {
+    let wait_result = wait_for_blocked_shutdown_signal(shutdown_mask, |set, signal| unsafe {
         libc::sigwait(set, signal)
     });
     let signal = wait_result?;
@@ -157,24 +157,24 @@ fn run_service(
     wait()
 }
 
+#[cfg(unix)]
 fn run() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let shutdown_signals = install_shutdown_signal_block()?;
-        let adapter = UnsupportedAciAdapter;
-        let run_result = run_service(&adapter, || {
-            wait_for_shutdown_signal(&shutdown_signals.blocked_set)
-        });
-        let restore_result = restore_signal_mask(&shutdown_signals.previous_mask);
-        if let Err(error) = run_result {
-            restore_result?;
-            return Err(error);
-        }
+    let shutdown_signals = install_shutdown_signal_block()?;
+    let adapter = UnsupportedAciAdapter;
+    let run_result = run_service(&adapter, || {
+        wait_for_shutdown_signal(&shutdown_signals.blocked_set)
+    });
+    let restore_result = restore_signal_mask(&shutdown_signals.previous_mask);
+    if let Err(error) = run_result {
         restore_result?;
-        return Ok(());
+        return Err(error);
     }
+    restore_result?;
+    Ok(())
+}
 
-    #[cfg(not(unix))]
+#[cfg(not(unix))]
+fn run() -> Result<()> {
     let adapter = UnsupportedAciAdapter;
     run_service(&adapter, wait_for_shutdown_signal)
 }
@@ -192,6 +192,16 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use ::std::process::Command;
+    #[cfg(unix)]
+    use ::std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    const BLOCKED_SIGNAL_HELPER_ENV: &str = "NVX_AGENT_BLOCKED_SIGNAL_HELPER";
+    #[cfg(unix)]
+    const BLOCKED_SIGNAL_HELPER_TEST: &str =
+        "tests::blocked_signal_during_initialization_helper_entrypoint";
 
     struct AcceptingService;
 
@@ -267,77 +277,56 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn blocked_signal_during_initialization_is_consumed_by_wait() {
-        let mut pipefds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(pipefds.as_mut_ptr()) }, 0);
-        let child_pid = unsafe { libc::fork() };
-        assert!(
-            child_pid >= 0,
-            "fork failed: {}",
-            ::std::io::Error::last_os_error()
-        );
-        if child_pid == 0 {
-            unsafe {
-                libc::close(pipefds[0]);
-            }
-            let child_exit = match install_shutdown_signal_block() {
-                Ok(shutdown_signals) => {
-                    let ready: [u8; 1] = [1];
-                    let wrote =
-                        unsafe { libc::write(pipefds[1], ready.as_ptr().cast(), ready.len()) };
-                    if wrote != 1 {
-                        2
-                    } else {
-                        ::std::thread::sleep(::std::time::Duration::from_millis(100));
-                        match wait_for_shutdown_signal(&shutdown_signals.blocked_set) {
-                            Ok(()) => 0,
-                            Err(_) => 3,
-                        }
-                    }
-                }
-                Err(_) => 4,
-            };
-            unsafe {
-                libc::close(pipefds[1]);
-                libc::_exit(child_exit);
-            }
-        }
-        unsafe {
-            libc::close(pipefds[1]);
-        }
+        let current_exe = ::std::env::current_exe().unwrap();
+        let mut child = Command::new(current_exe)
+            .arg("--nocapture")
+            .arg("--exact")
+            .arg("--ignored")
+            .arg(BLOCKED_SIGNAL_HELPER_TEST)
+            .env(BLOCKED_SIGNAL_HELPER_ENV, "1")
+            .spawn()
+            .unwrap();
 
-        let mut ready = [0_u8; 1];
-        let read_result = unsafe { libc::read(pipefds[0], ready.as_mut_ptr().cast(), ready.len()) };
-        assert_eq!(read_result, 1);
-        assert_eq!(ready[0], 1);
-        assert_eq!(unsafe { libc::kill(child_pid, libc::SIGTERM) }, 0);
-
-        let mut status = 0;
-        let mut child_exited = false;
-        for _ in 0..100 {
-            let waited = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
-            assert_ne!(
-                waited,
-                -1,
-                "waitpid failed: {}",
-                ::std::io::Error::last_os_error()
-            );
-            if waited == child_pid {
-                child_exited = true;
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "helper subprocess failed with status: {status}"
+                );
                 break;
             }
-            ::std::thread::sleep(::std::time::Duration::from_millis(20));
-        }
-        if !child_exited {
-            unsafe {
-                libc::kill(child_pid, libc::SIGKILL);
-                libc::waitpid(child_pid, &mut status, 0);
+
+            if start.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("timed out waiting for helper subprocess");
             }
-            panic!("timed out waiting for child to consume pending signal");
+
+            ::std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 0);
-        unsafe {
-            libc::close(pipefds[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper subprocess entrypoint for blocked signal integration test"]
+    fn blocked_signal_during_initialization_helper_entrypoint() {
+        if ::std::env::var_os(BLOCKED_SIGNAL_HELPER_ENV).is_none() {
+            return;
         }
+
+        let shutdown_signals = install_shutdown_signal_block().unwrap();
+        let thread = unsafe { libc::pthread_self() };
+        let kill_result = unsafe { libc::pthread_kill(thread, libc::SIGTERM) };
+        assert_eq!(
+            kill_result,
+            0,
+            "failed to send blocked thread signal: {}",
+            ::std::io::Error::from_raw_os_error(kill_result)
+        );
+        let _ = probe_mxc_requirements(&UnsupportedAciAdapter);
+        wait_for_shutdown_signal(&shutdown_signals.blocked_set).unwrap();
+        restore_signal_mask(&shutdown_signals.previous_mask).unwrap();
     }
 }
