@@ -257,6 +257,13 @@ pub struct HvcFramedChannel<T: Read + Write> {
     write_credits: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChannelReadResult {
+    Record(InnerRecord),
+    WouldBlock,
+    Closed,
+}
+
 impl MxcControlService {
     pub fn new(binding: LaunchBinding) -> Self {
         Self::new_with_status(
@@ -292,30 +299,18 @@ impl MxcControlService {
     pub fn new_with_status(
         binding: LaunchBinding,
         build_status: BuildStatus,
-        network: NetworkStatus,
+        _network: NetworkStatus,
         isolation_status: IsolationStatus,
         workload_identity: WorkloadIdentityStatus,
     ) -> Self {
-        let mut protocol_state = AgentProtocolState::new();
-        let _ = protocol_state.admit_launch(LaunchAdmissionInput {
-            now_secs: 0,
-            service: SERVICE_IDENTITY.to_string(),
-            version: PROTOCOL_VERSION,
-            launch: binding.launch,
-            capability_proof: vec![0_u8; 32].try_into().expect("fixed 32-byte proof"),
-            build: build_status.clone(),
-            network,
-            isolation: isolation_status.clone(),
-            workload_identity: workload_identity.clone(),
-        });
         Self {
             binding,
             configured: None,
-            protocol_state,
+            protocol_state: AgentProtocolState::new(),
             build_status,
             isolation_status,
             workload_identity,
-            authenticated: true,
+            authenticated: false,
             quiesced: false,
             shutting_down: false,
             active_exec: None,
@@ -340,6 +335,21 @@ impl MxcControlService {
                 "Shutdown".to_string(),
             ],
             unavailable_operations: vec![],
+        }
+    }
+
+    pub fn update_runtime_isolation(&mut self, isolation: IsolationStatus) {
+        self.isolation_status = isolation;
+    }
+
+    pub fn ready_status(&self, network: NetworkStatus) -> ReadyStatus {
+        ReadyStatus {
+            service: SERVICE_IDENTITY.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            build: self.build_status.clone(),
+            network,
+            isolation: self.isolation_status.clone(),
+            workload_identity: self.workload_identity.clone(),
         }
     }
 
@@ -375,16 +385,6 @@ impl MxcControlService {
                 ServiceErrorCode::ChannelGenerationMismatch,
                 "channel generation mismatch for authenticated channel",
             ));
-        }
-        if self.authenticated {
-            return Ok(ReadyStatus {
-                service: SERVICE_IDENTITY.to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                build: self.build_status.clone(),
-                network,
-                isolation: self.isolation_status.clone(),
-                workload_identity: self.workload_identity.clone(),
-            });
         }
         let ready =
             self.protocol_state.admit_launch(LaunchAdmissionInput {
@@ -461,6 +461,12 @@ impl MxcControlService {
     }
 
     pub fn wait_ready(&self, request: WaitReadyRequest) -> Result<ReadySnapshot, ServiceError> {
+        if !self.authenticated {
+            return Err(ServiceError::new(
+                ServiceErrorCode::ConfigurationRequired,
+                "authenticated launch binding is required before WaitReady",
+            ));
+        }
         self.validate_binding(
             request.protocol_version,
             &request.image_version,
@@ -486,7 +492,7 @@ impl MxcControlService {
     pub fn health(&self) -> HealthSnapshot {
         let health = self.protocol_state.health();
         HealthSnapshot {
-            launch_admitted: true,
+            launch_admitted: health.launch_admitted,
             configured: self.configured.is_some(),
             quiesced: health.quiesced || self.quiesced,
             shutting_down: self.shutting_down,
@@ -1051,7 +1057,11 @@ impl<T: Read + Write> HvcFramedChannel<T> {
         if bytes.is_empty() {
             return Ok(false);
         }
-        let written = self.io.write(bytes).map_err(channel_io_error)?;
+        let written = match self.io.write(bytes) {
+            Ok(written) => written,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(channel_io_error(error)),
+        };
         if written == 0 {
             return Ok(false);
         }
@@ -1065,6 +1075,13 @@ impl<T: Read + Write> HvcFramedChannel<T> {
     }
 
     pub fn read_next_inner_record(&mut self) -> Result<Option<InnerRecord>, ServiceError> {
+        match self.try_read_next_inner_record()? {
+            ChannelReadResult::Record(record) => Ok(Some(record)),
+            ChannelReadResult::WouldBlock | ChannelReadResult::Closed => Ok(None),
+        }
+    }
+
+    pub fn try_read_next_inner_record(&mut self) -> Result<ChannelReadResult, ServiceError> {
         loop {
             if self.read_buffer.len() >= 4 {
                 let payload_len =
@@ -1099,13 +1116,19 @@ impl<T: Read + Write> HvcFramedChannel<T> {
                     let payload = self.read_buffer[4..frame_len].to_vec();
                     self.read_buffer.drain(0..frame_len);
                     let record = InnerRecord::decode(&payload).map_err(inner_decode_error)?;
-                    return Ok(Some(record));
+                    return Ok(ChannelReadResult::Record(record));
                 }
             }
             let mut scratch = [0_u8; 4096];
-            let size = self.io.read(&mut scratch).map_err(channel_io_error)?;
+            let size = match self.io.read(&mut scratch) {
+                Ok(size) => size,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(ChannelReadResult::WouldBlock);
+                }
+                Err(error) => return Err(channel_io_error(error)),
+            };
             if size == 0 {
-                return Ok(None);
+                return Ok(ChannelReadResult::Closed);
             }
             self.read_buffer.extend_from_slice(&scratch[..size]);
             if self.read_buffer.len() > self.max_frame_bytes {
@@ -1309,9 +1332,30 @@ mod tests {
         }
     }
 
+    fn authenticated_unconfigured_service() -> MxcControlService {
+        let mut service = MxcControlService::new(sample_binding());
+        service
+            .authenticate_channel(
+                AuthenticateChannelRequest {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    launch: launch(7),
+                    channel_generation: 17,
+                    capability_proof: [8; 32],
+                },
+                1,
+                NetworkStatus {
+                    mode: NetworkMode::NoNic,
+                    detail: None,
+                },
+            )
+            .unwrap();
+        service
+    }
+
     #[test]
     fn wait_ready_is_level_triggered_once_configuration_is_applied() {
-        let mut service = MxcControlService::new(sample_binding());
+        let mut service = authenticated_unconfigured_service();
         service
             .configure_session(ConfigureSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1331,7 +1375,7 @@ mod tests {
 
     #[test]
     fn wait_ready_rejects_wrong_nonce_version_and_channel_generation() {
-        let mut service = MxcControlService::new(sample_binding());
+        let mut service = authenticated_unconfigured_service();
         service
             .configure_session(ConfigureSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1379,7 +1423,7 @@ mod tests {
 
     #[test]
     fn configure_session_is_immutable_and_replay_requires_idempotent_bit() {
-        let mut service = MxcControlService::new(sample_binding());
+        let mut service = authenticated_unconfigured_service();
         let initial = sample_configuration();
         service
             .configure_session(ConfigureSessionRequest {
@@ -1445,7 +1489,7 @@ mod tests {
 
     #[test]
     fn health_reports_configuration_and_network_filesystem_state() {
-        let mut service = MxcControlService::new(sample_binding());
+        let mut service = authenticated_unconfigured_service();
         let initial = service.health();
         assert!(initial.launch_admitted);
         assert!(!initial.configured);
@@ -1472,7 +1516,7 @@ mod tests {
 
     #[test]
     fn configuration_bounds_enforce_map_list_string_and_body_limits() {
-        let mut service = MxcControlService::new(sample_binding());
+        let mut service = authenticated_unconfigured_service();
         let mut too_many_labels = sample_configuration();
         too_many_labels.labels = (0..=MAX_LABEL_COUNT)
             .map(|i| format!("label-{i}"))
@@ -1775,6 +1819,145 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn stdin_eof_closes_stream_and_calls_supervisor() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor::default();
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 51,
+                    argv: vec!["/bin/cat".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        service
+            .stdin_eof(
+                StdinEofRecord {
+                    exec_id: 51,
+                    sequence: 0,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        assert!(supervisor.stdin_closed, "stdin must be closed at EOF");
+    }
+
+    #[test]
+    fn timed_out_disposition_wins_over_signal_exit() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor::default();
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 52,
+                    argv: vec!["/bin/sleep".to_string(), "10".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: Some(1),
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        service
+            .cancel_exec(52, CancelReason::TimedOut, &mut supervisor)
+            .unwrap();
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 52,
+                stream: StreamName::Stdout,
+                credits: 1,
+            })
+            .unwrap();
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 52,
+                stream: StreamName::Stderr,
+                credits: 1,
+            })
+            .unwrap();
+        supervisor.events.push_back(SupervisorEvent::StdoutEof);
+        supervisor.events.push_back(SupervisorEvent::StderrEof);
+        supervisor
+            .events
+            .push_back(SupervisorEvent::DescendantsCleaned);
+        supervisor.events.push_back(SupervisorEvent::Signaled(9));
+        let messages = service.pump_supervisor(&mut supervisor).unwrap();
+        assert!(matches!(
+            messages.last(),
+            Some(AgentControlMessage::ExecTerminal {
+                disposition: ExecDisposition::TimedOut,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_message_is_emitted_after_output_and_eofs() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor::default();
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 53,
+                    argv: vec!["/bin/echo".to_string(), "x".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 53,
+                stream: StreamName::Stdout,
+                credits: 1,
+            })
+            .unwrap();
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 53,
+                stream: StreamName::Stderr,
+                credits: 1,
+            })
+            .unwrap();
+
+        supervisor
+            .events
+            .push_back(SupervisorEvent::StdoutChunk(vec![120]));
+        supervisor.events.push_back(SupervisorEvent::StdoutEof);
+        supervisor.events.push_back(SupervisorEvent::StderrEof);
+        supervisor.events.push_back(SupervisorEvent::Exited(0));
+        supervisor
+            .events
+            .push_back(SupervisorEvent::DescendantsCleaned);
+        let messages = service.pump_supervisor(&mut supervisor).unwrap();
+        let terminal_index = messages
+            .iter()
+            .position(|message| matches!(message, AgentControlMessage::ExecTerminal { .. }))
+            .unwrap();
+        let stdout_chunk_index = messages
+            .iter()
+            .position(|message| matches!(message, AgentControlMessage::StdoutChunk(_)))
+            .unwrap();
+        let stdout_eof_index = messages
+            .iter()
+            .position(|message| matches!(message, AgentControlMessage::StdoutEof(_)))
+            .unwrap();
+        let stderr_eof_index = messages
+            .iter()
+            .position(|message| matches!(message, AgentControlMessage::StderrEof(_)))
+            .unwrap();
+        assert!(stdout_chunk_index < terminal_index);
+        assert!(stdout_eof_index < terminal_index);
+        assert!(stderr_eof_index < terminal_index);
     }
 
     #[test]
