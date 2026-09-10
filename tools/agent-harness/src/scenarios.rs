@@ -32,7 +32,9 @@ use agent_protocol::messages::{
     WORKLOAD_UID_MXC, WORKLOAD_USER_MXC,
 };
 #[cfg(windows)]
-use agent_protocol::{PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES, PROTOCOL_VERSION};
+use agent_protocol::{
+    MAX_SHUTDOWN_GRACE_TIMEOUT_MS, PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES, PROTOCOL_VERSION,
+};
 #[cfg(windows)]
 use serde::Deserialize;
 
@@ -62,7 +64,7 @@ const REPARSE_ESCAPE_LINK: &str = "escape-link";
 #[cfg(windows)]
 const SHUTDOWN_VALIDATION_GRACE_MS: u64 = 1200;
 #[cfg(windows)]
-const SHUTDOWN_VALIDATION_EXIT_BOUND: Duration = Duration::from_secs(8);
+const SHUTDOWN_VALIDATION_GRACE_TOLERANCE_MS: u64 = 350;
 
 struct LiveHarnessState {
     run_key: Option<String>,
@@ -1624,8 +1626,10 @@ fn run_req11_health_quiesce_resume_shutdown(state: &mut LiveHarnessState) -> Che
             ),
             "active quiesce was rejected; once idle, quiesce succeeded, blocked new exec admission, then resume restored execution".to_string(),
             format!(
-                "dedicated shutdown-validation VM enforced grace={}ms and exited within {:?} even with a blocked writer",
-                SHUTDOWN_VALIDATION_GRACE_MS, SHUTDOWN_VALIDATION_EXIT_BOUND
+                "dedicated shutdown-validation VM rejected grace=0 and grace>{} with exact validation errors, then enforced one absolute shutdown budget of {}±{}ms across ack/admission-stop/cleanup/exit",
+                MAX_SHUTDOWN_GRACE_TIMEOUT_MS,
+                SHUTDOWN_VALIDATION_GRACE_MS,
+                SHUTDOWN_VALIDATION_GRACE_TOLERANCE_MS
             ),
             format!(
                 "auxiliary validation launches tracked: started={}, torn_down={}",
@@ -1644,10 +1648,21 @@ fn run_req12_channel_loss_generation(state: &mut LiveHarnessState) -> CheckOutco
     };
     let old_launch = session.launch;
     let exec_id = 1_201_u32;
+    let stale_flow_exec_id = 1_298_u32;
+    let stale_stdin_exec_id = 1_299_u32;
+    let queued_output_bytes = 131_072_u64;
     if let Err(error) = start_probe_exec(
         session,
         exec_id,
-        &["spawn-tree", "--hold-ms", "30000"],
+        &[
+            "spawn-tree",
+            "--hold-ms",
+            "30000",
+            "--stdout-bytes",
+            &queued_output_bytes.to_string(),
+            "--stdout-chunk",
+            "4096",
+        ],
         None,
     ) {
         return fail_check(error);
@@ -1688,10 +1703,10 @@ fn run_req12_channel_loss_generation(state: &mut LiveHarnessState) -> CheckOutco
                     return fail_check(error);
                 }
                 output.extend_from_slice(&record.chunk);
-                let _ = grant_stream(session, exec_id, StreamName::Stdout, 1);
                 if let Some(pids) = parse_tree_pids(&output) {
                     break pids;
                 }
+                let _ = grant_stream(session, exec_id, StreamName::Stdout, 1);
             }
             AgentControlMessage::StderrChunk(record) if record.exec_id == exec_id => {
                 observed_messages = observed_messages.saturating_add(1);
@@ -1709,24 +1724,38 @@ fn run_req12_channel_loss_generation(state: &mut LiveHarnessState) -> CheckOutco
             _ => {}
         }
     };
+    std::thread::sleep(Duration::from_millis(200));
+    let queue_established = match session
+        .client
+        .request_health_observing_inbound(LIVE_TIMEOUT, |message| {
+            if matches!(message, AgentControlMessage::StdoutChunk(record) if record.exec_id == exec_id)
+            {
+                return Err(ClientError::Protocol(format!(
+                    "req12 observed stdout for exec {exec_id} while credits were withheld to establish queue/backpressure"
+                )));
+            }
+            Ok(())
+        }) {
+        Ok(AgentControlMessage::Health(status)) => {
+            status.active_exec_id == Some(exec_id)
+                && status.channel_generation == session.vm.plan.channel_generation
+        }
+        Ok(other) => {
+            return fail_check(format!(
+                "req12 queue-establishment health returned unexpected message: {other:?}"
+            ));
+        }
+        Err(error) => return fail_check(format!("req12 queue-establishment health failed: {error}")),
+    };
     let reconnect_launch = LaunchIdentity {
         generation: old_launch.generation.saturating_add(1),
         nonce: next_launch_nonce(old_launch.nonce),
     };
-    let reconnect = match reconnect_after_control_drop(session, reconnect_launch) {
+    let reconnect = match reconnect_after_control_drop(session, old_launch, reconnect_launch) {
         Ok(value) => value,
         Err(error) => return fail_check(error),
     };
-    let tree_gone = match run_pid_check(session, 1_202, tree_pids.child, tree_pids.grandchild) {
-        Ok(value) => value,
-        Err(error) => return fail_check(error),
-    };
-    if !tree_gone {
-        return fail_check(
-            "req12 reconnect admitted work before old child tree was gone".to_string(),
-        );
-    }
-    let stale_launch_rejected = expect_error_after_send(
+    let stale_launch_detail = match expect_error_after_send(
         session,
         HostControlMessage::Configure {
             launch: old_launch,
@@ -1735,67 +1764,124 @@ fn run_req12_channel_loss_generation(state: &mut LiveHarnessState) -> CheckOutco
             containment: session.containment,
         },
         LIVE_TIMEOUT,
-    )
-    .map(|detail| {
-        detail.code == ProtocolErrorCode::LaunchGenerationConflict
-            || detail.code == ProtocolErrorCode::LaunchGenerationNotNewer
-            || detail.code == ProtocolErrorCode::InvalidLifecycleTransition
-    })
-    .unwrap_or(false);
-    let stale_flow_rejected = match session.client.send_flow_credits(FlowCreditRequest {
-        exec_id,
+    ) {
+        Ok(detail) => detail,
+        Err(error) => return fail_check(error),
+    };
+    let stale_launch_rejected = stale_launch_detail.code
+        == ProtocolErrorCode::InvalidLifecycleTransition
+        && stale_launch_detail
+            .message
+            .contains("LaunchGenerationConflict");
+    let stale_flow_detail = match session.client.send_flow_credits(FlowCreditRequest {
+        exec_id: stale_flow_exec_id,
         stream: StreamName::Stdout,
         credits: 1,
     }) {
         Ok(_) => match expect_protocol_error(session, LIVE_TIMEOUT) {
-            Ok(detail) => is_stale_identifier_rejection(&detail),
-            Err(_) => false,
+            Ok(detail) => detail,
+            Err(error) => return fail_check(error),
         },
-        Err(_) => false,
+        Err(error) => return fail_check(format!("req12 stale flow send failed: {error}")),
     };
-    let stale_stdin_rejected = match session.client.send_stdin_chunk(StdinChunkRecord {
-        exec_id,
+    let stale_flow_rejected = stale_flow_detail.code
+        == ProtocolErrorCode::InvalidLifecycleTransition
+        && stale_flow_detail.message.contains("UnknownExecId")
+        && stale_flow_detail
+            .message
+            .contains(&stale_flow_exec_id.to_string());
+    let stale_stdin_detail = match session.client.send_stdin_chunk(StdinChunkRecord {
+        exec_id: stale_stdin_exec_id,
         sequence: 0,
         chunk: vec![1, 2, 3],
     }) {
         Ok(_) => match expect_protocol_error(session, LIVE_TIMEOUT) {
-            Ok(detail) => is_stale_identifier_rejection(&detail),
-            Err(_) => false,
+            Ok(detail) => detail,
+            Err(error) => return fail_check(error),
         },
-        Err(_) => false,
+        Err(error) => return fail_check(format!("req12 stale stdin send failed: {error}")),
     };
-    let reused_exec_rejected =
-        match start_probe_exec(session, exec_id, &["seq", "--token", "stale"], None) {
+    let stale_stdin_rejected = stale_stdin_detail.code
+        == ProtocolErrorCode::InvalidLifecycleTransition
+        && stale_stdin_detail.message.contains("UnknownExecId")
+        && stale_stdin_detail
+            .message
+            .contains(&stale_stdin_exec_id.to_string());
+    let cleanup_health_ok = match session.client.request_health(LIVE_TIMEOUT) {
+        Ok(AgentControlMessage::Health(status)) => {
+            status.launch_admitted
+                && status.agent_state == agent_protocol::messages::AgentSessionState::Active
+                && status.active_exec_id.is_none()
+                && status.channel_generation == session.vm.plan.channel_generation
+        }
+        Ok(other) => {
+            return fail_check(format!(
+                "req12 post-reconnect cleanup health returned unexpected message: {other:?}"
+            ));
+        }
+        Err(error) => {
+            return fail_check(format!(
+                "req12 post-reconnect cleanup health failed: {error}"
+            ));
+        }
+    };
+    let tree_gone = match run_pid_check(session, 1_202, tree_pids.child, tree_pids.grandchild) {
+        Ok(value) => value,
+        Err(error) => return fail_check(error),
+    };
+    let old_exec_reused_once = matches!(
+        run_simple_probe_exec(session, exec_id, &["seq", "--token", "reuse-once", "--exit", "0"]),
+        Ok((ExecDisposition::ExitCode(0), ref out, _)) if out == b"seq:reuse-once\n"
+    );
+    let same_generation_second_reuse_detail =
+        match start_probe_exec(session, exec_id, &["seq", "--token", "reuse-twice"], None) {
             Ok(()) => match expect_protocol_error(session, LIVE_TIMEOUT) {
-                Ok(detail) => is_stale_identifier_rejection(&detail),
-                Err(_) => false,
+                Ok(detail) => detail,
+                Err(error) => return fail_check(error),
             },
-            Err(_) => false,
+            Err(error) => return fail_check(error),
         };
+    let same_generation_second_reuse_rejected = same_generation_second_reuse_detail.code
+        == ProtocolErrorCode::InvalidLifecycleTransition
+        && same_generation_second_reuse_detail
+            .message
+            .contains("ExecIdReusedInGeneration")
+        && same_generation_second_reuse_detail
+            .message
+            .contains(&exec_id.to_string());
     let new_exec_ok = matches!(
         run_simple_probe_exec(session, 1_203, &["seq", "--token", "fresh", "--exit", "0"]),
         Ok((ExecDisposition::ExitCode(0), ref out, _)) if out == b"seq:fresh\n"
     );
     let generation_advanced = reconnect.new_launch.generation > old_launch.generation;
     if generation_advanced
+        && queue_established
+        && reconnect.replacement_connect_after_close
         && reconnect.ready_observed
-        && tree_gone
+        && reconnect.stale_generation_rejected
+        && reconnect.same_previous_generation_rejected
+        && reconnect.stale_capability_rejected
         && stale_launch_rejected
         && stale_flow_rejected
         && stale_stdin_rejected
-        && reused_exec_rejected
+        && cleanup_health_ok
+        && tree_gone
+        && old_exec_reused_once
+        && same_generation_second_reuse_rejected
         && new_exec_ok
     {
         pass_check(vec![
             format!(
-                "dropped authenticated control pipe during active child+grandchild exec (child={}, grandchild={}) and reattached to same OpenVMM broker",
-                tree_pids.child, tree_pids.grandchild
+                "dropped authenticated control pipe during active output-producing child+grandchild exec (child={}, grandchild={}); queue/backpressure was established by withholding stdout credits while the workload emitted {} bytes",
+                tree_pids.child, tree_pids.grandchild, queued_output_bytes
             ),
             format!(
-                "reconnect handled broker attach flow (wait_seen={}, reset_seen={}), admitted strictly newer launch generation {}",
+                "reconnect closed prior control handle before replacement connect (ordered_close_connect={}); broker attach flow wait_seen={}, reset_seen={}, and admitted strictly newer launch generation {}",
+                reconnect.replacement_connect_after_close,
                 reconnect.wait_observed, reconnect.reset_observed, reconnect.new_launch.generation
             ),
-            "old tree was confirmed gone before new work admission; stale launch/stream/stdin/reused-exec identifiers were rejected; new unique exec succeeded exactly once".to_string(),
+            "before any new post-reconnect execution, stale HostHello/auth probes, stale configure, stale flow-credits/stdin records, and cleanup health(no active exec) checks each returned the exact correlated typed errors".to_string(),
+            "after cleanup completion checks, pid-gone probe verified prior child/grandchild termination; then old exec id succeeded exactly once in the new generation, same-generation second reuse was rejected, and a new unique exec succeeded".to_string(),
         ])
     } else {
         fail_check("req12 channel-loss/reconnect generation invariants failed".to_string())
@@ -1989,31 +2075,99 @@ struct ReconnectObservation {
     wait_observed: bool,
     ready_observed: bool,
     reset_observed: bool,
+    stale_generation_rejected: bool,
+    same_previous_generation_rejected: bool,
+    stale_capability_rejected: bool,
+    replacement_connect_after_close: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct ReconnectConnectMetadata {
+    pipe_path: String,
+    expected_image: String,
+    process_id: u32,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplaceOrderingObservation {
+    old_handle_closed_before_connect: bool,
+}
+
+#[cfg(windows)]
+fn replace_slot_after_drop<T, F>(
+    slot: &mut T,
+    placeholder: T,
+    connect: F,
+) -> Result<ReplaceOrderingObservation, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    let old = std::mem::replace(slot, placeholder);
+    drop(old);
+    let replacement = connect()?;
+    let stale_placeholder = std::mem::replace(slot, replacement);
+    drop(stale_placeholder);
+    Ok(ReplaceOrderingObservation {
+        old_handle_closed_before_connect: true,
+    })
+}
+
+#[cfg(windows)]
+fn replace_client_with_reconnect_connect<F>(
+    session: &mut LiveWhpSession,
+    metadata: &ReconnectConnectMetadata,
+    connect: F,
+) -> Result<ReplaceOrderingObservation, String>
+where
+    F: FnOnce(&ReconnectConnectMetadata) -> Result<MxcAgentClient<NamedPipeClient>, String>,
+{
+    let placeholder_client = MxcAgentClient::new(HostControlSession::new(
+        NamedPipeClient::disconnected_placeholder()
+            .map_err(|error| format!("req12 reconnect placeholder setup failed: {error}"))?,
+    ));
+    replace_slot_after_drop(&mut session.client, placeholder_client, || {
+        connect(metadata)
+    })
+}
+
+#[cfg(windows)]
+fn reconnect_connect_with_named_pipe(
+    metadata: &ReconnectConnectMetadata,
+) -> Result<MxcAgentClient<NamedPipeClient>, String> {
+    let reconnect_pipe = NamedPipeClient::connect(
+        &metadata.pipe_path,
+        Duration::from_secs(5),
+        Some(metadata.process_id),
+        Some(metadata.expected_image.as_str()),
+    )
+    .map_err(|error| format!("req12 reconnect control-pipe connect failed: {error}"))?;
+    Ok(MxcAgentClient::new(HostControlSession::new(reconnect_pipe)))
 }
 
 #[cfg(windows)]
 fn reconnect_after_control_drop(
     session: &mut LiveWhpSession,
+    old_launch: LaunchIdentity,
     new_launch: LaunchIdentity,
 ) -> Result<ReconnectObservation, String> {
-    let pipe_path = session.vm.plan.control_pipe_name.clone();
-    let expected_image = session
-        .vm
-        .plan
-        .artifacts
-        .openvmm_exe
-        .to_string_lossy()
-        .into_owned();
-    let reconnect_pipe = NamedPipeClient::connect(
-        &pipe_path,
-        Duration::from_secs(5),
-        Some(session.vm.process_id()),
-        Some(expected_image.as_str()),
-    )
-    .map_err(|error| format!("req12 reconnect control-pipe connect failed: {error}"))?;
-    let replacement_client = MxcAgentClient::new(HostControlSession::new(reconnect_pipe));
-    let old_client = std::mem::replace(&mut session.client, replacement_client);
-    drop(old_client);
+    let metadata = ReconnectConnectMetadata {
+        pipe_path: session.vm.plan.control_pipe_name.clone(),
+        expected_image: session
+            .vm
+            .plan
+            .artifacts
+            .openvmm_exe
+            .to_string_lossy()
+            .into_owned(),
+        process_id: session.vm.process_id(),
+    };
+    let replace_ordering = replace_client_with_reconnect_connect(
+        session,
+        &metadata,
+        reconnect_connect_with_named_pipe,
+    )?;
 
     let attach_deadline = Instant::now() + Duration::from_secs(5);
     let mut wait_observed = false;
@@ -2062,6 +2216,85 @@ fn reconnect_after_control_drop(
             }
         }
     }
+    let stale_generation_rejected = {
+        session
+            .client
+            .send_host_hello(HostControlMessage::HostHello {
+                service: SERVICE_IDENTITY.to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                launch: old_launch,
+                capability_proof: launch_capability_proof(old_launch.nonce)?,
+            })
+            .map_err(|error| format!("req12 reconnect stale HostHello send failed: {error}"))?;
+        let detail = expect_error_after_send(
+            session,
+            HostControlMessage::Configure {
+                launch: old_launch,
+                root: session.root.clone(),
+                mappings: session.req9_mappings.clone(),
+                containment: session.containment,
+            },
+            LIVE_TIMEOUT,
+        )?;
+        detail.code == ProtocolErrorCode::InvalidLifecycleTransition
+            && detail.message.contains("GenerationNotNewer")
+    };
+    let same_previous_generation = LaunchIdentity {
+        generation: old_launch.generation,
+        nonce: next_launch_nonce(old_launch.nonce),
+    };
+    let same_previous_generation_rejected = {
+        session
+            .client
+            .send_host_hello(HostControlMessage::HostHello {
+                service: SERVICE_IDENTITY.to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                launch: same_previous_generation,
+                capability_proof: launch_capability_proof(same_previous_generation.nonce)?,
+            })
+            .map_err(|error| {
+                format!("req12 reconnect same-generation HostHello send failed: {error}")
+            })?;
+        let detail = expect_error_after_send(
+            session,
+            HostControlMessage::Configure {
+                launch: same_previous_generation,
+                root: session.root.clone(),
+                mappings: session.req9_mappings.clone(),
+                containment: session.containment,
+            },
+            LIVE_TIMEOUT,
+        )?;
+        detail.code == ProtocolErrorCode::InvalidLifecycleTransition
+            && detail.message.contains("GenerationNotNewer")
+    };
+    let stale_capability_rejected = {
+        session
+            .client
+            .send_host_hello(HostControlMessage::HostHello {
+                service: SERVICE_IDENTITY.to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                launch: new_launch,
+                capability_proof: launch_capability_proof(old_launch.nonce)?,
+            })
+            .map_err(|error| {
+                format!("req12 reconnect stale capability HostHello send failed: {error}")
+            })?;
+        let detail = expect_error_after_send(
+            session,
+            HostControlMessage::Configure {
+                launch: new_launch,
+                root: session.root.clone(),
+                mappings: session.req9_mappings.clone(),
+                containment: session.containment,
+            },
+            LIVE_TIMEOUT,
+        )?;
+        detail.code == ProtocolErrorCode::InvalidLifecycleTransition
+            && detail
+                .message
+                .contains("capability proof did not match trusted launch capability")
+    };
     session
         .client
         .send_host_hello(HostControlMessage::HostHello {
@@ -2103,6 +2336,10 @@ fn reconnect_after_control_drop(
         wait_observed,
         ready_observed,
         reset_observed,
+        stale_generation_rejected,
+        same_previous_generation_rejected,
+        stale_capability_rejected,
+        replacement_connect_after_close: replace_ordering.old_handle_closed_before_connect,
     })
 }
 
@@ -2207,9 +2444,41 @@ fn run_req11_shutdown_validation_session(session: &mut LiveWhpSession) -> Result
                 .map_err(|error| format!("req11 shutdown validation health failed: {error}"))?,
             AgentControlMessage::Health(status) if status.active_exec_id == Some(11_901)
         );
+        let invalid_zero_detail = client.request_shutdown(0, LIVE_TIMEOUT).map_err(|error| {
+            format!("req11 shutdown validation zero-grace request failed: {error}")
+        })?;
+        let invalid_zero_rejected = matches!(
+            invalid_zero_detail,
+            AgentControlMessage::Error(ProtocolErrorDetail { code: ProtocolErrorCode::InvalidLifecycleTransition, ref message })
+            if message == "InvalidInput: grace_timeout_ms must be greater than zero"
+        );
+        let invalid_above_max_detail = client
+            .request_shutdown(
+                MAX_SHUTDOWN_GRACE_TIMEOUT_MS.saturating_add(1),
+                LIVE_TIMEOUT,
+            )
+            .map_err(|error| {
+                format!("req11 shutdown validation over-max request failed: {error}")
+            })?;
+        let invalid_above_max_rejected = matches!(
+            invalid_above_max_detail,
+            AgentControlMessage::Error(ProtocolErrorDetail { code: ProtocolErrorCode::InvalidLifecycleTransition, ref message })
+            if *message == format!(
+                "InvalidInput: grace_timeout_ms exceeds maximum supported value {MAX_SHUTDOWN_GRACE_TIMEOUT_MS}"
+            )
+        );
+        let shutdown_start = Instant::now();
+        let shutdown_deadline = shutdown_start
+            .checked_add(Duration::from_millis(
+                SHUTDOWN_VALIDATION_GRACE_MS + SHUTDOWN_VALIDATION_GRACE_TOLERANCE_MS,
+            ))
+            .ok_or_else(|| "req11 shutdown validation deadline overflowed".to_string())?;
         let shutdown_ack = matches!(
             client
-                .request_shutdown(SHUTDOWN_VALIDATION_GRACE_MS, LIVE_TIMEOUT)
+                .request_shutdown(
+                    SHUTDOWN_VALIDATION_GRACE_MS,
+                    remaining_until(shutdown_deadline, "req11 shutdown ack")?
+                )
                 .map_err(|error| format!(
                     "req11 shutdown validation shutdown request failed: {error}"
                 ))?,
@@ -2228,17 +2497,43 @@ fn run_req11_shutdown_validation_session(session: &mut LiveWhpSession) -> Result
                 env: vec![],
                 timeout_ms: None,
             }) {
-                Ok(_) => expect_protocol_error_in(&mut client, LIVE_TIMEOUT).is_ok(),
-                Err(_) => true,
+                Ok(_) => {
+                    let detail = expect_protocol_error_in(
+                        &mut client,
+                        remaining_until(shutdown_deadline, "req11 post-ack admission rejection")?,
+                    )?;
+                    detail.code == ProtocolErrorCode::InvalidLifecycleTransition
+                        && detail.message.contains("LaunchShuttingDown")
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "req11 shutdown validation post-ack create send failed: {error}"
+                    ));
+                }
             };
-        let shutdown_start = Instant::now();
-        let exited = vm.wait_for_exit_with_timeout(SHUTDOWN_VALIDATION_EXIT_BOUND)?;
-        let exited_elapsed = shutdown_start.elapsed();
+        let post_ack_health_ok = matches!(
+            client
+                .request_health(remaining_until(shutdown_deadline, "req11 post-ack cleanup health")?)
+                .map_err(|error| format!("req11 shutdown validation post-ack health failed: {error}"))?,
+            AgentControlMessage::Health(status)
+            if status.shutting_down && status.active_exec_id.is_none()
+        );
+        let exited = vm.wait_for_exit_with_timeout(remaining_until(
+            shutdown_deadline,
+            "req11 openvmm shutdown exit",
+        )?)?;
+        let elapsed = shutdown_start.elapsed();
         Ok(active
+            && invalid_zero_rejected
+            && invalid_above_max_rejected
             && shutdown_ack
             && post_ack_exec_rejected
+            && post_ack_health_ok
             && exited
-            && exited_elapsed <= SHUTDOWN_VALIDATION_EXIT_BOUND)
+            && elapsed
+                <= Duration::from_millis(
+                    SHUTDOWN_VALIDATION_GRACE_MS + SHUTDOWN_VALIDATION_GRACE_TOLERANCE_MS,
+                ))
     })();
     let teardown = vm
         .kill()
@@ -2356,13 +2651,6 @@ fn launch_capability_proof(nonce: [u8; 16]) -> Result<CapabilityProofMaterial, S
 }
 
 #[cfg(windows)]
-fn is_stale_identifier_rejection(detail: &ProtocolErrorDetail) -> bool {
-    detail.code == ProtocolErrorCode::UnknownExecId
-        || detail.code == ProtocolErrorCode::ExecIdReusedInGeneration
-        || detail.code == ProtocolErrorCode::InvalidLifecycleTransition
-}
-
-#[cfg(windows)]
 fn next_launch_nonce(current: [u8; 16]) -> [u8; 16] {
     let mut next = current;
     next[0] ^= 0xA5;
@@ -2440,6 +2728,15 @@ fn expect_protocol_error_in(
         }
     }
     Err("timed out waiting for protocol error response".to_string())
+}
+
+#[cfg(windows)]
+fn remaining_until(deadline: Instant, context: &str) -> Result<Duration, String> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(format!("deadline exhausted while waiting for {context}"));
+    }
+    Ok(deadline.saturating_duration_since(now))
 }
 
 #[cfg(windows)]
@@ -3146,6 +3443,8 @@ fn fail_check(error: String) -> CheckOutcome {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::{HarnessBackend, HarnessMode};
 
@@ -3443,27 +3742,44 @@ mod tests {
     }
 
     #[test]
-    fn req12_stale_identifier_rejection_classifier_accepts_only_expected_codes() {
-        let stale_unknown = ProtocolErrorDetail {
-            code: ProtocolErrorCode::UnknownExecId,
-            message: "unknown exec".to_string(),
+    fn req12_reconnect_replacement_connect_runs_after_old_drop() {
+        #[derive(Clone)]
+        struct DropTracked {
+            dropped: Arc<AtomicBool>,
+            label: &'static str,
+        }
+
+        impl Drop for DropTracked {
+            fn drop(&mut self) {
+                if self.label == "old" {
+                    self.dropped.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut slot = DropTracked {
+            dropped: Arc::clone(&dropped),
+            label: "old",
         };
-        let stale_reused = ProtocolErrorDetail {
-            code: ProtocolErrorCode::ExecIdReusedInGeneration,
-            message: "reused".to_string(),
+        let placeholder = DropTracked {
+            dropped: Arc::clone(&dropped),
+            label: "placeholder",
         };
-        let stale_lifecycle = ProtocolErrorDetail {
-            code: ProtocolErrorCode::InvalidLifecycleTransition,
-            message: "invalid".to_string(),
-        };
-        let non_stale = ProtocolErrorDetail {
-            code: ProtocolErrorCode::FlowControlCreditOverflow,
-            message: "overflow".to_string(),
-        };
-        assert!(is_stale_identifier_rejection(&stale_unknown));
-        assert!(is_stale_identifier_rejection(&stale_reused));
-        assert!(is_stale_identifier_rejection(&stale_lifecycle));
-        assert!(!is_stale_identifier_rejection(&non_stale));
+        let observation = replace_slot_after_drop(&mut slot, placeholder, || {
+            if !dropped.load(Ordering::SeqCst) {
+                return Err(
+                    "old client handle was not dropped before reconnect connect".to_string()
+                );
+            }
+            Ok(DropTracked {
+                dropped: Arc::clone(&dropped),
+                label: "replacement",
+            })
+        })
+        .expect("replace should succeed");
+        assert!(observation.old_handle_closed_before_connect);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]

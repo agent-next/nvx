@@ -61,9 +61,11 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   of hardcoded harness failures: req10 validates runtime-emitted
   `WaitReady`/`Health` network status by observed launch mode, req11 runs
   health/quiesce/resume on the shared session plus a dedicated shutdown
-  validation VM (tracked auxiliary launch lifecycle), and req12 validates
-  control-channel loss cleanup + strictly newer-generation reconnect with
-  stale-ID rejection before admitting new execution.
+  validation VM (tracked auxiliary launch lifecycle, typed invalid-shutdown
+  request checks, and one absolute grace-rooted shutdown budget), and req12
+  validates control-channel loss cleanup + strictly newer-generation reconnect
+  with ordered handle-close-then-connect, stale auth/config/flow/stdin rejection
+  correlation, and exec-ID reuse exactly once per generation.
 - Post-config capability advertisement now exposes `Exec`, `Streams`, `Cancel`,
   `Quiesce`, `Resume`, and `Shutdown` after full lifecycle activation.
 - Cancellation, timeout escalation, descendant termination, channel-loss cleanup,

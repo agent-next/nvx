@@ -787,6 +787,8 @@ fn run_signal_self(args: Vec<String>) -> Result<()> {
 fn run_spawn_tree(args: Vec<String>) -> Result<()> {
     let mut hold_ms = 30_000_u64;
     let mut ignore_term = false;
+    let mut stdout_bytes = 0_u64;
+    let mut stdout_chunk = 4096_usize;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -800,8 +802,25 @@ fn run_spawn_tree(args: Vec<String>) -> Result<()> {
                 ignore_term = true;
                 index += 1;
             }
+            "--stdout-bytes" => {
+                stdout_bytes = required_value(&args, index + 1, "--stdout-bytes")?
+                    .parse::<u64>()
+                    .map_err(|error| format!("invalid --stdout-bytes value: {error}"))?;
+                index += 2;
+            }
+            "--stdout-chunk" => {
+                stdout_chunk = required_value(&args, index + 1, "--stdout-chunk")?
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid --stdout-chunk value: {error}"))?;
+                index += 2;
+            }
             flag => return Err(format!("unknown spawn-tree flag {flag:?}")),
         }
+    }
+    if stdout_bytes > 0 && stdout_chunk == 0 {
+        return Err(
+            "spawn-tree requires --stdout-chunk > 0 when --stdout-bytes is set".to_string(),
+        );
     }
     let exe = std::env::current_exe().map_err(|error| format!("current_exe failed: {error}"))?;
     let mut child = Command::new(&exe)
@@ -839,6 +858,17 @@ fn run_spawn_tree(args: Vec<String>) -> Result<()> {
         "tree parent={parent_pid} child={child_pid} grandchild={grandchild_pid}"
     )
     .map_err(|error| format!("writing tree line failed: {error}"))?;
+    if stdout_bytes > 0 {
+        let mut remaining = stdout_bytes;
+        let payload = vec![b'Q'; stdout_chunk];
+        while remaining > 0 {
+            let write_now = remaining.min(payload.len() as u64) as usize;
+            stdout
+                .write_all(&payload[..write_now])
+                .map_err(|error| format!("writing queued tree payload failed: {error}"))?;
+            remaining -= write_now as u64;
+        }
+    }
     stdout
         .flush()
         .map_err(|error| format!("flushing tree line failed: {error}"))?;

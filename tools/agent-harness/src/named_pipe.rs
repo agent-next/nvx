@@ -115,6 +115,31 @@ impl NamedPipeClient {
         }
     }
 
+    pub fn disconnected_placeholder() -> Result<Self, NamedPipeError> {
+        let wide = wide_null(r"\\.\NUL");
+        // SAFETY: Win32 call with stable UTF-16 buffer.
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .map_err(|error| NamedPipeError {
+            message: format!("failed creating disconnected placeholder pipe handle: {error}"),
+        })?;
+        Ok(Self {
+            // SAFETY: handle is owned because CreateFileW succeeded.
+            handle: unsafe { OwnedHandle::from_raw_handle(handle.0 as *mut _) },
+            server_pid: 0,
+            server_image_path: String::new(),
+        })
+    }
+
     fn configure_nonblocking_mode(&self) -> Result<(), NamedPipeError> {
         let mode = PIPE_NOWAIT;
         // SAFETY: valid named-pipe handle and mode pointer.
