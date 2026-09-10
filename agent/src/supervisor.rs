@@ -44,14 +44,63 @@ struct PreparedExecCgroup {
     cgroup_dir: PathBuf,
     cgroup_procs_path: CString,
     cgroup_procs_fd: i32,
+    cleanup_armed: bool,
+}
+
+impl PreparedExecCgroup {
+    fn disarm_cleanup(&mut self) {
+        self.cleanup_armed = false;
+    }
+
+    fn rollback_empty_cgroup(&mut self) -> io::Result<()> {
+        let close_error = self.close_fd();
+        let remove_error = fs::remove_dir(&self.cgroup_dir);
+        match (close_error, remove_error) {
+            (Ok(()), Ok(())) => {
+                self.cleanup_armed = false;
+                Ok(())
+            }
+            (Err(close), Ok(())) => Err(close),
+            (Ok(()), Err(remove)) => Err(remove),
+            (Err(close), Err(remove)) => Err(io::Error::other(format!(
+                "closing prepared cgroup descriptor failed: {close}; removing empty prepared cgroup {} failed: {remove}",
+                self.cgroup_dir.display()
+            ))),
+        }
+    }
+
+    fn close_fd(&mut self) -> io::Result<()> {
+        if self.cgroup_procs_fd < 0 {
+            return Ok(());
+        }
+        // SAFETY: best-effort close for process-owned descriptor.
+        let rc = unsafe { libc::close(self.cgroup_procs_fd) };
+        self.cgroup_procs_fd = -1;
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
 }
 
 impl Drop for PreparedExecCgroup {
     fn drop(&mut self) {
-        if self.cgroup_procs_fd >= 0 {
-            // SAFETY: best-effort close for process-owned descriptor.
-            let _ = unsafe { libc::close(self.cgroup_procs_fd) };
-            self.cgroup_procs_fd = -1;
+        if let Err(error) = self.close_fd() {
+            eprintln!(
+                "nvx-agent supervisor cleanup failure action=close-prepared-exec-cgroup-fd path={} error={}",
+                self.cgroup_dir.display(),
+                error
+            );
+        }
+        if self.cleanup_armed
+            && let Err(error) = fs::remove_dir(&self.cgroup_dir)
+        {
+            eprintln!(
+                "nvx-agent supervisor cleanup failure action=remove-prepared-exec-cgroup path={} error={}",
+                self.cgroup_dir.display(),
+                error
+            );
         }
     }
 }
@@ -188,9 +237,15 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             }
         }
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| supervisor_io("spawning process", error))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(spawn_error) => {
+                return Err(report_spawn_failure_with_cgroup_cleanup(
+                    prepared_cgroup,
+                    spawn_error,
+                ));
+            }
+        };
         let pid = child.id() as i32;
         let mut stdin = child.stdin.take();
         let mut stdout = child.stdout.take();
@@ -207,7 +262,8 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
 
         let stdin_queue_bytes_atomic = Arc::new(AtomicUsize::new(0));
         let stdin_drained_bytes_atomic = Arc::new(AtomicUsize::new(0));
-        let cgroup_dir = if let Some(prepared) = prepared_cgroup {
+        let cgroup_dir = if let Some(mut prepared) = prepared_cgroup {
+            prepared.disarm_cleanup();
             if self.holder.is_none() {
                 let _ = move_pid_to_exec_cgroup(&prepared.cgroup_procs_path, pid);
             }
@@ -651,11 +707,12 @@ fn set_nonblocking(fd: i32) -> Result<(), ServiceError> {
 
 fn try_prepare_workload_cgroup(exec_id: u32, pid: i32) -> Option<PathBuf> {
     let root = Path::new("/sys/fs/cgroup/nvx.workload");
-    let prepared = prepare_exec_cgroup(root, exec_id).ok()?;
+    let mut prepared = prepare_exec_cgroup(root, exec_id).ok()?;
     if move_pid_to_exec_cgroup(&prepared.cgroup_procs_path, pid).is_err() {
-        remove_exec_cgroup(Some(prepared.cgroup_dir.as_path()), None);
+        let _ = prepared.rollback_empty_cgroup();
         return None;
     }
+    prepared.disarm_cleanup();
     Some(prepared.cgroup_dir.clone())
 }
 
@@ -666,7 +723,8 @@ fn prepare_exec_cgroup(root: &Path, exec_id: u32) -> Result<PreparedExecCgroup, 
             "injected failure preparing per-exec cgroup",
         ));
     }
-    for attempt in 0..64_u32 {
+    let mut attempt = 0_u64;
+    loop {
         let dir = root.join(format!("exec-{exec_id}-{}-{attempt}", std::process::id()));
         match fs::create_dir(&dir) {
             Ok(()) => {
@@ -685,15 +743,39 @@ fn prepare_exec_cgroup(root: &Path, exec_id: u32) -> Result<PreparedExecCgroup, 
                     cgroup_dir: dir,
                     cgroup_procs_path,
                     cgroup_procs_fd: fd,
+                    cleanup_armed: true,
                 });
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                attempt = attempt.wrapping_add(1);
+                continue;
+            }
             Err(error) => return Err(supervisor_io("creating per-exec cgroup directory", error)),
         }
     }
-    Err(supervisor_error(
-        "exhausted per-exec cgroup naming attempts without a free slot",
-    ))
+}
+
+fn report_spawn_failure_with_cgroup_cleanup(
+    mut prepared: Option<PreparedExecCgroup>,
+    spawn_error: io::Error,
+) -> ServiceError {
+    let primary = supervisor_io("spawning process", spawn_error);
+    let Some(prepared) = prepared.as_mut() else {
+        return primary;
+    };
+    let cleanup_path = prepared.cgroup_dir.clone();
+    match prepared.rollback_empty_cgroup() {
+        Ok(()) => primary,
+        Err(cleanup_error) => ServiceError {
+            code: primary.code,
+            message: format!(
+                "spawn rollback failed (primary=\"{}\", cleanup_action=\"remove_empty_prepared_exec_cgroup\", cleanup_path=\"{}\", cleanup_error=\"{}\")",
+                primary.message,
+                cleanup_path.display(),
+                cleanup_error
+            ),
+        },
+    }
 }
 
 fn move_self_to_cgroup_fd(cgroup_procs_fd: i32) -> io::Result<()> {
@@ -967,6 +1049,34 @@ mod tests {
         None
     }
 
+    fn count_exec_cgroup_dirs(root: &Path, prefix: &str) -> usize {
+        let Ok(entries) = fs::read_dir(root) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .and_then(|kind| kind.is_dir().then_some(entry))
+            })
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .count()
+    }
+
+    fn simulate_spawn_failure_with_prepared_cgroup(
+        root: &Path,
+        exec_id: u32,
+    ) -> Result<(), ServiceError> {
+        let prepared = prepare_exec_cgroup(root, exec_id)?;
+        let spawn_error = io::Error::other("simulated command.spawn failure");
+        Err(report_spawn_failure_with_cgroup_cleanup(
+            Some(prepared),
+            spawn_error,
+        ))
+    }
+
     #[test]
     fn subprocess_stdout_nul_bytes_are_preserved() {
         let mut supervisor = LinuxProcessSupervisor::new();
@@ -1191,5 +1301,103 @@ mod tests {
             .read_to_end(&mut content)
             .expect("read content");
         assert_eq!(content, b"31337\n");
+    }
+
+    #[test]
+    fn spawn_failure_rollback_retries_past_64_without_leaking_exec_dirs() {
+        let root = tempdir().expect("tempdir");
+        let exec_id = 31337_u32;
+        let prefix = format!("exec-{exec_id}-{}-", std::process::id());
+        for _ in 0..96 {
+            let error = simulate_spawn_failure_with_prepared_cgroup(root.path(), exec_id)
+                .expect_err("simulated spawn failure must return error");
+            assert!(
+                error
+                    .message
+                    .contains("spawning process: simulated command.spawn failure"),
+                "primary spawn context missing: {}",
+                error.message
+            );
+            assert_eq!(
+                count_exec_cgroup_dirs(root.path(), &prefix),
+                0,
+                "failed spawn rollback must remove temporary exec cgroup"
+            );
+        }
+        let mut prepared =
+            prepare_exec_cgroup(root.path(), exec_id).expect("prepare after retries");
+        let created_dir = prepared.cgroup_dir.clone();
+        prepared.disarm_cleanup();
+        drop(prepared);
+        assert!(
+            created_dir.exists(),
+            "successful retry must keep prepared cgroup when cleanup is disarmed"
+        );
+        remove_exec_cgroup(Some(created_dir.as_path()), None);
+        assert_eq!(
+            count_exec_cgroup_dirs(root.path(), &prefix),
+            0,
+            "final cleanup should leave no temporary exec cgroup directory"
+        );
+    }
+
+    #[test]
+    fn spawn_failure_reports_cleanup_error_without_masking_primary() {
+        let root = tempdir().expect("tempdir");
+        let exec_id = 5150_u32;
+        let prepared = prepare_exec_cgroup(root.path(), exec_id).expect("prepare");
+        fs::write(prepared.cgroup_dir.join("busy"), b"x").expect("seed non-empty cgroup");
+        let error = report_spawn_failure_with_cgroup_cleanup(
+            Some(prepared),
+            io::Error::other("simulated command.spawn failure"),
+        );
+        assert!(
+            error
+                .message
+                .contains("primary=\"spawning process: simulated command.spawn failure\""),
+            "primary spawn error context must be preserved: {}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("cleanup_action=\"remove_empty_prepared_exec_cgroup\""),
+            "cleanup action context missing: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Linux root privileges and namespace/cgroup write access"]
+    fn holder_failed_spawn_does_not_leak_exec_cgroup_directory() {
+        let mut supervisor = LinuxProcessSupervisor::new_with_holder(1).expect("holder");
+        let holder_root = supervisor
+            .holder
+            .as_ref()
+            .expect("holder present")
+            .cgroup_dir
+            .clone();
+        let exec_id = 9001_u32;
+        let prefix = format!("exec-{exec_id}-{}-", std::process::id());
+        let baseline = count_exec_cgroup_dirs(&holder_root, &prefix);
+        let spawn_error = supervisor
+            .spawn(&CreateProcessRequest {
+                exec_id,
+                argv: vec!["/definitely/missing/binary".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .expect_err("missing binary spawn must fail");
+        assert!(
+            spawn_error.message.contains("spawning process"),
+            "spawn failure context missing: {}",
+            spawn_error.message
+        );
+        assert_eq!(
+            count_exec_cgroup_dirs(&holder_root, &prefix),
+            baseline,
+            "failed holder-backed spawn must not leak per-exec cgroup directories"
+        );
     }
 }
