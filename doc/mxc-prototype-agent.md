@@ -38,7 +38,10 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   quiesce/resume/shutdown lifecycle transactions with bounded blocked-writer
   shutdown semantics, and channel-loss cleanup/new-generation enforcement).
   If the production runtime prerequisites are unavailable on the local host,
-  req10/req11 are reported as `Blocked` instead of passing. Any local runtime
+  req10/req11/req12 are reported as `Blocked` instead of passing. req12 pass
+  evidence is accepted only when it explicitly records production runtime +
+  `LinuxProcessSupervisor` channel-loss execution with a real child/grandchild.
+  Any local runtime
   pass remains non-conformance (`NotLive`) until observed on live WHP.
 - Post-config capability advertisement now exposes `Exec`, `Streams`, `Cancel`,
   `Quiesce`, `Resume`, and `Shutdown` after full lifecycle activation.
