@@ -22,11 +22,16 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 - Process execution is supervised with one active exec at a time, unlimited
   sequential execs, argv/env/cwd execution without shell expansion, bounded
   stdin queueing, and non-destructive credit-aware output streaming.
-- `tools/agent-harness` scenarios 3–6 now exercise the production
-  `MxcControlService` + `LinuxProcessSupervisor` path with real subprocesses on
-  Linux/WSL (sequential exec + typed busy, binary stdout/stderr separation,
-  backpressure/credits, and terminal-order invariants). On non-Linux hosts
-  these scenarios report `Blocked` rather than synthetic pass results.
+- `tools/agent-harness` reports explicit evidence source tiers
+  (`unit-static`, `local-linux-runtime`, `live-whp`) and a separate conformance
+  status. Static or local-runtime evidence can satisfy subchecks, but canonical
+  WHP conformance never passes without `live-whp` evidence for all requirements.
+- Scenarios 3–6 exercise the production `MxcControlService` +
+  `LinuxProcessSupervisor` path with real subprocesses on Linux/WSL
+  (`local-linux-runtime` evidence: sequential exec + typed busy, binary
+  stdout/stderr separation, backpressure/credits, and terminal-order
+  invariants). This remains non-conformance (`NotLive`) until observed on live
+  WHP.
 - Post-config capability advertisement now exposes `Exec`, `Streams`, and
   `Cancel` only. `Quiesce`, `Resume`, and `Shutdown` remain explicitly
   unavailable until reviewed.
@@ -52,8 +57,9 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 
 - Canonical host harness command:
   `python scripts\nvx.py test-mxc-agent --backend whp`
-- Optional deterministic in-process mode for CI/unit coverage (not a live WHP
-  proof): `--static-only`
+- Optional deterministic/static validation mode for CI/unit coverage:
+  `--static-only` (always non-conformance and exits nonzero for canonical WHP
+  conformance).
 - The harness always writes a machine-readable JSON report and bounded
   diagnostics to `build/mxc-agent-harness` (or `--output-dir` override), halts
   on the first failing invariant, and keeps the output directory on failures.

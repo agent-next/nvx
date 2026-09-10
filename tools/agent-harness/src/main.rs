@@ -5,6 +5,9 @@ use agent_harness::{HarnessBackend, HarnessMode, HarnessOptions, execute_harness
 
 fn print_usage() {
     eprintln!("usage: agent-harness --backend whp [--static-only] [--output-dir <path>]");
+    eprintln!(
+        "  --static-only runs validation/static checks only; canonical WHP conformance remains non-passing by design"
+    );
 }
 
 fn parse_args() -> Result<HarnessOptions, String> {
@@ -50,12 +53,19 @@ fn print_summary(run: &agent_harness::HarnessRun) {
         run.report_path.display()
     );
     for scenario in &run.report.scenarios {
+        let conformance = format!("{:?}", scenario.status);
+        let check = format!("{:?}", scenario.check_status);
+        let evidence = format!("{:?}", scenario.evidence_source);
+        let required = format!("{:?}", scenario.required_evidence_source);
         println!(
-            "req{:02} {:<36} {:<11} {}",
+            "req{:02} {:<36} conformance={:<9} check={:<7} evidence={:<20} required={} {}",
             scenario.requirement_number,
             scenario.id,
-            format!("{:?}", scenario.status),
-            scenario.error.as_deref().unwrap_or("ok")
+            conformance,
+            check,
+            evidence,
+            required,
+            scenario.error.as_deref().unwrap_or("ok"),
         );
     }
 }

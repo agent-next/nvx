@@ -578,7 +578,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     mxc_agent_tests = subparsers.add_parser(
         "test-mxc-agent",
-        help="run the deterministic MXC agent host harness",
+        help="run MXC agent harness evidence checks (live WHP conformance requires live-whp evidence)",
     )
     mxc_agent_tests.add_argument(
         "--backend",
@@ -588,7 +588,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mxc_agent_tests.add_argument(
         "--static-only",
         action="store_true",
-        help="run deterministic in-process checks without claiming live WHP proof",
+        help="run static validation only; exits nonzero for canonical conformance by design",
     )
     mxc_agent_tests.add_argument(
         "--output-dir",

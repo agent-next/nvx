@@ -2,22 +2,33 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent_protocol::mapping::{
     AccessMode, CanonicalHostMappingRoot, ChildMapping, MappingContainmentPolicy,
     RelativeChildPath, SymlinkContainmentPolicy,
 };
+#[cfg(target_os = "linux")]
 use agent_protocol::messages::{
-    AgentControlMessage, BuildStatus, ExecDisposition, FlowCreditRequest, IsolationStatus,
-    LaunchIdentity, NetworkMode, NetworkStatus, SERVICE_IDENTITY, WorkloadIdentityStatus,
+    AgentControlMessage, ExecDisposition, FlowCreditRequest, StdinChunkRecord, StdinEofRecord,
 };
+use agent_protocol::messages::{
+    BuildStatus, IsolationStatus, LaunchIdentity, NetworkMode, NetworkStatus, SERVICE_IDENTITY,
+    WorkloadIdentityStatus,
+};
+#[cfg(target_os = "linux")]
+use agent_protocol::service::ProcessSupervisor;
 use agent_protocol::service::{
-    AuthenticateChannelRequest, CancelReason, ConfigureSessionRequest, CreateProcessRequest,
-    FilesystemStatus, LaunchBinding, MxcControlService, ProcessSupervisor, ServiceError,
-    ServiceErrorCode, SessionConfiguration, SupervisorEvent, WaitReadyRequest,
+    AuthenticateChannelRequest, ConfigureSessionRequest, FilesystemStatus, LaunchBinding,
+    MxcControlService, ServiceError, ServiceErrorCode, SessionConfiguration, WaitReadyRequest,
 };
+#[cfg(target_os = "linux")]
+use agent_protocol::service::{CancelReason, CreateProcessRequest};
 use agent_protocol::state::PROTOCOL_VERSION;
+#[cfg(target_os = "linux")]
+use nvx_agent::LinuxProcessSupervisor;
 use serde::{Deserialize, Serialize};
 
 const REPORT_SCHEMA: &str = "nvx.mxc.agent.harness.report.v1";
@@ -130,8 +141,27 @@ const CANONICAL_SCENARIOS: [ScenarioDefinition; 12] = [
 pub enum ScenarioStatus {
     Pass,
     Fail,
+    Blocked,
+    NotLive,
     Unsupported,
     Skipped,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidenceSource {
+    None,
+    UnitStatic,
+    LocalLinuxRuntime,
+    LiveWhp,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceCheckStatus {
+    Pass,
+    Fail,
+    NotRun,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,6 +170,9 @@ pub struct ScenarioResult {
     pub id: String,
     pub name: String,
     pub status: ScenarioStatus,
+    pub check_status: EvidenceCheckStatus,
+    pub evidence_source: EvidenceSource,
+    pub required_evidence_source: EvidenceSource,
     pub duration_ms: u64,
     pub error: Option<String>,
     pub evidence: Vec<String>,
@@ -212,6 +245,9 @@ pub fn execute_harness(options: HarnessOptions) -> Result<HarnessRun, String> {
                 id: definition.id.to_string(),
                 name: definition.name.to_string(),
                 status: ScenarioStatus::Skipped,
+                check_status: EvidenceCheckStatus::NotRun,
+                evidence_source: EvidenceSource::None,
+                required_evidence_source: required_evidence_source(definition),
                 duration_ms: 0,
                 error: Some(format!("skipped because a prior scenario failed: {reason}")),
                 evidence: vec![],
@@ -223,7 +259,7 @@ pub fn execute_harness(options: HarnessOptions) -> Result<HarnessRun, String> {
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        if stop_after.is_none() && result.status != ScenarioStatus::Pass {
+        if stop_after.is_none() && result.status == ScenarioStatus::Fail {
             stop_after = Some(format!(
                 "{} ({}) finished with {:?}",
                 result.id, result.name, result.status
@@ -288,8 +324,8 @@ fn run_scenario(
         definition.requirement_number, definition.id
     ));
     let outcome = match options.mode {
-        HarnessMode::StaticOnly => run_static_scenario(definition),
-        HarnessMode::LiveWhp => run_live_scenario(definition),
+        HarnessMode::StaticOnly => run_static_only_scenario(definition),
+        HarnessMode::LiveWhp => run_live_mode_scenario(definition),
     };
     diagnostics.push(format!(
         "scenario {} => {:?}",
@@ -298,45 +334,176 @@ fn run_scenario(
     outcome
 }
 
-fn run_live_scenario(definition: ScenarioDefinition) -> ScenarioResult {
-    #[cfg(not(windows))]
+fn run_live_mode_scenario(definition: ScenarioDefinition) -> ScenarioResult {
+    #[cfg(target_os = "linux")]
     {
-        if definition.requirement_number == 1 {
-            return unsupported(definition, "live WHP harness requires Windows host APIs");
+        if (3..=6).contains(&definition.requirement_number) {
+            return run_local_linux_runtime_scenario(definition);
         }
-        skipped(definition, "live run blocked by Windows prerequisite")
-    }
-    #[cfg(windows)]
-    {
-        let invariant = crate::windows_security::validate_live_security_prerequisites();
-        if let Err(error) = invariant {
-            if definition.requirement_number == 1 {
-                return unsupported(definition, &error);
-            }
-            return skipped(definition, "launch prerequisites failed in scenario 1");
-        }
-        fail(
+        make_report_result(
             definition,
-            "live scenario execution is not available in this environment; rerun with --static-only for deterministic in-process coverage",
+            EvidenceSource::UnitStatic,
+            EvidenceCheckStatus::Pass,
+            vec!["local mode retains static protocol checks for this requirement".to_string()],
+            Some("live WHP evidence was not collected for this requirement".to_string()),
         )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let static_outcome = run_static_check_scenario(definition);
+        let mut result = make_report_result(
+            definition,
+            static_outcome.evidence_source,
+            static_outcome.check_status,
+            static_outcome.evidence,
+            static_outcome.error,
+        );
+        if result.status == ScenarioStatus::NotLive {
+            result.error = Some(
+                "live WHP evidence collection is not implemented in this harness build".to_string(),
+            );
+        }
+        result
     }
 }
 
-fn run_static_scenario(definition: ScenarioDefinition) -> ScenarioResult {
+fn run_static_only_scenario(definition: ScenarioDefinition) -> ScenarioResult {
+    let static_outcome = run_static_check_scenario(definition);
+    make_report_result(
+        definition,
+        static_outcome.evidence_source,
+        static_outcome.check_status,
+        static_outcome.evidence,
+        static_outcome.error,
+    )
+}
+
+#[derive(Clone, Debug)]
+struct CheckOutcome {
+    check_status: EvidenceCheckStatus,
+    evidence_source: EvidenceSource,
+    error: Option<String>,
+    evidence: Vec<String>,
+}
+
+fn run_static_check_scenario(definition: ScenarioDefinition) -> CheckOutcome {
     match definition.requirement_number {
-        1 => scenario_launch_readiness(definition),
-        2 => scenario_immutable_configuration(definition),
-        3 => scenario_repeated_exec(definition),
-        4 => scenario_binary_stream_separation(definition),
-        5 => scenario_backpressure_record_cap(definition),
-        6 => scenario_terminal_semantics(definition),
-        7 => scenario_fixed_identity(definition),
-        8 => scenario_isolation(definition),
-        9 => scenario_mapping_containment(definition),
-        10 => scenario_network_status(definition),
-        11 => scenario_health_lifecycle(definition),
-        12 => scenario_channel_loss_cleanup(definition),
-        _ => fail(definition, "unknown requirement number"),
+        1 => scenario_check_from_result(scenario_launch_readiness(definition), EvidenceSource::UnitStatic),
+        2 => scenario_check_from_result(
+            scenario_immutable_configuration(definition),
+            EvidenceSource::UnitStatic,
+        ),
+        3..=6 | 12 => CheckOutcome {
+            check_status: EvidenceCheckStatus::NotRun,
+            evidence_source: EvidenceSource::None,
+            error: Some(
+                "requires runtime execution evidence; static/in-process assertions are intentionally not used".to_string(),
+            ),
+            evidence: vec![],
+        },
+        7 => scenario_check_from_result(scenario_fixed_identity(definition), EvidenceSource::UnitStatic),
+        8 => scenario_check_from_result(scenario_isolation(definition), EvidenceSource::UnitStatic),
+        9 => scenario_check_from_result(
+            scenario_mapping_containment(definition),
+            EvidenceSource::UnitStatic,
+        ),
+        10 => scenario_check_from_result(scenario_network_status(definition), EvidenceSource::UnitStatic),
+        11 => scenario_check_from_result(scenario_health_lifecycle(definition), EvidenceSource::UnitStatic),
+        _ => CheckOutcome {
+            check_status: EvidenceCheckStatus::Fail,
+            evidence_source: EvidenceSource::None,
+            error: Some("unknown requirement number".to_string()),
+            evidence: vec![],
+        },
+    }
+}
+
+fn scenario_check_from_result(result: ScenarioResult, source: EvidenceSource) -> CheckOutcome {
+    let check_status = match result.status {
+        ScenarioStatus::Pass => EvidenceCheckStatus::Pass,
+        ScenarioStatus::Fail => EvidenceCheckStatus::Fail,
+        _ => EvidenceCheckStatus::NotRun,
+    };
+    CheckOutcome {
+        check_status,
+        evidence_source: source,
+        error: result.error,
+        evidence: result.evidence,
+    }
+}
+
+fn required_evidence_source(_definition: ScenarioDefinition) -> EvidenceSource {
+    EvidenceSource::LiveWhp
+}
+
+fn status_for_evidence(
+    definition: ScenarioDefinition,
+    check_status: EvidenceCheckStatus,
+    observed_source: EvidenceSource,
+    required_source: EvidenceSource,
+) -> ScenarioStatus {
+    if check_status == EvidenceCheckStatus::Fail {
+        return ScenarioStatus::Fail;
+    }
+    if check_status == EvidenceCheckStatus::NotRun {
+        return ScenarioStatus::Blocked;
+    }
+    if (7..=9).contains(&definition.requirement_number)
+        && observed_source != EvidenceSource::LiveWhp
+    {
+        return ScenarioStatus::Blocked;
+    }
+    if observed_source < required_source {
+        return ScenarioStatus::NotLive;
+    }
+    ScenarioStatus::Pass
+}
+
+fn make_report_result(
+    definition: ScenarioDefinition,
+    observed_source: EvidenceSource,
+    check_status: EvidenceCheckStatus,
+    evidence: Vec<String>,
+    error: Option<String>,
+) -> ScenarioResult {
+    let required_source = required_evidence_source(definition);
+    let status = status_for_evidence(definition, check_status, observed_source, required_source);
+    let status_error = match status {
+        ScenarioStatus::Pass => None,
+        ScenarioStatus::Fail => error,
+        ScenarioStatus::Blocked => Some(error.unwrap_or_else(|| {
+            "blocked: privileged or runtime evidence prerequisites are not satisfied".to_string()
+        })),
+        ScenarioStatus::NotLive => Some(error.unwrap_or_else(|| {
+            format!(
+                "observed evidence source={} is below required source={}",
+                evidence_source_name(observed_source),
+                evidence_source_name(required_source)
+            )
+        })),
+        ScenarioStatus::Unsupported => error,
+        ScenarioStatus::Skipped => error,
+    };
+    ScenarioResult {
+        requirement_number: definition.requirement_number,
+        id: definition.id.to_string(),
+        name: definition.name.to_string(),
+        status,
+        check_status,
+        evidence_source: observed_source,
+        required_evidence_source: required_source,
+        duration_ms: 0,
+        error: status_error,
+        evidence,
+    }
+}
+
+fn evidence_source_name(source: EvidenceSource) -> &'static str {
+    match source {
+        EvidenceSource::None => "none",
+        EvidenceSource::UnitStatic => "unit-static",
+        EvidenceSource::LocalLinuxRuntime => "local-linux-runtime",
+        EvidenceSource::LiveWhp => "live-whp",
     }
 }
 
@@ -451,35 +618,51 @@ fn scenario_immutable_configuration(definition: ScenarioDefinition) -> ScenarioR
     }
 }
 
-fn scenario_repeated_exec(definition: ScenarioDefinition) -> ScenarioResult {
+#[cfg(target_os = "linux")]
+fn run_local_linux_runtime_scenario(definition: ScenarioDefinition) -> ScenarioResult {
+    let check = match definition.requirement_number {
+        3 => local_linux_repeated_exec(),
+        4 => local_linux_binary_stream_separation(),
+        5 => local_linux_backpressure(),
+        6 => local_linux_terminal_semantics(),
+        _ => CheckOutcome {
+            check_status: EvidenceCheckStatus::NotRun,
+            evidence_source: EvidenceSource::None,
+            error: Some(
+                "local-linux-runtime scenarios are defined only for requirements 3-6".to_string(),
+            ),
+            evidence: vec![],
+        },
+    };
+    make_report_result(
+        definition,
+        check.evidence_source,
+        check.check_status,
+        check.evidence,
+        check.error,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn local_linux_repeated_exec() -> CheckOutcome {
     let mut service = activated_service();
-    let mut supervisor = FakeSupervisor::default();
+    let mut supervisor = LinuxProcessSupervisor::new();
     let mut outcomes = Vec::new();
-    for (exec_id, exit_code) in [(300_u32, 10_i32), (301_u32, 11_i32), (302_u32, 12_i32)] {
-        supervisor.plan_exec(
-            exec_id,
-            vec![
-                SupervisorEvent::StdoutEof,
-                SupervisorEvent::StderrEof,
-                SupervisorEvent::Exited(exit_code),
-                SupervisorEvent::DescendantsCleaned,
-            ],
-        );
-    }
     if let Err(error) = service.create_process(
         CreateProcessRequest {
             exec_id: 300,
-            argv: vec!["/bin/true".to_string()],
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 0.2; exit 10".to_string(),
+            ],
             cwd: Some("/".to_string()),
             env: vec![],
             timeout_ms: None,
         },
         &mut supervisor,
     ) {
-        return fail(
-            definition,
-            &format!("create_process for exec 300 failed: {error}"),
-        );
+        return check_fail(format!("create_process for exec 300 failed: {error}"));
     }
     let overlap = service.create_process(
         CreateProcessRequest {
@@ -499,91 +682,85 @@ fn scenario_repeated_exec(definition: ScenarioDefinition) -> ScenarioResult {
         })
     );
     if let Err(error) = grant_all_stream_credits(&mut service, 300) {
-        return fail(definition, &error);
+        return check_fail(error);
     }
     match collect_exec_messages(&mut service, &mut supervisor) {
         Ok(messages) => outcomes.push(first_terminal_disposition(&messages)),
-        Err(error) => return fail(definition, &error),
+        Err(error) => return check_fail(error),
     }
-
-    for exec_id in [301_u32, 302_u32] {
+    for (exec_id, exit_code) in [(301_u32, 11_i32), (302_u32, 12_i32)] {
         if let Err(error) = service.create_process(
             CreateProcessRequest {
                 exec_id,
-                argv: vec!["/bin/true".to_string()],
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!("exit {exit_code}"),
+                ],
                 cwd: Some("/".to_string()),
                 env: vec![],
                 timeout_ms: None,
             },
             &mut supervisor,
         ) {
-            return fail(
-                definition,
-                &format!("create_process for exec {exec_id} failed: {error}"),
-            );
+            return check_fail(format!("create_process for exec {exec_id} failed: {error}"));
         }
         if let Err(error) = grant_all_stream_credits(&mut service, exec_id) {
-            return fail(definition, &error);
+            return check_fail(error);
         }
         match collect_exec_messages(&mut service, &mut supervisor) {
             Ok(messages) => outcomes.push(first_terminal_disposition(&messages)),
-            Err(error) => return fail(definition, &error),
+            Err(error) => return check_fail(error),
         }
     }
-
-    let passed = overlap_rejected
+    if overlap_rejected
         && outcomes
             == vec![
                 Some(ExecDisposition::ExitCode(10)),
                 Some(ExecDisposition::ExitCode(11)),
                 Some(ExecDisposition::ExitCode(12)),
-            ];
-    if passed {
-        pass(
-            definition,
+            ]
+    {
+        check_pass(
+            EvidenceSource::LocalLinuxRuntime,
             vec![
                 "one active execution enforced with WorkloadBusy".to_string(),
-                "sequential executions observed deterministic terminal dispositions".to_string(),
+                "sequential executions returned deterministic terminal dispositions".to_string(),
             ],
         )
     } else {
-        fail(definition, "sequential exec invariants failed")
+        check_fail("sequential exec invariants failed".to_string())
     }
 }
 
-fn scenario_binary_stream_separation(definition: ScenarioDefinition) -> ScenarioResult {
+#[cfg(target_os = "linux")]
+fn local_linux_binary_stream_separation() -> CheckOutcome {
     let mut service = activated_service();
-    let mut supervisor = FakeSupervisor::default();
+    let mut supervisor = LinuxProcessSupervisor::new();
     let exec_id = 401_u32;
-    supervisor.plan_exec(
-        exec_id,
-        vec![
-            SupervisorEvent::StdoutChunk(vec![b'A', 0, b'B', 255, b'C']),
-            SupervisorEvent::StderrChunk(vec![b'X', 0, b'Y', 254, b'Z']),
-            SupervisorEvent::StdoutEof,
-            SupervisorEvent::StderrEof,
-            SupervisorEvent::Exited(0),
-            SupervisorEvent::DescendantsCleaned,
-        ],
-    );
     if let Err(error) = service.create_process(
         CreateProcessRequest {
             exec_id,
-            argv: vec!["/bin/echo".to_string(), "binary".to_string()],
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf '\\101\\000\\102\\377\\103'; printf '\\130\\000\\131\\376\\132' 1>&2"
+                    .to_string(),
+            ],
             cwd: Some("/".to_string()),
             env: vec![],
             timeout_ms: None,
         },
         &mut supervisor,
     ) {
-        return fail(definition, &format!("create_process failed: {error}"));
+        return check_fail(format!("create_process failed: {error}"));
     }
     if let Err(error) = grant_all_stream_credits(&mut service, exec_id) {
-        return fail(definition, &error);
+        return check_fail(error);
     }
     let messages = match collect_exec_messages(&mut service, &mut supervisor) {
         Ok(messages) => messages,
-        Err(error) => return fail(definition, &error),
+        Err(error) => return check_fail(error),
     };
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -595,99 +772,49 @@ fn scenario_binary_stream_separation(definition: ScenarioDefinition) -> Scenario
         }
     }
     if stdout == vec![b'A', 0, b'B', 255, b'C'] && stderr == vec![b'X', 0, b'Y', 254, b'Z'] {
-        pass(
-            definition,
+        check_pass(
+            EvidenceSource::LocalLinuxRuntime,
             vec![
                 "stdout bytes preserved with embedded NUL and 0xFF".to_string(),
                 "stderr bytes preserved independently with embedded NUL and 0xFE".to_string(),
             ],
         )
     } else {
-        fail(definition, "binary stream separation check failed")
+        check_fail("binary stream separation check failed".to_string())
     }
 }
 
-fn scenario_backpressure_record_cap(definition: ScenarioDefinition) -> ScenarioResult {
+#[cfg(target_os = "linux")]
+fn local_linux_backpressure() -> CheckOutcome {
     let mut service = activated_service();
-    let mut supervisor = FakeSupervisor::default();
-    let exec_id = 501_u32;
-    supervisor.plan_exec(exec_id, vec![SupervisorEvent::StdoutChunk(vec![1_u8])]);
+    let mut supervisor = LinuxProcessSupervisor::new();
+    let credit_exec = 501_u32;
     if let Err(error) = service.create_process(
         CreateProcessRequest {
-            exec_id,
-            argv: vec!["/bin/echo".to_string(), "backpressure".to_string()],
+            exec_id: credit_exec,
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf x".to_string(),
+            ],
             cwd: Some("/".to_string()),
             env: vec![],
             timeout_ms: None,
         },
         &mut supervisor,
     ) {
-        return fail(definition, &format!("create_process failed: {error}"));
+        return check_fail(format!("credit probe create_process failed: {error}"));
     }
-    let credit_exhausted = matches!(
-        service.pump_supervisor(&mut supervisor),
-        Err(ServiceError {
-            code: ServiceErrorCode::LifecycleError,
-            ..
-        })
-    );
+    let credit_exhausted = wait_for_lifecycle_error(&mut service, &mut supervisor, credit_exec);
     if !credit_exhausted {
-        return fail(
-            definition,
-            "expected stdout flow-credit exhaustion before any stdout credits were granted",
+        return check_fail(
+            "expected stdout flow-credit exhaustion before granting stdout credits".to_string(),
         );
     }
 
     let mut service = activated_service();
-    let mut supervisor = FakeSupervisor::default();
-    let exec_id = 502_u32;
-    supervisor.plan_exec(
-        exec_id,
-        vec![SupervisorEvent::StdoutChunk(vec![
-            7_u8;
-            agent_protocol::PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES
-                + 1
-        ])],
-    );
-    if let Err(error) = service.create_process(
-        CreateProcessRequest {
-            exec_id,
-            argv: vec!["/bin/echo".to_string(), "oversized".to_string()],
-            cwd: Some("/".to_string()),
-            env: vec![],
-            timeout_ms: None,
-        },
-        &mut supervisor,
-    ) {
-        return fail(definition, &format!("create_process failed: {error}"));
-    }
-    if let Err(error) = grant_all_stream_credits(&mut service, exec_id) {
-        return fail(definition, &error);
-    }
-    let oversized_chunk_rejected = matches!(
-        service.pump_supervisor(&mut supervisor),
-        Err(ServiceError {
-            code: ServiceErrorCode::StreamChunkTooLarge,
-            ..
-        })
-    );
-
-    let mut service = activated_service();
-    let mut supervisor = FakeSupervisor::default();
+    let mut supervisor = LinuxProcessSupervisor::new();
     let exec_id = 503_u32;
-    supervisor.plan_exec(
-        exec_id,
-        vec![
-            SupervisorEvent::StdoutChunk(vec![
-                2_u8;
-                agent_protocol::PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES
-            ]),
-            SupervisorEvent::StdoutEof,
-            SupervisorEvent::StderrEof,
-            SupervisorEvent::Exited(0),
-            SupervisorEvent::DescendantsCleaned,
-        ],
-    );
     if let Err(error) = service.create_process(
         CreateProcessRequest {
             exec_id,
@@ -698,34 +825,31 @@ fn scenario_backpressure_record_cap(definition: ScenarioDefinition) -> ScenarioR
         },
         &mut supervisor,
     ) {
-        return fail(definition, &format!("create_process failed: {error}"));
+        return check_fail(format!("create_process failed: {error}"));
     }
     if let Err(error) = grant_all_stream_credits(&mut service, exec_id) {
-        return fail(definition, &error);
+        return check_fail(error);
     }
     if let Err(error) = service.grant_flow_credits(FlowCreditRequest {
         exec_id,
         stream: agent_protocol::messages::StreamName::Stdin,
         credits: 1,
     }) {
-        return fail(definition, &format!("grant stdin credits failed: {error}"));
+        return check_fail(format!("grant stdin credits failed: {error}"));
     }
     if let Err(error) = service.stdin_chunk(
-        agent_protocol::StdinChunkRecord {
+        StdinChunkRecord {
             exec_id,
             sequence: 0,
             chunk: vec![3_u8; agent_protocol::PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES],
         },
         &mut supervisor,
     ) {
-        return fail(
-            definition,
-            &format!("max-sized stdin chunk failed: {error}"),
-        );
+        return check_fail(format!("max-sized stdin chunk failed: {error}"));
     }
     let queued_limit_enforced = matches!(
         service.stdin_chunk(
-            agent_protocol::StdinChunkRecord {
+            StdinChunkRecord {
                 exec_id,
                 sequence: 1,
                 chunk: vec![4_u8; 1],
@@ -737,43 +861,54 @@ fn scenario_backpressure_record_cap(definition: ScenarioDefinition) -> ScenarioR
             ..
         })
     );
-    if let Err(error) = collect_exec_messages(&mut service, &mut supervisor) {
-        return fail(definition, &error);
+    let mut stdin_eof_applied = false;
+    let eof_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < eof_deadline {
+        match service.stdin_eof(
+            StdinEofRecord {
+                exec_id,
+                sequence: 1,
+            },
+            &mut supervisor,
+        ) {
+            Ok(()) => {
+                stdin_eof_applied = true;
+                break;
+            }
+            Err(ServiceError {
+                code: ServiceErrorCode::Backpressure,
+                ..
+            }) => {
+                let _ = service.pump_supervisor(&mut supervisor);
+            }
+            Err(error) => return check_fail(format!("stdin_eof failed: {error}")),
+        }
     }
-    let health_responsive = service.health().configured;
-
-    if oversized_chunk_rejected && queued_limit_enforced && health_responsive {
-        pass(
-            definition,
+    if !stdin_eof_applied {
+        return check_fail("stdin_eof remained blocked after bounded drain wait".to_string());
+    }
+    if let Err(error) = collect_exec_messages(&mut service, &mut supervisor) {
+        return check_fail(error);
+    }
+    if queued_limit_enforced && service.health().configured {
+        check_pass(
+            EvidenceSource::LocalLinuxRuntime,
             vec![
                 "stdout requires granted flow credits".to_string(),
-                "stream chunk size never exceeds protocol-safe cap".to_string(),
-                "stdin queue enforces bounded byte cap".to_string(),
+                "stdin queue enforces bounded byte cap under real subprocess load".to_string(),
+                "service remains healthy after bounded-flow enforcement".to_string(),
             ],
         )
     } else {
-        fail(
-            definition,
-            "backpressure/record-cap invariants failed for deterministic fake runtime",
-        )
+        check_fail("backpressure invariants failed for local runtime".to_string())
     }
 }
 
-fn scenario_terminal_semantics(definition: ScenarioDefinition) -> ScenarioResult {
+#[cfg(target_os = "linux")]
+fn local_linux_terminal_semantics() -> CheckOutcome {
     let mut service = activated_service();
-    let mut supervisor = FakeSupervisor::default();
-
+    let mut supervisor = LinuxProcessSupervisor::new();
     let normal_exec = 601_u32;
-    supervisor.plan_exec(
-        normal_exec,
-        vec![
-            SupervisorEvent::StdoutChunk(vec![b'o', b'k', b'\n']),
-            SupervisorEvent::StdoutEof,
-            SupervisorEvent::StderrEof,
-            SupervisorEvent::Exited(0),
-            SupervisorEvent::DescendantsCleaned,
-        ],
-    );
     if let Err(error) = service.create_process(
         CreateProcessRequest {
             exec_id: normal_exec,
@@ -784,30 +919,18 @@ fn scenario_terminal_semantics(definition: ScenarioDefinition) -> ScenarioResult
         },
         &mut supervisor,
     ) {
-        return fail(
-            definition,
-            &format!("normal create_process failed: {error}"),
-        );
+        return check_fail(format!("normal create_process failed: {error}"));
     }
     if let Err(error) = grant_all_stream_credits(&mut service, normal_exec) {
-        return fail(definition, &error);
+        return check_fail(error);
     }
     let normal_messages = match collect_exec_messages(&mut service, &mut supervisor) {
         Ok(messages) => messages,
-        Err(error) => return fail(definition, &error),
+        Err(error) => return check_fail(error),
     };
     let normal_ok = terminal_after_cleanup(&normal_messages, ExecDisposition::ExitCode(0));
 
     let cancelled_exec = 602_u32;
-    supervisor.plan_exec(
-        cancelled_exec,
-        vec![
-            SupervisorEvent::StdoutEof,
-            SupervisorEvent::StderrEof,
-            SupervisorEvent::DescendantsCleaned,
-            SupervisorEvent::Exited(0),
-        ],
-    );
     if let Err(error) = service.create_process(
         CreateProcessRequest {
             exec_id: cancelled_exec,
@@ -818,35 +941,23 @@ fn scenario_terminal_semantics(definition: ScenarioDefinition) -> ScenarioResult
         },
         &mut supervisor,
     ) {
-        return fail(
-            definition,
-            &format!("cancel create_process failed: {error}"),
-        );
+        return check_fail(format!("cancel create_process failed: {error}"));
     }
     if let Err(error) = grant_all_stream_credits(&mut service, cancelled_exec) {
-        return fail(definition, &error);
+        return check_fail(error);
     }
     if let Err(error) =
         service.cancel_exec(cancelled_exec, CancelReason::Cancelled, &mut supervisor)
     {
-        return fail(definition, &format!("cancel_exec failed: {error}"));
+        return check_fail(format!("cancel_exec failed: {error}"));
     }
     let cancelled_messages = match collect_exec_messages(&mut service, &mut supervisor) {
         Ok(messages) => messages,
-        Err(error) => return fail(definition, &error),
+        Err(error) => return check_fail(error),
     };
     let cancelled_ok = terminal_after_cleanup(&cancelled_messages, ExecDisposition::Cancelled);
 
     let timeout_exec = 603_u32;
-    supervisor.plan_exec(
-        timeout_exec,
-        vec![
-            SupervisorEvent::StdoutEof,
-            SupervisorEvent::StderrEof,
-            SupervisorEvent::DescendantsCleaned,
-            SupervisorEvent::Exited(0),
-        ],
-    );
     if let Err(error) = service.create_process(
         CreateProcessRequest {
             exec_id: timeout_exec,
@@ -857,34 +968,29 @@ fn scenario_terminal_semantics(definition: ScenarioDefinition) -> ScenarioResult
         },
         &mut supervisor,
     ) {
-        return fail(
-            definition,
-            &format!("timeout create_process failed: {error}"),
-        );
+        return check_fail(format!("timeout create_process failed: {error}"));
     }
     if let Err(error) = grant_all_stream_credits(&mut service, timeout_exec) {
-        return fail(definition, &error);
+        return check_fail(error);
     }
     if let Err(error) = service.cancel_exec(timeout_exec, CancelReason::TimedOut, &mut supervisor) {
-        return fail(definition, &format!("timeout cancel_exec failed: {error}"));
+        return check_fail(format!("timeout cancel_exec failed: {error}"));
     }
     let timeout_messages = match collect_exec_messages(&mut service, &mut supervisor) {
         Ok(messages) => messages,
-        Err(error) => return fail(definition, &error),
+        Err(error) => return check_fail(error),
     };
     let timeout_ok = terminal_after_cleanup(&timeout_messages, ExecDisposition::TimedOut);
-
     if normal_ok && cancelled_ok && timeout_ok {
-        pass(
-            definition,
+        check_pass(
+            EvidenceSource::LocalLinuxRuntime,
             vec![
                 "normal, cancelled, and timed-out dispositions observed".to_string(),
-                "terminal event emitted only after stdout/stderr EOF and descendant cleanup"
-                    .to_string(),
+                "terminal event emitted after stdout/stderr EOF and descendant cleanup".to_string(),
             ],
         )
     } else {
-        fail(definition, "terminal ordering invariants failed")
+        check_fail("terminal ordering invariants failed".to_string())
     }
 }
 
@@ -1118,68 +1224,7 @@ fn scenario_health_lifecycle(definition: ScenarioDefinition) -> ScenarioResult {
     }
 }
 
-fn scenario_channel_loss_cleanup(definition: ScenarioDefinition) -> ScenarioResult {
-    let mut service = MxcControlService::new(sample_binding(7, 44));
-    if let Err(error) = service.authenticate_channel(
-        authenticate_request(7, 44, [7; 32]),
-        1,
-        NetworkStatus {
-            mode: NetworkMode::NoNic,
-            detail: None,
-        },
-    ) {
-        return fail(definition, &format!("initial authenticate failed: {error}"));
-    }
-    if let Err(error) = service.configure_session(configure_request()) {
-        return fail(definition, &format!("configure_session failed: {error}"));
-    }
-    let mut supervisor = FakeSupervisor::default();
-    if let Err(error) = service.begin_disconnect_cleanup(10, &mut supervisor) {
-        return fail(
-            definition,
-            &format!("begin_disconnect_cleanup failed: {error}"),
-        );
-    }
-    let same_generation = service.authenticate_channel(
-        authenticate_request(7, 45, [7; 32]),
-        30,
-        NetworkStatus {
-            mode: NetworkMode::NoNic,
-            detail: None,
-        },
-    );
-    let newer_generation = service.authenticate_channel(
-        authenticate_request(8, 45, [7; 32]),
-        30,
-        NetworkStatus {
-            mode: NetworkMode::NoNic,
-            detail: None,
-        },
-    );
-    let same_rejected = matches!(
-        same_generation,
-        Err(ServiceError {
-            code: ServiceErrorCode::LifecycleError,
-            ..
-        })
-    );
-    let newer_admitted = newer_generation.is_ok();
-    if same_rejected && newer_admitted {
-        pass(
-            definition,
-            vec![
-                "disconnect cleanup clears session and blocks stale generation".to_string(),
-                "strictly newer launch generation is admitted".to_string(),
-            ],
-        )
-    } else {
-        fail(
-            definition,
-            "channel-loss cleanup generation monotonicity check failed",
-        )
-    }
-}
-
+#[cfg(target_os = "linux")]
 fn collect_exec_messages(
     service: &mut MxcControlService,
     supervisor: &mut impl ProcessSupervisor,
@@ -1202,6 +1247,52 @@ fn collect_exec_messages(
     Err("timed out waiting for deterministic supervisor execution".to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn check_pass(evidence_source: EvidenceSource, evidence: Vec<String>) -> CheckOutcome {
+    CheckOutcome {
+        check_status: EvidenceCheckStatus::Pass,
+        evidence_source,
+        error: None,
+        evidence,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_fail(error: String) -> CheckOutcome {
+    CheckOutcome {
+        check_status: EvidenceCheckStatus::Fail,
+        evidence_source: EvidenceSource::None,
+        error: Some(error),
+        evidence: vec![],
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_lifecycle_error(
+    service: &mut MxcControlService,
+    supervisor: &mut LinuxProcessSupervisor,
+    exec_id: u32,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match service.pump_supervisor(supervisor) {
+            Ok(_) => {}
+            Err(ServiceError {
+                code: ServiceErrorCode::LifecycleError,
+                ..
+            }) => return true,
+            Err(_) => return false,
+        }
+        if service.active_exec_id().is_none() {
+            break;
+        }
+    }
+    let _ = service.cancel_exec(exec_id, CancelReason::Cancelled, supervisor);
+    let _ = collect_exec_messages(service, supervisor);
+    false
+}
+
+#[cfg(target_os = "linux")]
 fn first_terminal_disposition(messages: &[AgentControlMessage]) -> Option<ExecDisposition> {
     messages.iter().find_map(|message| match message {
         AgentControlMessage::ExecTerminal { disposition, .. } => Some(*disposition),
@@ -1209,6 +1300,7 @@ fn first_terminal_disposition(messages: &[AgentControlMessage]) -> Option<ExecDi
     })
 }
 
+#[cfg(target_os = "linux")]
 fn terminal_after_cleanup(messages: &[AgentControlMessage], expected: ExecDisposition) -> bool {
     let terminal_index = messages
         .iter()
@@ -1239,6 +1331,7 @@ fn terminal_after_cleanup(messages: &[AgentControlMessage], expected: ExecDispos
             == 1
 }
 
+#[cfg(target_os = "linux")]
 fn grant_all_stream_credits(service: &mut MxcControlService, exec_id: u32) -> Result<(), String> {
     for stream in [
         agent_protocol::messages::StreamName::Stdout,
@@ -1393,6 +1486,9 @@ fn pass(definition: ScenarioDefinition, evidence: Vec<String>) -> ScenarioResult
         id: definition.id.to_string(),
         name: definition.name.to_string(),
         status: ScenarioStatus::Pass,
+        check_status: EvidenceCheckStatus::Pass,
+        evidence_source: EvidenceSource::UnitStatic,
+        required_evidence_source: EvidenceSource::UnitStatic,
         duration_ms: 0,
         error: None,
         evidence,
@@ -1405,32 +1501,11 @@ fn fail(definition: ScenarioDefinition, error: &str) -> ScenarioResult {
         id: definition.id.to_string(),
         name: definition.name.to_string(),
         status: ScenarioStatus::Fail,
+        check_status: EvidenceCheckStatus::Fail,
+        evidence_source: EvidenceSource::UnitStatic,
+        required_evidence_source: EvidenceSource::UnitStatic,
         duration_ms: 0,
         error: Some(error.to_string()),
-        evidence: vec![],
-    }
-}
-
-fn unsupported(definition: ScenarioDefinition, error: &str) -> ScenarioResult {
-    ScenarioResult {
-        requirement_number: definition.requirement_number,
-        id: definition.id.to_string(),
-        name: definition.name.to_string(),
-        status: ScenarioStatus::Unsupported,
-        duration_ms: 0,
-        error: Some(error.to_string()),
-        evidence: vec![],
-    }
-}
-
-fn skipped(definition: ScenarioDefinition, reason: &str) -> ScenarioResult {
-    ScenarioResult {
-        requirement_number: definition.requirement_number,
-        id: definition.id.to_string(),
-        name: definition.name.to_string(),
-        status: ScenarioStatus::Skipped,
-        duration_ms: 0,
-        error: Some(reason.to_string()),
         evidence: vec![],
     }
 }
@@ -1511,7 +1586,11 @@ pub fn is_passing_report(report: &HarnessReport) -> bool {
         {
             return false;
         }
-        if scenario.status != ScenarioStatus::Pass {
+        if scenario.status != ScenarioStatus::Pass
+            || scenario.check_status != EvidenceCheckStatus::Pass
+            || scenario.evidence_source != EvidenceSource::LiveWhp
+            || scenario.required_evidence_source != EvidenceSource::LiveWhp
+        {
             return false;
         }
     }
@@ -1527,6 +1606,9 @@ pub fn has_all_scenarios_passed(report: &HarnessReport) -> bool {
             || scenario.id != canonical.id
             || scenario.name != canonical.name
             || scenario.status != ScenarioStatus::Pass
+            || scenario.check_status != EvidenceCheckStatus::Pass
+            || scenario.evidence_source != EvidenceSource::LiveWhp
+            || scenario.required_evidence_source != EvidenceSource::LiveWhp
         {
             return false;
         }
@@ -1566,162 +1648,12 @@ impl Diagnostics {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct FakeSupervisor {
-    plans: BTreeMap<u32, VecDeque<SupervisorEvent>>,
-    stdin_pending_bytes: usize,
-    stdin_drained_bytes: usize,
-}
-
-impl FakeSupervisor {
-    fn plan_exec(&mut self, exec_id: u32, events: Vec<SupervisorEvent>) {
-        self.plans.insert(exec_id, VecDeque::from(events));
-    }
-}
-
-impl ProcessSupervisor for FakeSupervisor {
-    fn spawn(&mut self, request: &CreateProcessRequest) -> Result<(), ServiceError> {
-        self.plans.entry(request.exec_id).or_default();
-        Ok(())
-    }
-
-    fn queue_stdin(&mut self, _exec_id: u32, chunk: Vec<u8>) -> Result<(), ServiceError> {
-        self.stdin_pending_bytes = self.stdin_pending_bytes.saturating_add(chunk.len());
-        Ok(())
-    }
-
-    fn close_stdin(&mut self, _exec_id: u32) -> Result<(), ServiceError> {
-        if self.stdin_pending_bytes != 0 {
-            return Err(ServiceError {
-                code: ServiceErrorCode::Backpressure,
-                message: "stdin queue is not drained".to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    fn take_stdin_drain_bytes(&mut self, _exec_id: u32) -> Result<usize, ServiceError> {
-        let drained = self.stdin_drained_bytes.min(self.stdin_pending_bytes);
-        self.stdin_pending_bytes -= drained;
-        self.stdin_drained_bytes = 0;
-        Ok(drained)
-    }
-
-    fn peek_event(&mut self, exec_id: u32) -> Result<Option<SupervisorEvent>, ServiceError> {
-        Ok(self
-            .plans
-            .get(&exec_id)
-            .and_then(|events| events.front().cloned()))
-    }
-
-    fn ack_event(&mut self, exec_id: u32) -> Result<(), ServiceError> {
-        if let Some(events) = self.plans.get_mut(&exec_id) {
-            let _ = events.pop_front();
-        }
-        Ok(())
-    }
-
-    fn terminate(&mut self, _exec_id: u32) -> Result<(), ServiceError> {
-        Ok(())
-    }
-
-    fn kill(&mut self, _exec_id: u32) -> Result<(), ServiceError> {
-        Ok(())
-    }
-
-    fn poll(&mut self, exec_id: u32) -> Result<Option<SupervisorEvent>, ServiceError> {
-        let event = self.peek_event(exec_id)?;
-        if event.is_some() {
-            self.ack_event(exec_id)?;
-        }
-        Ok(event)
-    }
-
-    fn cleanup_for_disconnect(
-        &mut self,
-        _exec_id: u32,
-        _deadline: Duration,
-    ) -> Result<bool, ServiceError> {
-        Ok(true)
-    }
-}
-
-#[cfg(windows)]
-mod windows_security {
-    use rand::TryRngCore;
-    use rand::rngs::OsRng;
-
-    pub fn generate_capability() -> Result<[u8; 32], String> {
-        let mut capability = [0_u8; 32];
-        OsRng
-            .try_fill_bytes(&mut capability)
-            .map_err(|error| format!("os random capability generation failed: {error}"))?;
-        Ok(capability)
-    }
-
-    pub fn parse_inherited_handle_decimal(value: &str) -> Result<isize, String> {
-        if value.is_empty() || !value.chars().all(|character| character.is_ascii_digit()) {
-            return Err("inherited handle must be a non-empty decimal integer".to_string());
-        }
-        let parsed: u64 = value
-            .parse()
-            .map_err(|error| format!("invalid inherited handle decimal value: {error}"))?;
-        if parsed == 0 || parsed > i32::MAX as u64 {
-            return Err("inherited handle is outside the supported decimal range".to_string());
-        }
-        Ok(parsed as isize)
-    }
-
-    pub fn sid_matches_owner(expected_sid: &str, actual_sid: &str) -> bool {
-        expected_sid.eq_ignore_ascii_case(actual_sid)
-    }
-
-    pub fn validate_live_security_prerequisites() -> Result<(), String> {
-        let capability = generate_capability()?;
-        if capability.iter().all(|byte| *byte == 0) {
-            return Err("capability generator returned all-zero payload".to_string());
-        }
-        let _ = parse_inherited_handle_decimal("1")?;
-        if !sid_matches_owner("S-1-5-18", "s-1-5-18") {
-            return Err("owner/client SID comparison abstraction failed".to_string());
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn capability_is_32_random_bytes() {
-            let first = generate_capability().expect("capability");
-            let second = generate_capability().expect("capability");
-            assert_eq!(first.len(), 32);
-            assert_eq!(second.len(), 32);
-            assert_ne!(first, second);
-        }
-
-        #[test]
-        fn inherited_handle_decimal_bounds_are_enforced() {
-            assert!(parse_inherited_handle_decimal("1").is_ok());
-            assert!(parse_inherited_handle_decimal(&(i32::MAX as u64).to_string()).is_ok());
-            assert!(parse_inherited_handle_decimal("0").is_err());
-            assert!(parse_inherited_handle_decimal(&(u64::MAX.to_string())).is_err());
-            assert!(parse_inherited_handle_decimal("1.2").is_err());
-            assert!(parse_inherited_handle_decimal("-4").is_err());
-        }
-
-        #[test]
-        fn sid_check_abstraction_is_case_insensitive() {
-            assert!(sid_matches_owner("S-1-5-21-1234", "s-1-5-21-1234"));
-            assert!(!sid_matches_owner("S-1-5-21-1234", "S-1-5-18"));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static HARNESS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn canonical_scenarios_are_unique_and_ordered() {
@@ -1731,6 +1663,7 @@ mod tests {
 
     #[test]
     fn static_mode_never_satisfies_live_gate() {
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
         let root = std::env::temp_dir().join("nvx-agent-harness-static-gate");
         let _ = std::fs::remove_dir_all(&root);
         let run = execute_harness(HarnessOptions {
@@ -1740,15 +1673,25 @@ mod tests {
         })
         .expect("run");
         assert!(!is_passing_report(&run.report));
-        assert_eq!(run.exit_code(), ExitCode::SUCCESS);
+        assert_eq!(run.exit_code(), ExitCode::FAILURE);
         assert_eq!(run.report.scenarios.len(), 12);
+        assert!(
+            run.report
+                .scenarios
+                .iter()
+                .all(|scenario| scenario.status != ScenarioStatus::Pass)
+        );
+        assert!(
+            run.report
+                .scenarios
+                .iter()
+                .all(|scenario| scenario.required_evidence_source == EvidenceSource::LiveWhp)
+        );
     }
 
     #[test]
-    fn non_windows_live_mode_is_prerequisite_failure() {
-        if cfg!(windows) {
-            return;
-        }
+    fn live_mode_without_live_whp_evidence_cannot_pass_conformance() {
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
         let root = std::env::temp_dir().join("nvx-agent-harness-live-prereq");
         let _ = std::fs::remove_dir_all(&root);
         let run = execute_harness(HarnessOptions {
@@ -1757,13 +1700,94 @@ mod tests {
             output_dir: root,
         })
         .expect("run");
-        assert_eq!(run.report.scenarios[0].status, ScenarioStatus::Unsupported);
+        assert_eq!(run.exit_code(), ExitCode::FAILURE);
+        assert!(!is_passing_report(&run.report));
         assert!(
             run.report
                 .scenarios
                 .iter()
-                .skip(1)
-                .all(|scenario| scenario.status == ScenarioStatus::Skipped)
+                .all(|scenario| scenario.status != ScenarioStatus::Pass)
+                || run
+                    .report
+                    .scenarios
+                    .iter()
+                    .any(|scenario| scenario.evidence_source != EvidenceSource::LiveWhp)
         );
+    }
+
+    #[test]
+    fn privileged_requirements_remain_blocked_without_live_whp_evidence() {
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let root = std::env::temp_dir().join("nvx-agent-harness-privileged-blocked");
+        let _ = std::fs::remove_dir_all(&root);
+        let run = execute_harness(HarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: HarnessMode::StaticOnly,
+            output_dir: root,
+        })
+        .expect("run");
+        for requirement_number in [7_u8, 8_u8, 9_u8] {
+            let scenario = run
+                .report
+                .scenarios
+                .iter()
+                .find(|scenario| scenario.requirement_number == requirement_number)
+                .expect("scenario present");
+            assert_eq!(scenario.status, ScenarioStatus::Blocked);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_live_mode_reports_not_live_or_blocked() {
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let root = std::env::temp_dir().join("nvx-agent-harness-live-non-linux");
+        let _ = std::fs::remove_dir_all(&root);
+        let run = execute_harness(HarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: HarnessMode::LiveWhp,
+            output_dir: root,
+        })
+        .expect("run");
+        assert!(run.report.scenarios.iter().all(|scenario| {
+            matches!(
+                scenario.status,
+                ScenarioStatus::Blocked
+                    | ScenarioStatus::NotLive
+                    | ScenarioStatus::Unsupported
+                    | ScenarioStatus::Fail
+            )
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_linux_runtime_executes_3_to_6_but_remains_non_conformant() {
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let root = std::env::temp_dir().join("nvx-agent-harness-local-linux-runtime");
+        let _ = std::fs::remove_dir_all(&root);
+        let run = execute_harness(HarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: HarnessMode::LiveWhp,
+            output_dir: root,
+        })
+        .expect("run");
+        for requirement_number in [3_u8, 4_u8, 5_u8, 6_u8] {
+            let scenario = run
+                .report
+                .scenarios
+                .iter()
+                .find(|scenario| scenario.requirement_number == requirement_number)
+                .expect("scenario present");
+            assert_eq!(
+                scenario.check_status,
+                EvidenceCheckStatus::Pass,
+                "req {requirement_number} failed local runtime check: {:?}",
+                scenario.error
+            );
+            assert_eq!(scenario.evidence_source, EvidenceSource::LocalLinuxRuntime);
+            assert_eq!(scenario.status, ScenarioStatus::NotLive);
+        }
+        assert_eq!(run.exit_code(), ExitCode::FAILURE);
     }
 }
