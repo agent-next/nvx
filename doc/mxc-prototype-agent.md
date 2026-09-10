@@ -5,10 +5,11 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 
 ## What is live now
 
-- PID1 discovers the reserved control tty from `nvx_control_tty=<hvcN>` on
-  `/proc/cmdline`, rejects any boot-console overlap (`hvc1`), opens that
-  `/dev/hvcN` device read/write in raw nonblocking mode, and now speaks the
-  frozen OpenVMM outer control-session wire contract (`NVXS` magic,
+- PID1 fail-closed startup now ensures procfs is mounted idempotently before
+  reading `/proc/cmdline`; it then discovers the reserved control tty from
+  `nvx_control_tty=<hvcN>`, rejects any boot-console overlap (`hvc1`), opens
+  that `/dev/hvcN` device read/write in raw nonblocking mode, and now speaks
+  the frozen OpenVMM outer control-session wire contract (`NVXS` magic,
   version 1, fixed 44-byte little-endian header, record types 1..8). The guest
   control leg sends `GuestAttach`, waits for `Reset`, acknowledges exactly
   after `Reset`, then carries inner MXC records through outer `Data`.

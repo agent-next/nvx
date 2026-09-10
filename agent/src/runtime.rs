@@ -41,6 +41,8 @@ const CONTROL_SESSION_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GUEST_MAPPING_ROOT: &str = "/mnt/virtiofs";
 const DEFAULT_WORKLOAD_CGROUP_PATH: &str = "/sys/fs/cgroup/nvx.workload";
 const BOOT_DIAGNOSTIC_TTY: &str = "hvc1";
+const PROC_MOUNT_TARGET: &str = "/proc";
+const PROC_CMDLINE_PATH: &str = "/proc/cmdline";
 const OUTBOUND_PENDING_LIMIT: usize = 256;
 const FREEZE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const NETWORK_READY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1485,7 +1487,8 @@ fn enforce_active_timeout<S: ProcessSupervisor>(
 }
 
 fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
-    let cmdline = std::fs::read_to_string("/proc/cmdline")
+    ensure_procfs_for_pid1_startup()?;
+    let cmdline = std::fs::read_to_string(PROC_CMDLINE_PATH)
         .map_err(|error| AgentError::io("reading /proc/cmdline", error))?;
     let channel_generation = parse_required_u64_arg(
         &cmdline,
@@ -1504,6 +1507,80 @@ fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
         },
         control_tty_device_path,
     })
+}
+
+fn ensure_procfs_for_pid1_startup() -> Result<()> {
+    ensure_procfs_for_pid1_startup_with_ops(
+        || Path::new(PROC_CMDLINE_PATH).exists(),
+        || {
+            std::fs::create_dir_all(PROC_MOUNT_TARGET)
+                .map_err(|error| AgentError::io("creating /proc mountpoint", error))
+        },
+        mount_procfs_on_proc,
+    )
+}
+
+fn ensure_procfs_for_pid1_startup_with_ops(
+    cmdline_exists: impl FnMut() -> bool,
+    ensure_proc_mountpoint: impl FnMut() -> Result<()>,
+    mount_procfs: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    ensure_procfs_mounted_with_ops(cmdline_exists, ensure_proc_mountpoint, mount_procfs).map_err(
+        |error| {
+            if error.requires_fail_closed_action() {
+                error
+            } else {
+                AgentError::fail_closed(format!(
+                    "PID 1 startup requires mounted procfs before reading /proc/cmdline: {error}",
+                ))
+            }
+        },
+    )
+}
+
+fn ensure_procfs_mounted_with_ops(
+    mut cmdline_exists: impl FnMut() -> bool,
+    mut ensure_proc_mountpoint: impl FnMut() -> Result<()>,
+    mut mount_procfs: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    if cmdline_exists() {
+        return Ok(());
+    }
+    ensure_proc_mountpoint()?;
+    mount_procfs()?;
+    if cmdline_exists() {
+        return Ok(());
+    }
+    Err(AgentError::fail_closed(
+        "procfs mount completed but /proc/cmdline is still unavailable",
+    ))
+}
+
+fn mount_procfs_on_proc() -> Result<()> {
+    let source = std::ffi::CString::new("proc")
+        .map_err(|_| AgentError::mount("proc source contains NUL"))?;
+    let target = std::ffi::CString::new(PROC_MOUNT_TARGET)
+        .map_err(|_| AgentError::mount("proc target contains NUL"))?;
+    let fstype = std::ffi::CString::new("proc")
+        .map_err(|_| AgentError::mount("proc fstype contains NUL"))?;
+    // SAFETY: mount is called with constant C strings and null data.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EBUSY) {
+        return Ok(());
+    }
+    Err(AgentError::io("mounting procfs on /proc", error))
 }
 
 fn parse_required_u64_arg(cmdline: &str, keys: &[&str]) -> Result<u64> {
@@ -2087,6 +2164,92 @@ mod tests {
             &["nvx.channel_generation", "nvx_channel_generation"],
         );
         assert!(duplicate.is_err());
+    }
+
+    #[test]
+    fn procfs_startup_guard_is_idempotent_when_cmdline_already_present() {
+        let mut mkdir_calls = 0_u32;
+        let mut mount_calls = 0_u32;
+        ensure_procfs_mounted_with_ops(
+            || true,
+            || {
+                mkdir_calls = mkdir_calls.saturating_add(1);
+                Ok(())
+            },
+            || {
+                mount_calls = mount_calls.saturating_add(1);
+                Ok(())
+            },
+        )
+        .expect("existing procfs should not trigger setup");
+        assert_eq!(mkdir_calls, 0);
+        assert_eq!(mount_calls, 0);
+    }
+
+    #[test]
+    fn procfs_startup_guard_mounts_once_when_cmdline_initially_missing() {
+        let mut mount_calls = 0_u32;
+        let mut exists_checks = 0_u32;
+        ensure_procfs_mounted_with_ops(
+            || {
+                exists_checks = exists_checks.saturating_add(1);
+                exists_checks > 1
+            },
+            || Ok(()),
+            || {
+                mount_calls = mount_calls.saturating_add(1);
+                Ok(())
+            },
+        )
+        .expect("guard should mount procfs and proceed");
+        assert_eq!(mount_calls, 1);
+        assert_eq!(exists_checks, 2);
+    }
+
+    #[test]
+    fn procfs_startup_guard_fails_closed_when_cmdline_stays_missing() {
+        let error = ensure_procfs_mounted_with_ops(|| false, || Ok(()), || Ok(()))
+            .expect_err("missing cmdline after mount must fail closed");
+        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
+        assert!(
+            error
+                .to_string()
+                .contains("/proc/cmdline is still unavailable"),
+            "expected explicit procfs fail-closed reason"
+        );
+    }
+
+    #[test]
+    fn procfs_startup_guard_propagates_mount_failure() {
+        let error = ensure_procfs_mounted_with_ops(
+            || false,
+            || Ok(()),
+            || {
+                Err(AgentError::io(
+                    "mounting procfs on /proc",
+                    io::Error::from_raw_os_error(libc::EPERM),
+                ))
+            },
+        )
+        .expect_err("mount failure must be surfaced");
+        assert_eq!(error.code(), crate::error::ErrorCode::Internal);
+    }
+
+    #[test]
+    fn procfs_startup_guard_wraps_non_fail_closed_errors_for_pid1_path() {
+        let error = ensure_procfs_for_pid1_startup_with_ops(
+            || false,
+            || {
+                Err(AgentError::io(
+                    "creating /proc mountpoint",
+                    io::Error::from_raw_os_error(libc::EROFS),
+                ))
+            },
+            || Ok(()),
+        )
+        .expect_err("pid1 guard must fail closed on procfs setup failure");
+        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
+        assert!(error.to_string().contains("requires mounted procfs"));
     }
 
     #[test]
