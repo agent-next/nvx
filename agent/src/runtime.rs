@@ -244,6 +244,7 @@ fn protocol_error_from_service(error: ServiceError) -> ProtocolErrorDetail {
             ProtocolErrorCode::UnsupportedProtocolVersion
         }
         ServiceErrorCode::UnsupportedOperation => ProtocolErrorCode::UnsupportedOperation,
+        ServiceErrorCode::WorkloadBusy => ProtocolErrorCode::ActiveExecExists,
         _ => ProtocolErrorCode::InvalidLifecycleTransition,
     };
     ProtocolErrorDetail {

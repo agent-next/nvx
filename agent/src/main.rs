@@ -5,6 +5,8 @@ mod cgroup;
 mod config;
 mod error;
 mod isolation;
+#[cfg(target_os = "linux")]
+mod launcher;
 mod mappings;
 mod mounts;
 #[cfg(target_os = "linux")]
@@ -19,6 +21,18 @@ use crate::error::{AgentError, Result};
 fn run() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
+        let args = std::env::args().collect::<Vec<String>>();
+        match launcher::parse_launcher_invocation(&args) {
+            launcher::LauncherMode::Run(invocation) => {
+                launcher::run_launcher_mode(invocation)
+                    .map_err(|error| AgentError::io("running internal launcher mode", error))?;
+                return Ok(());
+            }
+            launcher::LauncherMode::Invalid(reason) => {
+                return Err(AgentError::bad_request(reason));
+            }
+            launcher::LauncherMode::NotLauncher => {}
+        }
         if !isolation::query_subreaper()? {
             // SAFETY: prctl is called with fixed integer arguments.
             let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };

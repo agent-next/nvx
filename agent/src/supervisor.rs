@@ -6,7 +6,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -18,8 +18,10 @@ use std::time::{Duration, Instant};
 use agent_protocol::{
     CreateProcessRequest, DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES,
     DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_RECORDS, DEFAULT_STDIN_QUEUE_LIMIT_BYTES, ProcessSupervisor,
-    ServiceError, ServiceErrorCode, SupervisorEvent, WORKLOAD_GID_MXC, WORKLOAD_UID_MXC,
+    ServiceError, ServiceErrorCode, SupervisorEvent,
 };
+
+use crate::launcher::{self, LauncherConfig};
 
 const STDIO_CHUNK_BYTES: usize = 4096;
 const TERM_GRACE: Duration = Duration::from_millis(250);
@@ -30,10 +32,21 @@ const DESCENDANTS_CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 static PREPARE_CGROUP_FAILPOINT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static REMOVE_CGROUP_FAIL_COUNTDOWN: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 pub struct LinuxProcessSupervisor {
     active: Option<ActiveProcess>,
     holder: Option<NamespaceHolder>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct SupervisorQueueUsage {
+    pub stdin_queue_bytes: usize,
+    pub event_queue_bytes: usize,
+    pub event_queue_records: usize,
 }
 
 struct NamespaceHolder {
@@ -109,11 +122,6 @@ impl Drop for PreparedExecCgroup {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ChildCredentialPlan {
-    last_capability_index: i32,
-}
-
 struct ActiveProcess {
     exec_id: u32,
     child: Child,
@@ -139,6 +147,7 @@ struct ActiveProcess {
     event_queue_bytes: usize,
     prefer_stdout_next: bool,
     holder_wait_status: Option<fs::File>,
+    pending_terminal_event: Option<SupervisorEvent>,
 }
 
 impl LinuxProcessSupervisor {
@@ -154,6 +163,18 @@ impl LinuxProcessSupervisor {
             active: None,
             holder: Some(NamespaceHolder::from_pid(holder_pid)?),
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn queue_usage(&self) -> SupervisorQueueUsage {
+        self.active
+            .as_ref()
+            .map(|active| SupervisorQueueUsage {
+                stdin_queue_bytes: active.stdin_queue_bytes,
+                event_queue_bytes: active.event_queue_bytes,
+                event_queue_records: active.event_queue.len(),
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -171,117 +192,144 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             ));
         }
 
-        let mut command = Command::new(&request.argv[0]);
-        command.args(request.argv.iter().skip(1));
-        if let Some(cwd) = &request.cwd {
-            command.current_dir(cwd);
-        }
-        for entry in &request.env {
-            let (key, value) = entry
-                .split_once('=')
-                .ok_or_else(|| supervisor_error("env entry must be KEY=VALUE"))?;
-            command.env(key, value);
-        }
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.process_group(0);
+        let mut command;
         let cgroup_root = self
             .holder
             .as_ref()
             .map(|holder| holder.cgroup_dir.as_path())
             .unwrap_or_else(|| Path::new("/sys/fs/cgroup/nvx.workload"));
         let strict_cgroup = self.holder.is_some();
-        let prepared_cgroup = if strict_cgroup {
+        let mut prepared_cgroup = if strict_cgroup {
             Some(prepare_exec_cgroup(cgroup_root, request.exec_id)?)
         } else {
             prepare_exec_cgroup(cgroup_root, request.exec_id).ok()
         };
-        let credential_plan = prepare_child_credential_plan().ok();
         let mut holder_wait_status = None;
+        let mut holder_launch_fds: Vec<RawFd> = Vec::new();
+        let mut holder_config_write_fd = None;
+        let mut holder_launcher_config: Option<LauncherConfig> = None;
         let mut holder_wait_status_write_fd = None;
         if let Some(holder) = self.holder.as_ref() {
-            let mount_ns_fd = holder.mount_ns_fd;
-            let uts_ns_fd = holder.uts_ns_fd;
-            let ipc_ns_fd = holder.ipc_ns_fd;
-            let pid_ns_fd = holder.pid_ns_fd;
             let exec_cgroup_fd = prepared_cgroup
                 .as_ref()
                 .map(|prepared| prepared.cgroup_procs_fd)
                 .ok_or_else(|| {
                     supervisor_error("holder-backed execution requires prepared cgroup")
                 })?;
+            let mount_ns_fd = dup_inheritable_fd(holder.mount_ns_fd)?;
+            let uts_ns_fd = dup_inheritable_fd(holder.uts_ns_fd)?;
+            let ipc_ns_fd = dup_inheritable_fd(holder.ipc_ns_fd)?;
+            let pid_ns_fd = dup_inheritable_fd(holder.pid_ns_fd)?;
+            let cgroup_procs_fd = dup_inheritable_fd(exec_cgroup_fd)?;
             let (status_read_fd, status_write_fd) = create_cloexec_pipe()
                 .map_err(|error| supervisor_io("creating status pipe", error))?;
+            let status_write_fd = clear_cloexec(status_write_fd)?;
+            let (config_read_fd, config_write_fd) = create_cloexec_pipe()
+                .map_err(|error| supervisor_io("creating launcher config pipe", error))?;
+            let config_read_fd = clear_cloexec(config_read_fd)?;
             // SAFETY: status_read_fd is newly created and uniquely owned here.
             let status_reader = unsafe { fs::File::from_raw_fd(status_read_fd) };
             set_nonblocking(status_reader.as_raw_fd())?;
             holder_wait_status = Some(status_reader);
             holder_wait_status_write_fd = Some(status_write_fd);
-            // SAFETY: closure performs direct namespace and identity syscalls before exec.
-            unsafe {
-                command.pre_exec(move || {
-                    // SAFETY: best-effort close in child pre-exec context.
-                    let _ = libc::close(status_read_fd);
-                    setns_checked(mount_ns_fd, libc::CLONE_NEWNS)?;
-                    setns_checked(uts_ns_fd, libc::CLONE_NEWUTS)?;
-                    setns_checked(ipc_ns_fd, libc::CLONE_NEWIPC)?;
-                    setns_checked(pid_ns_fd, libc::CLONE_NEWPID)?;
-                    move_self_to_cgroup_fd(exec_cgroup_fd)?;
-                    let workload_pid = libc::fork();
-                    if workload_pid < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if workload_pid > 0 {
-                        let mut status = 0_i32;
-                        loop {
-                            let rc = libc::waitpid(workload_pid, &mut status, 0);
-                            if rc < 0 {
-                                let error = io::Error::last_os_error();
-                                if error.raw_os_error() == Some(libc::EINTR) {
-                                    continue;
-                                }
-                                libc::_exit(1);
-                            }
-                            break;
-                        }
-                        let encoded = status.to_ne_bytes();
-                        let _ = write_all_fd(status_write_fd, &encoded);
-                        // SAFETY: best-effort close in child pre-exec context.
-                        let _ = libc::close(status_write_fd);
-                        if libc::WIFEXITED(status) {
-                            libc::_exit(libc::WEXITSTATUS(status));
-                        }
-                        if libc::WIFSIGNALED(status) {
-                            libc::_exit(128 + libc::WTERMSIG(status));
-                        }
-                        libc::_exit(1);
-                    }
-                    // SAFETY: best-effort close in child pre-exec context.
-                    let _ = libc::close(status_write_fd);
-                    apply_workload_exec_credentials(credential_plan)?;
-                    Ok(())
-                });
+            command =
+                Command::new(std::env::current_exe().map_err(|error| {
+                    supervisor_io("resolving current nvx-agent executable", error)
+                })?);
+            command.args(launcher::build_launcher_command_args(
+                config_read_fd,
+                status_write_fd,
+            ));
+            command.stdin(Stdio::piped());
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+            command.process_group(0);
+
+            holder_launch_fds.extend([
+                mount_ns_fd,
+                uts_ns_fd,
+                ipc_ns_fd,
+                pid_ns_fd,
+                cgroup_procs_fd,
+                config_read_fd,
+            ]);
+            holder_config_write_fd = Some(config_write_fd);
+            holder_launcher_config = Some(LauncherConfig {
+                version: 1,
+                argv: request.argv.clone(),
+                env: request.env.clone(),
+                cwd: request.cwd.clone(),
+                mount_ns_fd,
+                uts_ns_fd,
+                ipc_ns_fd,
+                pid_ns_fd,
+                cgroup_procs_fd,
+            });
+        } else {
+            command = Command::new(&request.argv[0]);
+            command.args(request.argv.iter().skip(1));
+            if let Some(cwd) = &request.cwd {
+                command.current_dir(cwd);
             }
+            for entry in &request.env {
+                let (key, value) = entry
+                    .split_once('=')
+                    .ok_or_else(|| supervisor_error("env entry must be KEY=VALUE"))?;
+                command.env(key, value);
+            }
+            command.stdin(Stdio::piped());
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+            command.process_group(0);
         }
 
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(spawn_error) => {
+                if let Some(fd) = holder_config_write_fd.take() {
+                    // SAFETY: best-effort close for locally created descriptor.
+                    let _ = unsafe { libc::close(fd) };
+                }
                 if let Some(fd) = holder_wait_status_write_fd.take() {
                     // SAFETY: best-effort close for locally created descriptor.
                     let _ = unsafe { libc::close(fd) };
                 }
+                close_fds_best_effort(&holder_launch_fds);
                 return Err(report_spawn_failure_with_cgroup_cleanup(
                     prepared_cgroup,
                     spawn_error,
                 ));
             }
         };
+        if let (Some(config), Some(fd)) = (
+            holder_launcher_config.as_ref(),
+            holder_config_write_fd.take(),
+        ) {
+            if let Err(error) = launcher::write_launcher_config(fd, config) {
+                // SAFETY: best-effort close for locally created descriptor.
+                let _ = unsafe { libc::close(fd) };
+                let _ = child.kill();
+                let _ = child.wait();
+                close_fds_best_effort(&holder_launch_fds);
+                if let Some(wait_fd) = holder_wait_status_write_fd.take() {
+                    // SAFETY: best-effort close for locally created descriptor.
+                    let _ = unsafe { libc::close(wait_fd) };
+                }
+                return Err(report_spawn_failure_with_cgroup_cleanup(
+                    prepared_cgroup.take(),
+                    io::Error::other(format!(
+                        "writing launcher config to inherited pipe failed: {error}"
+                    )),
+                ));
+            }
+            // SAFETY: best-effort close for locally created descriptor.
+            let _ = unsafe { libc::close(fd) };
+        }
         if let Some(fd) = holder_wait_status_write_fd.take() {
             // SAFETY: best-effort close for locally created descriptor.
             let _ = unsafe { libc::close(fd) };
         }
+        close_fds_best_effort(&holder_launch_fds);
         let pid = child.id() as i32;
         let mut stdin = child.stdin.take();
         let mut stdout = child.stdout.take();
@@ -332,6 +380,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             event_queue_bytes: 0,
             prefer_stdout_next: true,
             holder_wait_status,
+            pending_terminal_event: None,
         });
         Ok(())
     }
@@ -374,13 +423,14 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
     }
 
     fn peek_event(&mut self, exec_id: u32) -> Result<Option<SupervisorEvent>, ServiceError> {
+        let holder_root = self.holder.as_ref().map(|holder| holder.cgroup_dir.clone());
         let active = self.require_active(exec_id)?;
-        refresh_active_state(active)?;
+        refresh_active_state(active, holder_root.as_deref())?;
         Ok(active.event_queue.front().cloned())
     }
 
     fn ack_event(&mut self, exec_id: u32) -> Result<(), ServiceError> {
-        let mut release_cgroup = None;
+        let mut should_clear_active = false;
         {
             let active = self.require_active(exec_id)?;
             if let Some(event) = active.event_queue.pop_front() {
@@ -394,12 +444,11 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                 && active.stderr_eof
                 && active.event_queue.is_empty()
             {
-                release_cgroup = active.cgroup_dir.clone();
+                should_clear_active = true;
             }
         }
-        if release_cgroup.is_some() {
+        if should_clear_active {
             self.active = None;
-            remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref())?;
         }
         Ok(())
     }
@@ -431,6 +480,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
         exec_id: u32,
         deadline: Duration,
     ) -> Result<bool, ServiceError> {
+        let holder_root = self.holder.as_ref().map(|holder| holder.cgroup_dir.clone());
         let active = self.require_active(exec_id)?;
         active.stdin = None;
         send_terminate(active)?;
@@ -439,30 +489,26 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             .ok_or_else(|| supervisor_error("disconnect deadline overflow"))?;
 
         while Instant::now() < deadline_at {
-            refresh_active_state(active)?;
+            refresh_active_state(active, holder_root.as_deref())?;
             if active.exit_status_reported
                 && active.descendants_cleaned_reported
                 && active.stdout_eof
                 && active.stderr_eof
             {
-                let release_cgroup = active.cgroup_dir.clone();
                 self.active = None;
-                remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref())?;
                 return Ok(true);
             }
             std::thread::sleep(POLL_SLEEP);
         }
         send_kill(active)?;
         while Instant::now() < deadline_at {
-            refresh_active_state(active)?;
+            refresh_active_state(active, holder_root.as_deref())?;
             if active.exit_status_reported
                 && active.descendants_cleaned_reported
                 && active.stdout_eof
                 && active.stderr_eof
             {
-                let release_cgroup = active.cgroup_dir.clone();
                 self.active = None;
-                remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref())?;
                 return Ok(true);
             }
             std::thread::sleep(POLL_SLEEP);
@@ -524,16 +570,10 @@ fn open_namespace_fd(pid: libc::pid_t, ns_name: &str) -> Result<i32, ServiceErro
     Ok(fd)
 }
 
-fn setns_checked(fd: i32, nstype: i32) -> io::Result<()> {
-    // SAFETY: fd references a namespace descriptor opened by open_namespace_fd.
-    let rc = unsafe { libc::setns(fd, nstype) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn refresh_active_state(active: &mut ActiveProcess) -> Result<(), ServiceError> {
+fn refresh_active_state(
+    active: &mut ActiveProcess,
+    holder_root: Option<&Path>,
+) -> Result<(), ServiceError> {
     if can_refresh_streams(active) {
         pump_stdio_round_robin(active)?;
     }
@@ -543,7 +583,7 @@ fn refresh_active_state(active: &mut ActiveProcess) -> Result<(), ServiceError> 
         maybe_report_exit(active)?;
     }
     if can_enqueue_event(active, 0) {
-        maybe_report_descendants_cleaned(active)?;
+        maybe_report_descendants_cleaned(active, holder_root)?;
     }
     Ok(())
 }
@@ -561,30 +601,29 @@ fn maybe_report_exit(active: &mut ActiveProcess) -> Result<(), ServiceError> {
     };
     if let Some(wait_status) = read_holder_wait_status(active)? {
         if libc::WIFEXITED(wait_status) {
-            push_event(
-                active,
-                SupervisorEvent::Exited(libc::WEXITSTATUS(wait_status)),
-            )?;
+            active.pending_terminal_event =
+                Some(SupervisorEvent::Exited(libc::WEXITSTATUS(wait_status)));
         } else if libc::WIFSIGNALED(wait_status) {
-            push_event(
-                active,
-                SupervisorEvent::Signaled(libc::WTERMSIG(wait_status)),
-            )?;
+            active.pending_terminal_event =
+                Some(SupervisorEvent::Signaled(libc::WTERMSIG(wait_status)));
         } else {
-            push_event(active, SupervisorEvent::Exited(1))?;
+            active.pending_terminal_event = Some(SupervisorEvent::Exited(1));
         }
     } else if let Some(code) = status.code() {
-        push_event(active, SupervisorEvent::Exited(code))?;
+        active.pending_terminal_event = Some(SupervisorEvent::Exited(code));
     } else if let Some(signal) = status.signal() {
-        push_event(active, SupervisorEvent::Signaled(signal))?;
+        active.pending_terminal_event = Some(SupervisorEvent::Signaled(signal));
     } else {
-        push_event(active, SupervisorEvent::Exited(1))?;
+        active.pending_terminal_event = Some(SupervisorEvent::Exited(1));
     }
     active.exit_status_reported = true;
     Ok(())
 }
 
-fn maybe_report_descendants_cleaned(active: &mut ActiveProcess) -> Result<(), ServiceError> {
+fn maybe_report_descendants_cleaned(
+    active: &mut ActiveProcess,
+    holder_root: Option<&Path>,
+) -> Result<(), ServiceError> {
     if active.descendants_cleaned_reported || !active.exit_status_reported {
         return Ok(());
     }
@@ -593,6 +632,25 @@ fn maybe_report_descendants_cleaned(active: &mut ActiveProcess) -> Result<(), Se
     }
     kill_exec_descendants(active, libc::SIGKILL)?;
     if descendants_populated_zero(active)? {
+        if let Err(error) = remove_exec_cgroup(active.cgroup_dir.as_deref(), holder_root) {
+            let started = active
+                .descendants_cleanup_started_at
+                .unwrap_or_else(Instant::now);
+            if started.elapsed() >= DESCENDANTS_CLEANUP_DEADLINE {
+                return Err(ServiceError {
+                    code: ServiceErrorCode::CleanupTimeout,
+                    message: format!(
+                        "descendant cleanup deadline exceeded before cgroup removal: {}",
+                        error.message
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        active.cgroup_dir = None;
+        if let Some(terminal) = active.pending_terminal_event.take() {
+            push_event(active, terminal)?;
+        }
         push_event(active, SupervisorEvent::DescendantsCleaned)?;
         active.descendants_cleaned_reported = true;
         return Ok(());
@@ -924,6 +982,45 @@ fn create_cloexec_pipe() -> io::Result<(i32, i32)> {
     Ok((fds[0], fds[1]))
 }
 
+fn dup_inheritable_fd(fd: RawFd) -> Result<RawFd, ServiceError> {
+    // SAFETY: dup duplicates an open descriptor owned by this process.
+    let duplicated = unsafe { libc::dup(fd) };
+    if duplicated < 0 {
+        return Err(supervisor_io(
+            format!("duplicating inherited descriptor {fd}"),
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(duplicated)
+}
+
+fn clear_cloexec(fd: RawFd) -> Result<RawFd, ServiceError> {
+    // SAFETY: fcntl(F_GETFD) reads descriptor flags for an open descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(supervisor_io(
+            format!("reading descriptor flags for fd {fd}"),
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: fcntl(F_SETFD) updates descriptor flags for an open descriptor.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    if rc < 0 {
+        return Err(supervisor_io(
+            format!("clearing close-on-exec for fd {fd}"),
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(fd)
+}
+
+fn close_fds_best_effort(fds: &[RawFd]) {
+    for fd in fds {
+        // SAFETY: best-effort close for process-owned descriptor duplicates.
+        let _ = unsafe { libc::close(*fd) };
+    }
+}
+
 fn try_prepare_workload_cgroup(exec_id: u32, pid: i32) -> Option<PathBuf> {
     let root = Path::new("/sys/fs/cgroup/nvx.workload");
     let mut prepared = prepare_exec_cgroup(root, exec_id).ok()?;
@@ -997,13 +1094,6 @@ fn report_spawn_failure_with_cgroup_cleanup(
     }
 }
 
-fn move_self_to_cgroup_fd(cgroup_procs_fd: i32) -> io::Result<()> {
-    let mut payload = [0_u8; 32];
-    let pid = unsafe { libc::getpid() };
-    let encoded = encode_pid_line(pid, &mut payload)?;
-    write_all_fd(cgroup_procs_fd, encoded)
-}
-
 fn move_pid_to_exec_cgroup(cgroup_procs_path: &CString, pid: i32) -> io::Result<()> {
     // SAFETY: path pointer is NUL-terminated and flags are constants.
     let fd = unsafe { libc::open(cgroup_procs_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
@@ -1070,22 +1160,28 @@ fn write_all_fd(fd: i32, mut bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn remove_exec_cgroup(
-    path: Option<&Path>,
-    holder: Option<&NamespaceHolder>,
-) -> Result<(), ServiceError> {
+fn remove_exec_cgroup(path: Option<&Path>, holder_root: Option<&Path>) -> Result<(), ServiceError> {
     let Some(path) = path else {
         return Ok(());
     };
-    if let Some(holder) = holder
-        && path == holder.cgroup_dir.as_path()
-    {
+    if holder_root.is_some_and(|root| path == root) {
         return Ok(());
     }
-    if let Some(root) = holder.as_ref().map(|value| value.cgroup_dir.as_path())
+    if let Some(root) = holder_root
         && !path.starts_with(root)
     {
         return Ok(());
+    }
+    #[cfg(test)]
+    {
+        let remaining = REMOVE_CGROUP_FAIL_COUNTDOWN.load(Ordering::SeqCst);
+        if remaining > 0 {
+            REMOVE_CGROUP_FAIL_COUNTDOWN.fetch_sub(1, Ordering::SeqCst);
+            return Err(supervisor_io(
+                format!("removing per-exec cgroup directory {}", path.display()),
+                io::Error::from_raw_os_error(libc::EBUSY),
+            ));
+        }
     }
     let mut attempts = 0_u32;
     loop {
@@ -1110,143 +1206,6 @@ fn is_retryable_remove_error(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(libc::EBUSY) | Some(libc::ENOTEMPTY) | Some(libc::EINTR)
     )
-}
-
-fn prepare_child_credential_plan() -> io::Result<ChildCredentialPlan> {
-    let raw = fs::read_to_string("/proc/sys/kernel/cap_last_cap")?;
-    let last_capability_index = raw
-        .trim()
-        .parse::<i32>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cap_last_cap"))?;
-    Ok(ChildCredentialPlan {
-        last_capability_index,
-    })
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct LinuxCapHeader {
-    version: u32,
-    pid: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct LinuxCapData {
-    effective: u32,
-    permitted: u32,
-    inheritable: u32,
-}
-
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-
-fn apply_workload_exec_credentials(plan: Option<ChildCredentialPlan>) -> io::Result<()> {
-    let Some(plan) = plan else {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "child credential plan is missing",
-        ));
-    };
-    // SAFETY: setgroups called with zero groups and null pointer.
-    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: prctl ambient clear has no pointer arguments.
-    if unsafe {
-        libc::prctl(
-            libc::PR_CAP_AMBIENT,
-            libc::PR_CAP_AMBIENT_CLEAR_ALL,
-            0,
-            0,
-            0,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let mut capability = 0_i32;
-    while capability <= plan.last_capability_index {
-        // SAFETY: prctl validates capability indexes.
-        let rc = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) };
-        if rc != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EPERM) {
-                return Err(error);
-            }
-            break;
-        }
-        capability += 1;
-    }
-    // SAFETY: setgid/setuid use fixed workload identity constants.
-    if unsafe { libc::setgid(WORKLOAD_GID_MXC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: setuid uses fixed workload identity constants.
-    if unsafe { libc::setuid(WORKLOAD_UID_MXC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let header = LinuxCapHeader {
-        version: LINUX_CAPABILITY_VERSION_3,
-        pid: 0,
-    };
-    let mut data = [LinuxCapData {
-        effective: 0,
-        permitted: 0,
-        inheritable: 0,
-    }; 2];
-    // SAFETY: syscall receives valid pointers to initialized capability header/data.
-    if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: prctl no_new_privs has no pointer arguments.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    verify_no_capability_regain(plan)
-}
-
-fn verify_no_capability_regain(plan: ChildCredentialPlan) -> io::Result<()> {
-    let mut header = LinuxCapHeader {
-        version: LINUX_CAPABILITY_VERSION_3,
-        pid: 0,
-    };
-    let mut data = [LinuxCapData {
-        effective: 0,
-        permitted: 0,
-        inheritable: 0,
-    }; 2];
-    // SAFETY: syscall receives valid pointers to writable header/data structures.
-    if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    for entry in data {
-        if entry.effective != 0 || entry.permitted != 0 || entry.inheritable != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "capability set must be empty",
-            ));
-        }
-    }
-    let mut capability = 0_i32;
-    while capability <= plan.last_capability_index {
-        // SAFETY: prctl validates capability indexes and returns 0/1.
-        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
-        if present > 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "bounding capability set must be empty",
-            ));
-        }
-        capability += 1;
-    }
-    let no_new_privs = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
-    if no_new_privs != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "PR_SET_NO_NEW_PRIVS is not locked",
-        ));
-    }
-    Ok(())
 }
 
 fn would_block(error: &io::Error) -> bool {
@@ -1394,13 +1353,18 @@ mod tests {
             pid_ns_fd: -1,
         };
 
-        remove_exec_cgroup(Some(holder_root.as_path()), Some(&holder)).expect("remove holder root");
+        remove_exec_cgroup(
+            Some(holder_root.as_path()),
+            Some(holder.cgroup_dir.as_path()),
+        )
+        .expect("remove holder root");
         assert!(
             holder_root.exists(),
             "holder membership cgroup must never be deleted by exec cleanup"
         );
 
-        remove_exec_cgroup(Some(exec_dir.as_path()), Some(&holder)).expect("remove exec dir");
+        remove_exec_cgroup(Some(exec_dir.as_path()), Some(holder.cgroup_dir.as_path()))
+            .expect("remove exec dir");
         assert!(
             !exec_dir.exists(),
             "exec cleanup must target only per-exec child cgroups"
@@ -1465,6 +1429,57 @@ mod tests {
         assert!(
             cgroup_text.contains(&exec_leaf),
             "child must be moved into per-exec cgroup"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Linux root privileges and namespace/cgroup write access"]
+    fn holder_launcher_spawn_returns_before_stdin_and_preserves_signal_behavior() {
+        let mut supervisor = LinuxProcessSupervisor::new_with_holder(1).expect("holder");
+        let exec_id = 77_u32;
+        let started = Instant::now();
+        supervisor
+            .spawn(&CreateProcessRequest {
+                exec_id,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "read line; printf 'READY:%s\\n' \"$line\"; while :; do sleep 1; done"
+                        .to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .expect("spawn");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "holder spawn must return promptly without waiting on stdin"
+        );
+
+        supervisor
+            .queue_stdin(exec_id, b"hello\n".to_vec())
+            .expect("queue stdin");
+        supervisor.close_stdin(exec_id).expect("close stdin");
+
+        let stdout_ready = wait_for_event(
+            &mut supervisor,
+            exec_id,
+            Duration::from_secs(2),
+            |event| matches!(event, SupervisorEvent::StdoutChunk(chunk) if String::from_utf8_lossy(chunk).contains("READY:hello")),
+        );
+        assert!(
+            stdout_ready.is_some(),
+            "stdin must reach workload and produce output"
+        );
+
+        supervisor.terminate(exec_id).expect("terminate");
+        let signaled = wait_for_event(&mut supervisor, exec_id, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Signaled(_))
+        });
+        assert!(
+            signaled.is_some(),
+            "signal disposition must be preserved through holder launcher"
         );
     }
 
@@ -1658,9 +1673,10 @@ mod tests {
             event_queue_bytes: 0,
             prefer_stdout_next: true,
             holder_wait_status: None,
+            pending_terminal_event: None,
         };
 
-        maybe_report_descendants_cleaned(&mut active).expect("poll cleanup pending");
+        maybe_report_descendants_cleaned(&mut active, None).expect("poll cleanup pending");
         assert!(
             !active.descendants_cleaned_reported,
             "cleanup cannot complete while populated=1"
@@ -1668,7 +1684,7 @@ mod tests {
         assert!(active.event_queue.is_empty(), "no cleanup event yet");
 
         fs::write(&events_path, "populated 0\n").expect("flip populated=0");
-        maybe_report_descendants_cleaned(&mut active).expect("poll cleanup complete");
+        maybe_report_descendants_cleaned(&mut active, None).expect("poll cleanup complete");
         assert!(
             active.descendants_cleaned_reported,
             "cleanup should complete"
@@ -1716,9 +1732,121 @@ mod tests {
             event_queue_bytes: 0,
             prefer_stdout_next: true,
             holder_wait_status: None,
+            pending_terminal_event: None,
         };
-        let error = maybe_report_descendants_cleaned(&mut active).expect_err("timeout expected");
+        let error =
+            maybe_report_descendants_cleaned(&mut active, None).expect_err("timeout expected");
         assert_eq!(error.code, ServiceErrorCode::CleanupTimeout);
+    }
+
+    #[test]
+    fn descendants_cleanup_retries_cgroup_removal_then_publishes_terminal_and_cleanup() {
+        let temp = tempdir().expect("tempdir");
+        let events_path = temp.path().join("cgroup.events");
+        fs::write(&events_path, "populated 0\n").expect("seed populated=0");
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn child");
+        let mut active = ActiveProcess {
+            exec_id: 3,
+            child,
+            process_group_id: i32::MAX,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            stdout_eof: true,
+            stderr_eof: true,
+            stdin_queue: VecDeque::new(),
+            stdin_queue_bytes: 0,
+            stdin_queue_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_drained_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_offset: 0,
+            stdin_close_requested: false,
+            terminate_sent_at: None,
+            kill_sent: true,
+            exit_status_reported: false,
+            descendants_cleaned_reported: false,
+            descendants_cleanup_started_at: None,
+            cgroup_dir: Some(temp.path().to_path_buf()),
+            event_queue: VecDeque::new(),
+            event_queue_bytes: 0,
+            prefer_stdout_next: true,
+            holder_wait_status: None,
+            pending_terminal_event: None,
+        };
+        maybe_report_exit(&mut active).expect("capture terminal disposition");
+        REMOVE_CGROUP_FAIL_COUNTDOWN.store(1, Ordering::SeqCst);
+        maybe_report_descendants_cleaned(&mut active, None).expect("first removal attempt");
+        assert!(
+            active.event_queue.is_empty(),
+            "events must wait for cgroup removal"
+        );
+        maybe_report_descendants_cleaned(&mut active, None).expect("second removal attempt");
+        assert!(matches!(
+            active.event_queue.pop_front(),
+            Some(SupervisorEvent::Exited(0))
+        ));
+        assert!(matches!(
+            active.event_queue.pop_front(),
+            Some(SupervisorEvent::DescendantsCleaned)
+        ));
+        assert!(active.descendants_cleaned_reported);
+    }
+
+    #[test]
+    fn descendants_cleanup_timeout_on_persistent_removal_failure_publishes_nothing() {
+        let temp = tempdir().expect("tempdir");
+        let events_path = temp.path().join("cgroup.events");
+        fs::write(&events_path, "populated 0\n").expect("seed populated=0");
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn child");
+        let mut active = ActiveProcess {
+            exec_id: 4,
+            child,
+            process_group_id: i32::MAX,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            stdout_eof: true,
+            stderr_eof: true,
+            stdin_queue: VecDeque::new(),
+            stdin_queue_bytes: 0,
+            stdin_queue_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_drained_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_offset: 0,
+            stdin_close_requested: false,
+            terminate_sent_at: None,
+            kill_sent: true,
+            exit_status_reported: false,
+            descendants_cleaned_reported: false,
+            descendants_cleanup_started_at: Some(
+                Instant::now() - DESCENDANTS_CLEANUP_DEADLINE - Duration::from_millis(1),
+            ),
+            cgroup_dir: Some(temp.path().to_path_buf()),
+            event_queue: VecDeque::new(),
+            event_queue_bytes: 0,
+            prefer_stdout_next: true,
+            holder_wait_status: None,
+            pending_terminal_event: None,
+        };
+        maybe_report_exit(&mut active).expect("capture terminal disposition");
+        REMOVE_CGROUP_FAIL_COUNTDOWN.store(128, Ordering::SeqCst);
+        let error = maybe_report_descendants_cleaned(&mut active, None)
+            .expect_err("persistent removal failure must time out");
+        assert_eq!(error.code, ServiceErrorCode::CleanupTimeout);
+        assert!(
+            active.event_queue.is_empty(),
+            "cleanup timeout must publish neither terminal nor descendants-cleaned"
+        );
+        assert!(
+            active.pending_terminal_event.is_some(),
+            "terminal must remain pending while cgroup removal fails"
+        );
     }
 
     #[test]
