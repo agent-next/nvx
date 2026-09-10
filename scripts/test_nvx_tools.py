@@ -37,19 +37,37 @@ from nvx_tools import (  # noqa: E402
 
 
 def _static_x86_64_elf() -> bytes:
-    image = bytearray(120)
+    image = bytearray(240)
     image[:6] = b"\x7fELF\x02\x01"
     image[16:18] = (2).to_bytes(2, "little")
     image[18:20] = (62).to_bytes(2, "little")
     image[24:32] = (0x400040).to_bytes(8, "little")
     image[32:40] = (64).to_bytes(8, "little")
     image[54:56] = (56).to_bytes(2, "little")
-    image[56:58] = (1).to_bytes(2, "little")
+    image[56:58] = (2).to_bytes(2, "little")
     image[64:68] = (1).to_bytes(4, "little")
     image[68:72] = (5).to_bytes(4, "little")
     image[80:88] = (0x400000).to_bytes(8, "little")
     image[96:104] = len(image).to_bytes(8, "little")
     image[104:112] = len(image).to_bytes(8, "little")
+    note_program_header = 64 + 56
+    image[note_program_header : note_program_header + 4] = (4).to_bytes(4, "little")
+    image[note_program_header + 8 : note_program_header + 16] = (176).to_bytes(
+        8, "little"
+    )
+    note_size = 36
+    image[note_program_header + 32 : note_program_header + 40] = note_size.to_bytes(
+        8, "little"
+    )
+    image[note_program_header + 40 : note_program_header + 48] = note_size.to_bytes(
+        8, "little"
+    )
+    note_offset = 176
+    image[note_offset : note_offset + 4] = (4).to_bytes(4, "little")
+    image[note_offset + 4 : note_offset + 8] = (20).to_bytes(4, "little")
+    image[note_offset + 8 : note_offset + 12] = (3).to_bytes(4, "little")
+    image[note_offset + 12 : note_offset + 16] = b"GNU\x00"
+    image[note_offset + 16 : note_offset + 36] = bytes(range(1, 21))
     return bytes(image)
 
 
@@ -1795,10 +1813,18 @@ class BuildTests(unittest.TestCase):
                 provenance["source_authority"], build.SOURCE_AUTHORITY_VERIFIED_GIT
             )
             self.assertEqual(provenance["sha256"], sha256)
+            self.assertEqual(
+                provenance["build_id"],
+                "0102030405060708090a0b0c0d0e0f1011121314",
+            )
             self.assertEqual(guest_manifest["sha256"], sha256)
             self.assertEqual(
                 guest_manifest["source_authority"],
                 build.SOURCE_AUTHORITY_VERIFIED_GIT,
+            )
+            self.assertEqual(
+                guest_manifest["build_id"],
+                "0102030405060708090a0b0c0d0e0f1011121314",
             )
             self.assertIn("--locked", run_checked.call_args.args[0])
 
@@ -1889,6 +1915,126 @@ class BuildTests(unittest.TestCase):
                 provenance["source_authority"],
                 build.SOURCE_AUTHORITY_DECLARED_CONTAINER_INPUT,
             )
+
+    def test_build_mxc_prototype_probe_helper_stages_in_repo_binary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_revision = "a" * 40
+            built = (
+                root
+                / "target"
+                / build.GUEST_AGENT_TARGET
+                / "release"
+                / "nvx-agent-probe"
+            )
+            built.parent.mkdir(parents=True)
+            built.write_bytes(_static_x86_64_elf())
+            sha256 = hashlib.sha256(built.read_bytes()).hexdigest()
+            with (
+                patch.object(build, "REPO_ROOT", root),
+                patch.object(build, "require_tool", return_value="cargo"),
+                patch.object(build, "run_checked") as run_checked,
+                patch.object(
+                    build,
+                    "run_capture",
+                    side_effect=(
+                        common.CommandResult(
+                            ("git",),
+                            0,
+                            f"{source_revision}\n".encode("ascii"),
+                            b"",
+                        ),
+                        common.CommandResult(("git",), 0, b"", b""),
+                    ),
+                ),
+                patch.dict(os.environ, {}, clear=False),
+            ):
+                staged, actual_sha256, helper_manifest = (
+                    build.build_mxc_prototype_probe_helper()
+                )
+
+            self.assertEqual(actual_sha256, sha256)
+            self.assertEqual(staged, root / "build" / build.MXC_GUEST_PROBE_ARTIFACT_NAME)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o755)
+            self.assertEqual(
+                (root / "build" / build.MXC_GUEST_PROBE_SHA256_NAME)
+                .read_text(encoding="ascii")
+                .strip(),
+                sha256,
+            )
+            provenance = json.loads(
+                (root / "build" / build.MXC_GUEST_PROBE_PROVENANCE_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(provenance["source_revision"], source_revision)
+            self.assertEqual(
+                provenance["source_authority"], build.SOURCE_AUTHORITY_VERIFIED_GIT
+            )
+            self.assertEqual(provenance["sha256"], sha256)
+            self.assertEqual(
+                provenance["build_id"],
+                "0102030405060708090a0b0c0d0e0f1011121314",
+            )
+            self.assertEqual(helper_manifest["sha256"], sha256)
+            self.assertEqual(
+                helper_manifest["source_authority"],
+                build.SOURCE_AUTHORITY_VERIFIED_GIT,
+            )
+            self.assertEqual(
+                helper_manifest["build_id"],
+                "0102030405060708090a0b0c0d0e0f1011121314",
+            )
+            self.assertIn("--locked", run_checked.call_args.args[0])
+
+    def test_mxc_probe_helper_sidecar_requires_source_build_hash_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = root / "initramfs-mxc-agent.cpio.gz.packages.json"
+            expected_probe = {
+                "path": build.MXC_GUEST_PROBE_INSTALLED_PATH,
+                "sha256": "a" * 64,
+                "size": 1234,
+                "source_revision": "b" * 40,
+                "source_authority": build.SOURCE_AUTHORITY_VERIFIED_GIT,
+                "build_id": "c" * 40,
+                "origin": "in-repo-workspace",
+            }
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "helpers": {
+                            "nvx-agent-probe": {
+                                key: str(value) for key, value in expected_probe.items()
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            build._verify_mxc_probe_helper_sidecar(manifest_path, expected_probe)
+
+            for field, value in (
+                ("source_revision", "0" * 40),
+                ("build_id", "1" * 40),
+                ("sha256", "2" * 64),
+            ):
+                mutated = json.loads(manifest_path.read_text(encoding="utf-8"))
+                probe = cast(
+                    dict[str, object],
+                    cast(dict[str, object], mutated["helpers"])["nvx-agent-probe"],
+                )
+                probe[field] = value
+                manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+                with (
+                    self.subTest(field=field),
+                    self.assertRaisesRegex(
+                        common.ScriptError,
+                        "nvx-agent-probe provenance does not match",
+                    ),
+                ):
+                    build._verify_mxc_probe_helper_sidecar(manifest_path, expected_probe)
 
     def test_source_provenance_requires_complete_environment(self):
         with patch.dict(
@@ -5091,6 +5237,40 @@ class ReleaseTests(unittest.TestCase):
                     self.assertRaisesRegex(common.ScriptError, "pinned broker"),
                 ):
                     release._validate_root_broker_contract()
+
+    def test_mxc_prototype_workspace_inventory_matches_expected_build_inputs(self):
+        source_manifest = json.loads(
+            (common.REPO_ROOT / "SOURCE-MANIFEST.json").read_text(encoding="utf-8")
+        )
+        release._validate_mxc_prototype_workspace_inventory(source_manifest)
+        mutations: tuple[list[str], ...] = (
+            ["agent-protocol", "agent", "tools/agent-harness"],
+            [
+                "agent-protocol",
+                "agent",
+                "tools/agent-harness",
+                "tools/nvx-agent-probe",
+                "tools/extra-crate",
+            ],
+            [
+                "agent-protocol",
+                "agent",
+                "tools/nvx-agent-probe",
+                "tools/agent-harness",
+            ],
+        )
+        for members in mutations:
+            changed = json.loads(json.dumps(source_manifest))
+            changed_mxc = cast(dict[str, object], changed["mxc_prototype"])
+            changed_mxc["workspace_members"] = members
+            with (
+                self.subTest(members=members),
+                self.assertRaisesRegex(
+                    common.ScriptError,
+                    "workspace_members must exactly match",
+                ),
+            ):
+                release._validate_mxc_prototype_workspace_inventory(changed)
 
     def test_package_validator_rejects_cross_profile_initramfs(self):
         with tempfile.TemporaryDirectory() as temporary:

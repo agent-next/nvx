@@ -18,7 +18,7 @@ import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from .common import (
     REPO_ROOT,
@@ -350,6 +350,45 @@ def validate_static_x86_64_elf(path: Path) -> None:
         raise ScriptError("NVX guest agent entry point is not executable")
 
 
+def _elf_gnu_build_id(path: Path) -> str:
+    data = path.read_bytes()
+    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
+        raise ScriptError("expected a little-endian ELF64 binary")
+    program_offset = struct.unpack_from("<Q", data, 32)[0]
+    program_entry_size = struct.unpack_from("<H", data, 54)[0]
+    program_count = struct.unpack_from("<H", data, 56)[0]
+    if program_entry_size == 0 or program_count == 0:
+        raise ScriptError("ELF program headers are missing")
+    program_bytes = program_entry_size * program_count
+    if program_offset > len(data) or program_bytes > len(data) - program_offset:
+        raise ScriptError("ELF program headers are truncated")
+    for index in range(program_count):
+        offset = program_offset + index * program_entry_size
+        segment_type = struct.unpack_from("<I", data, offset)[0]
+        if segment_type != 4:
+            continue
+        file_offset = struct.unpack_from("<Q", data, offset + 8)[0]
+        file_size = struct.unpack_from("<Q", data, offset + 32)[0]
+        if file_offset > len(data) or file_size > len(data) - file_offset:
+            raise ScriptError("ELF note segment is truncated")
+        note_offset = file_offset
+        note_end = file_offset + file_size
+        while note_offset + 12 <= note_end:
+            namesz, descsz, note_type = struct.unpack_from("<III", data, note_offset)
+            note_offset += 12
+            if namesz > note_end - note_offset:
+                raise ScriptError("ELF note name is truncated")
+            name = data[note_offset : note_offset + namesz]
+            note_offset += (namesz + 3) & ~3
+            if descsz > note_end - note_offset:
+                raise ScriptError("ELF note descriptor is truncated")
+            descriptor = data[note_offset : note_offset + descsz]
+            note_offset += (descsz + 3) & ~3
+            if name == b"GNU\x00" and note_type == 3 and descriptor:
+                return descriptor.hex()
+    raise ScriptError(f"{path} is missing an ELF GNU build ID")
+
+
 def stage_guest_agent(source: Path, expected_sha256: str) -> Path:
     """Stage a pinned guest-agent binary without enabling it in the initramfs."""
     source = source.expanduser().resolve()
@@ -443,6 +482,7 @@ def build_mxc_prototype_guest_agent(
     shutil.copyfile(built_agent, destination)
     destination.chmod(0o755)
     sha256 = sha256_file(destination)
+    build_id = _elf_gnu_build_id(destination)
     (REPO_ROOT / "build" / MXC_GUEST_AGENT_SHA256_NAME).write_text(
         f"{sha256}\n",
         encoding="ascii",
@@ -454,6 +494,7 @@ def build_mxc_prototype_guest_agent(
         "source_revision": source.revision,
         "source_clean": source.clean,
         "source_authority": source.authority,
+        "build_id": build_id,
         "sha256": sha256,
         "size": size,
     }
@@ -470,7 +511,7 @@ def build_mxc_prototype_guest_agent(
             "size": size,
             "source_revision": provenance["source_revision"],
             "source_authority": provenance["source_authority"],
-            "build_id": None,
+            "build_id": provenance["build_id"],
             "origin": "in-repo-workspace",
         },
     )
@@ -517,6 +558,7 @@ def build_mxc_prototype_probe_helper(
     shutil.copyfile(built_probe, destination)
     destination.chmod(0o755)
     sha256 = sha256_file(destination)
+    build_id = _elf_gnu_build_id(destination)
     (REPO_ROOT / "build" / MXC_GUEST_PROBE_SHA256_NAME).write_text(
         f"{sha256}\n",
         encoding="ascii",
@@ -528,6 +570,7 @@ def build_mxc_prototype_probe_helper(
         "source_revision": source.revision,
         "source_clean": source.clean,
         "source_authority": source.authority,
+        "build_id": build_id,
         "sha256": sha256,
         "size": size,
     }
@@ -544,7 +587,7 @@ def build_mxc_prototype_probe_helper(
             "size": size,
             "source_revision": provenance["source_revision"],
             "source_authority": provenance["source_authority"],
-            "build_id": None,
+            "build_id": provenance["build_id"],
             "origin": "in-repo-workspace",
         },
     )
@@ -1207,6 +1250,23 @@ def _bind_apk_manifest_to_initramfs(output: Path) -> None:
     )
 
 
+def _verify_mxc_probe_helper_sidecar(
+    manifest_path: Path,
+    expected_probe: dict[str, object],
+) -> None:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    helpers = manifest.get("helpers")
+    if not isinstance(helpers, dict):
+        raise ScriptError(f"{manifest_path} does not declare helper provenance")
+    typed_helpers = cast(dict[str, object], helpers)
+    actual = typed_helpers.get("nvx-agent-probe")
+    expected = {key: str(value) for key, value in expected_probe.items()}
+    if actual != expected:
+        raise ScriptError(
+            f"{manifest_path} nvx-agent-probe provenance does not match the build sidecar"
+        )
+
+
 def _newc_entries(path: Path) -> tuple[InitramfsEntry, ...]:
     if path.stat().st_size > INITRAMFS_MAX_COMPRESSED_BYTES:
         raise ScriptError(f"{path} exceeds the compressed initramfs size limit")
@@ -1726,6 +1786,12 @@ def build_initramfs(config: AlpineBuildConfig) -> None:
     )
     _pack_initramfs(root, native_output, trusted_owners)
     _bind_apk_manifest_to_initramfs(native_output)
+    if config.profile == MXC_PROTOTYPE_TRANSPORT:
+        assert mxc_helper_manifest is not None
+        _verify_mxc_probe_helper_sidecar(
+            native_output.with_name(f"{native_output.name}.packages.json"),
+            mxc_helper_manifest,
+        )
     if agent_sha256 is not None:
         verify_agent_initramfs(
             native_output,

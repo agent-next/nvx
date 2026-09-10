@@ -124,6 +124,12 @@ RELEASE_TAR_MAX_DECOMPRESSED_BYTES = (
     + tarfile.RECORDSIZE
 )
 _TAR_STREAM_CHUNK_BYTES = 64 * 1024
+MXC_PROTOTYPE_WORKSPACE_MEMBERS = (
+    "agent-protocol",
+    "agent",
+    "tools/agent-harness",
+    "tools/nvx-agent-probe",
+)
 
 
 @dataclass(frozen=True)
@@ -548,6 +554,26 @@ def _validate_root_broker_contract() -> dict[str, object]:
             "root SOURCE-MANIFEST.json does not match the pinned broker contract"
         )
     return manifest
+
+
+def _validate_mxc_prototype_workspace_inventory(manifest: dict[str, object]) -> None:
+    section = manifest.get("mxc_prototype")
+    if not isinstance(section, dict):
+        raise ScriptError("SOURCE-MANIFEST.json lacks mxc_prototype inventory")
+    typed_section = cast(dict[str, object], section)
+    workspace_members = typed_section.get("workspace_members")
+    if not isinstance(workspace_members, list) or any(
+        not isinstance(member, str) for member in workspace_members
+    ):
+        raise ScriptError(
+            "SOURCE-MANIFEST.json mxc_prototype.workspace_members is invalid"
+        )
+    typed_workspace_members = cast(list[str], workspace_members)
+    if tuple(typed_workspace_members) != MXC_PROTOTYPE_WORKSPACE_MEMBERS:
+        raise ScriptError(
+            "SOURCE-MANIFEST.json mxc_prototype.workspace_members must exactly match "
+            "the MXC prototype build inventory"
+        )
 
 
 def _github_headers(token: str | None, accept: str) -> dict[str, str]:
@@ -2585,4 +2611,5 @@ def verify_source_tree() -> None:
             raise ScriptError(
                 f"SOURCE-MANIFEST.json guest-agent {field} does not match the build contract"
             )
+    _validate_mxc_prototype_workspace_inventory(manifest)
     print(">> source tree and submodule metadata are consistent")

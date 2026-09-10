@@ -5,7 +5,7 @@
     "version": "0.1.0"
   },
   "openvmm": {
-    "source_revision": "a31a59da95f12b530b918801e9ca6c12d156ae65",
+    "source_revision": "c89081b7673d63c32021fa00d9611acfbcb116b9",
     "microvm_abi_version": 2,
     "control_session_protocol_version": 1,
     "control_contract_revision": "nvx-microvm-v2-control-v1"
@@ -54,7 +54,8 @@
     "workspace_members": [
       "agent-protocol",
       "agent",
-      "tools/agent-harness"
+      "tools/agent-harness",
+      "tools/nvx-agent-probe"
     ],
     "initramfs_artifact": "guest/initramfs-mxc-agent.cpio.gz",
     "pid1_path": "/sbin/nvx-agent",
