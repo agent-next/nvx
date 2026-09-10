@@ -559,6 +559,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(mxc_agent_tests.backend, "whp")
         self.assertEqual(mxc_agent_tests.output_dir, common.BUILD_DIR / "mxc-agent-harness")
         self.assertFalse(mxc_agent_tests.static_only)
+        self.assertIsNone(mxc_agent_tests.openvmm_exe)
+        self.assertIsNone(mxc_agent_tests.kernel)
+        self.assertIsNone(mxc_agent_tests.mxc_initramfs)
+        self.assertIsNone(mxc_agent_tests.common_root)
         self.assertIs(mxc_agent_tests.handler, nvx.command_test_mxc_agent)
 
     def test_test_mxc_agent_builds_canonical_command(self):
@@ -573,7 +577,12 @@ class CliTests(unittest.TestCase):
             ]
         )
 
-        with patch.object(nvx, "_run") as run:
+        with (
+            patch.object(nvx, "_run") as run,
+            patch.object(nvx, "_validate_mxc_agent_live_inputs"),
+            patch.object(nvx, "openvmm_binary_path", return_value=Path("openvmm.exe")),
+            patch.object(nvx, "artifact_path", side_effect=lambda name: Path("build") / name),
+        ):
             nvx.command_test_mxc_agent(args)
 
         command = [str(value) for value in run.call_args.args[0]]
@@ -589,9 +598,29 @@ class CliTests(unittest.TestCase):
                 "whp",
                 "--output-dir",
                 str(Path("artifacts/mxc-harness")),
+                "--openvmm-exe",
+                str(Path("openvmm.exe")),
+                "--kernel",
+                str(Path("build") / "vmlinux"),
+                "--mxc-initramfs",
+                str(Path("build") / "initramfs-mxc-agent.cpio.gz"),
+                "--common-root",
+                str(Path("artifacts/mxc-harness") / "common-root"),
                 "--static-only",
             ],
         )
+
+    def test_test_mxc_agent_validation_reports_machine_readable_missing_prerequisites(self):
+        with self.assertRaises(common.ScriptError) as context:
+            nvx._validate_mxc_agent_live_inputs(
+                openvmm_exe=Path("missing-openvmm.exe"),
+                kernel=Path("missing-vmlinux"),
+                mxc_initramfs=Path("missing-initramfs"),
+                common_root=Path("missing-file"),
+            )
+        message = str(context.exception)
+        self.assertIn("\"kind\": \"missing-prerequisite\"", message)
+        self.assertIn("\"field\": \"openvmm_exe\"", message)
 
     def test_sandbox_command_parses_typed_launch_contract(self):
         args = nvx.parse_args(

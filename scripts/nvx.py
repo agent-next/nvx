@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import stat
@@ -222,6 +223,16 @@ def command_test_openvmm(args: argparse.Namespace) -> None:
 
 
 def command_test_mxc_agent(args: argparse.Namespace) -> None:
+    openvmm_exe = args.openvmm_exe or openvmm_binary_path()
+    kernel = args.kernel or artifact_path("vmlinux")
+    mxc_initramfs = args.mxc_initramfs or artifact_path(MXC_PROTOTYPE_INITRAMFS_NAME)
+    common_root = args.common_root or (args.output_dir / "common-root")
+    _validate_mxc_agent_live_inputs(
+        openvmm_exe=openvmm_exe,
+        kernel=kernel,
+        mxc_initramfs=mxc_initramfs,
+        common_root=common_root,
+    )
     command: list[str | os.PathLike[str]] = [
         "cargo",
         "run",
@@ -232,10 +243,53 @@ def command_test_mxc_agent(args: argparse.Namespace) -> None:
         args.backend,
         "--output-dir",
         args.output_dir,
+        "--openvmm-exe",
+        openvmm_exe,
+        "--kernel",
+        kernel,
+        "--mxc-initramfs",
+        mxc_initramfs,
+        "--common-root",
+        common_root,
     ]
     if args.static_only:
         command.append("--static-only")
     _run(command, cwd=REPO_ROOT)
+
+
+def _validate_mxc_agent_live_inputs(
+    *,
+    openvmm_exe: Path,
+    kernel: Path,
+    mxc_initramfs: Path,
+    common_root: Path,
+) -> None:
+    missing: list[dict[str, str]] = []
+    for field, path in (
+        ("openvmm_exe", openvmm_exe),
+        ("kernel", kernel),
+        ("mxc_initramfs", mxc_initramfs),
+    ):
+        if not path.is_file():
+            missing.append(
+                {
+                    "kind": "missing-prerequisite",
+                    "field": field,
+                    "path": str(path),
+                    "reason": "required file is missing",
+                }
+            )
+    if common_root.exists() and not common_root.is_dir():
+        missing.append(
+            {
+                "kind": "missing-prerequisite",
+                "field": "common_root",
+                "path": str(common_root),
+                "reason": "must be a directory",
+            }
+        )
+    if missing:
+        raise ScriptError(json.dumps({"errors": missing}, sort_keys=True))
 
 
 def command_build(args: argparse.Namespace) -> None:
@@ -594,6 +648,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=BUILD_DIR / "mxc-agent-harness",
+    )
+    mxc_agent_tests.add_argument(
+        "--openvmm-exe",
+        type=Path,
+        help="override OpenVMM executable path",
+    )
+    mxc_agent_tests.add_argument(
+        "--kernel",
+        type=Path,
+        help="override PVH kernel path",
+    )
+    mxc_agent_tests.add_argument(
+        "--mxc-initramfs",
+        type=Path,
+        help="override mxc-prototype initramfs path",
+    )
+    mxc_agent_tests.add_argument(
+        "--common-root",
+        type=Path,
+        help="override common-root host path used by the harness",
     )
     mxc_agent_tests.set_defaults(handler=command_test_mxc_agent)
 

@@ -58,6 +58,12 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
 };
 
+pub mod client;
+pub mod control_session;
+pub mod launch;
+pub mod named_pipe;
+pub mod scenarios;
+
 const REPORT_SCHEMA: &str = "nvx.mxc.agent.harness.report.v1";
 const REPORT_VERSION: u32 = 1;
 const ATTESTATION_MANIFEST_SCHEMA: &str = "nvx.mxc.agent.harness.attestation-manifest.v1";
@@ -96,7 +102,7 @@ impl HarnessBackend {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ScenarioDefinition {
+pub(crate) struct ScenarioDefinition {
     requirement_number: u8,
     id: &'static str,
     name: &'static str,
@@ -270,6 +276,7 @@ pub struct HarnessOptions {
     pub backend: HarnessBackend,
     pub mode: HarnessMode,
     pub output_dir: PathBuf,
+    pub launch_overrides: Option<launch::LaunchOverrides>,
 }
 
 #[derive(Clone, Debug)]
@@ -477,7 +484,7 @@ fn run_scenario(
     ));
     let outcome = match options.mode {
         HarnessMode::StaticOnly => run_static_only_scenario(definition),
-        HarnessMode::LiveWhp => run_live_mode_scenario(definition),
+        HarnessMode::LiveWhp => run_live_mode_scenario(options, definition),
     };
     diagnostics.push(format!(
         "scenario {} => {:?}",
@@ -486,7 +493,10 @@ fn run_scenario(
     outcome
 }
 
-fn run_live_mode_scenario(definition: ScenarioDefinition) -> ScenarioResult {
+fn run_live_mode_scenario(
+    options: &HarnessOptions,
+    definition: ScenarioDefinition,
+) -> ScenarioResult {
     #[cfg(target_os = "linux")]
     {
         if (3..=6).contains(&definition.requirement_number)
@@ -504,20 +514,14 @@ fn run_live_mode_scenario(definition: ScenarioDefinition) -> ScenarioResult {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let static_outcome = run_static_check_scenario(definition);
-        let mut result = make_report_result(
+        let live_outcome = scenarios::run_live_requirement(options, definition);
+        make_report_result(
             definition,
-            static_outcome.evidence_source,
-            static_outcome.check_status,
-            static_outcome.evidence,
-            static_outcome.error,
-        );
-        if result.status == ScenarioStatus::NotLive {
-            result.error = Some(
-                "live WHP evidence collection is not implemented in this harness build".to_string(),
-            );
-        }
-        result
+            live_outcome.evidence_source,
+            live_outcome.check_status,
+            live_outcome.evidence,
+            live_outcome.error,
+        )
     }
 }
 
@@ -533,7 +537,7 @@ fn run_static_only_scenario(definition: ScenarioDefinition) -> ScenarioResult {
 }
 
 #[derive(Clone, Debug)]
-struct CheckOutcome {
+pub(crate) struct CheckOutcome {
     check_status: EvidenceCheckStatus,
     evidence_source: EvidenceSource,
     error: Option<String>,
@@ -2651,6 +2655,7 @@ mod tests {
             backend: HarnessBackend::Whp,
             mode: HarnessMode::StaticOnly,
             output_dir: root,
+            launch_overrides: None,
         })
         .expect("run");
         assert!(!is_passing_report(&run));
@@ -2679,6 +2684,7 @@ mod tests {
             backend: HarnessBackend::Whp,
             mode: HarnessMode::LiveWhp,
             output_dir: root,
+            launch_overrides: None,
         })
         .expect("run");
         assert_eq!(run.exit_code(), ExitCode::FAILURE);
@@ -2705,6 +2711,7 @@ mod tests {
             backend: HarnessBackend::Whp,
             mode: HarnessMode::StaticOnly,
             output_dir: root,
+            launch_overrides: None,
         })
         .expect("run");
         for requirement_number in [7_u8, 8_u8, 9_u8] {
@@ -2727,6 +2734,7 @@ mod tests {
             backend: HarnessBackend::Whp,
             mode: HarnessMode::StaticOnly,
             output_dir: root,
+            launch_overrides: None,
         })
         .expect("run");
         for requirement_number in [10_u8, 11_u8, 12_u8] {
@@ -2751,6 +2759,7 @@ mod tests {
             backend: HarnessBackend::Whp,
             mode: HarnessMode::LiveWhp,
             output_dir: root,
+            launch_overrides: None,
         })
         .expect("run");
         assert!(run.report.scenarios.iter().all(|scenario| {
@@ -2774,6 +2783,7 @@ mod tests {
             backend: HarnessBackend::Whp,
             mode: HarnessMode::LiveWhp,
             output_dir: root,
+            launch_overrides: None,
         })
         .expect("run");
         for requirement_number in [3_u8, 4_u8, 5_u8, 6_u8, 10_u8, 11_u8, 12_u8] {

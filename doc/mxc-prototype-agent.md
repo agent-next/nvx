@@ -126,9 +126,17 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 
 - Canonical host harness command:
   `python scripts\nvx.py test-mxc-agent --backend whp`
+- Optional artifact overrides:
+  `--openvmm-exe <path> --kernel <path> --mxc-initramfs <path> --common-root <path> --output-dir <path>`
 - Optional deterministic/static validation mode for CI/unit coverage:
   `--static-only` (always non-conformance and exits nonzero for canonical WHP
   conformance).
+- Live prerequisites: Windows host with WHP, OpenVMM release executable,
+  `build/vmlinux`, and `build/initramfs-mxc-agent.cpio.gz` (unless overrides
+  are supplied). Missing inputs fail with machine-readable
+  `missing-prerequisite` errors.
 - The harness always writes a machine-readable JSON report and bounded
   diagnostics to `build/mxc-agent-harness` (or `--output-dir` override), halts
   on the first failing invariant, and keeps the output directory on failures.
+- No run may be claimed as `live-whp` conformance unless all 12 live invariants
+  pass and canonical attestations are emitted.
