@@ -270,12 +270,10 @@ impl Read for NamedPipeClient {
         };
         match result {
             Ok(()) => Ok(bytes_read as usize),
-            Err(error) if error.code().0 as u32 == windows::Win32::Foundation::ERROR_NO_DATA.0 => {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "named pipe has no available bytes",
-                ))
-            }
+            Err(error) if is_no_data_error(&error) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "named pipe has no available bytes",
+            )),
             Err(error) => Err(std::io::Error::other(error.to_string())),
         }
     }
@@ -296,12 +294,10 @@ impl Write for NamedPipeClient {
         };
         match result {
             Ok(()) => Ok(bytes_written as usize),
-            Err(error) if error.code().0 as u32 == windows::Win32::Foundation::ERROR_NO_DATA.0 => {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "named pipe cannot accept writes yet",
-                ))
-            }
+            Err(error) if is_no_data_error(&error) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "named pipe cannot accept writes yet",
+            )),
             Err(error) => Err(std::io::Error::other(error.to_string())),
         }
     }
@@ -309,6 +305,11 @@ impl Write for NamedPipeClient {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn is_no_data_error(error: &windows::core::Error) -> bool {
+    error.code() == windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_NO_DATA.0)
 }
 
 #[cfg(not(windows))]
@@ -379,6 +380,15 @@ mod tests {
     fn normalize_local_pipe_path_rejects_embedded_separators() {
         assert!(normalize_local_pipe_path("//./pipe/foo/bar").is_err());
         assert!(normalize_local_pipe_path(r"\\.\pipe\foo\bar").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recognizes_hresult_wrapped_no_data_error() {
+        let error = windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+            windows::Win32::Foundation::ERROR_NO_DATA.0,
+        ));
+        assert!(is_no_data_error(&error));
     }
 
     #[cfg(not(windows))]

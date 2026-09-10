@@ -15,6 +15,10 @@ const DEFAULT_POLL_SLEEP: Duration = Duration::from_millis(5);
 #[derive(Debug)]
 pub enum ClientError {
     Control(SessionError),
+    ControlOperation {
+        operation: &'static str,
+        source: SessionError,
+    },
     Timeout(&'static str),
     QueueOverflow(QueueOverflowDiagnostics),
     ClientInvalidated(QueueOverflowDiagnostics),
@@ -33,6 +37,9 @@ impl core::fmt::Display for ClientError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Control(error) => write!(f, "control-session transport error: {error}"),
+            Self::ControlOperation { operation, source } => {
+                write!(f, "control-session {operation} failed: {source}")
+            }
             Self::Timeout(operation) => {
                 write!(f, "timed out waiting for {operation}")
             }
@@ -107,8 +114,18 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
             ))?;
         self.control
             .send_host_attach(capability)
-            .map_err(ClientError::from)?;
-        match self.control.recv_attach_status_until(deadline)? {
+            .map_err(|source| ClientError::ControlOperation {
+                operation: "HostAttach write",
+                source,
+            })?;
+        let attach_status = self
+            .control
+            .recv_attach_status_until(deadline)
+            .map_err(|source| ClientError::ControlOperation {
+                operation: "HostAttach status read",
+                source,
+            })?;
+        match attach_status {
             HostAttachStatus::Wait => loop {
                 match self.control.recv_event_until(deadline)? {
                     HostEvent::Ready => break,
