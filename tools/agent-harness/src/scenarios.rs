@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use crate::client::{ClientError, MxcAgentClient};
 use crate::launch::{LaunchedVm, build_launch_plan, discover_artifacts, launch_whp_vm};
 use crate::{
-    CheckOutcome, EvidenceCheckStatus, EvidenceSource, HarnessOptions, ScenarioDefinition,
+    CANONICAL_SCENARIOS, CheckOutcome, EvidenceCheckStatus, EvidenceSource, HarnessOptions,
+    ScenarioDefinition,
 };
 #[cfg(windows)]
 use crate::{control_session::HostControlSession, named_pipe::NamedPipeClient};
@@ -244,14 +245,29 @@ pub(crate) fn run_live_requirement(
         reset_state(&mut guard);
         guard.run_key = Some(current_run_key);
     }
-    if let Err(error) = ensure_live_initialized(&mut guard, options) {
-        guard.init_error = Some(error.clone());
-        if definition.requirement_number > 1 {
-            return blocked_check(format!("blocked after launch/bootstrap failure: {error}"));
-        }
-        return fail_check(error);
-    }
+    run_live_requirement_in_state(
+        &mut guard,
+        options,
+        definition,
+        &mut ensure_live_initialized,
+        &mut run_requirement_check,
+        &mut teardown_live_session,
+    )
+}
 
+fn run_live_requirement_in_state<FInit, FRun, FTeardown>(
+    guard: &mut LiveHarnessState,
+    options: &HarnessOptions,
+    definition: ScenarioDefinition,
+    ensure_initialized: &mut FInit,
+    run_requirement: &mut FRun,
+    teardown: &mut FTeardown,
+) -> CheckOutcome
+where
+    FInit: FnMut(&mut LiveHarnessState, &HarnessOptions) -> Result<(), String>,
+    FRun: FnMut(&mut LiveHarnessState, ScenarioDefinition) -> CheckOutcome,
+    FTeardown: FnMut(&mut LiveHarnessState) -> Result<(), String>,
+{
     if let Some((failed_req, reason)) = guard.first_failure.clone()
         && definition.requirement_number > failed_req
     {
@@ -261,39 +277,95 @@ pub(crate) fn run_live_requirement(
         ));
     }
 
-    let outcome = match definition.requirement_number {
-        1 => pass_check(guard.req1_evidence.clone()),
-        2 => run_req2_immutable_config(&mut guard),
-        3 => run_req3_repeated_exec(&mut guard),
-        4 => run_req4_streams(&mut guard),
-        5 => run_req5_backpressure(&mut guard),
-        6 => run_req6_terminal_semantics(&mut guard),
-        7 => run_req7_fixed_mxc_identity(&mut guard),
-        8 => run_req8_full_isolation_verification(&mut guard),
-        9 => run_req9_mapping_containment(&mut guard),
-        10..=12 => fail_check(format!(
-            "req{:02} failed: live scenario invariant check did not pass",
-            definition.requirement_number
-        )),
-        _ => fail_check("unknown requirement number".to_string()),
-    };
+    if let Err(error) = ensure_initialized(guard, options) {
+        guard.init_error = Some(error.clone());
+        let combined = record_first_failure_and_teardown(
+            guard,
+            definition.requirement_number,
+            format!("launch/bootstrap failed: {error}"),
+            teardown,
+        );
+        if definition.requirement_number > 1 {
+            return blocked_check(format!(
+                "blocked after launch/bootstrap failure: {combined}"
+            ));
+        }
+        return fail_check(combined);
+    }
+
+    let outcome = run_requirement(guard, definition);
 
     if outcome.check_status != EvidenceCheckStatus::Pass && guard.first_failure.is_none() {
         let reason = outcome
             .error
             .clone()
             .unwrap_or_else(|| "scenario check did not pass".to_string());
-        let teardown_failure = teardown_live_session(&mut guard)
-            .err()
-            .map(|error| format!("; teardown failed: {error}"))
-            .unwrap_or_default();
-        let combined = format!("{reason}{teardown_failure}");
-        guard.first_failure = Some((definition.requirement_number, combined.clone()));
-        if !teardown_failure.is_empty() {
+        let combined = record_first_failure_and_teardown(
+            guard,
+            definition.requirement_number,
+            reason,
+            teardown,
+        );
+        return fail_check(combined);
+    }
+
+    if outcome.check_status == EvidenceCheckStatus::Pass && is_last_canonical_scenario(definition) {
+        if let Err(error) = teardown(guard) {
+            let combined = format!(
+                "req{:02} pass evidence collected but final teardown failed: {error}",
+                definition.requirement_number
+            );
+            guard.first_failure = Some((definition.requirement_number, combined.clone()));
             return fail_check(combined);
         }
     }
+
     outcome
+}
+
+fn run_requirement_check(
+    guard: &mut LiveHarnessState,
+    definition: ScenarioDefinition,
+) -> CheckOutcome {
+    match definition.requirement_number {
+        1 => pass_check(guard.req1_evidence.clone()),
+        2 => run_req2_immutable_config(guard),
+        3 => run_req3_repeated_exec(guard),
+        4 => run_req4_streams(guard),
+        5 => run_req5_backpressure(guard),
+        6 => run_req6_terminal_semantics(guard),
+        7 => run_req7_fixed_mxc_identity(guard),
+        8 => run_req8_full_isolation_verification(guard),
+        9 => run_req9_mapping_containment(guard),
+        10..=12 => fail_check(format!(
+            "req{:02} failed: live scenario invariant check did not pass",
+            definition.requirement_number
+        )),
+        _ => fail_check("unknown requirement number".to_string()),
+    }
+}
+
+fn is_last_canonical_scenario(definition: ScenarioDefinition) -> bool {
+    CANONICAL_SCENARIOS
+        .last()
+        .is_some_and(|scenario| scenario.requirement_number == definition.requirement_number)
+}
+
+fn record_first_failure_and_teardown(
+    guard: &mut LiveHarnessState,
+    requirement_number: u8,
+    reason: String,
+    teardown: &mut impl FnMut(&mut LiveHarnessState) -> Result<(), String>,
+) -> String {
+    let teardown_failure = teardown(guard)
+        .err()
+        .map(|error| format!("; teardown failed: {error}"))
+        .unwrap_or_default();
+    let combined = format!("{reason}{teardown_failure}");
+    if guard.first_failure.is_none() {
+        guard.first_failure = Some((requirement_number, combined.clone()));
+    }
+    combined
 }
 
 fn reset_state(state: &mut LiveHarnessState) {
@@ -2316,6 +2388,31 @@ fn fail_check(error: String) -> CheckOutcome {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    use crate::{HarnessBackend, HarnessMode};
+
+    fn test_options(tag: &str) -> HarnessOptions {
+        HarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: HarnessMode::LiveWhp,
+            output_dir: std::env::temp_dir().join(format!(
+                "agent-harness-live-lifecycle-{tag}-{}",
+                std::process::id()
+            )),
+            launch_overrides: None,
+        }
+    }
+
+    fn empty_state() -> LiveHarnessState {
+        LiveHarnessState {
+            run_key: None,
+            init_error: None,
+            first_failure: None,
+            req1_evidence: vec!["req1 evidence".to_string()],
+            session: None,
+        }
+    }
 
     #[test]
     fn safe_remove_dir_refuses_paths_outside_output_root() {
@@ -2410,5 +2507,139 @@ mod tests {
             true,
             limits.max_messages + 1
         ));
+    }
+
+    #[test]
+    fn first_failure_blocks_later_scenarios_without_relaunch_and_tears_down_once() {
+        let options = test_options("no-relaunch-after-failure");
+        let mut state = empty_state();
+        let launch_count = Cell::new(0_u32);
+        let teardown_count = Cell::new(0_u32);
+        let launched = Cell::new(false);
+
+        let req1 = CANONICAL_SCENARIOS[0];
+        let req2 = CANONICAL_SCENARIOS[1];
+        let req3 = CANONICAL_SCENARIOS[2];
+
+        let first = run_live_requirement_in_state(
+            &mut state,
+            &options,
+            req1,
+            &mut |_, _| {
+                if !launched.get() {
+                    launched.set(true);
+                    launch_count.set(launch_count.get() + 1);
+                }
+                Ok(())
+            },
+            &mut |_, definition| {
+                if definition.requirement_number == 1 {
+                    pass_check(vec!["req1".to_string()])
+                } else if definition.requirement_number == 2 {
+                    fail_check("req02 failed".to_string())
+                } else {
+                    fail_check("unexpected scenario".to_string())
+                }
+            },
+            &mut |_| {
+                teardown_count.set(teardown_count.get() + 1);
+                launched.set(false);
+                Ok(())
+            },
+        );
+        assert_eq!(first.check_status, EvidenceCheckStatus::Pass);
+
+        let second = run_live_requirement_in_state(
+            &mut state,
+            &options,
+            req2,
+            &mut |_, _| {
+                if !launched.get() {
+                    launched.set(true);
+                    launch_count.set(launch_count.get() + 1);
+                }
+                Ok(())
+            },
+            &mut |_, definition| {
+                if definition.requirement_number == 2 {
+                    fail_check("req02 failed".to_string())
+                } else {
+                    fail_check("unexpected scenario".to_string())
+                }
+            },
+            &mut |_| {
+                teardown_count.set(teardown_count.get() + 1);
+                launched.set(false);
+                Ok(())
+            },
+        );
+        assert_eq!(second.check_status, EvidenceCheckStatus::Fail);
+
+        let third = run_live_requirement_in_state(
+            &mut state,
+            &options,
+            req3,
+            &mut |_, _| {
+                if !launched.get() {
+                    launched.set(true);
+                    launch_count.set(launch_count.get() + 1);
+                }
+                Ok(())
+            },
+            &mut |_, _| pass_check(vec!["unexpected".to_string()]),
+            &mut |_| {
+                teardown_count.set(teardown_count.get() + 1);
+                launched.set(false);
+                Ok(())
+            },
+        );
+        assert_eq!(third.check_status, EvidenceCheckStatus::NotRun);
+        assert!(
+            third
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("skipped after req02 failed"))
+        );
+        assert_eq!(launch_count.get(), 1);
+        assert_eq!(teardown_count.get(), 1);
+    }
+
+    #[test]
+    fn successful_last_scenario_tears_down_exactly_once() {
+        let options = test_options("success-final-teardown");
+        let mut state = empty_state();
+        let launch_count = Cell::new(0_u32);
+        let teardown_count = Cell::new(0_u32);
+        let launched = Cell::new(false);
+
+        for definition in CANONICAL_SCENARIOS {
+            let outcome = run_live_requirement_in_state(
+                &mut state,
+                &options,
+                definition,
+                &mut |_, _| {
+                    if !launched.get() {
+                        launched.set(true);
+                        launch_count.set(launch_count.get() + 1);
+                    }
+                    Ok(())
+                },
+                &mut |_, _| pass_check(vec!["ok".to_string()]),
+                &mut |_| {
+                    teardown_count.set(teardown_count.get() + 1);
+                    launched.set(false);
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                outcome.check_status,
+                EvidenceCheckStatus::Pass,
+                "expected pass for req{:02}",
+                definition.requirement_number
+            );
+        }
+
+        assert_eq!(launch_count.get(), 1);
+        assert_eq!(teardown_count.get(), 1);
     }
 }

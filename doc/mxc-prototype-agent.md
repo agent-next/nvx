@@ -161,6 +161,8 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   `missing-prerequisite` errors.
 - The harness always writes a machine-readable JSON report and bounded
   diagnostics to `build/mxc-agent-harness` (or `--output-dir` override), halts
-  on the first failing invariant, and keeps the output directory on failures.
+  on the first failing invariant, explicitly tears down the live session on the
+  first failure (and after the final canonical scenario on success), and keeps
+  the output directory on failures.
 - No run may be claimed as `live-whp` conformance unless all 12 live invariants
   pass and canonical attestations are emitted.
