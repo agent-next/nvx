@@ -164,6 +164,8 @@ owns console enumeration and adds the single reserved
 The authentication handle must be an already-open, inherited one-way pipe
 created by the ACI-04 launcher; the numeric descriptor is not capability
 material, and this CLI never accepts or logs the capability bytes.
+On Windows, control-pipe access is scoped to the owning account SID (plus
+SYSTEM/Administrators), not to an individual logon session SID.
 Layer UUID/GPT identities belong to the authenticated ACI-04 Bootstrap request,
 not this boot-only CLI. The command validates files before launch, orders roles independently of option order,
 attaches layers read-only, and reserves the writable slot for scratch.
