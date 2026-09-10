@@ -26,8 +26,10 @@ pub use crate::mapping::{
     validate_mapping_set,
 };
 pub use crate::messages::{
-    AgentControlMessage, BuildStatus, CapabilityProofMaterial, ExecDisposition, FlowCreditRequest,
-    HealthStatus, HostControlMessage, IsolationStatus, LaunchIdentity, NetworkMode, NetworkStatus,
+    AgentControlMessage, AgentSessionState, BuildStatus, CapabilityProofMaterial, DnsStatus,
+    ExecDisposition, FilesystemHealthStatus, FlowCreditRequest, HealthFailureStatus, HealthStatus,
+    HostControlMessage, IsolationStatus, LaunchIdentity, NetworkFailureCode, NetworkFailureStatus,
+    NetworkInterfaceStatus, NetworkLinkState, NetworkMode, NetworkSetupState, NetworkStatus,
     ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, StderrChunkRecord,
     StderrEofRecord, StdinChunkRecord, StdinEofRecord, StdoutChunkRecord, StdoutEofRecord,
     StreamName, WORKLOAD_GID_MXC, WORKLOAD_GROUP_MXC, WORKLOAD_UID_MXC, WORKLOAD_USER_MXC,

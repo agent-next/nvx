@@ -4,6 +4,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io;
+use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,8 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_protocol::{
     AgentControlMessage, AuthenticateChannelRequest, BuildStatus, CancelReason, ChannelReadResult,
-    ConfigureSessionRequest, CreateProcessRequest, HVC1_DEVICE_PATH, HostControlMessage,
-    LaunchBinding, LaunchIdentity, MappingContainmentPolicy, MxcControlService, NetworkMode,
+    ConfigureSessionRequest, CreateProcessRequest, DnsStatus, HVC1_DEVICE_PATH, HostControlMessage,
+    LaunchBinding, LaunchIdentity, MappingContainmentPolicy, MxcControlService, NetworkFailureCode,
+    NetworkFailureStatus, NetworkInterfaceStatus, NetworkLinkState, NetworkMode, NetworkSetupState,
     NetworkStatus, OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, PROTOCOL_VERSION, ProcessSupervisor,
     ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, ServiceError,
     ServiceErrorCode, SessionConfiguration, WaitReadyRequest, WorkloadIdentityStatus,
@@ -32,9 +35,15 @@ const DEFAULT_GUEST_MAPPING_ROOT: &str = "/mnt/virtiofs";
 const DEFAULT_WORKLOAD_CGROUP_PATH: &str = "/sys/fs/cgroup/nvx.workload";
 const OUTBOUND_PENDING_LIMIT: usize = 256;
 const FREEZE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const NETWORK_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const NETWORK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_NETWORK_METADATA_ITEMS: usize = 8;
+const MAX_NETWORK_METADATA_STRING_BYTES: usize = 128;
+const MAX_PROC_TEXT_BYTES: usize = 64 * 1024;
 /// Best-effort fatal-session delivery window before fail-closed stop proceeds regardless
 /// of channel backpressure or host read behavior.
 const FATAL_SESSION_DELIVERY_DEADLINE: Duration = Duration::from_millis(250);
+const SHUTDOWN_DELIVERY_DEADLINE: Duration = Duration::from_millis(500);
 
 static SIGCHLD_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -63,6 +72,7 @@ pub fn run_runtime() -> Result<()> {
     let mut pending_outbound = VecDeque::new();
     let mut shutdown_requested = false;
     let mut shutdown_cleanup_started = false;
+    let mut shutdown_delivery_deadline: Option<Instant> = None;
     let mut fatal_shutdown: Option<FatalSessionShutdown> = None;
 
     loop {
@@ -100,21 +110,23 @@ pub fn run_runtime() -> Result<()> {
             }
 
             if shutdown_requested && !shutdown_cleanup_started {
-                if let Some(exec_id) = service.active_exec_id() {
-                    supervisor
-                        .close_stdin(exec_id)
-                        .map_err(|error| AgentError::internal(error.to_string()))?;
-                    supervisor
-                        .terminate(exec_id)
-                        .map_err(|error| AgentError::internal(error.to_string()))?;
-                }
+                service
+                    .begin_disconnect_cleanup(now_secs(), &mut supervisor)
+                    .map_err(|error| AgentError::fail_closed(error.to_string()))?;
                 shutdown_cleanup_started = true;
+                shutdown_delivery_deadline = Instant::now().checked_add(SHUTDOWN_DELIVERY_DEADLINE);
             }
 
             if shutdown_requested
                 && service.active_exec_id().is_none()
                 && pending_outbound.is_empty()
                 && !channel.has_queued_writes()
+            {
+                return Ok(());
+            }
+            if shutdown_requested
+                && shutdown_cleanup_started
+                && shutdown_delivery_deadline.is_some_and(|deadline| Instant::now() >= deadline)
             {
                 return Ok(());
             }
@@ -150,6 +162,7 @@ pub fn run_runtime() -> Result<()> {
                     active_timeout = None;
                     shutdown_requested = false;
                     shutdown_cleanup_started = false;
+                    shutdown_delivery_deadline = None;
                     break;
                 }
                 ChannelReadResult::Record(record) => {
@@ -192,6 +205,7 @@ pub fn run_runtime() -> Result<()> {
                     for message in outbound.messages {
                         if matches!(message, AgentControlMessage::ShuttingDown) {
                             shutdown_requested = true;
+                            shutdown_delivery_deadline = None;
                         }
                         enqueue_outbound(&mut pending_outbound, message)?;
                     }
@@ -455,8 +469,20 @@ fn handle_host_message<S: ProcessSupervisor>(
             let snapshot = service.health();
             Ok(vec![AgentControlMessage::Health(
                 agent_protocol::HealthStatus {
+                    agent_state: snapshot.agent_state,
                     quiesced: snapshot.quiesced,
                     launch_admitted: snapshot.launch_admitted,
+                    shutting_down: snapshot.shutting_down,
+                    channel_generation: snapshot.channel_generation,
+                    active_exec_id: snapshot.active_exec_id,
+                    filesystem: snapshot.filesystem.map(|fs| {
+                        agent_protocol::FilesystemHealthStatus {
+                            rootfs_ready: fs.rootfs_ready,
+                            detail: fs.detail,
+                        }
+                    }),
+                    network: snapshot.network,
+                    last_failure: snapshot.last_failure,
                 },
             )])
         }
@@ -540,27 +566,358 @@ fn resolve_declared_mappings(
 }
 
 fn detect_network_status() -> NetworkStatus {
+    match list_non_loopback_interfaces() {
+        Ok(adapters) if adapters.is_empty() => no_nic_network_status(),
+        Ok(_) => detect_portable_network_status(NETWORK_READY_TIMEOUT),
+        Err(failure) => failed_portable_network_status(failure),
+    }
+}
+
+fn no_nic_network_status() -> NetworkStatus {
+    NetworkStatus {
+        mode: NetworkMode::NoNic,
+        setup_state: NetworkSetupState::Ready,
+        interface: None,
+        default_gateway: None,
+        dns: DnsStatus {
+            ready: true,
+            servers: Vec::new(),
+        },
+        failure: None,
+    }
+}
+
+fn detect_portable_network_status(timeout: Duration) -> NetworkStatus {
+    detect_portable_network_status_with_probe(timeout, collect_portable_network_status, |delay| {
+        thread::sleep(delay);
+    })
+}
+
+fn detect_portable_network_status_with_probe(
+    timeout: Duration,
+    mut probe: impl FnMut() -> std::result::Result<NetworkStatus, NetworkFailureStatus>,
+    mut sleep: impl FnMut(Duration),
+) -> NetworkStatus {
+    let started = Instant::now();
+    let deadline = started.checked_add(timeout).unwrap_or(started);
+    loop {
+        let failure = match probe() {
+            Ok(status) => return status,
+            Err(failure) => failure,
+        };
+        if Instant::now() >= deadline {
+            return failed_portable_network_status(failure);
+        }
+        sleep(NETWORK_POLL_INTERVAL);
+    }
+}
+
+fn collect_portable_network_status() -> std::result::Result<NetworkStatus, NetworkFailureStatus> {
+    let interfaces = list_non_loopback_interfaces()?;
+    let primary = interfaces.first().ok_or(NetworkFailureStatus {
+        code: NetworkFailureCode::InterfaceMissing,
+        detail: "portable-network mode requires one non-loopback interface".to_string(),
+    })?;
+    let interface = collect_interface_status(primary)?;
+    if !matches!(interface.link_state, NetworkLinkState::Up) {
+        return Err(NetworkFailureStatus {
+            code: NetworkFailureCode::InterfaceMissing,
+            detail: format!("interface {} is not link-up", interface.name),
+        });
+    }
+    if interface.addresses.is_empty() {
+        return Err(NetworkFailureStatus {
+            code: NetworkFailureCode::AddressMissing,
+            detail: format!("interface {} has no assigned addresses", interface.name),
+        });
+    }
+    let gateway =
+        parse_default_route_gateway_ipv4(&interface.name)?.ok_or(NetworkFailureStatus {
+            code: NetworkFailureCode::RouteMissing,
+            detail: format!("interface {} has no IPv4 default route", interface.name),
+        })?;
+    let dns = parse_dns_status()?;
+    if !dns.ready {
+        return Err(NetworkFailureStatus {
+            code: NetworkFailureCode::DnsMissing,
+            detail: "portable-network mode requires at least one DNS server".to_string(),
+        });
+    }
+    Ok(NetworkStatus {
+        mode: NetworkMode::PortableNetwork,
+        setup_state: NetworkSetupState::Ready,
+        interface: Some(NetworkInterfaceStatus {
+            default_route: Some(gateway.to_string()),
+            ..interface
+        }),
+        default_gateway: Some(gateway.to_string()),
+        dns,
+        failure: None,
+    })
+}
+
+fn failed_portable_network_status(failure: NetworkFailureStatus) -> NetworkStatus {
+    NetworkStatus {
+        mode: NetworkMode::PortableNetwork,
+        setup_state: NetworkSetupState::Failed,
+        interface: None,
+        default_gateway: None,
+        dns: DnsStatus {
+            ready: false,
+            servers: Vec::new(),
+        },
+        failure: Some(NetworkFailureStatus {
+            code: failure.code,
+            detail: bounded_network_text(&failure.detail),
+        }),
+    }
+}
+
+fn list_non_loopback_interfaces() -> std::result::Result<Vec<String>, NetworkFailureStatus> {
+    let entries = std::fs::read_dir("/sys/class/net").map_err(|error| NetworkFailureStatus {
+        code: NetworkFailureCode::Io,
+        detail: bounded_network_text(&format!("reading /sys/class/net failed: {error}")),
+    })?;
     let mut adapters = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name != "lo" {
-                adapters.push(name);
+    for entry in entries {
+        let entry = entry.map_err(|error| NetworkFailureStatus {
+            code: NetworkFailureCode::Io,
+            detail: bounded_network_text(&format!("reading interface entry failed: {error}")),
+        })?;
+        let name = bounded_network_text(&entry.file_name().to_string_lossy());
+        if name.is_empty() || name == "lo" {
+            continue;
+        }
+        if adapters.len() < MAX_NETWORK_METADATA_ITEMS {
+            adapters.push(name);
+        }
+    }
+    adapters.sort();
+    Ok(adapters)
+}
+
+fn collect_interface_status(
+    interface_name: &str,
+) -> std::result::Result<NetworkInterfaceStatus, NetworkFailureStatus> {
+    let ifindex_text = read_limited_text(
+        Path::new(&format!("/sys/class/net/{interface_name}/ifindex")),
+        128,
+    )?;
+    let index = ifindex_text
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| NetworkFailureStatus {
+            code: NetworkFailureCode::InterfaceMalformed,
+            detail: bounded_network_text(&format!("invalid ifindex for {interface_name}: {error}")),
+        })?;
+    let operstate_text = read_limited_text(
+        Path::new(&format!("/sys/class/net/{interface_name}/operstate")),
+        64,
+    )?;
+    let link_state = match operstate_text.trim() {
+        "up" => NetworkLinkState::Up,
+        "down" => NetworkLinkState::Down,
+        _ => NetworkLinkState::Unknown,
+    };
+    let addresses = collect_interface_addresses(interface_name)?;
+    Ok(NetworkInterfaceStatus {
+        name: bounded_network_text(interface_name),
+        index,
+        link_state,
+        addresses,
+        default_route: None,
+    })
+}
+
+fn collect_interface_addresses(
+    interface_name: &str,
+) -> std::result::Result<Vec<String>, NetworkFailureStatus> {
+    let mut addrs = Vec::new();
+    let mut ptr: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes a linked list pointer to ptr on success.
+    let rc = unsafe { libc::getifaddrs(&mut ptr as *mut *mut libc::ifaddrs) };
+    if rc != 0 {
+        return Err(NetworkFailureStatus {
+            code: NetworkFailureCode::Io,
+            detail: bounded_network_text(&format!(
+                "getifaddrs failed: {}",
+                io::Error::last_os_error()
+            )),
+        });
+    }
+    // SAFETY: ptr is initialized by successful getifaddrs and must be released with freeifaddrs.
+    let mut current = ptr;
+    while !current.is_null() && addrs.len() < MAX_NETWORK_METADATA_ITEMS {
+        // SAFETY: current points to a valid ifaddrs node while traversing the list.
+        let item = unsafe { &*current };
+        if !item.ifa_name.is_null() {
+            // SAFETY: ifa_name is a NUL-terminated C string.
+            let name = unsafe { std::ffi::CStr::from_ptr(item.ifa_name) };
+            if name.to_string_lossy() == interface_name
+                && let Some(value) = sockaddr_to_ip(item.ifa_addr)
+            {
+                addrs.push(bounded_network_text(&value.to_string()));
             }
         }
+        current = item.ifa_next;
     }
-    if adapters.is_empty() {
-        NetworkStatus {
-            mode: NetworkMode::NoNic,
-            detail: None,
+    // SAFETY: ptr is the original list pointer from getifaddrs.
+    unsafe { libc::freeifaddrs(ptr) };
+    if addrs.is_empty() {
+        return Err(NetworkFailureStatus {
+            code: NetworkFailureCode::AddressMissing,
+            detail: format!("interface {interface_name} has no IP addresses"),
+        });
+    }
+    Ok(addrs)
+}
+
+fn sockaddr_to_ip(addr: *const libc::sockaddr) -> Option<IpAddr> {
+    if addr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees addr points to a valid socket address for family dispatch.
+    let family = unsafe { (*addr).sa_family as i32 };
+    match family {
+        libc::AF_INET => {
+            // SAFETY: AF_INET implies sockaddr_in layout.
+            let sin = unsafe { &*(addr as *const libc::sockaddr_in) };
+            Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                sin.sin_addr.s_addr,
+            ))))
         }
-    } else {
-        adapters.sort();
-        NetworkStatus {
-            mode: NetworkMode::PortableNetwork,
-            detail: Some(format!("interfaces={}", adapters.join(","))),
+        libc::AF_INET6 => {
+            // SAFETY: AF_INET6 implies sockaddr_in6 layout.
+            let sin6 = unsafe { &*(addr as *const libc::sockaddr_in6) };
+            Some(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
+        }
+        _ => None,
+    }
+}
+
+fn parse_default_route_gateway_ipv4(
+    interface_name: &str,
+) -> std::result::Result<Option<Ipv4Addr>, NetworkFailureStatus> {
+    let route = read_limited_text(Path::new("/proc/net/route"), MAX_PROC_TEXT_BYTES)?;
+    parse_default_route_gateway_ipv4_from_text(interface_name, &route)
+}
+
+fn parse_default_route_gateway_ipv4_from_text(
+    interface_name: &str,
+    route_text: &str,
+) -> std::result::Result<Option<Ipv4Addr>, NetworkFailureStatus> {
+    for line in route_text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        if fields[0] != interface_name || fields[1] != "00000000" {
+            continue;
+        }
+        let flags = u16::from_str_radix(fields[3], 16).map_err(|error| NetworkFailureStatus {
+            code: NetworkFailureCode::RouteMalformed,
+            detail: bounded_network_text(&format!(
+                "invalid route flags for {interface_name}: {error}"
+            )),
+        })?;
+        if (flags & 0x1) == 0 {
+            continue;
+        }
+        let gateway = u32::from_str_radix(fields[2], 16).map_err(|error| NetworkFailureStatus {
+            code: NetworkFailureCode::RouteMalformed,
+            detail: bounded_network_text(&format!("invalid gateway for {interface_name}: {error}")),
+        })?;
+        return Ok(Some(Ipv4Addr::from(gateway.to_le_bytes())));
+    }
+    Ok(None)
+}
+
+fn parse_dns_status() -> std::result::Result<DnsStatus, NetworkFailureStatus> {
+    let resolv = read_limited_text(Path::new("/etc/resolv.conf"), MAX_PROC_TEXT_BYTES)?;
+    parse_dns_status_from_text(&resolv)
+}
+
+fn parse_dns_status_from_text(
+    resolv_conf: &str,
+) -> std::result::Result<DnsStatus, NetworkFailureStatus> {
+    let mut servers = Vec::new();
+    for line in resolv_conf.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        let mut fields = trimmed.split_whitespace();
+        let Some(key) = fields.next() else {
+            continue;
+        };
+        if key != "nameserver" {
+            continue;
+        }
+        let value = fields.next().ok_or(NetworkFailureStatus {
+            code: NetworkFailureCode::DnsMalformed,
+            detail: "resolv.conf nameserver entry missing address".to_string(),
+        })?;
+        let parsed = value
+            .parse::<IpAddr>()
+            .map_err(|error| NetworkFailureStatus {
+                code: NetworkFailureCode::DnsMalformed,
+                detail: bounded_network_text(&format!(
+                    "invalid nameserver address {value}: {error}"
+                )),
+            })?;
+        if servers.len() < MAX_NETWORK_METADATA_ITEMS {
+            servers.push(bounded_network_text(&parsed.to_string()));
         }
     }
+    Ok(DnsStatus {
+        ready: !servers.is_empty(),
+        servers,
+    })
+}
+
+fn read_limited_text(
+    path: &Path,
+    max_bytes: usize,
+) -> std::result::Result<String, NetworkFailureStatus> {
+    let file = File::open(path).map_err(|error| NetworkFailureStatus {
+        code: NetworkFailureCode::Io,
+        detail: bounded_network_text(&format!("opening {} failed: {error}", path.display())),
+    })?;
+    let mut limited = file.take(max_bytes.saturating_add(1) as u64);
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|error| NetworkFailureStatus {
+            code: NetworkFailureCode::Io,
+            detail: bounded_network_text(&format!("reading {} failed: {error}", path.display())),
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(NetworkFailureStatus {
+            code: NetworkFailureCode::Parse,
+            detail: bounded_network_text(&format!(
+                "{} exceeded bounded metadata size {max_bytes}",
+                path.display()
+            )),
+        });
+    }
+    String::from_utf8(bytes).map_err(|error| NetworkFailureStatus {
+        code: NetworkFailureCode::Parse,
+        detail: bounded_network_text(&format!("{} is not valid UTF-8: {error}", path.display())),
+    })
+}
+
+fn bounded_network_text(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_control() && ch != ' ' {
+            continue;
+        }
+        if out.len() >= MAX_NETWORK_METADATA_STRING_BYTES {
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn detect_build_status() -> BuildStatus {
@@ -831,6 +1188,11 @@ fn quiesce_transactional(
     if initial.quiesced {
         return Err(AgentError::bad_request(
             "invalid lifecycle transition: quiesce",
+        ));
+    }
+    if initial.active_exec_id.is_some() {
+        return Err(AgentError::bad_request(
+            "quiesce rejected while an execution is active; retry after workload completion",
         ));
     }
     set_frozen(true)?;
@@ -1112,10 +1474,11 @@ mod tests {
     use super::*;
     use agent_protocol::{
         AccessMode, AuthenticateChannelRequest, CanonicalHostMappingRoot, ConfigureSessionRequest,
-        CreateProcessRequest, FlowCreditRequest, HealthStatus, HostControlMessage, InnerRecord,
-        LaunchBinding, LaunchIdentity, MappingContainmentPolicy, NetworkMode, NetworkStatus,
-        ProcessSupervisor, ProtocolErrorCode, SERVICE_IDENTITY, ServiceError, ServiceErrorCode,
-        SessionConfiguration, StreamName, SupervisorEvent, SymlinkContainmentPolicy,
+        CreateProcessRequest, DnsStatus, FlowCreditRequest, HealthStatus, HostControlMessage,
+        InnerRecord, LaunchBinding, LaunchIdentity, MappingContainmentPolicy, NetworkMode,
+        NetworkSetupState, NetworkStatus, ProcessSupervisor, ProtocolErrorCode, SERVICE_IDENTITY,
+        ServiceError, ServiceErrorCode, SessionConfiguration, StreamName, SupervisorEvent,
+        SymlinkContainmentPolicy,
     };
     use std::cell::RefCell;
     use std::io::{self, Cursor, Read, Write};
@@ -1161,6 +1524,60 @@ mod tests {
     fn openvmm_overhead_constant_remains_conservative() {
         assert!(assert_conservative_openvmm_overhead().is_ok());
         assert_eq!(OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, 64);
+    }
+
+    #[test]
+    fn no_nic_network_status_is_ready_without_interface_fields() {
+        let status = no_nic_network_status();
+        assert_eq!(status.mode, NetworkMode::NoNic);
+        assert_eq!(status.setup_state, NetworkSetupState::Ready);
+        assert!(status.interface.is_none());
+        assert!(status.default_gateway.is_none());
+        assert!(status.dns.ready);
+        assert!(status.failure.is_none());
+    }
+
+    #[test]
+    fn parses_portable_default_route_and_dns_with_typed_bounds() {
+        let route = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\neth0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n";
+        let gateway = parse_default_route_gateway_ipv4_from_text("eth0", route)
+            .expect("parse route")
+            .expect("default route");
+        assert_eq!(gateway.to_string(), "10.0.0.1");
+
+        let dns = parse_dns_status_from_text(
+            "# comment\nnameserver 10.0.0.53\nnameserver 2001:4860:4860::8888\n",
+        )
+        .expect("parse resolv");
+        assert!(dns.ready);
+        assert_eq!(dns.servers.len(), 2);
+        assert_eq!(dns.servers[0], "10.0.0.53");
+    }
+
+    #[test]
+    fn portable_status_probe_timeout_returns_typed_failure() {
+        let mut probes = 0_u32;
+        let status = detect_portable_network_status_with_probe(
+            Duration::from_millis(1),
+            || {
+                probes = probes.saturating_add(1);
+                Err(NetworkFailureStatus {
+                    code: NetworkFailureCode::RouteMissing,
+                    detail: "missing default route".to_string(),
+                })
+            },
+            |_sleep| {},
+        );
+        assert!(probes >= 1);
+        assert_eq!(status.mode, NetworkMode::PortableNetwork);
+        assert_eq!(status.setup_state, NetworkSetupState::Failed);
+        assert!(matches!(
+            status.failure,
+            Some(NetworkFailureStatus {
+                code: NetworkFailureCode::RouteMissing,
+                ..
+            })
+        ));
     }
 
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1329,10 +1746,7 @@ mod tests {
                     capability_proof: [7; 32],
                 },
                 1,
-                NetworkStatus {
-                    mode: NetworkMode::NoNic,
-                    detail: None,
-                },
+                no_nic_network_status(),
             )
             .unwrap();
         service
@@ -1359,14 +1773,39 @@ mod tests {
                         rootfs_ready: true,
                         detail: "ready".to_string(),
                     },
-                    network: NetworkStatus {
-                        mode: NetworkMode::PortableNetwork,
-                        detail: Some("test".to_string()),
-                    },
+                    network: portable_network_status(),
                 },
             })
             .unwrap();
         service
+    }
+
+    fn no_nic_network_status() -> NetworkStatus {
+        NetworkStatus {
+            mode: NetworkMode::NoNic,
+            setup_state: NetworkSetupState::Ready,
+            interface: None,
+            default_gateway: None,
+            dns: DnsStatus {
+                ready: true,
+                servers: Vec::new(),
+            },
+            failure: None,
+        }
+    }
+
+    fn portable_network_status() -> NetworkStatus {
+        NetworkStatus {
+            mode: NetworkMode::PortableNetwork,
+            setup_state: NetworkSetupState::Ready,
+            interface: None,
+            default_gateway: Some("10.0.0.1".to_string()),
+            dns: DnsStatus {
+                ready: true,
+                servers: vec!["10.0.0.53".to_string()],
+            },
+            failure: None,
+        }
     }
 
     #[test]
@@ -1402,8 +1841,15 @@ mod tests {
         let writes = Rc::new(RefCell::new(Vec::new()));
         let mut channel = agent_protocol::HvcFramedChannel::new(RuntimeTestIo::new(writes.clone()));
         let filler = AgentControlMessage::Health(HealthStatus {
+            agent_state: agent_protocol::AgentSessionState::Active,
             quiesced: false,
             launch_admitted: true,
+            shutting_down: false,
+            channel_generation: 17,
+            active_exec_id: None,
+            filesystem: None,
+            network: Some(no_nic_network_status()),
+            last_failure: None,
         });
         for _ in 0..agent_protocol::DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_RECORDS {
             channel.queue_control_message(&filler).unwrap();
@@ -1536,24 +1982,23 @@ mod tests {
     }
 
     #[test]
-    fn quiesce_remains_unavailable_after_runtime_activation() {
+    fn quiesce_freezes_and_marks_service_quiesced_after_runtime_activation() {
         let mut service = runtime_test_service();
         service.activate_full_lifecycle().unwrap();
 
         let mut touched_freezer = false;
-        let error = quiesce_transactional(&mut service, |_freeze| {
+        let message = quiesce_transactional(&mut service, |_freeze| {
             touched_freezer = true;
             Ok(())
         })
-        .unwrap_err();
-        assert!(!touched_freezer);
-        assert_eq!(error.code(), crate::error::ErrorCode::BadRequest);
-        assert!(error.to_string().contains("UnsupportedOperation"));
-        assert!(!service.health().quiesced);
+        .unwrap();
+        assert!(touched_freezer);
+        assert!(matches!(message, AgentControlMessage::Quiesced));
+        assert!(service.health().quiesced);
     }
 
     #[test]
-    fn resume_remains_unavailable_after_runtime_activation() {
+    fn resume_requires_quiesced_state_after_runtime_activation() {
         let mut service = runtime_test_service();
         service.activate_full_lifecycle().unwrap();
 
@@ -1565,12 +2010,12 @@ mod tests {
         .unwrap_err();
         assert!(!touched_freezer);
         assert_eq!(error.code(), crate::error::ErrorCode::BadRequest);
-        assert!(error.to_string().contains("UnsupportedOperation"));
+        assert!(error.to_string().contains("invalid lifecycle transition"));
         assert!(!service.health().quiesced);
     }
 
     #[test]
-    fn quiesce_unavailable_preserves_active_execution() {
+    fn quiesce_rejects_active_execution_without_freezing() {
         let mut service = runtime_test_service();
         service.activate_full_lifecycle().unwrap();
         let mut supervisor = RuntimeTestSupervisor::default();
@@ -1597,7 +2042,11 @@ mod tests {
 
         assert!(!touched_freezer);
         assert_eq!(error.code(), crate::error::ErrorCode::BadRequest);
-        assert!(error.to_string().contains("UnsupportedOperation"));
+        assert!(
+            error
+                .to_string()
+                .contains("quiesce rejected while an execution is active")
+        );
         assert!(!service.health().quiesced);
         assert_eq!(service.active_exec_id(), Some(9));
     }

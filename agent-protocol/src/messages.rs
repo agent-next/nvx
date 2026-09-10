@@ -221,7 +221,11 @@ pub struct BuildStatus {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkStatus {
     pub mode: NetworkMode,
-    pub detail: Option<String>,
+    pub setup_state: NetworkSetupState,
+    pub interface: Option<NetworkInterfaceStatus>,
+    pub default_gateway: Option<String>,
+    pub dns: DnsStatus,
+    pub failure: Option<NetworkFailureStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -229,6 +233,61 @@ pub struct NetworkStatus {
 pub enum NetworkMode {
     NoNic,
     PortableNetwork,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkSetupState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkInterfaceStatus {
+    pub name: String,
+    pub index: u32,
+    pub link_state: NetworkLinkState,
+    pub addresses: Vec<String>,
+    pub default_route: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkLinkState {
+    Up,
+    Down,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsStatus {
+    pub ready: bool,
+    pub servers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkFailureStatus {
+    pub code: NetworkFailureCode,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkFailureCode {
+    InterfaceMissing,
+    InterfaceMalformed,
+    AddressMissing,
+    RouteMissing,
+    RouteMalformed,
+    DnsMissing,
+    DnsMalformed,
+    Timeout,
+    Io,
+    Parse,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -269,11 +328,43 @@ impl WorkloadIdentityStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthStatus {
+    pub agent_state: AgentSessionState,
     pub quiesced: bool,
     pub launch_admitted: bool,
+    pub shutting_down: bool,
+    pub channel_generation: u64,
+    pub active_exec_id: Option<u32>,
+    pub filesystem: Option<FilesystemHealthStatus>,
+    pub network: Option<NetworkStatus>,
+    pub last_failure: Option<HealthFailureStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilesystemHealthStatus {
+    pub rootfs_ready: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentSessionState {
+    Phase0Readiness,
+    Active,
+    Quiesced,
+    ShuttingDown,
+    CleanupInProgress,
+    FatalSession,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthFailureStatus {
+    pub code: ProtocolErrorCode,
+    pub detail: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

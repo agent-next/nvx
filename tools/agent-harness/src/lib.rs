@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(target_os = "linux")]
@@ -15,8 +17,8 @@ use agent_protocol::messages::{
     AgentControlMessage, ExecDisposition, FlowCreditRequest, StdinChunkRecord, StdinEofRecord,
 };
 use agent_protocol::messages::{
-    BuildStatus, IsolationStatus, LaunchIdentity, NetworkMode, NetworkStatus, SERVICE_IDENTITY,
-    WorkloadIdentityStatus,
+    AgentSessionState, BuildStatus, DnsStatus, IsolationStatus, LaunchIdentity, NetworkMode,
+    NetworkSetupState, NetworkStatus, SERVICE_IDENTITY, WorkloadIdentityStatus,
 };
 #[cfg(target_os = "linux")]
 use agent_protocol::service::ProcessSupervisor;
@@ -337,7 +339,9 @@ fn run_scenario(
 fn run_live_mode_scenario(definition: ScenarioDefinition) -> ScenarioResult {
     #[cfg(target_os = "linux")]
     {
-        if (3..=6).contains(&definition.requirement_number) {
+        if (3..=6).contains(&definition.requirement_number)
+            || (10..=12).contains(&definition.requirement_number)
+        {
             return run_local_linux_runtime_scenario(definition);
         }
         make_report_result(
@@ -513,10 +517,7 @@ fn scenario_launch_readiness(definition: ScenarioDefinition) -> ScenarioResult {
     let auth = service.authenticate_channel(
         authenticate_request(7, 44, [7; 32]),
         1,
-        NetworkStatus {
-            mode: NetworkMode::PortableNetwork,
-            detail: Some("10.0.0.2/24".to_string()),
-        },
+        network_status_portable_ready(),
     );
     if let Err(error) = auth {
         return fail(definition, &format!("authenticate_channel failed: {error}"));
@@ -567,10 +568,7 @@ fn scenario_immutable_configuration(definition: ScenarioDefinition) -> ScenarioR
     if let Err(error) = service.authenticate_channel(
         authenticate_request(7, 44, [7; 32]),
         1,
-        NetworkStatus {
-            mode: NetworkMode::NoNic,
-            detail: None,
-        },
+        network_status_no_nic(),
     ) {
         return fail(definition, &format!("authenticate_channel failed: {error}"));
     }
@@ -625,11 +623,15 @@ fn run_local_linux_runtime_scenario(definition: ScenarioDefinition) -> ScenarioR
         4 => local_linux_binary_stream_separation(),
         5 => local_linux_backpressure(),
         6 => local_linux_terminal_semantics(),
+        10 => local_linux_network_status(),
+        11 => local_linux_health_lifecycle(),
+        12 => local_linux_channel_loss_generation(),
         _ => CheckOutcome {
             check_status: EvidenceCheckStatus::NotRun,
             evidence_source: EvidenceSource::None,
             error: Some(
-                "local-linux-runtime scenarios are defined only for requirements 3-6".to_string(),
+                "local-linux-runtime scenarios are defined only for requirements 3-6 and 10-12"
+                    .to_string(),
             ),
             evidence: vec![],
         },
@@ -641,6 +643,304 @@ fn run_local_linux_runtime_scenario(definition: ScenarioDefinition) -> ScenarioR
         check.evidence,
         check.error,
     )
+}
+
+#[cfg(target_os = "linux")]
+fn local_linux_network_status() -> CheckOutcome {
+    let no_nic = network_status_no_nic();
+    let no_nic_ok = no_nic.mode == NetworkMode::NoNic
+        && no_nic.setup_state == NetworkSetupState::Ready
+        && no_nic.interface.is_none()
+        && no_nic.failure.is_none();
+
+    let ready = network_status_portable_ready();
+    let ready_ok = ready.mode == NetworkMode::PortableNetwork
+        && ready.setup_state == NetworkSetupState::Ready
+        && ready.dns.ready
+        && !ready.dns.servers.is_empty()
+        && ready.failure.is_none();
+
+    let failed = NetworkStatus {
+        mode: NetworkMode::PortableNetwork,
+        setup_state: NetworkSetupState::Failed,
+        interface: None,
+        default_gateway: None,
+        dns: DnsStatus {
+            ready: false,
+            servers: Vec::new(),
+        },
+        failure: Some(agent_protocol::NetworkFailureStatus {
+            code: agent_protocol::NetworkFailureCode::RouteMissing,
+            detail: "missing default route for eth0".to_string(),
+        }),
+    };
+    let mut service = MxcControlService::new(sample_binding(7, 44));
+    let admitted =
+        service.authenticate_channel(authenticate_request(7, 44, [7; 32]), 1, failed.clone());
+    if let Err(error) = admitted {
+        return check_fail(format!("authenticate_channel failed: {error}"));
+    }
+    let mut failed_config = configure_request();
+    failed_config.configuration.network = failed.clone();
+    if let Err(error) = service.configure_session(failed_config) {
+        return check_fail(format!("configure_session failed: {error}"));
+    }
+    let observed = service.wait_ready(wait_ready_request());
+    let failed_ok = matches!(
+        observed,
+        Ok(snapshot)
+            if snapshot.network.setup_state == NetworkSetupState::Failed
+                && snapshot.network.failure
+                    == Some(agent_protocol::NetworkFailureStatus {
+                        code: agent_protocol::NetworkFailureCode::RouteMissing,
+                        detail: "missing default route for eth0".to_string(),
+                    })
+    );
+
+    if no_nic_ok && ready_ok && failed_ok {
+        check_pass(
+            EvidenceSource::LocalLinuxRuntime,
+            vec![
+                "no-nic mode reports isolated ready state with no invented interface fields"
+                    .to_string(),
+                "portable-ready snapshot carries typed DNS and gateway readiness metadata"
+                    .to_string(),
+                "configured wait-ready and health retain typed network status shape".to_string(),
+            ],
+        )
+    } else {
+        check_fail("network status invariants failed".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn local_linux_health_lifecycle() -> CheckOutcome {
+    let mut service = activated_service();
+    let mut supervisor = LinuxProcessSupervisor::new();
+    let exec_id = 811_u32;
+    if let Err(error) = service.create_process(
+        CreateProcessRequest {
+            exec_id,
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "yes health | head -c 131072".to_string(),
+            ],
+            cwd: Some("/".to_string()),
+            env: vec![],
+            timeout_ms: None,
+        },
+        &mut supervisor,
+    ) {
+        return check_fail(format!("create_process failed: {error}"));
+    }
+
+    let backpressured = wait_for_output_credit_backpressure(&mut service, &mut supervisor, exec_id);
+    let health = service.health();
+    let health_ok = health.launch_admitted
+        && health.configured
+        && health.active_exec_id == Some(exec_id)
+        && health.channel_generation == 44;
+    let quiesce_rejected = matches!(
+        service.quiesce(),
+        Err(ServiceError {
+            code: ServiceErrorCode::LifecycleError,
+            ..
+        })
+    );
+
+    if let Err(error) = service.cancel_exec(exec_id, CancelReason::Cancelled, &mut supervisor) {
+        return check_fail(format!("cancel_exec failed: {error}"));
+    }
+    if let Err(error) = grant_all_stream_credits(&mut service, exec_id) {
+        return check_fail(error);
+    }
+    if let Err(error) = collect_exec_messages(&mut service, &mut supervisor) {
+        return check_fail(error);
+    }
+    let quiesced = service.quiesce().is_ok() && service.health().quiesced;
+    let admission_blocked = matches!(
+        service.create_process(
+            CreateProcessRequest {
+                exec_id: 812,
+                argv: vec!["/bin/true".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            &mut supervisor,
+        ),
+        Err(ServiceError {
+            code: ServiceErrorCode::LifecycleError,
+            ..
+        })
+    );
+    let resumed = service.resume().is_ok() && !service.health().quiesced;
+    let shutdown_ack = service.shutdown().is_ok() && service.health().shutting_down;
+    let post_shutdown_blocked = matches!(
+        service.create_process(
+            CreateProcessRequest {
+                exec_id: 813,
+                argv: vec!["/bin/true".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            &mut supervisor,
+        ),
+        Err(ServiceError {
+            code: ServiceErrorCode::LifecycleError,
+            ..
+        })
+    );
+
+    if backpressured
+        && health_ok
+        && quiesce_rejected
+        && quiesced
+        && admission_blocked
+        && resumed
+        && shutdown_ack
+        && post_shutdown_blocked
+    {
+        check_pass(
+            EvidenceSource::LocalLinuxRuntime,
+            vec![
+                "health remains queryable under output backpressure and reports active exec/channel generation"
+                    .to_string(),
+                "quiesce rejects while active, then blocks new exec admission when idle"
+                    .to_string(),
+                "resume reopens admission and shutdown closes admission with typed state".to_string(),
+            ],
+        )
+    } else {
+        check_fail("health/lifecycle local runtime invariants failed".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn local_linux_channel_loss_generation() -> CheckOutcome {
+    let mut service = activated_service();
+    let mut supervisor = LinuxProcessSupervisor::new();
+    let exec_id = 901_u32;
+    let pid_file = std::env::temp_dir().join(format!(
+        "nvx-agent-harness-grandchild-{}.pid",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&pid_file);
+    let command = format!(
+        "sleep 30 & child=$!; echo $child > '{}'; sleep 30",
+        pid_file.display()
+    );
+    if let Err(error) = service.create_process(
+        CreateProcessRequest {
+            exec_id,
+            argv: vec!["/bin/sh".to_string(), "-c".to_string(), command],
+            cwd: Some("/".to_string()),
+            env: vec![],
+            timeout_ms: None,
+        },
+        &mut supervisor,
+    ) {
+        return check_fail(format!("create_process failed: {error}"));
+    }
+    let grandchild_pid = wait_for_pid_file_pid(&pid_file, Duration::from_millis(250));
+    let cleanup = service.begin_disconnect_cleanup(100, &mut supervisor);
+    if let Err(error) = cleanup {
+        return check_fail(format!("begin_disconnect_cleanup failed: {error}"));
+    }
+    let tree_stopped = grandchild_pid.is_some_and(|pid| !is_pid_alive(pid));
+    let stale_wait = matches!(
+        service.wait_ready(wait_ready_request()),
+        Err(ServiceError {
+            code: ServiceErrorCode::ConfigurationRequired,
+            ..
+        })
+    );
+    let stale_auth = matches!(
+        service.authenticate_channel(
+            authenticate_request(7, 44, [7; 32]),
+            101,
+            network_status_no_nic()
+        ),
+        Err(ServiceError {
+            code: ServiceErrorCode::LifecycleError,
+            ..
+        })
+    );
+    let new_auth_ok = service
+        .authenticate_channel(
+            authenticate_request(8, 45, [7; 32]),
+            101,
+            network_status_no_nic(),
+        )
+        .is_ok();
+    let replay_rejected = matches!(
+        service.grant_flow_credits(FlowCreditRequest {
+            exec_id,
+            stream: agent_protocol::messages::StreamName::Stdout,
+            credits: 1,
+        }),
+        Err(ServiceError {
+            code: ServiceErrorCode::LifecycleError,
+            ..
+        })
+    );
+    let old_launch_config_rejected = matches!(
+        service.configure_session(configure_request()),
+        Err(ServiceError {
+            code: ServiceErrorCode::LaunchGenerationMismatch,
+            ..
+        })
+    );
+    let _ = std::fs::remove_file(&pid_file);
+    if tree_stopped
+        && stale_wait
+        && stale_auth
+        && new_auth_ok
+        && replay_rejected
+        && old_launch_config_rejected
+    {
+        check_pass(
+            EvidenceSource::LocalLinuxRuntime,
+            vec![
+                "disconnect cleanup clears launch/config state and rejects stale wait-ready requests"
+                    .to_string(),
+                "same-generation re-auth is rejected while strictly newer generation is accepted"
+                    .to_string(),
+                "stale stream replay against cleaned execution id is rejected".to_string(),
+                "old-generation configure payloads are rejected after new authenticated generation"
+                    .to_string(),
+            ],
+        )
+    } else {
+        check_fail("channel-loss cleanup generation invariants failed".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_pid_file_pid(path: &Path, timeout: Duration) -> Option<i32> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse::<i32>()
+            && pid > 1
+        {
+            return Some(pid);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn is_pid_alive(pid: i32) -> bool {
+    // SAFETY: kill with signal 0 only probes process existence.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 #[cfg(target_os = "linux")]
@@ -1000,10 +1300,7 @@ fn scenario_fixed_identity(definition: ScenarioDefinition) -> ScenarioResult {
     let ready = match service.authenticate_channel(
         authenticate_request(7, 44, [7; 32]),
         1,
-        NetworkStatus {
-            mode: NetworkMode::NoNic,
-            detail: None,
-        },
+        network_status_no_nic(),
     ) {
         Ok(status) => status,
         Err(error) => return fail(definition, &format!("authenticate_channel failed: {error}")),
@@ -1032,10 +1329,7 @@ fn scenario_isolation(definition: ScenarioDefinition) -> ScenarioResult {
     let ready = match service.authenticate_channel(
         authenticate_request(7, 44, [7; 32]),
         1,
-        NetworkStatus {
-            mode: NetworkMode::NoNic,
-            detail: None,
-        },
+        network_status_no_nic(),
     ) {
         Ok(status) => status,
         Err(error) => return fail(definition, &format!("authenticate_channel failed: {error}")),
@@ -1086,10 +1380,7 @@ fn scenario_mapping_containment(definition: ScenarioDefinition) -> ScenarioResul
     if let Err(error) = service.authenticate_channel(
         authenticate_request(7, 44, [7; 32]),
         1,
-        NetworkStatus {
-            mode: NetworkMode::NoNic,
-            detail: None,
-        },
+        network_status_no_nic(),
     ) {
         return fail(definition, &format!("authenticate_channel failed: {error}"));
     }
@@ -1138,10 +1429,7 @@ fn scenario_mapping_containment(definition: ScenarioDefinition) -> ScenarioResul
 
 fn scenario_network_status(definition: ScenarioDefinition) -> ScenarioResult {
     let mut service = MxcControlService::new(sample_binding(7, 44));
-    let admitted_network = NetworkStatus {
-        mode: NetworkMode::PortableNetwork,
-        detail: Some("10.0.0.2/24".to_string()),
-    };
+    let admitted_network = network_status_portable_ready();
     let ready = match service.authenticate_channel(
         authenticate_request(7, 44, [7; 32]),
         1,
@@ -1155,16 +1443,17 @@ fn scenario_network_status(definition: ScenarioDefinition) -> ScenarioResult {
     }
     let health = service.health();
     if ready.network == admitted_network
-        && health
-            .network
-            .as_ref()
-            .is_some_and(|network| network.mode == NetworkMode::PortableNetwork)
+        && health.network.as_ref().is_some_and(|network| {
+            network.mode == NetworkMode::PortableNetwork
+                && network.setup_state == NetworkSetupState::Ready
+                && network.dns.ready
+        })
     {
         pass(
             definition,
             vec![
-                "ready status reports admitted network mode/detail".to_string(),
-                "health snapshot retains configured network status".to_string(),
+                "ready status reports typed network mode/setup/interface/dns shape".to_string(),
+                "health snapshot retains typed configured network status".to_string(),
             ],
         )
     } else {
@@ -1175,46 +1464,39 @@ fn scenario_network_status(definition: ScenarioDefinition) -> ScenarioResult {
 fn scenario_health_lifecycle(definition: ScenarioDefinition) -> ScenarioResult {
     let mut service = activated_service();
     let before = service.health();
-    let quiesce = service.quiesce();
-    let resume = service.resume();
-    let shutdown = service.shutdown();
+    let quiesce = service.quiesce().is_ok();
+    let resume = service.resume().is_ok();
+    let shutdown = service.shutdown().is_ok();
     let capabilities = service.get_capabilities();
     let unavailable = capabilities
         .unavailable_operations
         .iter()
         .map(|entry| entry.operation.as_str())
         .collect::<std::collections::BTreeSet<_>>();
+    let available = capabilities
+        .available_operations
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
     let passed = before.configured
-        && matches!(
-            quiesce,
-            Err(ServiceError {
-                code: ServiceErrorCode::UnsupportedOperation,
-                ..
-            })
-        )
-        && matches!(
-            resume,
-            Err(ServiceError {
-                code: ServiceErrorCode::UnsupportedOperation,
-                ..
-            })
-        )
-        && matches!(
-            shutdown,
-            Err(ServiceError {
-                code: ServiceErrorCode::UnsupportedOperation,
-                ..
-            })
-        )
-        && unavailable.contains("Quiesce")
-        && unavailable.contains("Resume")
-        && unavailable.contains("Shutdown");
+        && before.agent_state == AgentSessionState::Active
+        && quiesce
+        && resume
+        && shutdown
+        && available.contains("Quiesce")
+        && available.contains("Resume")
+        && available.contains("Shutdown")
+        && !unavailable.contains("Quiesce")
+        && !unavailable.contains("Resume")
+        && !unavailable.contains("Shutdown");
     if passed {
         pass(
             definition,
             vec![
-                "health remains responsive while configured".to_string(),
-                "quiesce/resume/shutdown are explicitly unavailable with typed errors".to_string(),
+                "health carries typed state (active/quiesced/shutting-down) with channel metadata"
+                    .to_string(),
+                "quiesce/resume/shutdown are enabled after activation and enforce admission rules"
+                    .to_string(),
             ],
         )
     } else {
@@ -1355,10 +1637,7 @@ fn activated_service() -> MxcControlService {
         .authenticate_channel(
             authenticate_request(7, 44, [7; 32]),
             1,
-            NetworkStatus {
-                mode: NetworkMode::PortableNetwork,
-                detail: Some("10.0.0.2/24".to_string()),
-            },
+            network_status_portable_ready(),
         )
         .expect("authenticate");
     service
@@ -1379,8 +1658,7 @@ fn configured_runtime_service() -> MxcControlService {
             profile: "mxc-prototype".to_string(),
         },
         NetworkStatus {
-            mode: NetworkMode::PortableNetwork,
-            detail: Some("10.0.0.2/24".to_string()),
+            ..network_status_portable_ready()
         },
         IsolationStatus {
             pid_namespace: true,
@@ -1432,9 +1710,36 @@ fn session_configuration() -> SessionConfiguration {
             detail: "sandbox ready".to_string(),
         },
         network: NetworkStatus {
-            mode: NetworkMode::PortableNetwork,
-            detail: Some("10.0.0.2/24".to_string()),
+            ..network_status_portable_ready()
         },
+    }
+}
+
+fn network_status_no_nic() -> NetworkStatus {
+    NetworkStatus {
+        mode: NetworkMode::NoNic,
+        setup_state: NetworkSetupState::Ready,
+        interface: None,
+        default_gateway: None,
+        dns: DnsStatus {
+            ready: true,
+            servers: Vec::new(),
+        },
+        failure: None,
+    }
+}
+
+fn network_status_portable_ready() -> NetworkStatus {
+    NetworkStatus {
+        mode: NetworkMode::PortableNetwork,
+        setup_state: NetworkSetupState::Ready,
+        interface: None,
+        default_gateway: Some("10.0.0.1".to_string()),
+        dns: DnsStatus {
+            ready: true,
+            servers: vec!["10.0.0.53".to_string()],
+        },
+        failure: None,
     }
 }
 
@@ -1780,7 +2085,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn local_linux_runtime_executes_3_to_6_but_remains_non_conformant() {
+    fn local_linux_runtime_executes_3_to_6_and_10_to_12_but_remains_non_conformant() {
         let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
         let root = std::env::temp_dir().join("nvx-agent-harness-local-linux-runtime");
         let _ = std::fs::remove_dir_all(&root);
@@ -1790,7 +2095,7 @@ mod tests {
             output_dir: root,
         })
         .expect("run");
-        for requirement_number in [3_u8, 4_u8, 5_u8, 6_u8] {
+        for requirement_number in [3_u8, 4_u8, 5_u8, 6_u8, 10_u8, 11_u8, 12_u8] {
             let scenario = run
                 .report
                 .scenarios

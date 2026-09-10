@@ -1575,9 +1575,9 @@ mod tests {
     use super::*;
     use agent_protocol::{
         AccessMode, AuthenticateChannelRequest, CancelReason, CanonicalHostMappingRoot,
-        ConfigureSessionRequest, LaunchBinding, LaunchIdentity, MappingContainmentPolicy,
-        MxcControlService, NetworkMode, NetworkStatus, PROTOCOL_VERSION, SERVICE_IDENTITY,
-        SessionConfiguration, SymlinkContainmentPolicy,
+        ConfigureSessionRequest, DnsStatus, LaunchBinding, LaunchIdentity,
+        MappingContainmentPolicy, MxcControlService, NetworkMode, NetworkSetupState, NetworkStatus,
+        PROTOCOL_VERSION, SERVICE_IDENTITY, SessionConfiguration, SymlinkContainmentPolicy,
     };
     use std::fs;
     use std::io::Read;
@@ -1703,10 +1703,7 @@ mod tests {
                     capability_proof: [11; 32],
                 },
                 1,
-                NetworkStatus {
-                    mode: NetworkMode::NoNic,
-                    detail: None,
-                },
+                no_nic_network_status(),
             )
             .unwrap();
         service
@@ -1733,14 +1730,39 @@ mod tests {
                         rootfs_ready: true,
                         detail: "ready".to_string(),
                     },
-                    network: NetworkStatus {
-                        mode: NetworkMode::PortableNetwork,
-                        detail: Some("test".to_string()),
-                    },
+                    network: portable_network_status(),
                 },
             })
             .unwrap();
         service
+    }
+
+    fn no_nic_network_status() -> NetworkStatus {
+        NetworkStatus {
+            mode: NetworkMode::NoNic,
+            setup_state: NetworkSetupState::Ready,
+            interface: None,
+            default_gateway: None,
+            dns: DnsStatus {
+                ready: true,
+                servers: Vec::new(),
+            },
+            failure: None,
+        }
+    }
+
+    fn portable_network_status() -> NetworkStatus {
+        NetworkStatus {
+            mode: NetworkMode::PortableNetwork,
+            setup_state: NetworkSetupState::Ready,
+            interface: None,
+            default_gateway: Some("10.0.0.1".to_string()),
+            dns: DnsStatus {
+                ready: true,
+                servers: vec!["10.0.0.53".to_string()],
+            },
+            failure: None,
+        }
     }
 
     fn cleanup_active_exec(supervisor: &mut LinuxProcessSupervisor, exec_id: u32) {

@@ -29,17 +29,24 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   (`unit-static`, `local-linux-runtime`, `live-whp`) and a separate conformance
   status. Static or local-runtime evidence can satisfy subchecks, but canonical
   WHP conformance never passes without `live-whp` evidence for all requirements.
-- Scenarios 3–6 exercise the production `MxcControlService` +
+- Scenarios 3–6 and 10–12 exercise the production `MxcControlService` +
   `LinuxProcessSupervisor` path with real subprocesses on Linux/WSL
   (`local-linux-runtime` evidence: sequential exec + typed busy, binary
-  stdout/stderr separation, backpressure/credits, and terminal-order
-  invariants). This remains non-conformance (`NotLive`) until observed on live
-  WHP.
-- Post-config capability advertisement now exposes `Exec`, `Streams`, and
-  `Cancel` only. `Quiesce`, `Resume`, and `Shutdown` remain explicitly
-  unavailable until reviewed.
+  stdout/stderr separation, backpressure/credits, terminal-order invariants,
+  typed network status semantics, health/quiesce/resume/shutdown transitions,
+  and channel-loss cleanup/new-generation enforcement). This remains
+  non-conformance (`NotLive`) until observed on live WHP.
+- Post-config capability advertisement now exposes `Exec`, `Streams`, `Cancel`,
+  `Quiesce`, `Resume`, and `Shutdown` after full lifecycle activation.
 - Cancellation, timeout escalation, descendant termination, channel-loss cleanup,
   and graceful shutdown all execute with fail-closed behavior.
+- Runtime `Health` now returns typed session state (`phase0/active/quiesced/
+  shutting-down/cleanup-in-progress/fatal-session`), channel generation, active
+  exec id, last failure detail, and configured filesystem/network snapshots.
+- Runtime network reporting is now structured and bounded: mode, setup state,
+  interface/index/link state, assigned addresses, default gateway/route, DNS
+  readiness/servers, and typed setup failure (`NetworkFailureCode` + detail)
+  with no freeform boot-log parsing.
 - Fatal-session shutdown now starts fail-closed cleanup immediately, then attempts
   typed fatal error delivery only within a bounded runtime deadline
   (`FATAL_SESSION_DELIVERY_DEADLINE`, currently 250 ms). PID1 stops by that
@@ -51,6 +58,8 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   cleared.
 - Quiesce/resume now drives cgroup freezer state (`cgroup.freeze` +
   `cgroup.events:frozen`) with bounded waits and fail-closed transitions.
+  Current explicit policy: quiesce is rejected when an exec is active; callers
+  must retry after workload completion.
 - Post-spawn rollback now distinguishes successful cleanup (retryable spawn
   failure) from cleanup-uncertain rollback failures. Cleanup uncertainty is
   promoted to a typed fatal-session protocol error and PID1 stops accepting

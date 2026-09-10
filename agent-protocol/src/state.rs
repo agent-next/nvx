@@ -8,9 +8,10 @@ use crate::mapping::{
     validate_mapping_set,
 };
 use crate::messages::{
-    AgentControlMessage, BuildStatus, CapabilityProofMaterial, ExecDisposition, HealthStatus,
-    IsolationStatus, LaunchIdentity, NetworkStatus, ProtocolErrorCode, ProtocolErrorDetail,
-    ReadyStatus, SERVICE_IDENTITY, StreamName, WorkloadIdentityStatus,
+    AgentControlMessage, AgentSessionState, BuildStatus, CapabilityProofMaterial, DnsStatus,
+    ExecDisposition, HealthStatus, IsolationStatus, LaunchIdentity, NetworkMode, NetworkSetupState,
+    NetworkStatus, ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY,
+    StreamName, WorkloadIdentityStatus,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -423,9 +424,42 @@ impl AgentProtocolState {
             .launch
             .as_ref()
             .is_some_and(|launch| launch.lifecycle == LaunchLifecycle::Quiesced);
+        let shutting_down = self
+            .launch
+            .as_ref()
+            .is_some_and(|launch| launch.lifecycle == LaunchLifecycle::ShuttingDown);
+        let agent_state = if shutting_down {
+            AgentSessionState::ShuttingDown
+        } else if quiesced {
+            AgentSessionState::Quiesced
+        } else if launch_admitted {
+            AgentSessionState::Active
+        } else {
+            AgentSessionState::Phase0Readiness
+        };
         HealthStatus {
+            agent_state,
             quiesced,
             launch_admitted,
+            shutting_down,
+            channel_generation: 0,
+            active_exec_id: self
+                .launch
+                .as_ref()
+                .and_then(|launch| launch.active_exec.map(|exec| exec.exec_id)),
+            filesystem: None,
+            network: Some(NetworkStatus {
+                mode: NetworkMode::NoNic,
+                setup_state: NetworkSetupState::Ready,
+                interface: None,
+                default_gateway: None,
+                dns: DnsStatus {
+                    ready: true,
+                    servers: Vec::new(),
+                },
+                failure: None,
+            }),
+            last_failure: None,
         }
     }
 
@@ -961,7 +995,14 @@ mod tests {
             },
             network: NetworkStatus {
                 mode: NetworkMode::NoNic,
-                detail: None,
+                setup_state: NetworkSetupState::Ready,
+                interface: None,
+                default_gateway: None,
+                dns: DnsStatus {
+                    ready: true,
+                    servers: Vec::new(),
+                },
+                failure: None,
             },
             isolation: test_isolation(),
             workload_identity: WorkloadIdentityStatus::mxc_fixed(),

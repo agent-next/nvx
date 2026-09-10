@@ -16,10 +16,11 @@ use crate::mapping::{
     CanonicalHostMappingRoot, ChildMapping, MappingContainmentPolicy, validate_mapping_set,
 };
 use crate::messages::{
-    AgentControlMessage, BuildStatus, ExecDisposition, FlowCreditRequest, IsolationStatus,
-    LaunchIdentity, NetworkStatus, ReadyStatus, SERVICE_IDENTITY, StderrChunkRecord,
-    StderrEofRecord, StdinChunkRecord, StdinEofRecord, StdoutChunkRecord, StdoutEofRecord,
-    StreamName, WorkloadIdentityStatus,
+    AgentControlMessage, AgentSessionState, BuildStatus, DnsStatus, ExecDisposition,
+    FlowCreditRequest, HealthFailureStatus, IsolationStatus, LaunchIdentity, NetworkMode,
+    NetworkSetupState, NetworkStatus, ProtocolErrorCode, ReadyStatus, SERVICE_IDENTITY,
+    StderrChunkRecord, StderrEofRecord, StdinChunkRecord, StdinEofRecord, StdoutChunkRecord,
+    StdoutEofRecord, StreamName, WorkloadIdentityStatus,
 };
 use crate::state::{
     ActiveExecEvent, AgentProtocolState, CHANNEL_LOSS_CLEANUP_DEADLINE_SECS, LaunchAdmissionInput,
@@ -128,12 +129,16 @@ pub struct ReadySnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthSnapshot {
+    pub agent_state: AgentSessionState,
     pub launch_admitted: bool,
     pub configured: bool,
     pub quiesced: bool,
     pub shutting_down: bool,
+    pub channel_generation: u64,
+    pub active_exec_id: Option<u32>,
     pub filesystem: Option<FilesystemStatus>,
     pub network: Option<NetworkStatus>,
+    pub last_failure: Option<HealthFailureStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,6 +220,8 @@ pub struct MxcControlService {
     shutting_down: bool,
     fatal_session_reason: Option<String>,
     active_exec: Option<ActiveExecution>,
+    disconnect_cleanup_in_progress: bool,
+    last_failure: Option<HealthFailureStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,8 +329,15 @@ impl MxcControlService {
                 profile: "mxc-prototype".to_string(),
             },
             NetworkStatus {
-                mode: crate::messages::NetworkMode::NoNic,
-                detail: None,
+                mode: NetworkMode::NoNic,
+                setup_state: NetworkSetupState::Ready,
+                interface: None,
+                default_gateway: None,
+                dns: DnsStatus {
+                    ready: true,
+                    servers: Vec::new(),
+                },
+                failure: None,
             },
             IsolationStatus {
                 pid_namespace: true,
@@ -353,8 +367,15 @@ impl MxcControlService {
                 profile: "mxc-prototype".to_string(),
             },
             NetworkStatus {
-                mode: crate::messages::NetworkMode::NoNic,
-                detail: None,
+                mode: NetworkMode::NoNic,
+                setup_state: NetworkSetupState::Ready,
+                interface: None,
+                default_gateway: None,
+                dns: DnsStatus {
+                    ready: true,
+                    servers: Vec::new(),
+                },
+                failure: None,
             },
             IsolationStatus {
                 pid_namespace: true,
@@ -398,6 +419,8 @@ impl MxcControlService {
             shutting_down: false,
             fatal_session_reason: None,
             active_exec: None,
+            disconnect_cleanup_in_progress: false,
+            last_failure: None,
         }
     }
 
@@ -434,6 +457,9 @@ impl MxcControlService {
                 "Exec".to_string(),
                 "Streams".to_string(),
                 "Cancel".to_string(),
+                "Quiesce".to_string(),
+                "Resume".to_string(),
+                "Shutdown".to_string(),
             ]);
         }
         MxcCapabilities {
@@ -469,31 +495,29 @@ impl MxcControlService {
                 },
             ]);
         }
-        vec![
-            UnavailableOperation {
-                operation: "Quiesce".to_string(),
-                capability_flag: "quiesce.phase0".to_string(),
-                reason: "quiesce is intentionally unavailable until that operation is reviewed and approved"
-                    .to_string(),
-            },
-            UnavailableOperation {
-                operation: "Resume".to_string(),
-                capability_flag: "resume.phase0".to_string(),
-                reason: "resume is intentionally unavailable until that operation is reviewed and approved"
-                    .to_string(),
-            },
-            UnavailableOperation {
-                operation: "Shutdown".to_string(),
-                capability_flag: "shutdown.phase0".to_string(),
-                reason: "shutdown is intentionally unavailable until that operation is reviewed and approved"
-                    .to_string(),
-            },
-        ]
-        .into_iter()
-        .fold(entries, |mut acc, item| {
-            acc.push(item);
-            acc
-        })
+        if self.operation_slice == OperationSlice::Phase0Readiness {
+            entries.extend([
+                UnavailableOperation {
+                    operation: "Quiesce".to_string(),
+                    capability_flag: "quiesce.phase0".to_string(),
+                    reason: "quiesce is unavailable until full lifecycle activation completes"
+                        .to_string(),
+                },
+                UnavailableOperation {
+                    operation: "Resume".to_string(),
+                    capability_flag: "resume.phase0".to_string(),
+                    reason: "resume is unavailable until full lifecycle activation completes"
+                        .to_string(),
+                },
+                UnavailableOperation {
+                    operation: "Shutdown".to_string(),
+                    capability_flag: "shutdown.phase0".to_string(),
+                    reason: "shutdown is unavailable until full lifecycle activation completes"
+                        .to_string(),
+                },
+            ]);
+        }
+        entries
     }
 
     pub fn update_runtime_isolation(&mut self, isolation: IsolationStatus) {
@@ -652,11 +676,27 @@ impl MxcControlService {
 
     pub fn health(&self) -> HealthSnapshot {
         let health = self.protocol_state.health();
+        let agent_state = if self.fatal_session_reason.is_some() {
+            AgentSessionState::FatalSession
+        } else if self.disconnect_cleanup_in_progress {
+            AgentSessionState::CleanupInProgress
+        } else if self.shutting_down {
+            AgentSessionState::ShuttingDown
+        } else if health.quiesced || self.quiesced {
+            AgentSessionState::Quiesced
+        } else if self.operation_slice == OperationSlice::Phase0Readiness {
+            AgentSessionState::Phase0Readiness
+        } else {
+            AgentSessionState::Active
+        };
         HealthSnapshot {
+            agent_state,
             launch_admitted: health.launch_admitted,
             configured: self.configured.is_some(),
             quiesced: health.quiesced || self.quiesced,
             shutting_down: self.shutting_down,
+            channel_generation: self.binding.channel_generation,
+            active_exec_id: self.active_exec.as_ref().map(|exec| exec.exec_id),
             filesystem: self
                 .configured
                 .as_ref()
@@ -665,6 +705,7 @@ impl MxcControlService {
                 .configured
                 .as_ref()
                 .map(|config| config.network.clone()),
+            last_failure: self.last_failure.clone(),
         }
     }
 
@@ -941,23 +982,41 @@ impl MxcControlService {
         now_secs: u64,
         supervisor: &mut impl ProcessSupervisor,
     ) -> Result<(), ServiceError> {
+        self.disconnect_cleanup_in_progress = true;
         self.protocol_state.begin_channel_loss_cleanup(now_secs)?;
         if let Some(active) = self.active_exec.as_ref() {
-            let cleaned = supervisor.cleanup_for_disconnect(
-                active.exec_id,
-                Duration::from_secs(CHANNEL_LOSS_CLEANUP_DEADLINE_SECS),
-            )?;
+            let cleaned = supervisor
+                .cleanup_for_disconnect(
+                    active.exec_id,
+                    Duration::from_secs(CHANNEL_LOSS_CLEANUP_DEADLINE_SECS),
+                )
+                .map_err(|error| {
+                    self.enter_fatal_session(format!(
+                        "channel-loss cleanup supervisor failure: {}",
+                        error.message
+                    ));
+                    ServiceError::new(
+                        ServiceErrorCode::FatalSession,
+                        format!(
+                            "channel-loss cleanup supervisor failure is fail-closed: {}",
+                            error.message
+                        ),
+                    )
+                })?;
             if !cleaned {
-                return Err(ServiceError::new(
-                    ServiceErrorCode::CleanupTimeout,
-                    "channel-loss cleanup exceeded bounded deadline; must fail closed",
-                ));
+                let reason = "channel-loss cleanup exceeded bounded deadline; fail-closed session stop required".to_string();
+                self.enter_fatal_session(reason.clone());
+                return Err(ServiceError::new(ServiceErrorCode::FatalSession, reason));
             }
             self.active_exec = None;
         }
         self.protocol_state.complete_channel_loss_cleanup();
         self.authenticated = false;
         self.configured = None;
+        self.quiesced = false;
+        self.shutting_down = false;
+        self.fatal_session_reason = None;
+        self.disconnect_cleanup_in_progress = false;
         Ok(())
     }
 
@@ -1044,7 +1103,10 @@ impl MxcControlService {
         if self.operation_slice == OperationSlice::Phase0Readiness {
             return self.unsupported_operation(operation);
         }
-        if matches!(operation, "Exec" | "Streams" | "Cancel") {
+        if matches!(
+            operation,
+            "Exec" | "Streams" | "Cancel" | "Quiesce" | "Resume" | "Shutdown"
+        ) {
             return Ok(());
         }
         self.unsupported_operation(operation)
@@ -1105,6 +1167,10 @@ impl MxcControlService {
     }
 
     fn enter_fatal_session(&mut self, reason: String) {
+        self.last_failure = Some(HealthFailureStatus {
+            code: ProtocolErrorCode::FatalSession,
+            detail: reason.clone(),
+        });
         self.fatal_session_reason = Some(reason);
         self.shutting_down = true;
     }
@@ -1864,9 +1930,36 @@ mod tests {
                 detail: "sandbox layers mounted".to_string(),
             },
             network: NetworkStatus {
-                mode: NetworkMode::PortableNetwork,
-                detail: Some("10.0.0.2/24 gateway=10.0.0.1".to_string()),
+                ..portable_network_status()
             },
+        }
+    }
+
+    fn no_nic_network_status() -> NetworkStatus {
+        NetworkStatus {
+            mode: NetworkMode::NoNic,
+            setup_state: NetworkSetupState::Ready,
+            interface: None,
+            default_gateway: None,
+            dns: DnsStatus {
+                ready: true,
+                servers: Vec::new(),
+            },
+            failure: None,
+        }
+    }
+
+    fn portable_network_status() -> NetworkStatus {
+        NetworkStatus {
+            mode: NetworkMode::PortableNetwork,
+            setup_state: NetworkSetupState::Ready,
+            interface: None,
+            default_gateway: Some("10.0.0.1".to_string()),
+            dns: DnsStatus {
+                ready: true,
+                servers: vec!["10.0.0.53".to_string()],
+            },
+            failure: None,
         }
     }
 
@@ -1891,10 +1984,7 @@ mod tests {
                     capability_proof: [7; 32],
                 },
                 1,
-                NetworkStatus {
-                    mode: NetworkMode::NoNic,
-                    detail: None,
-                },
+                no_nic_network_status(),
             )
             .unwrap();
         service
@@ -2053,10 +2143,7 @@ mod tests {
                     capability_proof: [4; 32],
                 },
                 1,
-                NetworkStatus {
-                    mode: NetworkMode::NoNic,
-                    detail: None,
-                },
+                no_nic_network_status(),
             )
             .expect_err("must reject wrong capability");
         assert_eq!(error.code, ServiceErrorCode::AuthenticationFailed);
@@ -2361,10 +2448,7 @@ mod tests {
                     capability_proof: [7; 32],
                 },
                 1,
-                NetworkStatus {
-                    mode: NetworkMode::NoNic,
-                    detail: None,
-                },
+                no_nic_network_status(),
             )
             .unwrap();
         assert_eq!(ready.service, SERVICE_IDENTITY);
@@ -2402,10 +2486,7 @@ mod tests {
                     capability_proof: [7; 32],
                 },
                 1,
-                NetworkStatus {
-                    mode: NetworkMode::NoNic,
-                    detail: None,
-                },
+                no_nic_network_status(),
             )
             .unwrap();
         let before_config = runtime_service.activate_full_lifecycle().unwrap_err();
@@ -2429,10 +2510,7 @@ mod tests {
             .iter()
             .map(|entry| entry.operation.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            unavailable,
-            std::collections::BTreeSet::from(["Quiesce", "Resume", "Shutdown"])
-        );
+        assert!(unavailable.is_empty());
         assert!(
             capabilities
                 .available_operations
@@ -2455,7 +2533,19 @@ mod tests {
             capabilities
                 .available_operations
                 .iter()
-                .all(|operation| operation != "Quiesce")
+                .any(|operation| operation == "Quiesce")
+        );
+        assert!(
+            capabilities
+                .available_operations
+                .iter()
+                .any(|operation| operation == "Resume")
+        );
+        assert!(
+            capabilities
+                .available_operations
+                .iter()
+                .any(|operation| operation == "Shutdown")
         );
     }
 
@@ -2472,10 +2562,7 @@ mod tests {
                     capability_proof: [7; 32],
                 },
                 1,
-                NetworkStatus {
-                    mode: NetworkMode::NoNic,
-                    detail: None,
-                },
+                no_nic_network_status(),
             )
             .unwrap();
         runtime_service
@@ -2582,20 +2669,17 @@ mod tests {
     }
 
     #[test]
-    fn post_activation_keeps_quiesce_resume_shutdown_unavailable() {
+    fn post_activation_enables_quiesce_resume_shutdown() {
         let mut service = authenticated_service();
-        assert_eq!(
-            service.quiesce().unwrap_err().code,
-            ServiceErrorCode::UnsupportedOperation
-        );
-        assert_eq!(
-            service.resume().unwrap_err().code,
-            ServiceErrorCode::UnsupportedOperation
-        );
-        assert_eq!(
-            service.shutdown().unwrap_err().code,
-            ServiceErrorCode::UnsupportedOperation
-        );
+        assert!(matches!(
+            service.quiesce(),
+            Ok(AgentControlMessage::Quiesced)
+        ));
+        assert!(matches!(service.resume(), Ok(AgentControlMessage::Resumed)));
+        assert!(matches!(
+            service.shutdown(),
+            Ok(AgentControlMessage::ShuttingDown)
+        ));
     }
 
     #[test]
@@ -3475,7 +3559,7 @@ mod tests {
             )
             .unwrap();
         let cleanup = service.begin_disconnect_cleanup(100, &mut supervisor);
-        assert_eq!(cleanup.unwrap_err().code, ServiceErrorCode::CleanupTimeout);
+        assert_eq!(cleanup.unwrap_err().code, ServiceErrorCode::FatalSession);
     }
 
     #[test]
@@ -3491,10 +3575,7 @@ mod tests {
                     capability_proof: [7; 32],
                 },
                 1,
-                NetworkStatus {
-                    mode: NetworkMode::NoNic,
-                    detail: None,
-                },
+                no_nic_network_status(),
             )
             .unwrap();
         let mut supervisor = FakeSupervisor::default();
@@ -3510,10 +3591,7 @@ mod tests {
                 capability_proof: [7; 32],
             },
             40,
-            NetworkStatus {
-                mode: NetworkMode::NoNic,
-                detail: None,
-            },
+            no_nic_network_status(),
         );
         assert_eq!(same.unwrap_err().code, ServiceErrorCode::LifecycleError);
         let newer = service.authenticate_channel(
@@ -3525,10 +3603,7 @@ mod tests {
                 capability_proof: [7; 32],
             },
             40,
-            NetworkStatus {
-                mode: NetworkMode::NoNic,
-                detail: None,
-            },
+            no_nic_network_status(),
         );
         assert!(newer.is_ok());
     }
@@ -3600,8 +3675,15 @@ mod tests {
         let mut channel = HvcFramedChannel::new(io);
         channel.write_queue_limit_records = 1;
         let record = InnerRecord::control(&HealthStatus {
+            agent_state: AgentSessionState::Active,
             quiesced: false,
             launch_admitted: true,
+            shutting_down: false,
+            channel_generation: 17,
+            active_exec_id: None,
+            filesystem: None,
+            network: Some(no_nic_network_status()),
+            last_failure: None,
         })
         .unwrap();
         channel.queue_inner_record(&record).unwrap();
@@ -3615,13 +3697,27 @@ mod tests {
         let mut channel = HvcFramedChannel::new(io);
         channel.write_credits = 1;
         let first = InnerRecord::control(&HealthStatus {
+            agent_state: AgentSessionState::Active,
             quiesced: false,
             launch_admitted: true,
+            shutting_down: false,
+            channel_generation: 17,
+            active_exec_id: None,
+            filesystem: None,
+            network: Some(no_nic_network_status()),
+            last_failure: None,
         })
         .unwrap();
         let second = InnerRecord::control(&HealthStatus {
+            agent_state: AgentSessionState::Phase0Readiness,
             quiesced: true,
             launch_admitted: false,
+            shutting_down: false,
+            channel_generation: 17,
+            active_exec_id: None,
+            filesystem: None,
+            network: Some(no_nic_network_status()),
+            last_failure: None,
         })
         .unwrap();
         channel.queue_inner_record(&first).unwrap();
@@ -3882,8 +3978,15 @@ mod tests {
         channel.write_queue_limit_records = 256;
         channel.write_credits = 256;
         let filler = AgentControlMessage::Health(HealthStatus {
+            agent_state: AgentSessionState::Active,
             quiesced: false,
             launch_admitted: true,
+            shutting_down: false,
+            channel_generation: 17,
+            active_exec_id: None,
+            filesystem: None,
+            network: Some(no_nic_network_status()),
+            last_failure: None,
         });
         for _ in 0..256 {
             channel.queue_control_message(&filler).unwrap();
