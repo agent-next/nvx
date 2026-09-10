@@ -10,6 +10,8 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use agent_protocol::{
@@ -20,6 +22,10 @@ use agent_protocol::{
 const STDIO_CHUNK_BYTES: usize = 4096;
 const TERM_GRACE: Duration = Duration::from_millis(250);
 const POLL_SLEEP: Duration = Duration::from_millis(10);
+
+#[cfg(test)]
+static PREPARE_CGROUP_FAILPOINT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub struct LinuxProcessSupervisor {
     active: Option<ActiveProcess>,
@@ -34,10 +40,20 @@ struct NamespaceHolder {
     pid_ns_fd: i32,
 }
 
-#[derive(Clone)]
 struct PreparedExecCgroup {
     cgroup_dir: PathBuf,
     cgroup_procs_path: CString,
+    cgroup_procs_fd: i32,
+}
+
+impl Drop for PreparedExecCgroup {
+    fn drop(&mut self) {
+        if self.cgroup_procs_fd >= 0 {
+            // SAFETY: best-effort close for process-owned descriptor.
+            let _ = unsafe { libc::close(self.cgroup_procs_fd) };
+            self.cgroup_procs_fd = -1;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -56,7 +72,10 @@ struct ActiveProcess {
     stderr_eof: bool,
     stdin_queue: VecDeque<Vec<u8>>,
     stdin_queue_bytes: usize,
+    stdin_queue_bytes_atomic: Arc<AtomicUsize>,
+    stdin_drained_bytes_atomic: Arc<AtomicUsize>,
     stdin_offset: usize,
+    stdin_close_requested: bool,
     terminate_sent_at: Option<Instant>,
     kill_sent: bool,
     exit_status_reported: bool,
@@ -115,16 +134,24 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             .as_ref()
             .map(|holder| holder.cgroup_dir.as_path())
             .unwrap_or_else(|| Path::new("/sys/fs/cgroup/nvx.workload"));
-        let prepared_cgroup = prepare_exec_cgroup(cgroup_root, request.exec_id);
+        let strict_cgroup = self.holder.is_some();
+        let prepared_cgroup = if strict_cgroup {
+            Some(prepare_exec_cgroup(cgroup_root, request.exec_id)?)
+        } else {
+            prepare_exec_cgroup(cgroup_root, request.exec_id).ok()
+        };
         let credential_plan = prepare_child_credential_plan().ok();
         if let Some(holder) = self.holder.as_ref() {
             let mount_ns_fd = holder.mount_ns_fd;
             let uts_ns_fd = holder.uts_ns_fd;
             let ipc_ns_fd = holder.ipc_ns_fd;
             let pid_ns_fd = holder.pid_ns_fd;
-            let exec_cgroup_procs_path = prepared_cgroup
+            let exec_cgroup_fd = prepared_cgroup
                 .as_ref()
-                .map(|prepared| prepared.cgroup_procs_path.clone());
+                .map(|prepared| prepared.cgroup_procs_fd)
+                .ok_or_else(|| {
+                    supervisor_error("holder-backed execution requires prepared cgroup")
+                })?;
             // SAFETY: closure performs direct namespace and identity syscalls before exec.
             unsafe {
                 command.pre_exec(move || {
@@ -132,9 +159,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                     setns_checked(uts_ns_fd, libc::CLONE_NEWUTS)?;
                     setns_checked(ipc_ns_fd, libc::CLONE_NEWIPC)?;
                     setns_checked(pid_ns_fd, libc::CLONE_NEWPID)?;
-                    if let Some(cgroup_procs_path) = exec_cgroup_procs_path.as_ref() {
-                        move_self_to_cgroup(cgroup_procs_path)?;
-                    }
+                    move_self_to_cgroup_fd(exec_cgroup_fd)?;
                     let workload_pid = libc::fork();
                     if workload_pid < 0 {
                         return Err(io::Error::last_os_error());
@@ -180,11 +205,13 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             set_nonblocking(stderr_ref.as_raw_fd())?;
         }
 
+        let stdin_queue_bytes_atomic = Arc::new(AtomicUsize::new(0));
+        let stdin_drained_bytes_atomic = Arc::new(AtomicUsize::new(0));
         let cgroup_dir = if let Some(prepared) = prepared_cgroup {
             if self.holder.is_none() {
                 let _ = move_pid_to_exec_cgroup(&prepared.cgroup_procs_path, pid);
             }
-            Some(prepared.cgroup_dir)
+            Some(prepared.cgroup_dir.clone())
         } else {
             try_prepare_workload_cgroup(request.exec_id, pid)
         };
@@ -199,7 +226,10 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             stderr_eof: false,
             stdin_queue: VecDeque::new(),
             stdin_queue_bytes: 0,
+            stdin_queue_bytes_atomic,
+            stdin_drained_bytes_atomic,
             stdin_offset: 0,
+            stdin_close_requested: false,
             terminate_sent_at: None,
             kill_sent: false,
             exit_status_reported: false,
@@ -223,16 +253,54 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             });
         }
         active.stdin_queue_bytes = next_bytes;
+        active
+            .stdin_queue_bytes_atomic
+            .store(next_bytes, Ordering::Release);
         active.stdin_queue.push_back(chunk);
         Ok(())
     }
 
     fn close_stdin(&mut self, exec_id: u32) -> Result<(), ServiceError> {
         let active = self.require_active(exec_id)?;
-        active.stdin_queue.clear();
-        active.stdin_queue_bytes = 0;
-        active.stdin_offset = 0;
-        active.stdin = None;
+        active.stdin_close_requested = true;
+        if active.stdin_queue_bytes == 0
+            && active.stdin_queue.is_empty()
+            && active.stdin_offset == 0
+        {
+            active.stdin = None;
+        }
+        Ok(())
+    }
+
+    fn take_stdin_drain_bytes(&mut self, exec_id: u32) -> Result<usize, ServiceError> {
+        let active = self.require_active(exec_id)?;
+        Ok(active.stdin_drained_bytes_atomic.swap(0, Ordering::AcqRel))
+    }
+
+    fn peek_event(&mut self, exec_id: u32) -> Result<Option<SupervisorEvent>, ServiceError> {
+        let active = self.require_active(exec_id)?;
+        refresh_active_state(active)?;
+        Ok(active.event_queue.front().cloned())
+    }
+
+    fn ack_event(&mut self, exec_id: u32) -> Result<(), ServiceError> {
+        let mut release_cgroup = None;
+        {
+            let active = self.require_active(exec_id)?;
+            let _ = active.event_queue.pop_front();
+            if active.exit_status_reported
+                && active.descendants_cleaned_reported
+                && active.stdout_eof
+                && active.stderr_eof
+                && active.event_queue.is_empty()
+            {
+                release_cgroup = active.cgroup_dir.clone();
+            }
+        }
+        if release_cgroup.is_some() {
+            self.active = None;
+            remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref());
+        }
         Ok(())
     }
 
@@ -251,24 +319,9 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
     }
 
     fn poll(&mut self, exec_id: u32) -> Result<Option<SupervisorEvent>, ServiceError> {
-        let mut release_cgroup = None;
-        let event = {
-            let active = self.require_active(exec_id)?;
-            refresh_active_state(active)?;
-            let event = active.event_queue.pop_front();
-            if active.exit_status_reported
-                && active.descendants_cleaned_reported
-                && active.stdout_eof
-                && active.stderr_eof
-                && active.event_queue.is_empty()
-            {
-                release_cgroup = active.cgroup_dir.clone();
-            }
-            event
-        };
-        if release_cgroup.is_some() {
-            self.active = None;
-            remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref());
+        let event = self.peek_event(exec_id)?;
+        if event.is_some() {
+            self.ack_event(exec_id)?;
         }
         Ok(event)
     }
@@ -375,38 +428,6 @@ fn setns_checked(fd: i32, nstype: i32) -> io::Result<()> {
     // SAFETY: fd references a namespace descriptor opened by open_namespace_fd.
     let rc = unsafe { libc::setns(fd, nstype) };
     if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn move_self_to_cgroup(cgroup_procs_path: &CString) -> io::Result<()> {
-    // SAFETY: path pointer is NUL-terminated and flags are constants.
-    let fd = unsafe { libc::open(cgroup_procs_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut pid_digits = [0_u8; 21];
-    let mut len = 0usize;
-    let mut value = unsafe { libc::getpid() } as u32;
-    loop {
-        pid_digits[len] = b'0' + (value % 10) as u8;
-        len += 1;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    let mut payload = [0_u8; 22];
-    for index in 0..len {
-        payload[index] = pid_digits[len - index - 1];
-    }
-    payload[len] = b'\n';
-    // SAFETY: payload pointer valid for len+1 bytes.
-    let rc = unsafe { libc::write(fd, payload.as_ptr().cast(), len + 1) };
-    // SAFETY: best-effort close for opened descriptor.
-    let _ = unsafe { libc::close(fd) };
-    if rc < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -587,6 +608,12 @@ fn pump_stdin(active: &mut ActiveProcess) -> Result<(), ServiceError> {
             Ok(size) => {
                 active.stdin_offset = active.stdin_offset.saturating_add(size);
                 active.stdin_queue_bytes = active.stdin_queue_bytes.saturating_sub(size);
+                active
+                    .stdin_queue_bytes_atomic
+                    .store(active.stdin_queue_bytes, Ordering::Release);
+                active
+                    .stdin_drained_bytes_atomic
+                    .fetch_add(size, Ordering::AcqRel);
                 if active.stdin_offset >= front.len() {
                     active.stdin_offset = 0;
                     active.stdin_queue.pop_front();
@@ -595,6 +622,9 @@ fn pump_stdin(active: &mut ActiveProcess) -> Result<(), ServiceError> {
             Err(error) if would_block(&error) => return Ok(()),
             Err(error) => return Err(supervisor_io("writing child stdin", error)),
         }
+    }
+    if active.stdin_close_requested && active.stdin_queue_bytes == 0 {
+        active.stdin = None;
     }
     Ok(())
 }
@@ -621,31 +651,61 @@ fn set_nonblocking(fd: i32) -> Result<(), ServiceError> {
 
 fn try_prepare_workload_cgroup(exec_id: u32, pid: i32) -> Option<PathBuf> {
     let root = Path::new("/sys/fs/cgroup/nvx.workload");
-    let prepared = prepare_exec_cgroup(root, exec_id)?;
+    let prepared = prepare_exec_cgroup(root, exec_id).ok()?;
     if move_pid_to_exec_cgroup(&prepared.cgroup_procs_path, pid).is_err() {
         remove_exec_cgroup(Some(prepared.cgroup_dir.as_path()), None);
         return None;
     }
-    Some(prepared.cgroup_dir)
+    Some(prepared.cgroup_dir.clone())
 }
 
-fn prepare_exec_cgroup(root: &Path, exec_id: u32) -> Option<PreparedExecCgroup> {
+fn prepare_exec_cgroup(root: &Path, exec_id: u32) -> Result<PreparedExecCgroup, ServiceError> {
+    #[cfg(test)]
+    if PREPARE_CGROUP_FAILPOINT.load(Ordering::SeqCst) {
+        return Err(supervisor_error(
+            "injected failure preparing per-exec cgroup",
+        ));
+    }
     for attempt in 0..64_u32 {
         let dir = root.join(format!("exec-{exec_id}-{}-{attempt}", std::process::id()));
         match fs::create_dir(&dir) {
             Ok(()) => {
-                let cgroup_procs_path =
-                    CString::new(format!("{}/cgroup.procs", dir.display())).ok()?;
-                return Some(PreparedExecCgroup {
+                let cgroup_procs_path = CString::new(format!("{}/cgroup.procs", dir.display()))
+                    .map_err(|_| supervisor_error("invalid cgroup path encoding"))?;
+                // SAFETY: cgroup.procs_path is a valid NUL-terminated path.
+                let fd = unsafe {
+                    libc::open(cgroup_procs_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
+                };
+                if fd < 0 {
+                    let error = io::Error::last_os_error();
+                    remove_exec_cgroup(Some(dir.as_path()), None);
+                    return Err(supervisor_io("opening cgroup.procs", error));
+                }
+                return Ok(PreparedExecCgroup {
                     cgroup_dir: dir,
                     cgroup_procs_path,
+                    cgroup_procs_fd: fd,
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return None,
+            Err(error) => return Err(supervisor_io("creating per-exec cgroup directory", error)),
         }
     }
-    None
+    Err(supervisor_error(
+        "exhausted per-exec cgroup naming attempts without a free slot",
+    ))
+}
+
+fn move_self_to_cgroup_fd(cgroup_procs_fd: i32) -> io::Result<()> {
+    let payload = std::process::id().to_string();
+    // SAFETY: payload pointer is valid for payload bytes.
+    let write_pid = unsafe { libc::write(cgroup_procs_fd, payload.as_ptr().cast(), payload.len()) };
+    // SAFETY: "\n" literal has static lifetime and length 1.
+    let write_newline = unsafe { libc::write(cgroup_procs_fd, b"\n".as_ptr().cast(), 1) };
+    if write_pid < 0 || write_newline < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn move_pid_to_exec_cgroup(cgroup_procs_path: &CString, pid: i32) -> io::Result<()> {
@@ -951,6 +1011,35 @@ mod tests {
     }
 
     #[test]
+    fn holder_spawn_fails_closed_when_exec_cgroup_prepare_fails() {
+        PREPARE_CGROUP_FAILPOINT.store(true, Ordering::SeqCst);
+        let holder_root = tempdir().expect("tempdir");
+        let mut supervisor = LinuxProcessSupervisor {
+            active: None,
+            holder: Some(NamespaceHolder {
+                cgroup_dir: holder_root.path().to_path_buf(),
+                mount_ns_fd: -1,
+                uts_ns_fd: -1,
+                ipc_ns_fd: -1,
+                pid_ns_fd: -1,
+            }),
+        };
+        let spawn_result = supervisor.spawn(&CreateProcessRequest {
+            exec_id: 99,
+            argv: vec!["/bin/echo".to_string(), "x".to_string()],
+            cwd: Some("/".to_string()),
+            env: vec![],
+            timeout_ms: None,
+        });
+        PREPARE_CGROUP_FAILPOINT.store(false, Ordering::SeqCst);
+        assert!(spawn_result.is_err(), "spawn must fail closed");
+        assert!(
+            supervisor.active.is_none(),
+            "failed cgroup setup must not leave an active child"
+        );
+    }
+
+    #[test]
     #[ignore = "requires Linux root privileges and namespace/cgroup write access"]
     fn holder_namespace_execution_matches_holder_namespace_ids() {
         let mut supervisor = LinuxProcessSupervisor::new_with_holder(1).expect("holder");
@@ -967,6 +1056,19 @@ mod tests {
                 timeout_ms: None,
             })
             .expect("spawn");
+        let active = supervisor.active.as_ref().expect("active child");
+        let cgroup_dir = active.cgroup_dir.as_ref().expect("exec cgroup");
+        let cgroup_text =
+            fs::read_to_string(format!("/proc/{}/cgroup", active.child.id())).expect("cgroup");
+        let exec_leaf = cgroup_dir
+            .file_name()
+            .expect("exec leaf")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            cgroup_text.contains(&exec_leaf),
+            "child must be moved into per-exec cgroup"
+        );
     }
 
     #[test]
