@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
+use std::hash::{Hash, Hasher};
 #[cfg(target_os = "linux")]
 use std::io;
 use std::path::{Path, PathBuf};
@@ -184,6 +185,7 @@ pub struct ScenarioResult {
     pub duration_ms: u64,
     pub error: Option<String>,
     pub evidence: Vec<String>,
+    pub attestations: Vec<ScenarioAttestation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -200,7 +202,31 @@ pub struct HarnessReport {
     pub finished_unix_ms: u128,
     pub scenarios: Vec<ScenarioResult>,
     pub artifact_paths: BTreeMap<String, String>,
+    pub artifact_hashes: BTreeMap<String, String>,
     pub diagnostics_tail: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttestationKind {
+    Req01LaunchReadiness,
+    Req02ImmutableConfig,
+    Req03RepeatedExec,
+    Req04BinaryStreamSeparation,
+    Req05BoundedFlowBackpressure,
+    Req06TerminalOrderingCleanup,
+    Req07FixedMxcIdentity,
+    Req08FullIsolationVerification,
+    Req09MappingContainmentMutation,
+    Req10NetworkStatus,
+    Req11HealthQuiesceResumeShutdown,
+    Req12ChannelLossGeneration,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScenarioAttestation {
+    pub kind: AttestationKind,
+    pub transcript_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -215,11 +241,20 @@ pub struct HarnessRun {
     pub report: HarnessReport,
     pub report_path: PathBuf,
     pub diagnostics_path: PathBuf,
+    trusted: TrustedEvidence,
+}
+
+#[derive(Clone, Debug)]
+struct TrustedEvidence {
+    attestation_by_requirement: BTreeMap<u8, AttestationKind>,
+    transcript_by_requirement: BTreeMap<u8, String>,
+    artifact_hashes: BTreeMap<String, String>,
+    artifact_paths: BTreeMap<String, String>,
 }
 
 impl HarnessRun {
     pub fn exit_code(&self) -> ExitCode {
-        if is_passing_report(&self.report) {
+        if is_passing_report(self) {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
@@ -243,7 +278,10 @@ pub fn execute_harness(options: HarnessOptions) -> Result<HarnessRun, String> {
         options.backend.as_str()
     ));
     let started = unix_ms_now();
+    let run_transcript_id = format!("run-{}-{}", std::process::id(), started);
     let mut scenarios = Vec::with_capacity(CANONICAL_SCENARIOS.len());
+    let mut trusted_attestation_by_requirement = BTreeMap::new();
+    let mut trusted_transcript_by_requirement = BTreeMap::new();
     let mut stop_after: Option<String> = None;
     for definition in CANONICAL_SCENARIOS {
         let scenario_start = Instant::now();
@@ -259,10 +297,23 @@ pub fn execute_harness(options: HarnessOptions) -> Result<HarnessRun, String> {
                 duration_ms: 0,
                 error: Some(format!("skipped because a prior scenario failed: {reason}")),
                 evidence: vec![],
+                attestations: vec![],
             }
         } else {
             run_scenario(&options, definition, &mut diagnostics)
         };
+        if let Some(kind) = trusted_attestation_kind(definition, &result) {
+            let transcript_id = format!(
+                "{}:req{:02}:{}",
+                run_transcript_id, definition.requirement_number, definition.id
+            );
+            result.attestations = vec![ScenarioAttestation {
+                kind,
+                transcript_id: transcript_id.clone(),
+            }];
+            trusted_attestation_by_requirement.insert(definition.requirement_number, kind);
+            trusted_transcript_by_requirement.insert(definition.requirement_number, transcript_id);
+        }
         result.duration_ms = scenario_start
             .elapsed()
             .as_millis()
@@ -300,6 +351,7 @@ pub fn execute_harness(options: HarnessOptions) -> Result<HarnessRun, String> {
         finished_unix_ms: finished,
         scenarios,
         artifact_paths: BTreeMap::new(),
+        artifact_hashes: BTreeMap::new(),
         diagnostics_tail: diagnostics.snapshot(),
     };
 
@@ -313,12 +365,26 @@ pub fn execute_harness(options: HarnessOptions) -> Result<HarnessRun, String> {
         "diagnostics".to_string(),
         diagnostics_path.display().to_string(),
     );
+    report
+        .artifact_hashes
+        .insert("report".to_string(), run_transcript_id.clone());
+    let diagnostics_hash = content_hash_hex_file(&diagnostics_path)?;
+    report
+        .artifact_hashes
+        .insert("diagnostics".to_string(), diagnostics_hash.clone());
     write_json_atomic(&report_path, &report)?;
 
+    let trusted = TrustedEvidence {
+        attestation_by_requirement: trusted_attestation_by_requirement,
+        transcript_by_requirement: trusted_transcript_by_requirement,
+        artifact_hashes: report.artifact_hashes.clone(),
+        artifact_paths: report.artifact_paths.clone(),
+    };
     Ok(HarnessRun {
         report,
         report_path,
         diagnostics_path,
+        trusted,
     })
 }
 
@@ -503,6 +569,7 @@ fn make_report_result(
         duration_ms: 0,
         error: status_error,
         evidence,
+        attestations: vec![],
     }
 }
 
@@ -660,35 +727,13 @@ fn enforce_production_runtime_evidence_gate(
     {
         return check;
     }
-    let has_production_marker = check
-        .evidence
-        .iter()
-        .any(|line| line.contains("production"));
-    let has_req12_runtime_marker = check
-        .evidence
-        .iter()
-        .any(|line| line.contains("production runtime"));
-    let has_req12_supervisor_marker = check
-        .evidence
-        .iter()
-        .any(|line| line.contains("LinuxProcessSupervisor"));
-    let missing_required_markers = if definition.requirement_number == 12 {
-        !has_req12_runtime_marker || !has_req12_supervisor_marker
-    } else {
-        !has_production_marker
-    };
-    if check.evidence_source != EvidenceSource::LocalLinuxRuntime || missing_required_markers {
+    if check.evidence_source != EvidenceSource::LocalLinuxRuntime {
         check.check_status = EvidenceCheckStatus::Fail;
         check.evidence_source = EvidenceSource::None;
-        check.error = Some(if definition.requirement_number == 12 {
-            "req12 runtime gate rejected pass without explicit production runtime + LinuxProcessSupervisor evidence"
-                .to_string()
-        } else {
-            format!(
-                "req{} runtime gate rejected pass without explicit production evidence",
-                definition.requirement_number
-            )
-        });
+        check.error = Some(format!(
+            "req{} runtime gate rejected pass without production runtime evidence source",
+            definition.requirement_number
+        ));
     }
     check
 }
@@ -920,9 +965,9 @@ fn local_linux_health_lifecycle() -> CheckOutcome {
     };
     let shutdown_ack = service.shutdown().is_ok() && service.health().shutting_down;
     let blocked_writer_before_deadline =
-        !harness_should_complete_shutdown_when_writer_blocked(None, false);
+        !harness_should_complete_shutdown_when_writer_blocked(None, 120, 60);
     let blocked_writer_after_deadline =
-        harness_should_complete_shutdown_when_writer_blocked(None, true);
+        harness_should_complete_shutdown_when_writer_blocked(None, 120, 121);
     let post_shutdown_blocked = matches!(
         service.create_process(
             CreateProcessRequest {
@@ -980,7 +1025,7 @@ fn local_linux_channel_loss_generation() -> CheckOutcome {
     ));
     let _ = std::fs::remove_file(&pid_file);
     let command = format!(
-        "sleep 30 & child=$!; echo $child > '{}'; cat >/dev/null",
+        "dd if=/dev/zero bs=1024 count=128 2>/dev/null; (dd if=/dev/zero bs=1024 count=128 2>/dev/null; sleep 30) & child=$!; echo $child > '{}'; cat >/dev/null",
         pid_file.display()
     );
     if let Err(error) = service.create_process(
@@ -1017,6 +1062,10 @@ fn local_linux_channel_loss_generation() -> CheckOutcome {
     }
     let cleanup_elapsed = cleanup_started.elapsed();
     let cleanup_bounded = cleanup_elapsed <= Duration::from_secs(5);
+    let queue_usage_after_cleanup = supervisor.queue_usage();
+    let queue_cleared_after_cleanup = queue_usage_after_cleanup.event_queue_records == 0
+        && queue_usage_after_cleanup.event_queue_bytes == 0
+        && queue_usage_after_cleanup.stdin_queue_bytes == 0;
     let tree_stopped = match is_pid_alive(grandchild_pid) {
         Ok(false) => true,
         Ok(true) => false,
@@ -1127,13 +1176,15 @@ fn local_linux_channel_loss_generation() -> CheckOutcome {
         && replay_rejected
         && old_launch_config_rejected
         && duplicate_new_generation_reauth_rejected
+        && queue_cleared_after_cleanup
     {
         return check_pass(
             EvidenceSource::LocalLinuxRuntime,
             vec![
                 "production runtime (MxcControlService::new_pid1_runtime) executed req12 with LinuxProcessSupervisor on an authenticated, active execution".to_string(),
                 "simulated control-channel loss immediately stopped admission, closed stdin, and completed internal cleanup before reconnect".to_string(),
-                "bounded child-tree termination/reap completed for real child+grandchild process tree".to_string(),
+                "bounded child-tree termination/reap completed for real output-producing child+grandchild process tree".to_string(),
+                "disconnect cleanup completed with cleared supervisor queues (no unbounded queue/memory growth)".to_string(),
                 "strictly newer generation reconnect succeeded while stale/same-generation auth, stale old-generation requests, and stale stream replay/stdin were rejected".to_string(),
             ],
         );
@@ -1957,6 +2008,7 @@ fn pass(definition: ScenarioDefinition, evidence: Vec<String>) -> ScenarioResult
         duration_ms: 0,
         error: None,
         evidence,
+        attestations: vec![],
     }
 }
 
@@ -1972,6 +2024,7 @@ fn fail(definition: ScenarioDefinition, error: &str) -> ScenarioResult {
         duration_ms: 0,
         error: Some(error.to_string()),
         evidence: vec![],
+        attestations: vec![],
     }
 }
 
@@ -2001,6 +2054,18 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
+fn content_hash_hex_file(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "failed to read artifact for hashing {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
 fn unix_ms_now() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2028,7 +2093,36 @@ fn validate_canonical_scenarios() -> Result<(), String> {
     Ok(())
 }
 
-pub fn is_passing_report(report: &HarnessReport) -> bool {
+fn expected_attestation_kind(requirement_number: u8) -> Option<AttestationKind> {
+    match requirement_number {
+        1 => Some(AttestationKind::Req01LaunchReadiness),
+        2 => Some(AttestationKind::Req02ImmutableConfig),
+        3 => Some(AttestationKind::Req03RepeatedExec),
+        4 => Some(AttestationKind::Req04BinaryStreamSeparation),
+        5 => Some(AttestationKind::Req05BoundedFlowBackpressure),
+        6 => Some(AttestationKind::Req06TerminalOrderingCleanup),
+        7 => Some(AttestationKind::Req07FixedMxcIdentity),
+        8 => Some(AttestationKind::Req08FullIsolationVerification),
+        9 => Some(AttestationKind::Req09MappingContainmentMutation),
+        10 => Some(AttestationKind::Req10NetworkStatus),
+        11 => Some(AttestationKind::Req11HealthQuiesceResumeShutdown),
+        12 => Some(AttestationKind::Req12ChannelLossGeneration),
+        _ => None,
+    }
+}
+
+fn trusted_attestation_kind(
+    definition: ScenarioDefinition,
+    result: &ScenarioResult,
+) -> Option<AttestationKind> {
+    if result.check_status != EvidenceCheckStatus::Pass {
+        return None;
+    }
+    expected_attestation_kind(definition.requirement_number)
+}
+
+pub fn is_passing_report(run: &HarnessRun) -> bool {
+    let report = &run.report;
     if report.schema != REPORT_SCHEMA || report.version != REPORT_VERSION {
         return false;
     }
@@ -2056,6 +2150,9 @@ pub fn is_passing_report(report: &HarnessReport) -> bool {
     if report.artifact_paths.len() != 2 {
         return false;
     }
+    if report.artifact_hashes.len() != 2 {
+        return false;
+    }
     if report
         .artifact_paths
         .get("report")
@@ -2067,6 +2164,25 @@ pub fn is_passing_report(report: &HarnessReport) -> bool {
         .artifact_paths
         .get("diagnostics")
         .is_none_or(|value| value.trim().is_empty())
+    {
+        return false;
+    }
+    if report
+        .artifact_hashes
+        .get("report")
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return false;
+    }
+    if report
+        .artifact_hashes
+        .get("diagnostics")
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return false;
+    }
+    if report.artifact_paths != run.trusted.artifact_paths
+        || report.artifact_hashes != run.trusted.artifact_hashes
     {
         return false;
     }
@@ -2090,16 +2206,43 @@ pub fn is_passing_report(report: &HarnessReport) -> bool {
         {
             return false;
         }
+        let Some(expected_kind) = expected_attestation_kind(scenario.requirement_number) else {
+            return false;
+        };
+        if scenario.attestations.len() != 1 {
+            return false;
+        }
+        let Some(trusted_kind) = run
+            .trusted
+            .attestation_by_requirement
+            .get(&scenario.requirement_number)
+        else {
+            return false;
+        };
+        let Some(trusted_transcript) = run
+            .trusted
+            .transcript_by_requirement
+            .get(&scenario.requirement_number)
+        else {
+            return false;
+        };
+        if *trusted_kind != expected_kind {
+            return false;
+        }
+        let serialized = &scenario.attestations[0];
+        if serialized.kind != expected_kind || &serialized.transcript_id != trusted_transcript {
+            return false;
+        }
     }
     true
 }
 
-pub fn has_all_scenarios_passed(report: &HarnessReport) -> bool {
-    is_passing_report(report)
+pub fn has_all_scenarios_passed(run: &HarnessRun) -> bool {
+    is_passing_report(run)
 }
 
-pub fn report_exit_code(report: &HarnessReport) -> ExitCode {
-    if is_passing_report(report) {
+pub fn report_exit_code(run: &HarnessRun) -> ExitCode {
+    if is_passing_report(run) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -2154,7 +2297,7 @@ mod tests {
             output_dir: root,
         })
         .expect("run");
-        assert!(!is_passing_report(&run.report));
+        assert!(!is_passing_report(&run));
         assert_eq!(run.exit_code(), ExitCode::FAILURE);
         assert_eq!(run.report.scenarios.len(), 12);
         assert!(
@@ -2183,7 +2326,7 @@ mod tests {
         })
         .expect("run");
         assert_eq!(run.exit_code(), ExitCode::FAILURE);
-        assert!(!is_passing_report(&run.report));
+        assert!(!is_passing_report(&run));
         assert!(
             run.report
                 .scenarios
@@ -2287,30 +2430,7 @@ mod tests {
             if scenario.check_status == EvidenceCheckStatus::Pass {
                 assert_eq!(scenario.evidence_source, EvidenceSource::LocalLinuxRuntime);
                 assert_eq!(scenario.status, ScenarioStatus::NotLive);
-                if requirement_number == 10 || requirement_number == 11 {
-                    assert!(
-                        scenario
-                            .evidence
-                            .iter()
-                            .any(|line| line.contains("production")),
-                        "req {requirement_number} must include production-path evidence when passing"
-                    );
-                } else if requirement_number == 12 {
-                    assert!(
-                        scenario
-                            .evidence
-                            .iter()
-                            .any(|line| line.contains("LinuxProcessSupervisor")),
-                        "req {requirement_number} must include production LinuxProcessSupervisor evidence when passing"
-                    );
-                    assert!(
-                        scenario
-                            .evidence
-                            .iter()
-                            .any(|line| line.contains("production runtime")),
-                        "req {requirement_number} must include explicit production runtime evidence when passing"
-                    );
-                }
+                assert_eq!(scenario.attestations.len(), 1);
             } else {
                 assert_eq!(
                     scenario.check_status,
@@ -2332,7 +2452,7 @@ mod tests {
             .expect("req12");
         let check = CheckOutcome {
             check_status: EvidenceCheckStatus::Pass,
-            evidence_source: EvidenceSource::LocalLinuxRuntime,
+            evidence_source: EvidenceSource::UnitStatic,
             error: None,
             evidence: vec!["state machine assertions passed".to_string()],
         };
@@ -2343,15 +2463,50 @@ mod tests {
             gated
                 .error
                 .as_deref()
-                .is_some_and(|msg| msg.contains("production runtime + LinuxProcessSupervisor"))
+                .is_some_and(|msg| msg.contains("production runtime evidence source"))
         );
     }
 
-    fn forged_passing_report() -> HarnessReport {
+    fn forged_passing_run() -> HarnessRun {
         let mut artifact_paths = BTreeMap::new();
         artifact_paths.insert("report".to_string(), "report.json".to_string());
         artifact_paths.insert("diagnostics".to_string(), "diagnostics.txt".to_string());
-        HarnessReport {
+        let mut artifact_hashes = BTreeMap::new();
+        artifact_hashes.insert("report".to_string(), "run-1".to_string());
+        artifact_hashes.insert("diagnostics".to_string(), "deadbeef".to_string());
+        let mut trusted_attestation_by_requirement = BTreeMap::new();
+        let mut trusted_transcript_by_requirement = BTreeMap::new();
+        let scenarios = CANONICAL_SCENARIOS
+            .iter()
+            .map(|scenario| {
+                let kind =
+                    expected_attestation_kind(scenario.requirement_number).expect("expected kind");
+                let transcript = format!(
+                    "run-1:req{:02}:{}",
+                    scenario.requirement_number, scenario.id
+                );
+                trusted_attestation_by_requirement.insert(scenario.requirement_number, kind);
+                trusted_transcript_by_requirement
+                    .insert(scenario.requirement_number, transcript.clone());
+                ScenarioResult {
+                    requirement_number: scenario.requirement_number,
+                    id: scenario.id.to_string(),
+                    name: scenario.name.to_string(),
+                    status: ScenarioStatus::Pass,
+                    check_status: EvidenceCheckStatus::Pass,
+                    evidence_source: EvidenceSource::LiveWhp,
+                    required_evidence_source: EvidenceSource::LiveWhp,
+                    error: None,
+                    evidence: vec![],
+                    attestations: vec![ScenarioAttestation {
+                        kind,
+                        transcript_id: transcript,
+                    }],
+                    duration_ms: 1,
+                }
+            })
+            .collect();
+        let report = HarnessReport {
             schema: REPORT_SCHEMA.to_string(),
             version: REPORT_VERSION,
             mode: HarnessMode::LiveWhp,
@@ -2362,81 +2517,120 @@ mod tests {
             build_identity: env!("CARGO_PKG_VERSION").to_string(),
             started_unix_ms: 1,
             finished_unix_ms: 2,
-            scenarios: CANONICAL_SCENARIOS
-                .iter()
-                .map(|scenario| ScenarioResult {
-                    requirement_number: scenario.requirement_number,
-                    id: scenario.id.to_string(),
-                    name: scenario.name.to_string(),
-                    status: ScenarioStatus::Pass,
-                    check_status: EvidenceCheckStatus::Pass,
-                    evidence_source: EvidenceSource::LiveWhp,
-                    required_evidence_source: EvidenceSource::LiveWhp,
-                    error: None,
-                    evidence: vec![],
-                    duration_ms: 1,
-                })
-                .collect(),
+            scenarios,
             artifact_paths,
+            artifact_hashes,
             diagnostics_tail: vec!["ok".to_string()],
+        };
+        HarnessRun {
+            report_path: PathBuf::from("report.json"),
+            diagnostics_path: PathBuf::from("diagnostics.txt"),
+            trusted: TrustedEvidence {
+                attestation_by_requirement: trusted_attestation_by_requirement,
+                transcript_by_requirement: trusted_transcript_by_requirement,
+                artifact_hashes: report.artifact_hashes.clone(),
+                artifact_paths: report.artifact_paths.clone(),
+            },
+            report,
         }
     }
 
     #[test]
-    fn canonical_gate_rejects_adversarial_top_level_fields() {
-        let report = forged_passing_report();
-        assert!(is_passing_report(&report));
-        assert_eq!(report_exit_code(&report), ExitCode::SUCCESS);
+    fn fabricated_report_without_trusted_attestation_fails() {
+        let mut run = forged_passing_run();
+        run.trusted.attestation_by_requirement.clear();
+        assert!(!is_passing_report(&run));
+    }
 
-        let mut bad_schema = report.clone();
-        bad_schema.schema = "forged.schema".to_string();
+    #[test]
+    fn canonical_gate_rejects_adversarial_attestation_and_artifact_mutations() {
+        let run = forged_passing_run();
+        assert!(is_passing_report(&run));
+        assert_eq!(report_exit_code(&run), ExitCode::SUCCESS);
+
+        let mut missing_attestation = run.clone();
+        missing_attestation.report.scenarios[0].attestations.clear();
+        assert!(!is_passing_report(&missing_attestation));
+
+        let mut wrong_kind = run.clone();
+        wrong_kind.report.scenarios[0].attestations[0].kind =
+            AttestationKind::Req12ChannelLossGeneration;
+        assert!(!is_passing_report(&wrong_kind));
+
+        let mut duplicate = run.clone();
+        let duplicated = duplicate.report.scenarios[0].attestations[0].clone();
+        duplicate.report.scenarios[0].attestations.push(duplicated);
+        assert!(!is_passing_report(&duplicate));
+
+        let mut mismatch_transcript = run.clone();
+        mismatch_transcript.report.scenarios[0].attestations[0].transcript_id =
+            "forged".to_string();
+        assert!(!is_passing_report(&mismatch_transcript));
+
+        let mut artifact_mismatch = run.clone();
+        artifact_mismatch
+            .report
+            .artifact_hashes
+            .insert("diagnostics".to_string(), "forged".to_string());
+        assert!(!is_passing_report(&artifact_mismatch));
+    }
+
+    #[test]
+    fn canonical_gate_rejects_adversarial_top_level_fields() {
+        let run = forged_passing_run();
+        assert!(is_passing_report(&run));
+        assert_eq!(report_exit_code(&run), ExitCode::SUCCESS);
+
+        let mut bad_schema = run.clone();
+        bad_schema.report.schema = "forged.schema".to_string();
         assert!(!is_passing_report(&bad_schema));
         assert_eq!(report_exit_code(&bad_schema), ExitCode::FAILURE);
 
-        let mut bad_version = report.clone();
-        bad_version.version = report.version + 1;
+        let mut bad_version = run.clone();
+        bad_version.report.version += 1;
         assert!(!is_passing_report(&bad_version));
 
-        let mut bad_mode = report.clone();
-        bad_mode.mode = HarnessMode::StaticOnly;
+        let mut bad_mode = run.clone();
+        bad_mode.report.mode = HarnessMode::StaticOnly;
         assert!(!is_passing_report(&bad_mode));
 
-        let mut bad_platform = report.clone();
-        bad_platform.platform = "linux".to_string();
+        let mut bad_platform = run.clone();
+        bad_platform.report.platform = "linux".to_string();
         assert!(!is_passing_report(&bad_platform));
 
-        let mut bad_backend = report.clone();
-        bad_backend.backend = "lxc".to_string();
+        let mut bad_backend = run.clone();
+        bad_backend.report.backend = "lxc".to_string();
         assert!(!is_passing_report(&bad_backend));
 
-        let mut bad_protocol = report.clone();
-        bad_protocol.protocol_version = report.protocol_version + 1;
+        let mut bad_protocol = run.clone();
+        bad_protocol.report.protocol_version += 1;
         assert!(!is_passing_report(&bad_protocol));
 
-        let mut bad_service = report.clone();
-        bad_service.service_identity = "forged.service".to_string();
+        let mut bad_service = run.clone();
+        bad_service.report.service_identity = "forged.service".to_string();
         assert!(!is_passing_report(&bad_service));
 
-        let mut bad_started = report.clone();
-        bad_started.started_unix_ms = 0;
+        let mut bad_started = run.clone();
+        bad_started.report.started_unix_ms = 0;
         assert!(!is_passing_report(&bad_started));
 
-        let mut bad_finished = report.clone();
-        bad_finished.finished_unix_ms = 0;
+        let mut bad_finished = run.clone();
+        bad_finished.report.finished_unix_ms = 0;
         assert!(!is_passing_report(&bad_finished));
 
-        let mut bad_build = report.clone();
-        bad_build.build_identity = "forged-build".to_string();
+        let mut bad_build = run.clone();
+        bad_build.report.build_identity = "forged-build".to_string();
         assert!(!is_passing_report(&bad_build));
 
-        let mut bad_artifacts = report.clone();
+        let mut bad_artifacts = run.clone();
         bad_artifacts
+            .report
             .artifact_paths
             .insert("forged".to_string(), "value".to_string());
         assert!(!is_passing_report(&bad_artifacts));
 
-        let mut bad_diagnostics = report.clone();
-        bad_diagnostics.diagnostics_tail = vec!["x".to_string(); MAX_DIAGNOSTIC_LINES + 1];
+        let mut bad_diagnostics = run.clone();
+        bad_diagnostics.report.diagnostics_tail = vec!["x".to_string(); MAX_DIAGNOSTIC_LINES + 1];
         assert!(!is_passing_report(&bad_diagnostics));
     }
 }

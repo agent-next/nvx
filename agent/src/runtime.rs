@@ -15,11 +15,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use agent_protocol::{
     AgentControlMessage, AuthenticateChannelRequest, BuildStatus, CancelReason, ChannelReadResult,
     ConfigureSessionRequest, CreateProcessRequest, DnsStatus, HVC1_DEVICE_PATH, HostControlMessage,
-    LaunchBinding, LaunchIdentity, MappingContainmentPolicy, MxcControlService, NetworkFailureCode,
-    NetworkFailureStatus, NetworkInterfaceStatus, NetworkLinkState, NetworkMode, NetworkSetupState,
-    NetworkStatus, OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, PROTOCOL_VERSION, ProcessSupervisor,
-    ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, ServiceError,
-    ServiceErrorCode, SessionConfiguration, WaitReadyRequest, WorkloadIdentityStatus,
+    LaunchBinding, LaunchIdentity, MAX_SHUTDOWN_GRACE_TIMEOUT_MS, MappingContainmentPolicy,
+    MxcControlService, NetworkFailureCode, NetworkFailureStatus, NetworkInterfaceStatus,
+    NetworkLinkState, NetworkMode, NetworkSetupState, NetworkStatus,
+    OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, PROTOCOL_VERSION, ProcessSupervisor, ProtocolErrorCode,
+    ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, ServiceError, ServiceErrorCode,
+    SessionConfiguration, WaitReadyRequest, WorkloadIdentityStatus,
 };
 
 use crate::config::{GuestMountRoot, SessionConfiguration as AgentSessionConfiguration};
@@ -43,7 +44,6 @@ const MAX_PROC_TEXT_BYTES: usize = 64 * 1024;
 /// Best-effort fatal-session delivery window before fail-closed stop proceeds regardless
 /// of channel backpressure or host read behavior.
 const FATAL_SESSION_DELIVERY_DEADLINE: Duration = Duration::from_millis(250);
-const SHUTDOWN_DELIVERY_DEADLINE: Duration = Duration::from_millis(500);
 
 static SIGCHLD_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -70,9 +70,7 @@ pub fn run_runtime() -> Result<()> {
     let mut pending_hello: Option<AuthenticateChannelRequest> = None;
     let mut active_timeout: Option<(u32, Instant)> = None;
     let mut pending_outbound = VecDeque::new();
-    let mut shutdown_requested = false;
-    let mut shutdown_cleanup_started = false;
-    let mut shutdown_delivery_deadline: Option<Instant> = None;
+    let mut graceful_shutdown: Option<GracefulShutdownState> = None;
     let mut fatal_shutdown: Option<FatalSessionShutdown> = None;
 
     loop {
@@ -109,21 +107,35 @@ pub fn run_runtime() -> Result<()> {
                 return Ok(());
             }
 
-            if shutdown_requested && !shutdown_cleanup_started {
+            if let Some(state) = graceful_shutdown.as_mut()
+                && !state.cleanup_started
+            {
+                let remaining = state
+                    .absolute_deadline
+                    .saturating_duration_since(Instant::now());
                 service
-                    .begin_disconnect_cleanup(now_secs(), &mut supervisor)
+                    .begin_disconnect_cleanup_with_timeout(now_secs(), &mut supervisor, remaining)
                     .map_err(|error| AgentError::fail_closed(error.to_string()))?;
-                shutdown_cleanup_started = true;
-                shutdown_delivery_deadline = Instant::now().checked_add(SHUTDOWN_DELIVERY_DEADLINE);
+                state.cleanup_started = true;
+            }
+
+            if let Some(state) = graceful_shutdown.as_mut()
+                && state.cleanup_started
+                && !state.sync_done
+            {
+                if Instant::now() >= state.absolute_deadline {
+                    return Ok(());
+                }
+                // SAFETY: sync has no memory-safety preconditions.
+                unsafe { libc::sync() };
+                state.sync_done = true;
             }
 
             if should_complete_shutdown(
-                shutdown_requested,
-                shutdown_cleanup_started,
+                graceful_shutdown.as_ref(),
                 service.active_exec_id(),
                 pending_outbound.is_empty(),
                 channel.has_queued_writes(),
-                shutdown_delivery_deadline,
                 Instant::now(),
             ) {
                 return Ok(());
@@ -158,9 +170,7 @@ pub fn run_runtime() -> Result<()> {
                     pending_hello = None;
                     pending_outbound.clear();
                     active_timeout = None;
-                    shutdown_requested = false;
-                    shutdown_cleanup_started = false;
-                    shutdown_delivery_deadline = None;
+                    graceful_shutdown = None;
                     break;
                 }
                 ChannelReadResult::Record(record) => {
@@ -202,8 +212,25 @@ pub fn run_runtime() -> Result<()> {
                     }
                     for message in outbound.messages {
                         if matches!(message, AgentControlMessage::ShuttingDown) {
-                            shutdown_requested = true;
-                            shutdown_delivery_deadline = None;
+                            let grace_timeout_ms =
+                                service.shutdown_grace_timeout_ms().ok_or_else(|| {
+                                    AgentError::fail_closed(
+                                        "shutdown transition missing caller grace timeout"
+                                            .to_string(),
+                                    )
+                                })?;
+                            let deadline = Instant::now()
+                                .checked_add(Duration::from_millis(grace_timeout_ms))
+                                .ok_or_else(|| {
+                                    AgentError::bad_request(format!(
+                                        "grace_timeout_ms cannot be represented as a runtime deadline ({grace_timeout_ms})"
+                                    ))
+                                })?;
+                            graceful_shutdown = Some(GracefulShutdownState {
+                                absolute_deadline: deadline,
+                                cleanup_started: false,
+                                sync_done: false,
+                            });
                         }
                         enqueue_outbound(&mut pending_outbound, message)?;
                     }
@@ -509,7 +536,25 @@ fn handle_host_message<S: ProcessSupervisor>(
                 )
             })?])
         }
-        HostControlMessage::Shutdown { .. } => Ok(vec![service.shutdown()?]),
+        HostControlMessage::Shutdown { grace_timeout_ms } => {
+            if grace_timeout_ms == 0 {
+                return Err(ServiceError {
+                    code: ServiceErrorCode::InvalidInput,
+                    message: "grace_timeout_ms must be greater than zero".to_string(),
+                }
+                .into());
+            }
+            if grace_timeout_ms > MAX_SHUTDOWN_GRACE_TIMEOUT_MS {
+                return Err(ServiceError {
+                    code: ServiceErrorCode::InvalidInput,
+                    message: format!(
+                        "grace_timeout_ms exceeds maximum supported value {MAX_SHUTDOWN_GRACE_TIMEOUT_MS}"
+                    ),
+                }
+                .into());
+            }
+            Ok(vec![service.shutdown_with_grace_timeout(grace_timeout_ms)?])
+        }
     }
 }
 
@@ -1009,6 +1054,12 @@ struct FatalSessionShutdown {
     delivery_deadline: Instant,
 }
 
+struct GracefulShutdownState {
+    absolute_deadline: Instant,
+    cleanup_started: bool,
+    sync_done: bool,
+}
+
 fn start_fatal_shutdown<S: ProcessSupervisor>(
     service: &mut MxcControlService,
     supervisor: &mut S,
@@ -1039,36 +1090,41 @@ fn should_stop_after_fatal_delivery(
 }
 
 fn should_complete_shutdown(
-    shutdown_requested: bool,
-    shutdown_cleanup_started: bool,
+    shutdown: Option<&GracefulShutdownState>,
     active_exec_id: Option<u32>,
     pending_outbound_empty: bool,
     has_queued_writes: bool,
-    shutdown_delivery_deadline: Option<Instant>,
     now: Instant,
 ) -> bool {
-    if !shutdown_requested {
+    let Some(shutdown) = shutdown else {
         return false;
-    }
+    };
     if active_exec_id.is_none() && pending_outbound_empty && !has_queued_writes {
         return true;
     }
-    shutdown_cleanup_started && shutdown_delivery_deadline.is_some_and(|deadline| now >= deadline)
+    shutdown.cleanup_started && now >= shutdown.absolute_deadline
 }
 
 #[cfg(feature = "harness-supervisor")]
 #[allow(dead_code)]
 pub fn harness_should_complete_shutdown_when_writer_blocked(
     active_exec_id: Option<u32>,
-    deadline_elapsed: bool,
+    grace_timeout_ms: u64,
+    elapsed_ms: u64,
 ) -> bool {
-    let now = Instant::now();
-    let deadline = if deadline_elapsed {
-        Some(now.checked_sub(Duration::from_millis(1)).unwrap_or(now))
-    } else {
-        now.checked_add(Duration::from_secs(1))
+    let start = Instant::now();
+    let deadline = start
+        .checked_add(Duration::from_millis(grace_timeout_ms))
+        .unwrap_or(start);
+    let now = start
+        .checked_add(Duration::from_millis(elapsed_ms))
+        .unwrap_or(deadline);
+    let shutdown = GracefulShutdownState {
+        absolute_deadline: deadline,
+        cleanup_started: true,
+        sync_done: true,
     };
-    should_complete_shutdown(true, true, active_exec_id, false, true, deadline, now)
+    should_complete_shutdown(Some(&shutdown), active_exec_id, false, true, now)
 }
 
 fn enforce_active_timeout<S: ProcessSupervisor>(
@@ -2638,6 +2694,19 @@ mod tests {
             pending_outbound_empty,
             has_queued_writes,
             start + FATAL_SESSION_DELIVERY_DEADLINE + Duration::from_millis(1),
+        ));
+    }
+
+    #[test]
+    fn shutdown_blocked_writer_honors_requested_deadline_without_extension() {
+        assert!(!harness_should_complete_shutdown_when_writer_blocked(
+            None, 10, 9
+        ));
+        assert!(harness_should_complete_shutdown_when_writer_blocked(
+            None, 10, 10
+        ));
+        assert!(harness_should_complete_shutdown_when_writer_blocked(
+            None, 10, 11
         ));
     }
 }

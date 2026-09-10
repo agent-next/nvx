@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use crate::mapping::{
     CanonicalHostMappingRoot, ChildMapping, MappingContainmentPolicy, MappingError,
@@ -534,14 +535,21 @@ impl AgentProtocolState {
         Ok(None)
     }
 
-    pub fn begin_channel_loss_cleanup(&mut self, now_secs: u64) -> Result<(), StateError> {
+    pub fn begin_channel_loss_cleanup(
+        &mut self,
+        now_secs: u64,
+        cleanup_timeout: Duration,
+    ) -> Result<(), StateError> {
         let launch = self
             .launch
             .take()
             .ok_or(StateError::ChannelAuthenticationRequired)?;
         let generation = launch.identity.generation;
         self.latest_generation = Some(self.latest_generation.unwrap_or(generation).max(generation));
-        let deadline_secs = now_secs.saturating_add(CHANNEL_LOSS_CLEANUP_DEADLINE_SECS);
+        let cleanup_secs = cleanup_timeout
+            .as_secs()
+            .clamp(1, CHANNEL_LOSS_CLEANUP_DEADLINE_SECS);
+        let deadline_secs = now_secs.saturating_add(cleanup_secs);
         self.cleanup_status = CleanupStatus::InProgress {
             generation,
             deadline_secs,
@@ -1162,7 +1170,9 @@ mod tests {
         state
             .admit_launch(admission_input(2, 1))
             .expect("first launch");
-        state.begin_channel_loss_cleanup(10).expect("cleanup start");
+        state
+            .begin_channel_loss_cleanup(10, Duration::from_secs(30))
+            .expect("cleanup start");
         assert!(matches!(
             state.admit_launch(admission_input(2, 45)),
             Err(StateError::LaunchAdmission(
@@ -1184,7 +1194,7 @@ mod tests {
             .admit_launch(admission_input(5, 1))
             .expect("first launch");
         state
-            .begin_channel_loss_cleanup(100)
+            .begin_channel_loss_cleanup(100, Duration::from_secs(30))
             .expect("cleanup start");
         assert!(matches!(
             state.admit_launch(admission_input(6, 120)),
@@ -1206,7 +1216,9 @@ mod tests {
     fn cleanup_can_be_completed_early_after_disconnect_cleanup_finishes() {
         let mut state = AgentProtocolState::new();
         state.admit_launch(admission_input(9, 1)).expect("launch");
-        state.begin_channel_loss_cleanup(10).expect("cleanup start");
+        state
+            .begin_channel_loss_cleanup(10, Duration::from_secs(30))
+            .expect("cleanup start");
         state.complete_channel_loss_cleanup();
         state
             .admit_launch(admission_input(10, 11))
@@ -1293,7 +1305,9 @@ mod tests {
     #[test]
     fn channel_loss_enters_bounded_cleanup_state() {
         let mut state = ready_state(3);
-        state.begin_channel_loss_cleanup(10).expect("cleanup");
+        state
+            .begin_channel_loss_cleanup(10, Duration::from_secs(30))
+            .expect("cleanup");
         assert!(matches!(
             state.cleanup_status(),
             CleanupStatus::InProgress {

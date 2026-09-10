@@ -30,6 +30,9 @@ const TERM_GRACE: Duration = Duration::from_millis(250);
 const POLL_SLEEP: Duration = Duration::from_millis(10);
 const MAX_STDIO_CHUNKS_PER_REFRESH: usize = 4;
 const DESCENDANTS_CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
+const DISCONNECT_TERM_BUDGET_PERCENT: u32 = 60;
+const DISCONNECT_POST_KILL_BUDGET_PERCENT: u32 = 20;
+const DISCONNECT_DISCARD_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -367,6 +370,9 @@ struct ActiveProcess {
     holder_wait_status: Option<fs::File>,
     holder_wait_status_buffer: Vec<u8>,
     pending_terminal_event: Option<SupervisorEvent>,
+    disconnect_discard_output: bool,
+    discarded_output_bytes: usize,
+    discard_byte_budget_exhausted: bool,
 }
 
 enum HolderWaitStatusRead {
@@ -622,6 +628,9 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             holder_wait_status,
             holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
+            disconnect_discard_output: false,
+            discarded_output_bytes: 0,
+            discard_byte_budget_exhausted: false,
         });
         Ok(())
     }
@@ -723,14 +732,24 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
     ) -> Result<bool, ServiceError> {
         let holder_root = self.holder.as_ref().map(|holder| holder.cgroup_dir.clone());
         let active = self.require_active(exec_id)?;
+        active.disconnect_discard_output = true;
+        active.event_queue.clear();
+        active.event_queue_bytes = 0;
         active.stdin = None;
         send_terminate(active)?;
-        let deadline_at = Instant::now()
+        let start = Instant::now();
+        let deadline_at = start
             .checked_add(deadline)
             .ok_or_else(|| supervisor_error("disconnect deadline overflow"))?;
+        let (term_grace_budget, post_kill_budget) = partition_disconnect_budget(deadline);
+        let kill_phase_deadline = deadline_at.checked_sub(post_kill_budget).unwrap_or(start);
+        let term_phase_deadline = start
+            .checked_add(term_grace_budget)
+            .unwrap_or(deadline_at)
+            .min(kill_phase_deadline);
 
-        while Instant::now() < deadline_at {
-            refresh_active_state(active, holder_root.as_deref())?;
+        while Instant::now() < term_phase_deadline {
+            refresh_active_state_for_disconnect(active, holder_root.as_deref())?;
             if active.exit_status_reported
                 && active.descendants_cleaned_reported
                 && active.stdout_eof
@@ -743,7 +762,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
         }
         send_kill(active)?;
         while Instant::now() < deadline_at {
-            refresh_active_state(active, holder_root.as_deref())?;
+            refresh_active_state_for_disconnect(active, holder_root.as_deref())?;
             if active.exit_status_reported
                 && active.descendants_cleaned_reported
                 && active.stdout_eof
@@ -826,6 +845,21 @@ fn refresh_active_state(
     if can_enqueue_event(active, 0) {
         maybe_report_descendants_cleaned(active, holder_root)?;
     }
+    Ok(())
+}
+
+fn refresh_active_state_for_disconnect(
+    active: &mut ActiveProcess,
+    holder_root: Option<&Path>,
+) -> Result<(), ServiceError> {
+    drain_stdio_for_disconnect(active)?;
+    pump_stdin(active)?;
+    if active.discard_byte_budget_exhausted && !active.kill_sent {
+        send_kill(active)?;
+    }
+    maybe_escalate_kill(active)?;
+    maybe_report_exit(active)?;
+    maybe_report_descendants_cleaned(active, holder_root)?;
     Ok(())
 }
 
@@ -1018,6 +1052,9 @@ fn event_payload_bytes(event: &SupervisorEvent) -> usize {
 }
 
 fn push_event(active: &mut ActiveProcess, event: SupervisorEvent) -> Result<(), ServiceError> {
+    if active.disconnect_discard_output {
+        return Ok(());
+    }
     let payload = event_payload_bytes(&event);
     if !can_enqueue_event(active, payload) {
         return Err(ServiceError {
@@ -1051,6 +1088,25 @@ fn maybe_escalate_kill(active: &mut ActiveProcess) -> Result<(), ServiceError> {
         send_kill(active)?;
     }
     Ok(())
+}
+
+fn partition_disconnect_budget(total: Duration) -> (Duration, Duration) {
+    if total.is_zero() {
+        return (Duration::ZERO, Duration::ZERO);
+    }
+    let total_millis = total.as_millis().min(u128::from(u64::MAX)) as u64;
+    let post_kill_millis =
+        total_millis.saturating_mul(u64::from(DISCONNECT_POST_KILL_BUDGET_PERCENT)) / 100;
+    let mut post_kill = Duration::from_millis(post_kill_millis.max(1));
+    if post_kill > total {
+        post_kill = total;
+    }
+    let term_millis = total_millis.saturating_mul(u64::from(DISCONNECT_TERM_BUDGET_PERCENT)) / 100;
+    let mut term = Duration::from_millis(term_millis).min(TERM_GRACE);
+    if term + post_kill > total {
+        term = total.saturating_sub(post_kill);
+    }
+    (term, post_kill)
 }
 
 fn send_terminate(active: &mut ActiveProcess) -> Result<(), ServiceError> {
@@ -1191,6 +1247,92 @@ fn pump_stdout_chunk(active: &mut ActiveProcess) -> Result<bool, ServiceError> {
         Err(error) if would_block(&error) => Ok(false),
         Err(error) => Err(supervisor_io("reading child stdout", error)),
     }
+}
+
+#[derive(Clone, Copy)]
+enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+fn discard_stdio_chunk(
+    active: &mut ActiveProcess,
+    stream: StreamKind,
+) -> Result<bool, ServiceError> {
+    if active.discard_byte_budget_exhausted {
+        return Ok(false);
+    }
+    let size = match stream {
+        StreamKind::Stdout => {
+            read_discard_chunk(&mut active.stdout, &mut active.stdout_eof, "stdout")?
+        }
+        StreamKind::Stderr => {
+            read_discard_chunk(&mut active.stderr, &mut active.stderr_eof, "stderr")?
+        }
+    };
+    if let Some(size) = size {
+        let next = active.discarded_output_bytes.saturating_add(size);
+        active.discarded_output_bytes = next;
+        if next >= DISCONNECT_DISCARD_MAX_BYTES {
+            active.discard_byte_budget_exhausted = true;
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn read_discard_chunk<R: Read>(
+    reader_opt: &mut Option<R>,
+    eof_flag: &mut bool,
+    label: &str,
+) -> Result<Option<usize>, ServiceError> {
+    if *eof_flag {
+        return Ok(None);
+    }
+    let Some(reader) = reader_opt.as_mut() else {
+        *eof_flag = true;
+        return Ok(None);
+    };
+    let mut chunk = vec![0_u8; STDIO_CHUNK_BYTES];
+    match io::Read::read(reader, &mut chunk) {
+        Ok(0) => {
+            *reader_opt = None;
+            *eof_flag = true;
+            Ok(Some(0))
+        }
+        Ok(size) => Ok(Some(size)),
+        Err(error) if would_block(&error) => Ok(None),
+        Err(error) => Err(supervisor_io(format!("reading child {label}"), error)),
+    }
+}
+
+fn drain_stdio_for_disconnect(active: &mut ActiveProcess) -> Result<(), ServiceError> {
+    let mut budget = MAX_STDIO_CHUNKS_PER_REFRESH;
+    while budget > 0 {
+        let mut produced = 0_usize;
+        if active.prefer_stdout_next {
+            if discard_stdio_chunk(active, StreamKind::Stdout)? {
+                produced = produced.saturating_add(1);
+            }
+            if budget > produced && discard_stdio_chunk(active, StreamKind::Stderr)? {
+                produced = produced.saturating_add(1);
+            }
+        } else {
+            if discard_stdio_chunk(active, StreamKind::Stderr)? {
+                produced = produced.saturating_add(1);
+            }
+            if budget > produced && discard_stdio_chunk(active, StreamKind::Stdout)? {
+                produced = produced.saturating_add(1);
+            }
+        }
+        active.prefer_stdout_next = !active.prefer_stdout_next;
+        if produced == 0 {
+            break;
+        }
+        budget = budget.saturating_sub(produced);
+    }
+    Ok(())
 }
 
 fn pump_stderr_chunk(active: &mut ActiveProcess) -> Result<bool, ServiceError> {
@@ -1859,6 +2001,79 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_cleanup_escalates_to_sigkill_within_total_budget() {
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let exec_id = 90_u32;
+        supervisor
+            .spawn(&CreateProcessRequest {
+                exec_id,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "trap '' TERM; sleep 30".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .expect("spawn");
+        let budget = Duration::from_millis(700);
+        let started = Instant::now();
+        let cleaned = supervisor
+            .cleanup_for_disconnect(exec_id, budget)
+            .expect("disconnect cleanup");
+        let elapsed = started.elapsed();
+        assert!(cleaned, "cleanup should succeed via SIGKILL escalation");
+        assert!(
+            elapsed <= budget + Duration::from_millis(300),
+            "cleanup must stay within bounded total budget (elapsed={elapsed:?}, budget={budget:?})"
+        );
+        assert!(supervisor.active.is_none());
+    }
+
+    #[test]
+    fn disconnect_cleanup_drains_output_even_when_queue_is_nonempty() {
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let exec_id = 91_u32;
+        supervisor
+            .spawn(&CreateProcessRequest {
+                exec_id,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "trap '' TERM; dd if=/dev/zero bs=1024 count=128 2>/dev/null; (dd if=/dev/zero bs=1024 count=128 2>/dev/null; sleep 30) & cat >/dev/null".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .expect("spawn");
+        let peek_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < peek_deadline {
+            if let Some(SupervisorEvent::StdoutChunk(_)) =
+                supervisor.peek_event(exec_id).expect("peek")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            supervisor
+                .active
+                .as_ref()
+                .is_some_and(|active| !active.event_queue.is_empty()),
+            "expected non-empty queue before disconnect cleanup"
+        );
+        let cleaned = supervisor
+            .cleanup_for_disconnect(exec_id, Duration::from_secs(2))
+            .expect("disconnect cleanup");
+        assert!(cleaned, "cleanup must finish with queued output present");
+        assert_eq!(supervisor.queue_usage().event_queue_records, 0);
+        assert_eq!(supervisor.queue_usage().event_queue_bytes, 0);
+        assert!(supervisor.active.is_none());
+    }
+
+    #[test]
     fn terminate_with_empty_holder_status_pipe_uses_launcher_signal_once() {
         let exec_id = 73_u32;
         let temp = tempdir().expect("tempdir");
@@ -1895,6 +2110,9 @@ mod tests {
             holder_wait_status: Some(eof_holder_status_pipe()),
             holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
+            disconnect_discard_output: false,
+            discarded_output_bytes: 0,
+            discard_byte_budget_exhausted: false,
         });
 
         supervisor.terminate(exec_id).expect("terminate");
@@ -1969,6 +2187,9 @@ mod tests {
             holder_wait_status: Some(eof_holder_status_pipe()),
             holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
+            disconnect_discard_output: false,
+            discarded_output_bytes: 0,
+            discard_byte_budget_exhausted: false,
         });
 
         supervisor.kill(exec_id).expect("kill");
@@ -2044,6 +2265,9 @@ mod tests {
             holder_wait_status: Some(reader),
             holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
+            disconnect_discard_output: false,
+            discarded_output_bytes: 0,
+            discard_byte_budget_exhausted: false,
         };
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -2878,6 +3102,9 @@ mod tests {
             holder_wait_status: None,
             holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
+            disconnect_discard_output: false,
+            discarded_output_bytes: 0,
+            discard_byte_budget_exhausted: false,
         };
 
         maybe_report_descendants_cleaned(&mut active, None).expect("poll cleanup pending");
@@ -2938,6 +3165,9 @@ mod tests {
             holder_wait_status: None,
             holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
+            disconnect_discard_output: false,
+            discarded_output_bytes: 0,
+            discard_byte_budget_exhausted: false,
         };
         let error =
             maybe_report_descendants_cleaned(&mut active, None).expect_err("timeout expected");
@@ -2982,6 +3212,9 @@ mod tests {
             holder_wait_status: None,
             holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
+            disconnect_discard_output: false,
+            discarded_output_bytes: 0,
+            discard_byte_budget_exhausted: false,
         };
         wait_for_exit_capture(&mut active, Duration::from_secs(2));
         REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(1));
@@ -3042,6 +3275,9 @@ mod tests {
             holder_wait_status: None,
             holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
+            disconnect_discard_output: false,
+            discarded_output_bytes: 0,
+            discard_byte_budget_exhausted: false,
         };
         wait_for_exit_capture(&mut active, Duration::from_secs(2));
         REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(128));

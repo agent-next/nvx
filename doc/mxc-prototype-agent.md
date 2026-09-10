@@ -39,14 +39,30 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   shutdown semantics, and channel-loss cleanup/new-generation enforcement).
   If the production runtime prerequisites are unavailable on the local host,
   req10/req11/req12 are reported as `Blocked` instead of passing. req12 pass
-  evidence is accepted only when it explicitly records production runtime +
-  `LinuxProcessSupervisor` channel-loss execution with a real child/grandchild.
+  evidence is accepted only when the production runtime executes channel-loss
+  cleanup with a real output-producing child+grandchild process tree and
+  bounded queue cleanup.
   Any local runtime
   pass remains non-conformance (`NotLive`) until observed on live WHP.
 - Post-config capability advertisement now exposes `Exec`, `Streams`, `Cancel`,
   `Quiesce`, `Resume`, and `Shutdown` after full lifecycle activation.
 - Cancellation, timeout escalation, descendant termination, channel-loss cleanup,
   and graceful shutdown all execute with fail-closed behavior.
+- `Shutdown.grace_timeout_ms` is now strictly validated: it must be greater
+  than zero and no larger than `MAX_SHUTDOWN_GRACE_TIMEOUT_MS` (30,000 ms).
+  Runtime shutdown derives one absolute deadline from this caller value and
+  spends that remaining budget across disconnect cleanup, sync, best-effort
+  acknowledgement delivery, and runtime stop; no fixed post-deadline extension
+  is applied.
+- Disconnect cleanup now uses deterministic TERM→KILL budget partitioning under
+  one absolute deadline, always reserves post-KILL verification/drain time, and
+  enters bounded output-discard mode on channel loss (clears queued events,
+  drains stdout/stderr to EOF under byte/time caps, escalates to KILL on
+  overflow, and fails closed if termination/cleanup cannot be verified).
+- Harness conformance gating now uses typed per-requirement probe attestations
+  plus retained artifact metadata (paths + validated report/diagnostic IDs and
+  hashes) produced in-memory by the harness runtime; user-crafted JSON strings
+  cannot satisfy `is_passing_report`.
 - Runtime `Health` now returns typed session state (`phase0/active/quiesced/
   shutting-down/cleanup-in-progress/fatal-session`), channel generation, active
   exec id, last failure detail, and configured filesystem/network snapshots.

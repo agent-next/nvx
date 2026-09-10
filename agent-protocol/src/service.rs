@@ -36,6 +36,11 @@ pub const MAX_STRING_BYTES: usize = 256;
 /// The protocol enforces a bounded timeout so runtime deadline arithmetic remains
 /// representable and a caller request can never be silently downgraded.
 pub const MAX_EXEC_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+/// Maximum graceful shutdown timeout accepted by `HostControlMessage::Shutdown::grace_timeout_ms`.
+///
+/// The value is bounded so disconnect cleanup and runtime stop always execute under
+/// a caller-supplied, representable deadline.
+pub const MAX_SHUTDOWN_GRACE_TIMEOUT_MS: u64 = 30 * 1000;
 pub const HVC1_DEVICE_PATH: &str = "/dev/hvc1";
 /// Conservative fixed cap for OpenVMM outer framing bytes.
 ///
@@ -218,6 +223,7 @@ pub struct MxcControlService {
     authenticated: bool,
     quiesced: bool,
     shutting_down: bool,
+    shutdown_grace_timeout_ms: Option<u64>,
     fatal_session_reason: Option<String>,
     active_exec: Option<ActiveExecution>,
     disconnect_cleanup_in_progress: bool,
@@ -417,6 +423,7 @@ impl MxcControlService {
             authenticated: false,
             quiesced: false,
             shutting_down: false,
+            shutdown_grace_timeout_ms: None,
             fatal_session_reason: None,
             active_exec: None,
             disconnect_cleanup_in_progress: false,
@@ -971,10 +978,23 @@ impl MxcControlService {
     }
 
     pub fn shutdown(&mut self) -> Result<AgentControlMessage, ServiceError> {
+        self.shutdown_with_grace_timeout(MAX_SHUTDOWN_GRACE_TIMEOUT_MS)
+    }
+
+    pub fn shutdown_with_grace_timeout(
+        &mut self,
+        grace_timeout_ms: u64,
+    ) -> Result<AgentControlMessage, ServiceError> {
         self.require_supported_operation("Shutdown")?;
+        validate_shutdown_grace_timeout_ms(grace_timeout_ms)?;
         let message = self.protocol_state.graceful_shutdown()?;
         self.shutting_down = true;
+        self.shutdown_grace_timeout_ms = Some(grace_timeout_ms);
         Ok(message)
+    }
+
+    pub fn shutdown_grace_timeout_ms(&self) -> Option<u64> {
+        self.shutdown_grace_timeout_ms
     }
 
     pub fn begin_disconnect_cleanup(
@@ -982,14 +1002,25 @@ impl MxcControlService {
         now_secs: u64,
         supervisor: &mut impl ProcessSupervisor,
     ) -> Result<(), ServiceError> {
+        self.begin_disconnect_cleanup_with_timeout(
+            now_secs,
+            supervisor,
+            Duration::from_secs(CHANNEL_LOSS_CLEANUP_DEADLINE_SECS),
+        )
+    }
+
+    pub fn begin_disconnect_cleanup_with_timeout(
+        &mut self,
+        now_secs: u64,
+        supervisor: &mut impl ProcessSupervisor,
+        cleanup_timeout: Duration,
+    ) -> Result<(), ServiceError> {
         self.disconnect_cleanup_in_progress = true;
-        self.protocol_state.begin_channel_loss_cleanup(now_secs)?;
+        self.protocol_state
+            .begin_channel_loss_cleanup(now_secs, cleanup_timeout)?;
         if let Some(active) = self.active_exec.as_ref() {
             let cleaned = supervisor
-                .cleanup_for_disconnect(
-                    active.exec_id,
-                    Duration::from_secs(CHANNEL_LOSS_CLEANUP_DEADLINE_SECS),
-                )
+                .cleanup_for_disconnect(active.exec_id, cleanup_timeout)
                 .map_err(|error| {
                     self.enter_fatal_session(format!(
                         "channel-loss cleanup supervisor failure: {}",
@@ -1015,6 +1046,7 @@ impl MxcControlService {
         self.configured = None;
         self.quiesced = false;
         self.shutting_down = false;
+        self.shutdown_grace_timeout_ms = None;
         self.fatal_session_reason = None;
         self.disconnect_cleanup_in_progress = false;
         Ok(())
@@ -1847,6 +1879,24 @@ fn validate_create_process_request(request: &CreateProcessRequest) -> Result<(),
     Ok(())
 }
 
+fn validate_shutdown_grace_timeout_ms(grace_timeout_ms: u64) -> Result<(), ServiceError> {
+    if grace_timeout_ms == 0 {
+        return Err(ServiceError::new(
+            ServiceErrorCode::InvalidInput,
+            "grace_timeout_ms must be greater than zero",
+        ));
+    }
+    if grace_timeout_ms > MAX_SHUTDOWN_GRACE_TIMEOUT_MS {
+        return Err(ServiceError::new(
+            ServiceErrorCode::InvalidInput,
+            format!(
+                "grace_timeout_ms exceeds maximum supported value {MAX_SHUTDOWN_GRACE_TIMEOUT_MS}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_string(value: &str, context: &str) -> Result<(), ServiceError> {
     if value.len() > MAX_STRING_BYTES {
         return Err(ServiceError::new(
@@ -2353,6 +2403,7 @@ mod tests {
         terminated: u32,
         killed: u32,
         cleanup_ok: bool,
+        cleanup_deadline: Option<Duration>,
     }
 
     impl ProcessSupervisor for FakeSupervisor {
@@ -2430,8 +2481,9 @@ mod tests {
         fn cleanup_for_disconnect(
             &mut self,
             _exec_id: u32,
-            _deadline: Duration,
+            deadline: Duration,
         ) -> Result<bool, ServiceError> {
+            self.cleanup_deadline = Some(deadline);
             Ok(self.cleanup_ok)
         }
     }
@@ -2680,6 +2732,57 @@ mod tests {
             service.shutdown(),
             Ok(AgentControlMessage::ShuttingDown)
         ));
+    }
+
+    #[test]
+    fn shutdown_grace_timeout_bounds_are_validated() {
+        let mut service = authenticated_service();
+        let zero = service
+            .shutdown_with_grace_timeout(0)
+            .expect_err("zero timeout");
+        assert_eq!(zero.code, ServiceErrorCode::InvalidInput);
+
+        let mut service = authenticated_service();
+        let over = service
+            .shutdown_with_grace_timeout(MAX_SHUTDOWN_GRACE_TIMEOUT_MS + 1)
+            .expect_err("oversized timeout");
+        assert_eq!(over.code, ServiceErrorCode::InvalidInput);
+
+        let mut service = authenticated_service();
+        assert!(matches!(
+            service.shutdown_with_grace_timeout(MAX_SHUTDOWN_GRACE_TIMEOUT_MS),
+            Ok(AgentControlMessage::ShuttingDown)
+        ));
+        assert_eq!(
+            service.shutdown_grace_timeout_ms(),
+            Some(MAX_SHUTDOWN_GRACE_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn disconnect_cleanup_uses_caller_deadline_budget() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor {
+            cleanup_ok: true,
+            ..FakeSupervisor::default()
+        };
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 95,
+                    argv: vec!["/bin/sleep".to_string(), "1".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .expect("create");
+        let timeout = Duration::from_millis(7);
+        service
+            .begin_disconnect_cleanup_with_timeout(77, &mut supervisor, timeout)
+            .expect("cleanup");
+        assert_eq!(supervisor.cleanup_deadline, Some(timeout));
     }
 
     #[test]
