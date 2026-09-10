@@ -939,12 +939,10 @@ fn maybe_report_exit(active: &mut ActiveProcess) -> Result<(), ServiceError> {
     };
     let terminal = match read_holder_wait_status(active)? {
         HolderWaitStatusRead::Ready(wait_status) => {
-            terminal_event_from_wait_status(wait_status, terminal_termination_outcome(active))
+            terminal_event_from_wait_status(wait_status, None)
         }
         HolderWaitStatusRead::Pending => return Ok(()),
-        HolderWaitStatusRead::EofBeforePayload => {
-            terminal_event_from_exit_status(status, terminal_termination_outcome(active))
-        }
+        HolderWaitStatusRead::EofBeforePayload => terminal_event_from_exit_status(status, None),
     };
     active.pending_terminal_event = Some(terminal);
     active.exit_status_reported = true;
@@ -961,7 +959,12 @@ fn maybe_report_descendants_cleaned(
     if active.descendants_cleanup_started_at.is_none() {
         active.descendants_cleanup_started_at = Some(Instant::now());
     }
-    kill_exec_descendants(active, libc::SIGKILL)?;
+    if !descendants_populated_zero(active)? {
+        kill_exec_descendants(active, libc::SIGKILL)?;
+        if active.terminate_sent_at.is_some() {
+            active.kill_sent = true;
+        }
+    }
     if descendants_populated_zero(active)? {
         if let Err(error) = remove_exec_cgroup(active.cgroup_dir.as_deref(), holder_root) {
             let started = active
@@ -980,7 +983,10 @@ fn maybe_report_descendants_cleaned(
         }
         active.cgroup_dir = None;
         if let Some(terminal) = active.pending_terminal_event.take() {
-            push_event(active, terminal)?;
+            push_event(
+                active,
+                with_terminal_termination(terminal, terminal_termination_outcome(active)),
+            )?;
         }
         push_event(active, SupervisorEvent::DescendantsCleaned)?;
         active.descendants_cleaned_reported = true;
@@ -1000,7 +1006,7 @@ fn maybe_report_descendants_cleaned(
 
 fn descendants_populated_zero(active: &ActiveProcess) -> Result<bool, ServiceError> {
     let Some(cgroup_dir) = active.cgroup_dir.as_ref() else {
-        return Ok(true);
+        return process_group_empty(active.process_group_id);
     };
     let events_path = cgroup_dir.join("cgroup.events");
     let text = fs::read_to_string(&events_path).map_err(|error| {
@@ -1017,6 +1023,23 @@ fn descendants_populated_zero(active: &ActiveProcess) -> Result<bool, ServiceErr
         ),
     })?;
     Ok(!populated)
+}
+
+fn process_group_empty(process_group_id: i32) -> Result<bool, ServiceError> {
+    // SAFETY: signal 0 probes process-group existence without delivering a signal.
+    let rc = unsafe { libc::kill(-process_group_id, 0) };
+    if rc == 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(true),
+        Some(libc::EPERM) => Ok(false),
+        _ => Err(supervisor_io(
+            format!("probing process-group liveness for pgid={process_group_id}"),
+            error,
+        )),
+    }
 }
 
 fn parse_populated_from_cgroup_events(text: &str) -> Option<bool> {
@@ -1081,6 +1104,24 @@ fn terminal_termination_outcome(active: &ActiveProcess) -> Option<TerminationOut
         return Some(TerminationOutcome::GracefulTerm);
     }
     None
+}
+
+fn with_terminal_termination(
+    mut terminal: SupervisorEvent,
+    termination: Option<TerminationOutcome>,
+) -> SupervisorEvent {
+    match &mut terminal {
+        SupervisorEvent::Exited {
+            termination: existing,
+            ..
+        }
+        | SupervisorEvent::Signaled {
+            termination: existing,
+            ..
+        } => *existing = termination,
+        _ => {}
+    }
+    terminal
 }
 
 fn terminal_event_from_wait_status(
@@ -2039,6 +2080,12 @@ mod tests {
         panic!("rolled-back spawned child pid {pid} still appears alive");
     }
 
+    fn parse_child_pid_line(chunk: &[u8]) -> Option<i32> {
+        let text = std::str::from_utf8(chunk).ok()?;
+        let value = text.trim().strip_prefix("child=")?;
+        value.parse::<i32>().ok()
+    }
+
     fn eof_holder_status_pipe() -> fs::File {
         let (read_fd, write_fd) = create_cloexec_pipe().expect("create holder status pipe");
         // SAFETY: write_fd is owned by this test helper and closed exactly once.
@@ -2099,6 +2146,72 @@ mod tests {
             matches!(event, SupervisorEvent::DescendantsCleaned)
         });
         assert!(cleaned.is_some(), "expected descendant cleanup event");
+    }
+
+    #[test]
+    fn terminate_parent_on_term_but_term_ignoring_descendant_reports_forced_kill() {
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let exec_id = 94_u32;
+        supervisor
+            .spawn(&CreateProcessRequest {
+                exec_id,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "(trap '' TERM; sleep 30) & echo child=$!; sleep 30".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .expect("spawn");
+
+        let child_pid =
+            match wait_for_event(&mut supervisor, exec_id, Duration::from_secs(2), |event| {
+                matches!(event, SupervisorEvent::StdoutChunk(_))
+            }) {
+                Some(SupervisorEvent::StdoutChunk(chunk)) => {
+                    parse_child_pid_line(&chunk).expect("parse child pid")
+                }
+                other => panic!("expected child pid line, got {other:?}"),
+            };
+
+        supervisor.terminate(exec_id).expect("terminate");
+
+        let mut terminal_termination = None;
+        let mut cleaned = false;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            if supervisor.active.is_none() {
+                break;
+            }
+            let Some(event) = supervisor.poll(exec_id).expect("poll") else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            match event {
+                SupervisorEvent::Exited { termination, .. }
+                | SupervisorEvent::Signaled { termination, .. } => {
+                    terminal_termination = termination;
+                }
+                SupervisorEvent::DescendantsCleaned => {
+                    cleaned = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            supervisor.active.is_none(),
+            "active process must fully clean up"
+        );
+        assert!(cleaned, "must publish descendants-cleaned");
+        assert_eq!(
+            terminal_termination,
+            Some(TerminationOutcome::ForcedKill),
+            "descendant SIGKILL cleanup must be reflected in terminal metadata"
+        );
+        assert_pid_eventually_absent(child_pid, Duration::from_secs(2));
     }
 
     #[test]

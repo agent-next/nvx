@@ -275,18 +275,49 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         &mut self,
         timeout: Duration,
     ) -> Result<AgentControlMessage, ClientError> {
+        self.request_health_observing_inbound(timeout, |_| Ok(()))
+    }
+
+    pub fn request_health_observing_inbound<F>(
+        &mut self,
+        timeout: Duration,
+        mut observe_unrelated: F,
+    ) -> Result<AgentControlMessage, ClientError>
+    where
+        F: FnMut(&AgentControlMessage) -> Result<(), ClientError>,
+    {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(ClientError::Protocol(
                 "health request deadline overflowed".to_string(),
             ))?;
         self.send_host_control(HostControlMessage::Health)?;
-        self.recv_matching_until(deadline, |message| {
-            matches!(
+        let mut deferred = VecDeque::new();
+        loop {
+            let message = match self.recv_next_until(deadline, "agent control response") {
+                Ok(message) => message,
+                Err(ClientError::Timeout(_)) => {
+                    self.restore_deferred(deferred)?;
+                    return Err(ClientError::Timeout("agent control response"));
+                }
+                Err(error) => {
+                    self.restore_deferred(deferred)?;
+                    return Err(error);
+                }
+            };
+            if matches!(
                 message,
                 AgentControlMessage::Health(_) | AgentControlMessage::Error(_)
-            )
-        })
+            ) {
+                self.restore_deferred(deferred)?;
+                return Ok(message);
+            }
+            if let Err(error) = observe_unrelated(&message) {
+                self.restore_deferred(deferred)?;
+                return Err(error);
+            }
+            self.push_deferred(&mut deferred, message)?;
+        }
     }
 
     pub fn request_quiesce(
@@ -831,6 +862,76 @@ mod tests {
         assert!(matches!(
             preserved,
             AgentControlMessage::ExecTerminal { exec_id: 9, .. }
+        ));
+    }
+
+    #[test]
+    fn health_request_observer_can_reject_specific_pre_health_events_without_losing_unrelated() {
+        let capability = [0x9A; 32];
+        let fixture = Arc::new(Mutex::new(ClientFixtureBroker::new(capability)));
+        let session = HostControlSession::new(ClientFixtureEndpoint::new(fixture));
+        let mut client = MxcAgentClient::new(session);
+        client.max_inbound_queue = 8;
+        let launch = LaunchIdentity {
+            generation: 22,
+            nonce: [0xAB; 16],
+        };
+        client
+            .authenticate_launch(
+                capability,
+                HostControlMessage::HostHello {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: 1,
+                    launch,
+                    capability_proof: CapabilityProofMaterial::try_from(capability.to_vec())
+                        .expect("capability proof"),
+                },
+                Duration::from_secs(1),
+            )
+            .expect("authenticated");
+        client
+            .send_configure(HostControlMessage::Configure {
+                launch,
+                root: CanonicalHostMappingRoot::parse("/sandbox-root".to_string()).expect("root"),
+                mappings: vec![],
+                containment: MappingContainmentPolicy {
+                    symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                    reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                },
+            })
+            .expect("configure request");
+        let _ = client.wait_ready(Duration::from_secs(1)).expect("ready");
+        client
+            .queue_agent_message_for_test(AgentControlMessage::StdoutChunk(
+                agent_protocol::messages::StdoutChunkRecord {
+                    exec_id: 77,
+                    sequence: 0,
+                    chunk: vec![1, 2, 3],
+                },
+            ))
+            .expect("queue unrelated stream");
+        client
+            .queue_agent_message_for_test(AgentControlMessage::Health(sample_health_status()))
+            .expect("queue health");
+
+        let health = client
+            .request_health_observing_inbound(Duration::from_millis(25), |message| match message {
+                AgentControlMessage::StdoutChunk(record) if record.exec_id == 88 => Err(
+                    ClientError::Protocol("unexpected target chunk before health".to_string()),
+                ),
+                _ => Ok(()),
+            })
+            .expect("health response");
+        assert!(matches!(health, AgentControlMessage::Health(_)));
+        let preserved = client
+            .recv_agent_control(Duration::from_millis(25))
+            .expect("preserved unrelated event");
+        assert!(matches!(
+            preserved,
+            AgentControlMessage::StdoutChunk(agent_protocol::messages::StdoutChunkRecord {
+                exec_id: 77,
+                ..
+            })
         ));
     }
 

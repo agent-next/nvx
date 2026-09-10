@@ -625,10 +625,38 @@ fn run_req5_backpressure(state: &mut LiveHarnessState) -> CheckOutcome {
     if let Err(error) = grant_stream(session, exec_id, StreamName::Stderr, 1) {
         return fail_check(error);
     }
-    std::thread::sleep(Duration::from_millis(200));
-    let health_ok = match session.client.request_health(LIVE_TIMEOUT) {
+    let health_ok = match session
+        .client
+        .request_health_observing_inbound(LIVE_TIMEOUT, |message| match message {
+            AgentControlMessage::StdoutChunk(record) if record.exec_id == exec_id => {
+                Err(ClientError::Protocol(format!(
+                    "req05 pre-credit violation: observed stdout chunk for exec {exec_id} before any stdout credits"
+                )))
+            }
+            AgentControlMessage::StderrChunk(record) if record.exec_id == exec_id => {
+                Err(ClientError::Protocol(format!(
+                    "req05 pre-credit violation: observed stderr chunk for exec {exec_id} before any stdout credits"
+                )))
+            }
+            _ => Ok(()),
+        }) {
         Ok(AgentControlMessage::Health(status)) => status.active_exec_id == Some(exec_id),
-        _ => false,
+        Ok(AgentControlMessage::Error(detail)) => {
+            return fail_check(format!(
+                "health request failed during req05 zero-credit gate: {:?}: {}",
+                detail.code, detail.message
+            ));
+        }
+        Ok(other) => {
+            return fail_check(format!(
+                "unexpected response while waiting for req05 health gate: {other:?}"
+            ));
+        }
+        Err(error) => {
+            return fail_check(format!(
+                "health gate failed while verifying req05 zero-credit behavior: {error}"
+            ));
+        }
     };
     if let Err(error) = grant_stream(session, exec_id, StreamName::Stdout, 1) {
         return fail_check(error);
