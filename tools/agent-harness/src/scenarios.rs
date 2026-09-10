@@ -33,6 +33,10 @@ const LIVE_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(windows)]
 const PROBE_PATH: &str = "/sbin/nvx-agent-probe";
 #[cfg(windows)]
+const TREE_PID_CAPTURE_MAX_BYTES: usize = 8 * 1024;
+#[cfg(windows)]
+const TREE_PID_CAPTURE_MAX_MESSAGES: usize = 256;
+#[cfg(windows)]
 const LIVE_RUN_DIR: &str = "live-whp-run";
 #[cfg(windows)]
 const RAW_ROOT_GUEST_PATH: &str = "/mnt/virtiofs";
@@ -117,6 +121,14 @@ struct ProbeIsolationReport {
     mountinfo_has_raw_virtiofs_root: bool,
     capabilities: ProbeCapabilities,
     proc1: ProbeProcIdentity,
+    open_fds: Vec<ProbeFdEntry>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Deserialize)]
+struct ProbeFdEntry {
+    fd: i32,
+    target: String,
 }
 
 #[cfg(windows)]
@@ -155,6 +167,49 @@ struct ExecObservation {
     termination: Option<TerminationOutcome>,
     stdout_chunk_max: usize,
     stderr_chunk_max: usize,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct ExecCollectionLimits {
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+    max_total_bytes: usize,
+    max_messages: usize,
+    max_duration: Duration,
+}
+
+#[cfg(windows)]
+impl ExecCollectionLimits {
+    fn small_probe(timeout: Duration) -> Self {
+        Self {
+            max_stdout_bytes: 128 * 1024,
+            max_stderr_bytes: 64 * 1024,
+            max_total_bytes: 160 * 1024,
+            max_messages: 256,
+            max_duration: timeout,
+        }
+    }
+
+    fn tree_probe(timeout: Duration) -> Self {
+        Self {
+            max_stdout_bytes: 64 * 1024,
+            max_stderr_bytes: 64 * 1024,
+            max_total_bytes: 96 * 1024,
+            max_messages: 384,
+            max_duration: timeout,
+        }
+    }
+
+    fn flood_probe(timeout: Duration, expected_stdout_bytes: usize) -> Self {
+        Self {
+            max_stdout_bytes: expected_stdout_bytes.saturating_add(4096),
+            max_stderr_bytes: 64 * 1024,
+            max_total_bytes: expected_stdout_bytes.saturating_add(96 * 1024),
+            max_messages: 2048,
+            max_duration: timeout,
+        }
+    }
 }
 
 static LIVE_STATE: OnceLock<Mutex<LiveHarnessState>> = OnceLock::new();
@@ -228,8 +283,15 @@ pub(crate) fn run_live_requirement(
             .error
             .clone()
             .unwrap_or_else(|| "scenario check did not pass".to_string());
-        guard.first_failure = Some((definition.requirement_number, reason));
-        teardown_live_session(&mut guard);
+        let teardown_failure = teardown_live_session(&mut guard)
+            .err()
+            .map(|error| format!("; teardown failed: {error}"))
+            .unwrap_or_default();
+        let combined = format!("{reason}{teardown_failure}");
+        guard.first_failure = Some((definition.requirement_number, combined.clone()));
+        if !teardown_failure.is_empty() {
+            return fail_check(combined);
+        }
     }
     outcome
 }
@@ -238,17 +300,29 @@ fn reset_state(state: &mut LiveHarnessState) {
     state.init_error = None;
     state.first_failure = None;
     state.req1_evidence.clear();
-    teardown_live_session(state);
+    if let Err(error) = teardown_live_session(state) {
+        state.init_error = Some(format!("live session teardown failed: {error}"));
+    }
 }
 
-fn teardown_live_session(state: &mut LiveHarnessState) {
+fn teardown_live_session(state: &mut LiveHarnessState) -> Result<(), String> {
+    let mut failures = Vec::new();
     #[cfg(windows)]
-    if let Some(mut session) = state.session.take() {
-        session.vm.kill();
+    if let Some(mut session) = state.session.take()
+        && let Err(error) = session.vm.kill()
+    {
+        failures.push(format!("live session VM teardown failed: {error}"));
     }
     #[cfg(not(windows))]
-    if let Some(mut vm) = state.vm.take() {
-        vm.kill();
+    if let Some(mut vm) = state.vm.take()
+        && let Err(error) = vm.kill()
+    {
+        failures.push(format!("live session VM teardown failed: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -718,7 +792,13 @@ fn run_req3_repeated_exec(state: &mut LiveHarnessState) -> CheckOutcome {
         Ok(AgentControlMessage::Health(status)) => status.active_exec_id == Some(exec1),
         _ => false,
     };
-    let first = match collect_exec_until_terminal(session, exec1, Duration::from_secs(10), true) {
+    let first = match collect_exec_until_terminal(
+        session,
+        exec1,
+        Duration::from_secs(10),
+        true,
+        ExecCollectionLimits::small_probe(Duration::from_secs(10)),
+    ) {
         Ok(obs) => obs,
         Err(error) => return fail_check(error),
     };
@@ -803,7 +883,13 @@ fn run_req4_streams(state: &mut LiveHarnessState) -> CheckOutcome {
     }) {
         return fail_check(format!("sending stdin EOF failed: {error}"));
     }
-    let observed = match collect_exec_until_terminal(session, exec_id, LIVE_TIMEOUT, true) {
+    let observed = match collect_exec_until_terminal(
+        session,
+        exec_id,
+        LIVE_TIMEOUT,
+        true,
+        ExecCollectionLimits::small_probe(LIVE_TIMEOUT),
+    ) {
         Ok(obs) => obs,
         Err(error) => return fail_check(error),
     };
@@ -878,11 +964,16 @@ fn run_req5_backpressure(state: &mut LiveHarnessState) -> CheckOutcome {
     if let Err(error) = grant_stream(session, exec_id, StreamName::Stdout, 1) {
         return fail_check(error);
     }
-    let observed =
-        match collect_exec_until_terminal(session, exec_id, Duration::from_secs(20), true) {
-            Ok(obs) => obs,
-            Err(error) => return fail_check(error),
-        };
+    let observed = match collect_exec_until_terminal(
+        session,
+        exec_id,
+        Duration::from_secs(20),
+        true,
+        ExecCollectionLimits::flood_probe(Duration::from_secs(20), target_bytes),
+    ) {
+        Ok(obs) => obs,
+        Err(error) => return fail_check(error),
+    };
     let mut expected = Vec::with_capacity(target_bytes);
     for i in 0..target_bytes {
         expected.push((i % 256) as u8);
@@ -928,11 +1019,16 @@ fn run_req6_terminal_semantics(state: &mut LiveHarnessState) -> CheckOutcome {
     }) {
         return fail_check(format!("stdin EOF request failed: {error}"));
     }
-    let stdin_observed =
-        match collect_exec_until_terminal(session, stdin_exec, Duration::from_secs(10), true) {
-            Ok(value) => value,
-            Err(error) => return fail_check(error),
-        };
+    let stdin_observed = match collect_exec_until_terminal(
+        session,
+        stdin_exec,
+        Duration::from_secs(10),
+        true,
+        ExecCollectionLimits::small_probe(Duration::from_secs(10)),
+    ) {
+        Ok(value) => value,
+        Err(error) => return fail_check(error),
+    };
     let stdin_eof_ok = stdin_observed.stdout == b"stdin-eof-observed\n"
         && stdin_observed.disposition == Some(ExecDisposition::ExitCode(0))
         && stdin_observed.termination.is_none()
@@ -1020,7 +1116,7 @@ fn run_req7_fixed_mxc_identity(state: &mut LiveHarnessState) -> CheckOutcome {
         && identity.saved_gid == expected_gid;
     let non_root = expected_uid != 0
         && expected_gid != 0
-        && identity.supplementary_gids.iter().all(|gid| *gid != 0);
+        && supplementary_groups_are_empty(&identity.supplementary_gids);
     let identity_names_ok = identity
         .username
         .as_ref()
@@ -1050,7 +1146,7 @@ fn run_req7_fixed_mxc_identity(state: &mut LiveHarnessState) -> CheckOutcome {
                 "probe verified fixed identity uid/gid {}/{} for real/effective/saved IDs",
                 expected_uid, expected_gid
             ),
-            "identity remained non-root and supplementary groups excluded gid 0".to_string(),
+            "identity remained non-root and supplementary groups were empty".to_string(),
             "ready/health snapshots remained consistent with fixed mxc identity configuration"
                 .to_string(),
         ])
@@ -1113,6 +1209,7 @@ fn run_req8_full_isolation_verification(state: &mut LiveHarnessState) -> CheckOu
         && !report.mountinfo_has_raw_virtiofs_root
         && report.proc1.uid == Some(WORKLOAD_UID_MXC)
         && report.proc1.gid == Some(WORKLOAD_GID_MXC);
+    let fd_allowlist_ok = workload_fd_allowlist_ok(&report.open_fds);
     let normal_cleanup_ok = match run_normal_tree_exec_cleanup(session, 802, 500) {
         Ok(value) => value,
         Err(error) => return fail_check(error),
@@ -1127,12 +1224,14 @@ fn run_req8_full_isolation_verification(state: &mut LiveHarnessState) -> CheckOu
     };
     if core_isolation_ok
         && probe_isolation_ok
+        && fd_allowlist_ok
         && normal_cleanup_ok
         && cancel_cleanup_ok
         && timeout_cleanup_ok
     {
         pass_check(vec![
             "live probe confirmed private pid/mount/uts/ipc namespaces, private proc/dev/devpts/shm, read-only /sys, no_new_privs, and zero capability sets".to_string(),
+            "workload fd table was exact-safe allowlist (only fds 0/1/2 with expected stdio targets)".to_string(),
             "host OpenVMM pid was not visible in guest /proc and raw virtio-fs export remained hidden behind declared mappings".to_string(),
             "child+grandchild workload trees were cleaned after normal exit, cancellation, and timeout paths".to_string(),
         ])
@@ -1277,6 +1376,7 @@ fn run_normal_tree_exec_cleanup(
     grant_stream(session, exec_id, StreamName::Stderr, 1)?;
     let mut output = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(8);
+    let mut observed_messages = 0_usize;
     let tree_pids = loop {
         if Instant::now() >= deadline {
             return Err(format!(
@@ -1289,6 +1389,14 @@ fn run_normal_tree_exec_cleanup(
             .map_err(|error| format!("waiting for normal tree line failed: {error}"))?;
         match message {
             AgentControlMessage::StdoutChunk(record) if record.exec_id == exec_id => {
+                observed_messages = observed_messages.saturating_add(1);
+                enforce_tree_pid_capture_limit(
+                    session,
+                    exec_id,
+                    observed_messages,
+                    output.len(),
+                    record.chunk.len(),
+                )?;
                 output.extend_from_slice(&record.chunk);
                 grant_stream(session, exec_id, StreamName::Stdout, 1)?;
                 if let Some(pids) = parse_tree_pids(&output) {
@@ -1296,12 +1404,26 @@ fn run_normal_tree_exec_cleanup(
                 }
             }
             AgentControlMessage::StderrChunk(record) if record.exec_id == exec_id => {
+                observed_messages = observed_messages.saturating_add(1);
+                enforce_tree_pid_capture_limit(
+                    session,
+                    exec_id,
+                    observed_messages,
+                    output.len(),
+                    0,
+                )?;
                 grant_stream(session, exec_id, StreamName::Stderr, 1)?;
             }
             _ => {}
         }
     };
-    let observed = collect_exec_until_terminal(session, exec_id, Duration::from_secs(10), true)?;
+    let observed = collect_exec_until_terminal(
+        session,
+        exec_id,
+        Duration::from_secs(10),
+        true,
+        ExecCollectionLimits::tree_probe(Duration::from_secs(10)),
+    )?;
     if observed.disposition != Some(ExecDisposition::ExitCode(0)) {
         return Ok(false);
     }
@@ -1319,92 +1441,104 @@ fn run_req9_validation_session(shared: &LiveWhpSession) -> Result<bool, String> 
         &shared.req9_fixtures.run_dir,
         shared.vm.plan.artifacts.clone(),
     ))?;
-    let pid = vm.process_id();
-    let expected_image = vm.plan.artifacts.openvmm_exe.to_string_lossy().into_owned();
-    let control = NamedPipeClient::connect(
-        &vm.plan.control_pipe_name,
-        Duration::from_secs(5),
-        Some(pid),
-        Some(expected_image.as_str()),
-    )
-    .map_err(|error| format!("req9 validation control-pipe connect failed: {error}"))?;
-    let session = HostControlSession::new(control);
-    let mut client = MxcAgentClient::new(session);
-    let launch = LaunchIdentity {
-        generation: vm.plan.channel_generation.saturating_add(1),
-        nonce: vm.plan.launch_nonce,
-    };
-    let mut capability_proof = [0_u8; 32];
-    capability_proof[..16].copy_from_slice(&vm.plan.launch_nonce);
-    capability_proof[16..].copy_from_slice(&vm.plan.launch_nonce);
-    client
-        .authenticate_launch(
-            vm.plan.launch_capability,
-            HostControlMessage::HostHello {
-                service: SERVICE_IDENTITY.to_string(),
-                protocol_version: PROTOCOL_VERSION,
+    let checks = (|| -> Result<bool, String> {
+        let pid = vm.process_id();
+        let expected_image = vm.plan.artifacts.openvmm_exe.to_string_lossy().into_owned();
+        let control = NamedPipeClient::connect(
+            &vm.plan.control_pipe_name,
+            Duration::from_secs(5),
+            Some(pid),
+            Some(expected_image.as_str()),
+        )
+        .map_err(|error| format!("req9 validation control-pipe connect failed: {error}"))?;
+        let session = HostControlSession::new(control);
+        let mut client = MxcAgentClient::new(session);
+        let launch = LaunchIdentity {
+            generation: vm.plan.channel_generation.saturating_add(1),
+            nonce: vm.plan.launch_nonce,
+        };
+        let mut capability_proof = [0_u8; 32];
+        capability_proof[..16].copy_from_slice(&vm.plan.launch_nonce);
+        capability_proof[16..].copy_from_slice(&vm.plan.launch_nonce);
+        client
+            .authenticate_launch(
+                vm.plan.launch_capability,
+                HostControlMessage::HostHello {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    launch,
+                    capability_proof: CapabilityProofMaterial::try_from(capability_proof.to_vec())
+                        .map_err(|error| format!("req9 validation proof build failed: {error}"))?,
+                },
+                LIVE_TIMEOUT,
+            )
+            .map_err(|error| format!("req9 validation launch authentication failed: {error}"))?;
+        let root = CanonicalHostMappingRoot::parse(ROOT_CANONICAL_HOST.to_string())
+            .map_err(|error| format!("req9 validation root parse failed: {error}"))?;
+        let containment = MappingContainmentPolicy {
+            symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+            reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+        };
+        let traversal_detail = send_req9_traversal_probe(&mut client, launch, containment, &root)?;
+        let traversal_rejected = traversal_detail.code
+            == ProtocolErrorCode::InvalidLifecycleTransition
+            && traversal_detail
+                .message
+                .contains("invalid host control payload");
+
+        let overlap_error = expect_error_after_send_in(
+            &mut client,
+            HostControlMessage::Configure {
                 launch,
-                capability_proof: CapabilityProofMaterial::try_from(capability_proof.to_vec())
-                    .map_err(|error| format!("req9 validation proof build failed: {error}"))?,
+                root: root.clone(),
+                mappings: vec![
+                    ChildMapping {
+                        child: RelativeChildPath::parse(RW_CHILD.to_string())
+                            .map_err(|error| format!("req9 overlap parse failed: {error}"))?,
+                        access: AccessMode::ReadWrite,
+                    },
+                    ChildMapping {
+                        child: RelativeChildPath::parse(format!("{RW_CHILD}/nested"))
+                            .map_err(|error| format!("req9 overlap child parse failed: {error}"))?,
+                        access: AccessMode::ReadOnly,
+                    },
+                ],
+                containment,
             },
             LIVE_TIMEOUT,
-        )
-        .map_err(|error| format!("req9 validation launch authentication failed: {error}"))?;
-    let root = CanonicalHostMappingRoot::parse(ROOT_CANONICAL_HOST.to_string())
-        .map_err(|error| format!("req9 validation root parse failed: {error}"))?;
-    let containment = MappingContainmentPolicy {
-        symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
-        reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
-    };
-    let traversal_detail = send_req9_traversal_probe(&mut client, launch, containment, &root)?;
-    let traversal_rejected = traversal_detail.code == ProtocolErrorCode::InvalidLifecycleTransition
-        && traversal_detail
-            .message
-            .contains("invalid host control payload");
+        )?;
+        let overlap_rejected = overlap_error.code == ProtocolErrorCode::MappingConflict
+            || overlap_error.code == ProtocolErrorCode::InvalidLifecycleTransition;
 
-    let overlap_error = expect_error_after_send_in(
-        &mut client,
-        HostControlMessage::Configure {
-            launch,
-            root: root.clone(),
-            mappings: vec![
-                ChildMapping {
-                    child: RelativeChildPath::parse(RW_CHILD.to_string())
-                        .map_err(|error| format!("req9 overlap parse failed: {error}"))?,
-                    access: AccessMode::ReadWrite,
-                },
-                ChildMapping {
-                    child: RelativeChildPath::parse(format!("{RW_CHILD}/nested"))
-                        .map_err(|error| format!("req9 overlap child parse failed: {error}"))?,
+        let symlink_error = expect_error_after_send_in(
+            &mut client,
+            HostControlMessage::Configure {
+                launch,
+                root,
+                mappings: vec![ChildMapping {
+                    child: RelativeChildPath::parse(format!("{RW_CHILD}/{REPARSE_ESCAPE_LINK}"))
+                        .map_err(|error| format!("req9 symlink parse failed: {error}"))?,
                     access: AccessMode::ReadOnly,
-                },
-            ],
-            containment,
-        },
-        LIVE_TIMEOUT,
-    )?;
-    let overlap_rejected = overlap_error.code == ProtocolErrorCode::MappingConflict
-        || overlap_error.code == ProtocolErrorCode::InvalidLifecycleTransition;
-
-    let symlink_error = expect_error_after_send_in(
-        &mut client,
-        HostControlMessage::Configure {
-            launch,
-            root,
-            mappings: vec![ChildMapping {
-                child: RelativeChildPath::parse(format!("{RW_CHILD}/{REPARSE_ESCAPE_LINK}"))
-                    .map_err(|error| format!("req9 symlink parse failed: {error}"))?,
-                access: AccessMode::ReadOnly,
-            }],
-            containment,
-        },
-        LIVE_TIMEOUT,
-    )?;
-    let symlink_rejected = symlink_error.code == ProtocolErrorCode::InvalidLifecycleTransition
-        && (symlink_error.message.contains("symlink")
-            || symlink_error.message.contains("escaped mapping root"));
-    vm.kill();
-    Ok(traversal_rejected && overlap_rejected && symlink_rejected)
+                }],
+                containment,
+            },
+            LIVE_TIMEOUT,
+        )?;
+        let symlink_rejected = symlink_error.code == ProtocolErrorCode::InvalidLifecycleTransition
+            && (symlink_error.message.contains("symlink")
+                || symlink_error.message.contains("escaped mapping root"));
+        Ok(traversal_rejected && overlap_rejected && symlink_rejected)
+    })();
+    let teardown = vm
+        .kill()
+        .map_err(|error| format!("req9 validation teardown failed: {error}"));
+    match (checks, teardown) {
+        (Ok(true), Ok(())) => Ok(true),
+        (Ok(false), Ok(())) => Ok(false),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(teardown_error)) => Err(teardown_error),
+        (Err(check_error), Err(teardown_error)) => Err(format!("{check_error}; {teardown_error}")),
+    }
 }
 
 #[cfg(windows)]
@@ -1501,7 +1635,13 @@ fn run_exec_terminal_check(
     start_probe_exec(session, exec_id, args, timeout_ms)?;
     grant_stream(session, exec_id, StreamName::Stdout, 1)?;
     grant_stream(session, exec_id, StreamName::Stderr, 1)?;
-    let observed = collect_exec_until_terminal(session, exec_id, Duration::from_secs(10), true)?;
+    let observed = collect_exec_until_terminal(
+        session,
+        exec_id,
+        Duration::from_secs(10),
+        true,
+        ExecCollectionLimits::small_probe(Duration::from_secs(10)),
+    )?;
     Ok(observed.disposition == Some(expected)
         && observed.termination.is_none()
         && terminal_order_ok(&observed.messages, exec_id, expected, None))
@@ -1523,6 +1663,7 @@ fn run_cancelled_tree_exec(
     grant_stream(session, exec_id, StreamName::Stderr, 1)?;
     let mut output = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(8);
+    let mut observed_messages = 0_usize;
     let tree_pids = loop {
         if Instant::now() >= deadline {
             return Err(format!(
@@ -1535,6 +1676,14 @@ fn run_cancelled_tree_exec(
             .map_err(|error| format!("waiting for tree line failed: {error}"))?;
         match message {
             AgentControlMessage::StdoutChunk(record) if record.exec_id == exec_id => {
+                observed_messages = observed_messages.saturating_add(1);
+                enforce_tree_pid_capture_limit(
+                    session,
+                    exec_id,
+                    observed_messages,
+                    output.len(),
+                    record.chunk.len(),
+                )?;
                 output.extend_from_slice(&record.chunk);
                 grant_stream(session, exec_id, StreamName::Stdout, 1)?;
                 if let Some(pids) = parse_tree_pids(&output) {
@@ -1542,6 +1691,14 @@ fn run_cancelled_tree_exec(
                 }
             }
             AgentControlMessage::StderrChunk(record) if record.exec_id == exec_id => {
+                observed_messages = observed_messages.saturating_add(1);
+                enforce_tree_pid_capture_limit(
+                    session,
+                    exec_id,
+                    observed_messages,
+                    output.len(),
+                    0,
+                )?;
                 grant_stream(session, exec_id, StreamName::Stderr, 1)?;
             }
             AgentControlMessage::Error(detail) => {
@@ -1557,7 +1714,13 @@ fn run_cancelled_tree_exec(
         .client
         .send_cancel_execution(exec_id)
         .map_err(|error| format!("cancel execution failed: {error}"))?;
-    let observed = collect_exec_until_terminal(session, exec_id, Duration::from_secs(12), true)?;
+    let observed = collect_exec_until_terminal(
+        session,
+        exec_id,
+        Duration::from_secs(12),
+        true,
+        ExecCollectionLimits::tree_probe(Duration::from_secs(12)),
+    )?;
     if observed.disposition != Some(ExecDisposition::Cancelled)
         || observed.termination
             != Some(if ignore_term {
@@ -1602,6 +1765,7 @@ fn run_timeout_tree_exec(
     grant_stream(session, exec_id, StreamName::Stderr, 1)?;
     let mut output = Vec::new();
     let pid_deadline = Instant::now() + Duration::from_secs(8);
+    let mut observed_messages = 0_usize;
     let tree_pids = loop {
         if Instant::now() >= pid_deadline {
             return Err(format!(
@@ -1614,6 +1778,14 @@ fn run_timeout_tree_exec(
             .map_err(|error| format!("waiting for timeout tree line failed: {error}"))?;
         match message {
             AgentControlMessage::StdoutChunk(record) if record.exec_id == exec_id => {
+                observed_messages = observed_messages.saturating_add(1);
+                enforce_tree_pid_capture_limit(
+                    session,
+                    exec_id,
+                    observed_messages,
+                    output.len(),
+                    record.chunk.len(),
+                )?;
                 output.extend_from_slice(&record.chunk);
                 grant_stream(session, exec_id, StreamName::Stdout, 1)?;
                 if let Some(pids) = parse_tree_pids(&output) {
@@ -1621,6 +1793,14 @@ fn run_timeout_tree_exec(
                 }
             }
             AgentControlMessage::StderrChunk(record) if record.exec_id == exec_id => {
+                observed_messages = observed_messages.saturating_add(1);
+                enforce_tree_pid_capture_limit(
+                    session,
+                    exec_id,
+                    observed_messages,
+                    output.len(),
+                    0,
+                )?;
                 grant_stream(session, exec_id, StreamName::Stderr, 1)?;
             }
             AgentControlMessage::Error(detail) => {
@@ -1632,7 +1812,13 @@ fn run_timeout_tree_exec(
             _ => {}
         }
     };
-    let observed = collect_exec_until_terminal(session, exec_id, Duration::from_secs(12), true)?;
+    let observed = collect_exec_until_terminal(
+        session,
+        exec_id,
+        Duration::from_secs(12),
+        true,
+        ExecCollectionLimits::tree_probe(Duration::from_secs(12)),
+    )?;
     if observed.disposition != Some(ExecDisposition::TimedOut)
         || observed.termination != Some(TerminationOutcome::ForcedKill)
         || !terminal_order_ok(
@@ -1671,7 +1857,13 @@ fn run_pid_check(
     )?;
     grant_stream(session, exec_id, StreamName::Stdout, 1)?;
     grant_stream(session, exec_id, StreamName::Stderr, 1)?;
-    let observed = collect_exec_until_terminal(session, exec_id, Duration::from_secs(8), true)?;
+    let observed = collect_exec_until_terminal(
+        session,
+        exec_id,
+        Duration::from_secs(8),
+        true,
+        ExecCollectionLimits::small_probe(Duration::from_secs(8)),
+    )?;
     Ok(observed.disposition == Some(ExecDisposition::ExitCode(0))
         && observed.stdout == b"pids-gone\n")
 }
@@ -1710,7 +1902,13 @@ fn run_simple_probe_exec(
     start_probe_exec(session, exec_id, args, None)?;
     grant_stream(session, exec_id, StreamName::Stdout, 1)?;
     grant_stream(session, exec_id, StreamName::Stderr, 1)?;
-    let observed = collect_exec_until_terminal(session, exec_id, LIVE_TIMEOUT, true)?;
+    let observed = collect_exec_until_terminal(
+        session,
+        exec_id,
+        LIVE_TIMEOUT,
+        true,
+        ExecCollectionLimits::small_probe(LIVE_TIMEOUT),
+    )?;
     let disposition = observed
         .disposition
         .ok_or_else(|| format!("exec {exec_id} did not produce a terminal disposition"))?;
@@ -1802,8 +2000,10 @@ fn collect_exec_until_terminal(
     exec_id: u32,
     timeout: Duration,
     auto_credit: bool,
+    limits: ExecCollectionLimits,
 ) -> Result<ExecObservation, String> {
     let deadline = Instant::now() + timeout;
+    let hard_deadline = Instant::now() + limits.max_duration;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut messages = Vec::new();
@@ -1812,6 +2012,13 @@ fn collect_exec_until_terminal(
     let mut stdout_chunk_max = 0_usize;
     let mut stderr_chunk_max = 0_usize;
     while Instant::now() < deadline {
+        if Instant::now() >= hard_deadline {
+            let _ = session.client.send_cancel_execution(exec_id);
+            return Err(format!(
+                "collection duration bound exceeded for exec {exec_id} after {:?}",
+                limits.max_duration
+            ));
+        }
         let poll = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(250));
@@ -1823,44 +2030,106 @@ fn collect_exec_until_terminal(
         match message {
             AgentControlMessage::StdoutChunk(record) => {
                 if record.exec_id == exec_id {
+                    if collection_chunk_exceeds_bounds(
+                        limits,
+                        stdout.len(),
+                        stderr.len(),
+                        record.chunk.len(),
+                        true,
+                        messages.len().saturating_add(1),
+                    ) {
+                        let new_stdout = stdout.len().saturating_add(record.chunk.len());
+                        let _ = session.client.send_cancel_execution(exec_id);
+                        return Err(format!(
+                            "collection bounds exceeded for exec {exec_id} (stdout={new_stdout}, stderr={}, messages={})",
+                            stderr.len(),
+                            messages.len().saturating_add(1)
+                        ));
+                    }
                     stdout_chunk_max = stdout_chunk_max.max(record.chunk.len());
                     stdout.extend_from_slice(&record.chunk);
+                    messages.push(AgentControlMessage::StdoutChunk(record.clone()));
                 }
                 if auto_credit {
                     let _ = grant_stream(session, record.exec_id, StreamName::Stdout, 1);
                 }
-                messages.push(AgentControlMessage::StdoutChunk(record));
             }
             AgentControlMessage::StderrChunk(record) => {
                 if record.exec_id == exec_id {
+                    if collection_chunk_exceeds_bounds(
+                        limits,
+                        stdout.len(),
+                        stderr.len(),
+                        record.chunk.len(),
+                        false,
+                        messages.len().saturating_add(1),
+                    ) {
+                        let new_stderr = stderr.len().saturating_add(record.chunk.len());
+                        let _ = session.client.send_cancel_execution(exec_id);
+                        return Err(format!(
+                            "collection bounds exceeded for exec {exec_id} (stdout={}, stderr={new_stderr}, messages={})",
+                            stdout.len(),
+                            messages.len().saturating_add(1)
+                        ));
+                    }
                     stderr_chunk_max = stderr_chunk_max.max(record.chunk.len());
                     stderr.extend_from_slice(&record.chunk);
+                    messages.push(AgentControlMessage::StderrChunk(record.clone()));
                 }
                 if auto_credit {
                     let _ = grant_stream(session, record.exec_id, StreamName::Stderr, 1);
                 }
-                messages.push(AgentControlMessage::StderrChunk(record));
             }
             AgentControlMessage::StdoutEof(record) => {
-                messages.push(AgentControlMessage::StdoutEof(record));
+                if record.exec_id == exec_id {
+                    if messages.len().saturating_add(1) > limits.max_messages {
+                        let _ = session.client.send_cancel_execution(exec_id);
+                        return Err(format!(
+                            "collection message bound exceeded for exec {exec_id}"
+                        ));
+                    }
+                    messages.push(AgentControlMessage::StdoutEof(record));
+                }
             }
             AgentControlMessage::StderrEof(record) => {
-                messages.push(AgentControlMessage::StderrEof(record));
+                if record.exec_id == exec_id {
+                    if messages.len().saturating_add(1) > limits.max_messages {
+                        let _ = session.client.send_cancel_execution(exec_id);
+                        return Err(format!(
+                            "collection message bound exceeded for exec {exec_id}"
+                        ));
+                    }
+                    messages.push(AgentControlMessage::StderrEof(record));
+                }
             }
             AgentControlMessage::DescendantsCleaned { exec_id: cleaned } => {
-                messages.push(AgentControlMessage::DescendantsCleaned { exec_id: cleaned });
+                if cleaned == exec_id {
+                    if messages.len().saturating_add(1) > limits.max_messages {
+                        let _ = session.client.send_cancel_execution(exec_id);
+                        return Err(format!(
+                            "collection message bound exceeded for exec {exec_id}"
+                        ));
+                    }
+                    messages.push(AgentControlMessage::DescendantsCleaned { exec_id: cleaned });
+                }
             }
             AgentControlMessage::ExecTerminal {
                 exec_id: terminal_exec_id,
                 disposition: terminal_disposition,
                 termination: terminal_termination,
             } => {
-                messages.push(AgentControlMessage::ExecTerminal {
-                    exec_id: terminal_exec_id,
-                    disposition: terminal_disposition,
-                    termination: terminal_termination,
-                });
                 if terminal_exec_id == exec_id {
+                    if messages.len().saturating_add(1) > limits.max_messages {
+                        let _ = session.client.send_cancel_execution(exec_id);
+                        return Err(format!(
+                            "collection message bound exceeded for exec {exec_id}"
+                        ));
+                    }
+                    messages.push(AgentControlMessage::ExecTerminal {
+                        exec_id: terminal_exec_id,
+                        disposition: terminal_disposition,
+                        termination: terminal_termination,
+                    });
                     disposition = Some(terminal_disposition);
                     termination = terminal_termination;
                     break;
@@ -1872,9 +2141,7 @@ fn collect_exec_until_terminal(
                     detail.code, detail.message
                 ));
             }
-            other => {
-                messages.push(other);
-            }
+            _ => {}
         }
     }
     if disposition.is_none() {
@@ -1891,6 +2158,90 @@ fn collect_exec_until_terminal(
         stdout_chunk_max,
         stderr_chunk_max,
     })
+}
+
+#[cfg(windows)]
+fn enforce_tree_pid_capture_limit(
+    session: &mut LiveWhpSession,
+    exec_id: u32,
+    observed_messages: usize,
+    current_output_len: usize,
+    incoming_stdout_chunk_len: usize,
+) -> Result<(), String> {
+    let next_size = current_output_len.saturating_add(incoming_stdout_chunk_len);
+    if observed_messages > TREE_PID_CAPTURE_MAX_MESSAGES || next_size > TREE_PID_CAPTURE_MAX_BYTES {
+        let _ = session.client.send_cancel_execution(exec_id);
+        return Err(format!(
+            "tree pid capture bounds exceeded for exec {exec_id} (bytes={next_size}, messages={observed_messages})"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn workload_fd_allowlist_ok(entries: &[ProbeFdEntry]) -> bool {
+    if entries.len() != 3 {
+        return false;
+    }
+    let mut seen = [false; 3];
+    for entry in entries {
+        let slot = match entry.fd {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => return false,
+        };
+        if seen[slot] {
+            return false;
+        }
+        seen[slot] = true;
+        if !stdio_target_allowlisted(&entry.target) {
+            return false;
+        }
+    }
+    seen.into_iter().all(|value| value)
+}
+
+#[cfg(windows)]
+fn stdio_target_allowlisted(target: &str) -> bool {
+    if target.contains("/proc/") || target.contains("/mnt/") || target.contains("ns:") {
+        return false;
+    }
+    target.starts_with("pipe:[")
+        || target.starts_with("/dev/null")
+        || target.starts_with("/dev/pts/")
+        || target == "/dev/console"
+}
+
+#[cfg(windows)]
+fn supplementary_groups_are_empty(groups: &[u32]) -> bool {
+    groups.is_empty()
+}
+
+#[cfg(windows)]
+fn collection_chunk_exceeds_bounds(
+    limits: ExecCollectionLimits,
+    current_stdout_bytes: usize,
+    current_stderr_bytes: usize,
+    incoming_chunk_bytes: usize,
+    is_stdout_chunk: bool,
+    next_message_count: usize,
+) -> bool {
+    let next_stdout = if is_stdout_chunk {
+        current_stdout_bytes.saturating_add(incoming_chunk_bytes)
+    } else {
+        current_stdout_bytes
+    };
+    let next_stderr = if is_stdout_chunk {
+        current_stderr_bytes
+    } else {
+        current_stderr_bytes.saturating_add(incoming_chunk_bytes)
+    };
+    let next_total = next_stdout.saturating_add(next_stderr);
+    next_stdout > limits.max_stdout_bytes
+        || next_stderr > limits.max_stderr_bytes
+        || next_total > limits.max_total_bytes
+        || next_message_count > limits.max_messages
 }
 
 #[cfg(windows)]
@@ -1981,5 +2332,83 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&output);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn req7_supplementary_groups_must_be_empty() {
+        assert!(supplementary_groups_are_empty(&[]));
+        assert!(!supplementary_groups_are_empty(&[123]));
+        assert!(!supplementary_groups_are_empty(&[0]));
+    }
+
+    #[test]
+    fn req8_fd_allowlist_rejects_unexpected_fd_and_host_paths() {
+        let allowed = vec![
+            ProbeFdEntry {
+                fd: 0,
+                target: "/dev/null".to_string(),
+            },
+            ProbeFdEntry {
+                fd: 1,
+                target: "pipe:[12345]".to_string(),
+            },
+            ProbeFdEntry {
+                fd: 2,
+                target: "/dev/pts/0".to_string(),
+            },
+        ];
+        let extra_fd = vec![
+            ProbeFdEntry {
+                fd: 0,
+                target: "/dev/null".to_string(),
+            },
+            ProbeFdEntry {
+                fd: 1,
+                target: "pipe:[12345]".to_string(),
+            },
+            ProbeFdEntry {
+                fd: 5,
+                target: "pipe:[99999]".to_string(),
+            },
+        ];
+        let host_fd = vec![
+            ProbeFdEntry {
+                fd: 0,
+                target: "/proc/1/ns/mnt".to_string(),
+            },
+            ProbeFdEntry {
+                fd: 1,
+                target: "pipe:[12345]".to_string(),
+            },
+            ProbeFdEntry {
+                fd: 2,
+                target: "/dev/pts/0".to_string(),
+            },
+        ];
+        assert!(workload_fd_allowlist_ok(&allowed));
+        assert!(!workload_fd_allowlist_ok(&extra_fd));
+        assert!(!workload_fd_allowlist_ok(&host_fd));
+    }
+
+    #[test]
+    fn collection_limits_fail_closed_on_flood_overflow() {
+        let limits = ExecCollectionLimits::flood_probe(Duration::from_secs(10), 1024);
+        assert!(!collection_chunk_exceeds_bounds(limits, 0, 0, 512, true, 1));
+        assert!(collection_chunk_exceeds_bounds(
+            limits,
+            limits.max_stdout_bytes,
+            0,
+            1,
+            true,
+            1
+        ));
+        assert!(collection_chunk_exceeds_bounds(
+            limits,
+            0,
+            0,
+            1,
+            true,
+            limits.max_messages + 1
+        ));
     }
 }

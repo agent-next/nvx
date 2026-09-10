@@ -417,7 +417,7 @@ fn read_groups() -> Result<Vec<u32>> {
     if rc < 0 {
         return Err("getgroups collection failed".to_string());
     }
-    Ok(groups.into_iter().map(|gid| gid as u32).collect())
+    Ok(groups.into_iter().collect())
 }
 
 #[cfg(target_os = "linux")]
@@ -558,6 +558,7 @@ fn proc_mountinfo_contains(path_marker: &str, fs_marker: &str) -> Result<bool> {
 }
 
 fn list_open_fds() -> Vec<FdEntry> {
+    let self_fd_dir = format!("/proc/{}/fd", process::id());
     let mut entries = fs::read_dir("/proc/self/fd")
         .ok()
         .into_iter()
@@ -567,6 +568,9 @@ fn list_open_fds() -> Vec<FdEntry> {
             let target = fs::read_link(entry.path())
                 .map(|value| value.display().to_string())
                 .unwrap_or_else(|_| "<unavailable>".to_string());
+            if target == self_fd_dir {
+                return None;
+            }
             Some(FdEntry { fd, target })
         })
         .collect::<Vec<_>>();

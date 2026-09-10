@@ -12,7 +12,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 #[cfg(windows)]
 use windows::Win32::Foundation::DUPLICATE_SAME_ACCESS;
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 #[cfg(all(windows, test))]
 use windows::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
 #[cfg(windows)]
@@ -21,7 +21,7 @@ use windows::Win32::Storage::FileSystem::WriteFile;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectExtendedLimitInformation, SetInformationJobObject,
+    JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
 };
 #[cfg(windows)]
 use windows::Win32::System::Pipes::CreatePipe;
@@ -36,6 +36,8 @@ use windows::Win32::System::Threading::{
 use windows::core::{PCWSTR, PWSTR};
 
 const DEFAULT_INITRAMFS: &str = "initramfs-mxc-agent.cpio.gz";
+#[cfg(windows)]
+const TEARDOWN_WAIT_MS: u32 = 5_000;
 
 #[derive(Clone, Debug, Default)]
 pub struct LaunchOverrides {
@@ -87,11 +89,11 @@ impl Drop for LaunchedVm {
     fn drop(&mut self) {
         #[cfg(windows)]
         {
-            let _ = close_job_handle_and_kill(self);
+            let _ = self.kill();
         }
         #[cfg(not(windows))]
         {
-            let _ = kill_child_process_tree(&mut self.child);
+            let _ = self.kill();
         }
     }
 }
@@ -109,15 +111,19 @@ impl LaunchedVm {
         let _ = self.child.wait();
     }
 
-    pub fn kill(&mut self) {
+    pub fn kill(&mut self) -> Result<(), String> {
         #[cfg(windows)]
         {
-            let _ = close_job_handle_and_kill(self);
+            close_job_handle_and_kill(self)
         }
         #[cfg(not(windows))]
         {
-            let _ = kill_child_process_tree(&mut self.child);
+            kill_child_process_tree(&mut self.child)
         }
+    }
+
+    pub fn close(&mut self) -> Result<(), String> {
+        self.kill()
     }
 
     pub fn process_id(&self) -> u32 {
@@ -355,11 +361,6 @@ impl LaunchFailureGuard {
             .ok_or_else(|| "launch failure guard lost auth pipe".to_string())
     }
 
-    fn process_id(&self) -> Result<u32, String> {
-        let process = self.process_handle()?;
-        Ok(unsafe { windows::Win32::System::Threading::GetProcessId(process) })
-    }
-
     fn take_success(mut self) -> Result<(OwnedHandle, OwnedHandle, u32), String> {
         let process = self
             .process
@@ -369,7 +370,12 @@ impl LaunchFailureGuard {
             .job
             .take()
             .ok_or_else(|| "launch success missing kill-on-close job".to_string())?;
-        let pid = self.process_id()?;
+        let pid = unsafe {
+            windows::Win32::System::Threading::GetProcessId(HANDLE(process.as_raw_handle()))
+        };
+        if pid == 0 {
+            return Err("launch success missing valid process id".to_string());
+        }
         self.thread.take();
         if let Some(mut pipe) = self.auth_pipe.take() {
             let _ = close_handle_if_valid(&mut pipe.read);
@@ -671,16 +677,102 @@ pub fn kill_child_process_tree(child: &mut Child) -> Result<(), String> {
 
 #[cfg(windows)]
 fn close_job_handle_and_kill(vm: &mut LaunchedVm) -> Result<(), String> {
-    if let Some(job) = vm.job_handle.take() {
+    let process = HANDLE(vm.process_handle.as_raw_handle());
+    let mut uncertainty = None::<String>;
+
+    if let Some(job) = vm.job_handle.as_ref() {
+        let injected_close_failure = failpoint(Failpoint::TeardownCloseHandle).is_err();
         let raw = HANDLE(job.as_raw_handle());
-        std::mem::forget(job);
         // SAFETY: close the job handle; KILL_ON_JOB_CLOSE tears down attached process tree.
-        let closed_job = unsafe { CloseHandle(raw) };
-        if closed_job.is_err() {
-            return Err("failed to close OpenVMM job handle".to_string());
+        let closed_job = if injected_close_failure {
+            Err(windows::core::Error::new(
+                windows::core::HRESULT(0x8000_4005_u32 as i32),
+                "injected teardown close failure",
+            ))
+        } else {
+            unsafe { CloseHandle(raw) }
+        };
+        if let Err(error) = closed_job {
+            uncertainty = Some(format!("failed to close OpenVMM job handle: {error}"));
+            let terminate_job = unsafe { TerminateJobObject(raw, 1) };
+            if let Err(terminate_error) = terminate_job {
+                let _ = fallback_terminate_process(process);
+                let detail = uncertainty.unwrap_or_default();
+                uncertainty = Some(format!(
+                    "{detail}; fallback TerminateJobObject also failed: {terminate_error}"
+                ));
+            }
+        } else {
+            let owned = vm
+                .job_handle
+                .take()
+                .ok_or_else(|| "OpenVMM job handle disappeared during teardown".to_string())?;
+            std::mem::forget(owned);
+        }
+    } else {
+        let _ = fallback_terminate_process(process);
+    }
+
+    if !wait_for_process_exit(process, TEARDOWN_WAIT_MS)? {
+        let _ = fallback_terminate_process(process);
+        if !wait_for_process_exit(process, TEARDOWN_WAIT_MS)? {
+            let base = uncertainty.unwrap_or_else(|| "OpenVMM teardown uncertain".to_string());
+            return Err(format!(
+                "{base}; OpenVMM process did not exit within {TEARDOWN_WAIT_MS} ms"
+            ));
         }
     }
+
+    if let Some(detail) = uncertainty {
+        return Err(format!(
+            "{detail}; fallback termination completed but teardown certainty is lost"
+        ));
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn fallback_terminate_process(process: HANDLE) -> Result<(), String> {
+    if process_exited(process)? {
+        return Ok(());
+    }
+    // SAFETY: process handle belongs to this launched VM instance.
+    unsafe { TerminateProcess(process, 1) }
+        .map_err(|error| format!("fallback TerminateProcess failed: {error}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn process_exited(process: HANDLE) -> Result<bool, String> {
+    // SAFETY: process handle belongs to this launched VM instance.
+    let status = unsafe { WaitForSingleObject(process, 0) };
+    match status {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err("WaitForSingleObject(0) failed while probing process exit".to_string()),
+        other => Err(format!(
+            "unexpected WaitForSingleObject(0) status while probing process exit: {other:?}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_process_exit(process: HANDLE, timeout_ms: u32) -> Result<bool, String> {
+    if failpoint(Failpoint::TeardownExitTimeout).is_err() {
+        return Ok(false);
+    }
+    // SAFETY: process handle belongs to this launched VM instance.
+    let status = unsafe { WaitForSingleObject(process, timeout_ms) };
+    match status {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(format!(
+            "WaitForSingleObject({timeout_ms}) failed while waiting for OpenVMM exit"
+        )),
+        other => Err(format!(
+            "unexpected WaitForSingleObject({timeout_ms}) status while waiting for OpenVMM exit: {other:?}"
+        )),
+    }
 }
 
 #[cfg(windows)]
@@ -757,6 +849,8 @@ enum Failpoint {
     CapabilityWrite,
     CapabilityPipeClose,
     ResumeThread,
+    TeardownCloseHandle,
+    TeardownExitTimeout,
 }
 
 #[cfg(windows)]
@@ -775,8 +869,10 @@ fn failpoint(kind: Failpoint) -> Result<(), String> {
 mod launch_failpoint {
     use super::Failpoint;
     use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     static FAILPOINT: AtomicU8 = AtomicU8::new(0);
+    static FAILPOINT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     pub fn set(kind: Option<Failpoint>) {
         let id = match kind {
@@ -785,6 +881,8 @@ mod launch_failpoint {
             Some(Failpoint::CapabilityWrite) => 3,
             Some(Failpoint::CapabilityPipeClose) => 4,
             Some(Failpoint::ResumeThread) => 5,
+            Some(Failpoint::TeardownCloseHandle) => 6,
+            Some(Failpoint::TeardownExitTimeout) => 7,
             None => 0,
         };
         FAILPOINT.store(id, Ordering::SeqCst);
@@ -797,8 +895,19 @@ mod launch_failpoint {
             Failpoint::CapabilityWrite => 3,
             Failpoint::CapabilityPipeClose => 4,
             Failpoint::ResumeThread => 5,
+            Failpoint::TeardownCloseHandle => 6,
+            Failpoint::TeardownExitTimeout => 7,
         };
         FAILPOINT.load(Ordering::SeqCst) == want
+    }
+
+    pub fn run_with<T>(kind: Option<Failpoint>, action: impl FnOnce() -> T) -> T {
+        let lock = FAILPOINT_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().expect("failpoint lock");
+        set(kind);
+        let result = action();
+        set(None);
+        result
     }
 }
 
@@ -851,6 +960,8 @@ fn quote_windows_arg(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::process::Command;
 
     #[test]
     fn default_artifact_discovery_reports_missing_openvmm() {
@@ -956,36 +1067,36 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn launch_failpoint_injects_job_create_failure() {
-        launch_failpoint::set(Some(Failpoint::JobCreate));
-        let result = failpoint(Failpoint::JobCreate);
-        launch_failpoint::set(None);
+        let result = launch_failpoint::run_with(Some(Failpoint::JobCreate), || {
+            failpoint(Failpoint::JobCreate)
+        });
         assert!(result.is_err());
     }
 
     #[cfg(windows)]
     #[test]
     fn launch_failpoint_injects_capability_pipe_close_failure() {
-        launch_failpoint::set(Some(Failpoint::CapabilityPipeClose));
-        let result = failpoint(Failpoint::CapabilityPipeClose);
-        launch_failpoint::set(None);
+        let result = launch_failpoint::run_with(Some(Failpoint::CapabilityPipeClose), || {
+            failpoint(Failpoint::CapabilityPipeClose)
+        });
         assert!(result.is_err());
     }
 
     #[cfg(windows)]
     #[test]
     fn launch_failpoint_injects_job_assign_failure() {
-        launch_failpoint::set(Some(Failpoint::JobAssign));
-        let result = failpoint(Failpoint::JobAssign);
-        launch_failpoint::set(None);
+        let result = launch_failpoint::run_with(Some(Failpoint::JobAssign), || {
+            failpoint(Failpoint::JobAssign)
+        });
         assert!(result.is_err());
     }
 
     #[cfg(windows)]
     #[test]
     fn launch_failpoint_injects_resume_failure() {
-        launch_failpoint::set(Some(Failpoint::ResumeThread));
-        let result = failpoint(Failpoint::ResumeThread);
-        launch_failpoint::set(None);
+        let result = launch_failpoint::run_with(Some(Failpoint::ResumeThread), || {
+            failpoint(Failpoint::ResumeThread)
+        });
         assert!(result.is_err());
     }
 
@@ -993,9 +1104,9 @@ mod tests {
     #[test]
     fn capability_pipe_write_close_failpoint_closes_handles() {
         let mut pipe = create_auth_pipe().expect("auth pipe");
-        launch_failpoint::set(Some(Failpoint::CapabilityPipeClose));
-        let result = write_auth_capability_and_close(&mut pipe, &[0xAB; 32]);
-        launch_failpoint::set(None);
+        let result = launch_failpoint::run_with(Some(Failpoint::CapabilityPipeClose), || {
+            write_auth_capability_and_close(&mut pipe, &[0xAB; 32])
+        });
         assert!(result.is_err());
         assert!(pipe.read.0.is_null());
         assert!(pipe.write.0.is_null());
@@ -1005,11 +1116,103 @@ mod tests {
     #[test]
     fn capability_pipe_write_failpoint_is_reported() {
         let mut pipe = create_auth_pipe().expect("auth pipe");
-        launch_failpoint::set(Some(Failpoint::CapabilityWrite));
-        let result = failpoint(Failpoint::CapabilityWrite);
-        launch_failpoint::set(None);
+        let result = launch_failpoint::run_with(Some(Failpoint::CapabilityWrite), || {
+            failpoint(Failpoint::CapabilityWrite)
+        });
         assert!(result.is_err());
         let _ = close_handle_if_valid(&mut pipe.read);
         let _ = close_handle_if_valid(&mut pipe.write);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_failure_guard_take_success_preserves_process_and_job_ownership() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping -n 10 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn child");
+        let process = owned_from_handle(
+            duplicate_inheritable_handle(HANDLE(child.as_raw_handle())).expect("dup process"),
+        )
+        .expect("owned process");
+        let thread = owned_from_handle(
+            duplicate_inheritable_handle(HANDLE(child.as_raw_handle())).expect("dup thread"),
+        )
+        .expect("owned thread");
+        let auth_pipe = create_auth_pipe().expect("auth pipe");
+        let mut guard = LaunchFailureGuard::new(process, thread, auth_pipe);
+        let job = create_kill_on_close_job(guard.process_handle().expect("process handle"))
+            .expect("create job");
+        guard.set_job(job);
+        let (_process, _job, pid) = guard.take_success().expect("take success");
+        assert_eq!(pid, child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vm_kill_reports_teardown_closehandle_uncertainty() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping -n 10 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn child");
+        let process_handle = owned_from_handle(
+            duplicate_inheritable_handle(HANDLE(child.as_raw_handle())).expect("dup process"),
+        )
+        .expect("owned process");
+        let job_handle = create_kill_on_close_job(HANDLE(process_handle.as_raw_handle()))
+            .expect("create kill-on-close job");
+        let plan = build_launch_plan(
+            &std::env::temp_dir(),
+            LaunchArtifacts {
+                openvmm_exe: PathBuf::from("openvmm.exe"),
+                kernel: PathBuf::from("vmlinux"),
+                mxc_initramfs: PathBuf::from("initramfs-mxc-agent.cpio.gz"),
+                common_root: std::env::temp_dir().join("common-root"),
+            },
+        );
+        let mut vm = LaunchedVm {
+            plan,
+            process_handle,
+            job_handle: Some(job_handle),
+            pid: child.id(),
+        };
+        let result = launch_failpoint::run_with(Some(Failpoint::TeardownCloseHandle), || vm.kill());
+        assert!(result.is_err());
+        let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vm_kill_reports_teardown_exit_timeout() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping -n 5 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn child");
+        let process_handle = owned_from_handle(
+            duplicate_inheritable_handle(HANDLE(child.as_raw_handle())).expect("dup process"),
+        )
+        .expect("owned process");
+        let job_handle = create_kill_on_close_job(HANDLE(process_handle.as_raw_handle()))
+            .expect("create kill-on-close job");
+        let plan = build_launch_plan(
+            &std::env::temp_dir(),
+            LaunchArtifacts {
+                openvmm_exe: PathBuf::from("openvmm.exe"),
+                kernel: PathBuf::from("vmlinux"),
+                mxc_initramfs: PathBuf::from("initramfs-mxc-agent.cpio.gz"),
+                common_root: std::env::temp_dir().join("common-root"),
+            },
+        );
+        let mut vm = LaunchedVm {
+            plan,
+            process_handle,
+            job_handle: Some(job_handle),
+            pid: child.id(),
+        };
+        let result = launch_failpoint::run_with(Some(Failpoint::TeardownExitTimeout), || vm.kill());
+        assert!(result.is_err());
+        let _ = child.wait();
     }
 }
