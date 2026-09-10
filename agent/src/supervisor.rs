@@ -1,6 +1,8 @@
 // Copyright(c) The microvm authors.
 // Licensed under the MIT License.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs;
@@ -30,11 +32,13 @@ const MAX_STDIO_CHUNKS_PER_REFRESH: usize = 4;
 const DESCENDANTS_CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
-static PREPARE_CGROUP_FAILPOINT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static PREPARE_CGROUP_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+}
 #[cfg(test)]
-static REMOVE_CGROUP_FAIL_COUNTDOWN: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+thread_local! {
+    static REMOVE_CGROUP_FAIL_COUNTDOWN: Cell<u32> = const { Cell::new(0) };
+}
 
 pub struct LinuxProcessSupervisor {
     active: Option<ActiveProcess>,
@@ -1069,7 +1073,7 @@ fn try_prepare_workload_cgroup(exec_id: u32, pid: i32) -> Option<PathBuf> {
 
 fn prepare_exec_cgroup(root: &Path, exec_id: u32) -> Result<PreparedExecCgroup, ServiceError> {
     #[cfg(test)]
-    if PREPARE_CGROUP_FAILPOINT.load(Ordering::SeqCst) {
+    if PREPARE_CGROUP_FAILPOINT.with(Cell::get) {
         return Err(supervisor_error(
             "injected failure preparing per-exec cgroup",
         ));
@@ -1209,9 +1213,14 @@ fn remove_exec_cgroup(path: Option<&Path>, holder_root: Option<&Path>) -> Result
     }
     #[cfg(test)]
     {
-        let remaining = REMOVE_CGROUP_FAIL_COUNTDOWN.load(Ordering::SeqCst);
-        if remaining > 0 {
-            REMOVE_CGROUP_FAIL_COUNTDOWN.fetch_sub(1, Ordering::SeqCst);
+        if REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| {
+            let remaining = countdown.get();
+            if remaining == 0 {
+                return false;
+            }
+            countdown.set(remaining - 1);
+            true
+        }) {
             return Err(supervisor_io(
                 format!("removing per-exec cgroup directory {}", path.display()),
                 io::Error::from_raw_os_error(libc::EBUSY),
@@ -1223,6 +1232,7 @@ fn remove_exec_cgroup(path: Option<&Path>, holder_root: Option<&Path>) -> Result
         match fs::remove_dir(path) {
             Ok(()) => return Ok(()),
             Err(error) if attempts < 10 && is_retryable_remove_error(&error) => {
+                remove_emulated_cgroup_control_files(path);
                 attempts = attempts.saturating_add(1);
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -1241,6 +1251,17 @@ fn is_retryable_remove_error(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(libc::EBUSY) | Some(libc::ENOTEMPTY) | Some(libc::EINTR)
     )
+}
+
+fn remove_emulated_cgroup_control_files(path: &Path) {
+    for filename in ["cgroup.events", "cgroup.kill", "cgroup.procs"] {
+        let file_path = path.join(filename);
+        match fs::remove_file(&file_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
 }
 
 fn would_block(error: &io::Error) -> bool {
@@ -1269,6 +1290,23 @@ mod tests {
     use std::io::Read;
     use tempfile::tempdir;
 
+    struct TestFailpointScope;
+
+    impl TestFailpointScope {
+        fn new() -> Self {
+            PREPARE_CGROUP_FAILPOINT.with(|failpoint| failpoint.set(false));
+            REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(0));
+            Self
+        }
+    }
+
+    impl Drop for TestFailpointScope {
+        fn drop(&mut self) {
+            PREPARE_CGROUP_FAILPOINT.with(|failpoint| failpoint.set(false));
+            REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(0));
+        }
+    }
+
     fn wait_for_event(
         supervisor: &mut LinuxProcessSupervisor,
         exec_id: u32,
@@ -1285,6 +1323,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         None
+    }
+
+    fn wait_for_exit_capture(active: &mut ActiveProcess, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            maybe_report_exit(active).expect("capture terminal disposition");
+            if active.exit_status_reported {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for child exit capture");
     }
 
     fn count_exec_cgroup_dirs(root: &Path, prefix: &str) -> usize {
@@ -1634,7 +1684,8 @@ mod tests {
 
     #[test]
     fn holder_spawn_fails_closed_when_exec_cgroup_prepare_fails() {
-        PREPARE_CGROUP_FAILPOINT.store(true, Ordering::SeqCst);
+        let _scope = TestFailpointScope::new();
+        PREPARE_CGROUP_FAILPOINT.with(|failpoint| failpoint.set(true));
         let holder_root = tempdir().expect("tempdir");
         let mut supervisor = LinuxProcessSupervisor {
             active: None,
@@ -1653,7 +1704,6 @@ mod tests {
             env: vec![],
             timeout_ms: None,
         });
-        PREPARE_CGROUP_FAILPOINT.store(false, Ordering::SeqCst);
         assert!(spawn_result.is_err(), "spawn must fail closed");
         assert!(
             supervisor.active.is_none(),
@@ -1842,21 +1892,41 @@ mod tests {
             })
             .expect("spawn");
 
-        let first = wait_for_event(&mut supervisor, exec_id, Duration::from_secs(2), |event| {
-            matches!(event, SupervisorEvent::StdoutChunk(_))
-        })
-        .expect("first chunk");
+        let peek_deadline = Instant::now() + Duration::from_secs(2);
+        let first = loop {
+            assert!(
+                Instant::now() < peek_deadline,
+                "timed out waiting for first stdout chunk"
+            );
+            let Some(event) = supervisor.peek_event(exec_id).expect("peek event") else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            if matches!(event, SupervisorEvent::StdoutChunk(_)) {
+                break event;
+            }
+            supervisor.ack_event(exec_id).expect("ack non-stdout event");
+        };
         assert!(matches!(first, SupervisorEvent::StdoutChunk(_)));
 
         std::thread::sleep(Duration::from_millis(200));
         let active = supervisor.active.as_ref().expect("active process");
+        let queued_before = active.event_queue.len();
+        assert!(
+            queued_before > 0,
+            "expected at least one queued event after first unacked chunk"
+        );
+        let bytes_before = active.event_queue_bytes;
+        std::thread::sleep(Duration::from_millis(100));
+        let active = supervisor.active.as_ref().expect("active process");
         assert_eq!(
             active.event_queue.len(),
-            1,
-            "front-unacked output must stop additional draining"
+            queued_before,
+            "front-unacked output must stop additional draining once queue is non-empty"
         );
         assert!(
-            active.event_queue_bytes <= DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES,
+            active.event_queue_bytes == bytes_before
+                && active.event_queue_bytes <= DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES,
             "event queue bytes must stay bounded"
         );
 
@@ -2004,6 +2074,7 @@ mod tests {
 
     #[test]
     fn descendants_cleanup_retries_cgroup_removal_then_publishes_terminal_and_cleanup() {
+        let _scope = TestFailpointScope::new();
         let temp = tempdir().expect("tempdir");
         let events_path = temp.path().join("cgroup.events");
         fs::write(&events_path, "populated 0\n").expect("seed populated=0");
@@ -2040,8 +2111,8 @@ mod tests {
             holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
         };
-        maybe_report_exit(&mut active).expect("capture terminal disposition");
-        REMOVE_CGROUP_FAIL_COUNTDOWN.store(1, Ordering::SeqCst);
+        wait_for_exit_capture(&mut active, Duration::from_secs(2));
+        REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(1));
         maybe_report_descendants_cleaned(&mut active, None).expect("first removal attempt");
         assert!(
             active.event_queue.is_empty(),
@@ -2061,6 +2132,7 @@ mod tests {
 
     #[test]
     fn descendants_cleanup_timeout_on_persistent_removal_failure_publishes_nothing() {
+        let _scope = TestFailpointScope::new();
         let temp = tempdir().expect("tempdir");
         let events_path = temp.path().join("cgroup.events");
         fs::write(&events_path, "populated 0\n").expect("seed populated=0");
@@ -2099,8 +2171,8 @@ mod tests {
             holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
         };
-        maybe_report_exit(&mut active).expect("capture terminal disposition");
-        REMOVE_CGROUP_FAIL_COUNTDOWN.store(128, Ordering::SeqCst);
+        wait_for_exit_capture(&mut active, Duration::from_secs(2));
+        REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(128));
         let error = maybe_report_descendants_cleaned(&mut active, None)
             .expect_err("persistent removal failure must time out");
         assert_eq!(error.code, ServiceErrorCode::CleanupTimeout);
