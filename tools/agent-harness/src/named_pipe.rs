@@ -1,5 +1,9 @@
+use std::time::Duration;
+
+#[cfg(windows)]
 use std::io::{Read, Write};
-use std::time::{Duration, Instant};
+#[cfg(windows)]
+use std::time::Instant;
 
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -9,10 +13,12 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_MODE,
-    OPEN_EXISTING,
+    OPEN_EXISTING, ReadFile, WriteFile,
 };
 #[cfg(windows)]
-use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
+use windows::Win32::System::Pipes::{
+    GetNamedPipeServerProcessId, PIPE_NOWAIT, SetNamedPipeHandleState, WaitNamedPipeW,
+};
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -50,6 +56,8 @@ pub fn validate_local_pipe_path(path: &str) -> Result<(), NamedPipeError> {
 #[cfg(windows)]
 pub struct NamedPipeClient {
     handle: OwnedHandle,
+    server_pid: u32,
+    server_image_path: String,
 }
 
 #[cfg(windows)]
@@ -57,6 +65,7 @@ impl NamedPipeClient {
     pub fn connect(
         path: &str,
         deadline: Duration,
+        expected_server_pid: Option<u32>,
         expected_server_image: Option<&str>,
     ) -> Result<Self, NamedPipeError> {
         validate_local_pipe_path(path)?;
@@ -77,12 +86,16 @@ impl NamedPipeClient {
             };
             if let Ok(handle) = handle {
                 // SAFETY: handle is owned because CreateFileW succeeded.
-                let client = Self {
+                let mut client = Self {
                     handle: unsafe { OwnedHandle::from_raw_handle(handle.0 as *mut _) },
+                    server_pid: 0,
+                    server_image_path: String::new(),
                 };
-                if let Some(expected) = expected_server_image {
-                    client.verify_server_image_path(expected)?;
-                }
+                client.configure_nonblocking_mode()?;
+                let (pid, image) = client.query_server_identity()?;
+                client.server_pid = pid;
+                client.server_image_path = image;
+                client.verify_expected_server(expected_server_pid, expected_server_image)?;
                 return Ok(client);
             }
             let remaining = deadline_at.saturating_duration_since(Instant::now());
@@ -102,7 +115,21 @@ impl NamedPipeClient {
         }
     }
 
-    pub fn verify_server_image_path(&self, expected_path: &str) -> Result<(), NamedPipeError> {
+    fn configure_nonblocking_mode(&self) -> Result<(), NamedPipeError> {
+        let mode = PIPE_NOWAIT;
+        // SAFETY: valid named-pipe handle and mode pointer.
+        let ok = unsafe {
+            SetNamedPipeHandleState(HANDLE(self.handle.as_raw_handle()), Some(&mode), None, None)
+        };
+        if ok.is_err() {
+            return Err(NamedPipeError {
+                message: "failed to set nonblocking named-pipe mode".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn query_server_identity(&self) -> Result<(u32, String), NamedPipeError> {
         let mut pid = 0_u32;
         // SAFETY: valid pipe handle and out pointer.
         let ok =
@@ -138,10 +165,31 @@ impl NamedPipeClient {
             });
         }
         let actual = String::from_utf16_lossy(&buffer[..len as usize]);
-        if !actual.eq_ignore_ascii_case(expected_path) {
+        Ok((pid, actual))
+    }
+
+    fn verify_expected_server(
+        &self,
+        expected_server_pid: Option<u32>,
+        expected_server_image: Option<&str>,
+    ) -> Result<(), NamedPipeError> {
+        if let Some(expected_pid) = expected_server_pid
+            && self.server_pid != expected_pid
+        {
             return Err(NamedPipeError {
                 message: format!(
-                    "named-pipe server image mismatch: actual={actual:?} expected={expected_path:?}"
+                    "named-pipe server pid mismatch: actual={} expected={expected_pid}",
+                    self.server_pid
+                ),
+            });
+        }
+        if let Some(expected_path) = expected_server_image
+            && !self.server_image_path.eq_ignore_ascii_case(expected_path)
+        {
+            return Err(NamedPipeError {
+                message: format!(
+                    "named-pipe server image mismatch: actual={:?} expected={expected_path:?}",
+                    self.server_image_path
                 ),
             });
         }
@@ -152,14 +200,52 @@ impl NamedPipeClient {
 #[cfg(windows)]
 impl Read for NamedPipeClient {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        std::fs::File::from(self.handle.try_clone()?).read(buf)
+        let mut bytes_read = 0_u32;
+        // SAFETY: valid buffer and named-pipe handle.
+        let result = unsafe {
+            ReadFile(
+                HANDLE(self.handle.as_raw_handle()),
+                Some(buf),
+                Some(&mut bytes_read),
+                None,
+            )
+        };
+        match result {
+            Ok(()) => Ok(bytes_read as usize),
+            Err(error) if error.code().0 as u32 == windows::Win32::Foundation::ERROR_NO_DATA.0 => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "named pipe has no available bytes",
+                ))
+            }
+            Err(error) => Err(std::io::Error::other(error.to_string())),
+        }
     }
 }
 
 #[cfg(windows)]
 impl Write for NamedPipeClient {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        std::fs::File::from(self.handle.try_clone()?).write(buf)
+        let mut bytes_written = 0_u32;
+        // SAFETY: valid buffer and named-pipe handle.
+        let result = unsafe {
+            WriteFile(
+                HANDLE(self.handle.as_raw_handle()),
+                Some(buf),
+                Some(&mut bytes_written),
+                None,
+            )
+        };
+        match result {
+            Ok(()) => Ok(bytes_written as usize),
+            Err(error) if error.code().0 as u32 == windows::Win32::Foundation::ERROR_NO_DATA.0 => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "named pipe cannot accept writes yet",
+                ))
+            }
+            Err(error) => Err(std::io::Error::other(error.to_string())),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -168,6 +254,7 @@ impl Write for NamedPipeClient {
 }
 
 #[cfg(not(windows))]
+#[derive(Debug)]
 pub struct NamedPipeClient;
 
 #[cfg(not(windows))]
@@ -175,6 +262,7 @@ impl NamedPipeClient {
     pub fn connect(
         path: &str,
         _deadline: Duration,
+        _expected_server_pid: Option<u32>,
         _expected_server_image: Option<&str>,
     ) -> Result<Self, NamedPipeError> {
         validate_local_pipe_path(path)?;
@@ -207,8 +295,12 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn non_windows_connect_reports_platform_requirement() {
-        let result =
-            NamedPipeClient::connect(r"\\.\pipe\nvx-control-test", Duration::from_millis(5), None);
+        let result = NamedPipeClient::connect(
+            r"\\.\pipe\nvx-control-test",
+            Duration::from_millis(5),
+            None,
+            None,
+        );
         assert!(result.is_err());
         let message = result.expect_err("expected error").to_string();
         assert!(message.contains("Windows"));

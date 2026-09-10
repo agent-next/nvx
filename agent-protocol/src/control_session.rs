@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 use std::io::{self, Read, Write};
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const CONTROL_HEADER_BYTES: usize = 44;
 pub const CONTROL_MAX_DATA_BYTES: usize = 65_536;
@@ -379,6 +381,7 @@ impl From<ProtocolError> for SessionError {
 pub enum HostAttachStatus {
     Wait,
     Ready,
+    Error(u32),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -393,6 +396,7 @@ pub enum HostEvent {
 pub struct HostControlSession<T: Read + Write> {
     io: T,
     parser: Parser,
+    pending_read_bytes: Vec<u8>,
     instance_id: Option<[u8; 16]>,
     epoch: Option<u64>,
     send_sequence: u64,
@@ -404,6 +408,7 @@ impl<T: Read + Write> HostControlSession<T> {
         Self {
             io,
             parser: Parser::new(),
+            pending_read_bytes: Vec::new(),
             instance_id: None,
             epoch: None,
             send_sequence: 0,
@@ -427,9 +432,22 @@ impl<T: Read + Write> HostControlSession<T> {
                 self.track_remote_record(&record)?;
                 Ok(HostAttachStatus::Ready)
             }
-            RecordType::Error => Ok(HostAttachStatus::Ready),
+            RecordType::Error => {
+                self.track_remote_record(&record)?;
+                let code = decode_error_code(&record.payload)?;
+                Ok(HostAttachStatus::Error(code))
+            }
             other => Err(SessionError::UnexpectedRecordType(other)),
         }
+    }
+
+    pub fn reset_for_reconnect(&mut self) {
+        self.parser = Parser::new();
+        self.pending_read_bytes.clear();
+        self.instance_id = None;
+        self.epoch = None;
+        self.send_sequence = 0;
+        self.recv_sequence = 0;
     }
 
     pub fn send_data(&mut self, payload: Vec<u8>) -> Result<u64, SessionError> {
@@ -473,7 +491,7 @@ impl<T: Read + Write> HostControlSession<T> {
                 Ok(HostEvent::Ready)
             }
             RecordType::Reset => {
-                self.track_remote_record(&record)?;
+                self.track_reset_record(&record)?;
                 self.send_sequence = 0;
                 Ok(HostEvent::Reset {
                     instance_id: record.instance_id,
@@ -486,15 +504,28 @@ impl<T: Read + Write> HostControlSession<T> {
             }
             RecordType::Error => {
                 self.track_remote_record(&record)?;
-                let code: [u8; 4] = record
-                    .payload
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| SessionError::UnexpectedRecordType(RecordType::Error))?;
-                Ok(HostEvent::Error(u32::from_le_bytes(code)))
+                Ok(HostEvent::Error(decode_error_code(&record.payload)?))
             }
             other => Err(SessionError::UnexpectedRecordType(other)),
         }
+    }
+
+    fn track_reset_record(&mut self, record: &Record) -> Result<(), SessionError> {
+        let identity_changed =
+            self.instance_id != Some(record.instance_id) || self.epoch != Some(record.epoch);
+        if identity_changed {
+            if record.sequence != 0 {
+                return Err(SessionError::SequenceMismatch {
+                    expected: 0,
+                    actual: record.sequence,
+                });
+            }
+            self.instance_id = Some(record.instance_id);
+            self.epoch = Some(record.epoch);
+            self.recv_sequence = 1;
+            return Ok(());
+        }
+        self.track_remote_record(record)
     }
 
     fn track_remote_record(&mut self, record: &Record) -> Result<(), SessionError> {
@@ -536,6 +567,12 @@ impl<T: Read + Write> HostControlSession<T> {
     }
 
     fn try_read_record(&mut self) -> Result<Option<Record>, SessionError> {
+        if !self.pending_read_bytes.is_empty() {
+            let pending = core::mem::take(&mut self.pending_read_bytes);
+            if let Some(record) = self.consume_from_bytes(&pending)? {
+                return Ok(Some(record));
+            }
+        }
         let mut scratch = [0_u8; 4096];
         loop {
             let read = match self.io.read(&mut scratch) {
@@ -546,15 +583,26 @@ impl<T: Read + Write> HostControlSession<T> {
             if read == 0 {
                 return Err(SessionError::Closed);
             }
-            let mut consumed = 0;
-            while consumed < read {
-                let progress = self.parser.accept(&scratch[consumed..read])?;
-                consumed += progress.consumed;
-                if let Some(record) = progress.record {
-                    return Ok(Some(record));
-                }
+            if let Some(record) = self.consume_from_bytes(&scratch[..read])? {
+                return Ok(Some(record));
             }
         }
+    }
+
+    fn consume_from_bytes(&mut self, bytes: &[u8]) -> Result<Option<Record>, SessionError> {
+        let mut consumed = 0;
+        while consumed < bytes.len() {
+            let progress = self.parser.accept(&bytes[consumed..])?;
+            consumed += progress.consumed;
+            if let Some(record) = progress.record {
+                if consumed < bytes.len() {
+                    self.pending_read_bytes
+                        .extend_from_slice(&bytes[consumed..]);
+                }
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -567,6 +615,7 @@ pub enum GuestEvent {
 pub struct GuestControlSession<T: Read + Write> {
     io: T,
     parser: Parser,
+    pending_read_bytes: Vec<u8>,
     attached: bool,
     instance_id: [u8; 16],
     epoch: u64,
@@ -579,6 +628,7 @@ impl<T: Read + Write> GuestControlSession<T> {
         Self {
             io,
             parser: Parser::new(),
+            pending_read_bytes: Vec::new(),
             attached: false,
             instance_id: [0; 16],
             epoch: 0,
@@ -588,18 +638,39 @@ impl<T: Read + Write> GuestControlSession<T> {
     }
 
     pub fn attach(&mut self) -> Result<(), SessionError> {
+        self.attach_with_deadline(Instant::now() + Duration::from_secs(30))
+    }
+
+    pub fn attach_with_deadline(&mut self, deadline: Instant) -> Result<(), SessionError> {
+        self.reset_for_reconnect();
+        self.write_record(&Record::bootstrap(RecordType::GuestAttach, Vec::new()))?;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(SessionError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for control-session reset after GuestAttach",
+                )));
+            }
+            let Some(record) = self.try_read_record()? else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            if record.record_type != RecordType::Reset {
+                return Err(SessionError::UnexpectedRecordType(record.record_type));
+            }
+            self.handle_reset(record)?;
+            return Ok(());
+        }
+    }
+
+    pub fn reset_for_reconnect(&mut self) {
+        self.parser = Parser::new();
+        self.pending_read_bytes.clear();
         self.attached = false;
-        self.send_sequence = 0;
-        self.recv_sequence = 0;
         self.instance_id = [0; 16];
         self.epoch = 0;
-        self.write_record(&Record::bootstrap(RecordType::GuestAttach, Vec::new()))?;
-        let record = self.read_record_blocking()?;
-        if record.record_type != RecordType::Reset {
-            return Err(SessionError::UnexpectedRecordType(record.record_type));
-        }
-        self.handle_reset(record)?;
-        Ok(())
+        self.send_sequence = 0;
+        self.recv_sequence = 0;
     }
 
     pub fn send_data(&mut self, payload: Vec<u8>) -> Result<u64, SessionError> {
@@ -694,6 +765,12 @@ impl<T: Read + Write> GuestControlSession<T> {
     }
 
     fn try_read_record(&mut self) -> Result<Option<Record>, SessionError> {
+        if !self.pending_read_bytes.is_empty() {
+            let pending = core::mem::take(&mut self.pending_read_bytes);
+            if let Some(record) = self.consume_from_bytes(&pending)? {
+                return Ok(Some(record));
+            }
+        }
         let mut scratch = [0_u8; 4096];
         loop {
             let read = match self.io.read(&mut scratch) {
@@ -704,16 +781,34 @@ impl<T: Read + Write> GuestControlSession<T> {
             if read == 0 {
                 return Err(SessionError::Closed);
             }
-            let mut consumed = 0;
-            while consumed < read {
-                let progress = self.parser.accept(&scratch[consumed..read])?;
-                consumed += progress.consumed;
-                if let Some(record) = progress.record {
-                    return Ok(Some(record));
-                }
+            if let Some(record) = self.consume_from_bytes(&scratch[..read])? {
+                return Ok(Some(record));
             }
         }
     }
+
+    fn consume_from_bytes(&mut self, bytes: &[u8]) -> Result<Option<Record>, SessionError> {
+        let mut consumed = 0;
+        while consumed < bytes.len() {
+            let progress = self.parser.accept(&bytes[consumed..])?;
+            consumed += progress.consumed;
+            if let Some(record) = progress.record {
+                if consumed < bytes.len() {
+                    self.pending_read_bytes
+                        .extend_from_slice(&bytes[consumed..]);
+                }
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn decode_error_code(payload: &[u8]) -> Result<u32, SessionError> {
+    let code: [u8; 4] = payload
+        .try_into()
+        .map_err(|_| SessionError::UnexpectedRecordType(RecordType::Error))?;
+    Ok(u32::from_le_bytes(code))
 }
 
 fn parse_header(bytes: &[u8; CONTROL_HEADER_BYTES]) -> Result<ParsedHeader, ProtocolError> {
@@ -908,7 +1003,7 @@ mod tests {
             guest.recv_event_blocking()?,
             GuestEvent::Data(b"first".to_vec())
         );
-        fixture.lock().expect("fixture").inject_host_stale_data()?;
+        fixture.lock().expect("fixture").inject_guest_stale_data()?;
         let stale = guest.recv_event_blocking();
         assert!(matches!(stale, Err(SessionError::SequenceMismatch { .. })));
         Ok(())
@@ -920,7 +1015,66 @@ mod tests {
         let fixture = Arc::new(Mutex::new(FixtureBroker::new([0x11; 32])));
         let mut host = HostControlSession::new(FixtureEndpoint::host(fixture));
         host.send_host_attach([0x44; 32])?;
-        assert_eq!(host.recv_event_blocking()?, HostEvent::Error(1));
+        assert_eq!(host.recv_attach_status()?, HostAttachStatus::Error(1));
+        Ok(())
+    }
+
+    #[test]
+    fn in_memory_fixture_full_handshake_bidirectional_reset_and_stale_rejection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let capability = [0x33; 32];
+        let fixture = Arc::new(Mutex::new(FixtureBroker::new(capability)));
+        let mut host = HostControlSession::new(FixtureEndpoint::host(fixture.clone()));
+        let mut guest = GuestControlSession::new(FixtureEndpoint::guest(fixture.clone()));
+
+        host.send_host_attach(capability)?;
+        assert_eq!(host.recv_attach_status()?, HostAttachStatus::Wait);
+        guest.attach()?;
+        assert_eq!(host.recv_event_blocking()?, HostEvent::Ready);
+
+        host.send_data(b"host-initial".to_vec())?;
+        assert_eq!(
+            guest.recv_event_blocking()?,
+            GuestEvent::Data(b"host-initial".to_vec())
+        );
+        guest.send_data(b"guest-initial".to_vec())?;
+        assert_eq!(
+            host.recv_event_blocking()?,
+            HostEvent::Data(b"guest-initial".to_vec())
+        );
+
+        fixture.lock().expect("fixture").inject_generation_reset()?;
+        let host_reset = host.recv_event_blocking()?;
+        let guest_reset = guest.recv_event_blocking()?;
+        assert!(matches!(host_reset, HostEvent::Reset { .. }));
+        assert!(matches!(guest_reset, GuestEvent::Reset { .. }));
+
+        host.send_data(b"host-after-reset".to_vec())?;
+        assert_eq!(
+            guest.recv_event_blocking()?,
+            GuestEvent::Data(b"host-after-reset".to_vec())
+        );
+        guest.send_data(b"guest-after-reset".to_vec())?;
+        let first_host_event = host.recv_event_blocking()?;
+        let data_event = if first_host_event == HostEvent::Ready {
+            host.recv_event_blocking()?
+        } else {
+            first_host_event
+        };
+        assert_eq!(data_event, HostEvent::Data(b"guest-after-reset".to_vec()));
+
+        fixture.lock().expect("fixture").inject_guest_stale_data()?;
+        let stale_guest = guest.recv_event_blocking();
+        assert!(matches!(
+            stale_guest,
+            Err(SessionError::SequenceMismatch { .. })
+        ));
+        fixture.lock().expect("fixture").inject_host_stale_data()?;
+        let stale_host = host.recv_event_blocking();
+        assert!(matches!(
+            stale_host,
+            Err(SessionError::SequenceMismatch { .. })
+        ));
         Ok(())
     }
 
@@ -1079,12 +1233,46 @@ mod tests {
         }
 
         fn inject_host_stale_data(&mut self) -> io::Result<()> {
+            self.push_host(Record::session(
+                RecordType::Data,
+                self.instance_id,
+                self.epoch,
+                self.host_recv_sequence.saturating_add(5),
+                b"stale-host".to_vec(),
+            ))
+        }
+
+        fn inject_guest_stale_data(&mut self) -> io::Result<()> {
             self.push_guest(Record::session(
                 RecordType::Data,
                 self.instance_id,
                 self.epoch,
                 self.guest_recv_sequence.saturating_add(5),
-                b"stale".to_vec(),
+                b"stale-guest".to_vec(),
+            ))
+        }
+
+        fn inject_generation_reset(&mut self) -> io::Result<()> {
+            self.epoch = self.epoch.saturating_add(1);
+            self.instance_id = [self.instance_id[0].saturating_add(1); 16];
+            self.guest_acked = false;
+            self.host_recv_sequence = 0;
+            self.guest_recv_sequence = 0;
+            self.host_send_sequence = 1;
+            self.guest_send_sequence = 1;
+            self.push_host(Record::session(
+                RecordType::Reset,
+                self.instance_id,
+                self.epoch,
+                0,
+                Vec::new(),
+            ))?;
+            self.push_guest(Record::session(
+                RecordType::Reset,
+                self.instance_id,
+                self.epoch,
+                0,
+                Vec::new(),
             ))
         }
     }

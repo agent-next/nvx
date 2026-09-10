@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::time::Duration;
+use std::time::Instant;
 
 use agent_protocol::codec::{InnerRecord, InnerRecordKind};
 use agent_protocol::control_session::{
@@ -9,6 +10,7 @@ use agent_protocol::messages::{AgentControlMessage, HostControlMessage};
 use agent_protocol::service::{ServiceError, ServiceErrorCode};
 
 const DEFAULT_MAX_INBOUND_QUEUE: usize = 256;
+const DEFAULT_POLL_SLEEP: Duration = Duration::from_millis(5);
 
 pub struct MxcAgentClient<T: std::io::Read + std::io::Write> {
     control: HostControlSession<T>,
@@ -53,6 +55,11 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
                 }
             },
             HostAttachStatus::Ready => {}
+            HostAttachStatus::Error(code) => {
+                return Err(format!(
+                    "control-session broker rejected host attach with error code {code}"
+                ));
+            }
         }
         self.send_host_control(hello)?;
         let response = self.recv_agent_control(timeout)?;
@@ -74,40 +81,203 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
     }
 
     pub fn recv_agent_control(&mut self, timeout: Duration) -> Result<AgentControlMessage, String> {
-        let _ = timeout;
         if let Some(message) = self.inbound.pop_front() {
             return Ok(message);
         }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "control receive deadline overflowed".to_string())?;
         loop {
-            match self.control.recv_event_blocking().map_err(control_error)? {
-                HostEvent::Data(payload) => {
-                    let record = InnerRecord::decode(&payload).map_err(|error| {
-                        format!("failed to decode inner record from control payload: {error:?}")
-                    })?;
-                    if record.kind != InnerRecordKind::Control {
-                        return Err(format!(
-                            "expected control inner record from agent, got {:?}",
-                            record.kind
-                        ));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if let Some(message) = self.poll_agent_control(remaining.min(DEFAULT_POLL_SLEEP))? {
+                return Ok(message);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for control response after {timeout:?}"
+                ));
+            }
+        }
+    }
+
+    pub fn poll_agent_control(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<AgentControlMessage>, String> {
+        if let Some(message) = self.inbound.pop_front() {
+            return Ok(Some(message));
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "control poll deadline overflowed".to_string())?;
+        loop {
+            match self.control.try_recv_event().map_err(control_error)? {
+                Some(event) => {
+                    self.handle_host_event(event)?;
+                    if let Some(message) = self.inbound.pop_front() {
+                        return Ok(Some(message));
                     }
-                    let message: AgentControlMessage = serde_json::from_slice(&record.payload)
-                        .map_err(|error| {
-                            format!("failed to decode agent control message: {error}")
-                        })?;
+                }
+                None => {
+                    if let Some(message) = self.inbound.pop_front() {
+                        return Ok(Some(message));
+                    }
+                    if Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(DEFAULT_POLL_SLEEP);
+                }
+            }
+        }
+    }
+
+    pub fn send_host_hello(&mut self, message: HostControlMessage) -> Result<u64, String> {
+        self.send_host_control(message)
+    }
+
+    pub fn send_configure(&mut self, message: HostControlMessage) -> Result<u64, String> {
+        self.send_host_control(message)
+    }
+
+    pub fn send_create_process(&mut self, message: HostControlMessage) -> Result<u64, String> {
+        self.send_host_control(message)
+    }
+
+    pub fn send_cancel_execution(&mut self, exec_id: u32) -> Result<u64, String> {
+        self.send_host_control(HostControlMessage::CancelExecution { exec_id })
+    }
+
+    pub fn send_flow_credits(
+        &mut self,
+        request: agent_protocol::messages::FlowCreditRequest,
+    ) -> Result<u64, String> {
+        self.send_host_control(HostControlMessage::FlowCredits(request))
+    }
+
+    pub fn send_stdin_chunk(
+        &mut self,
+        record: agent_protocol::messages::StdinChunkRecord,
+    ) -> Result<u64, String> {
+        self.send_host_control(HostControlMessage::StdinChunk(record))
+    }
+
+    pub fn send_stdin_eof(
+        &mut self,
+        record: agent_protocol::messages::StdinEofRecord,
+    ) -> Result<u64, String> {
+        self.send_host_control(HostControlMessage::StdinEof(record))
+    }
+
+    pub fn request_health(&mut self, timeout: Duration) -> Result<AgentControlMessage, String> {
+        self.send_host_control(HostControlMessage::Health)?;
+        loop {
+            let message = self.recv_agent_control(timeout)?;
+            if matches!(message, AgentControlMessage::Health(_)) {
+                return Ok(message);
+            }
+        }
+    }
+
+    pub fn request_quiesce(&mut self, timeout: Duration) -> Result<AgentControlMessage, String> {
+        self.send_host_control(HostControlMessage::Quiesce)?;
+        loop {
+            let message = self.recv_agent_control(timeout)?;
+            if matches!(
+                message,
+                AgentControlMessage::Quiesced | AgentControlMessage::Error(_)
+            ) {
+                return Ok(message);
+            }
+        }
+    }
+
+    pub fn request_resume(&mut self, timeout: Duration) -> Result<AgentControlMessage, String> {
+        self.send_host_control(HostControlMessage::Resume)?;
+        loop {
+            let message = self.recv_agent_control(timeout)?;
+            if matches!(
+                message,
+                AgentControlMessage::Resumed | AgentControlMessage::Error(_)
+            ) {
+                return Ok(message);
+            }
+        }
+    }
+
+    pub fn request_shutdown(
+        &mut self,
+        grace_timeout_ms: u64,
+        timeout: Duration,
+    ) -> Result<AgentControlMessage, String> {
+        self.send_host_control(HostControlMessage::Shutdown { grace_timeout_ms })?;
+        loop {
+            let message = self.recv_agent_control(timeout)?;
+            if matches!(
+                message,
+                AgentControlMessage::ShuttingDown | AgentControlMessage::Error(_)
+            ) {
+                return Ok(message);
+            }
+        }
+    }
+
+    pub fn wait_ready(&mut self, timeout: Duration) -> Result<AgentControlMessage, String> {
+        loop {
+            let message = self.recv_agent_control(timeout)?;
+            if matches!(
+                message,
+                AgentControlMessage::Ready { .. } | AgentControlMessage::Error(_)
+            ) {
+                return Ok(message);
+            }
+        }
+    }
+
+    pub fn wait_exec_terminal(
+        &mut self,
+        exec_id: u32,
+        timeout: Duration,
+    ) -> Result<AgentControlMessage, String> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "exec wait deadline overflowed".to_string())?;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = self.recv_agent_control(remaining)?;
+            match message {
+                AgentControlMessage::ExecTerminal {
+                    exec_id: terminal_exec_id,
+                    ..
+                } if terminal_exec_id == exec_id => {
                     return Ok(message);
                 }
-                HostEvent::Error(code) => {
-                    return Err(format!(
-                        "control-session broker sent Error with code {code}"
-                    ));
+                AgentControlMessage::StdoutChunk(agent_protocol::messages::StdoutChunkRecord {
+                    exec_id: chunk_exec_id,
+                    ..
+                }) if chunk_exec_id == exec_id => {
+                    self.send_flow_credits(agent_protocol::messages::FlowCreditRequest {
+                        exec_id,
+                        stream: agent_protocol::messages::StreamName::Stdout,
+                        credits: 1,
+                    })?;
                 }
-                HostEvent::Reset { .. } => {
-                    return Err(
-                        "control-session reset observed while waiting for agent control message"
-                            .to_string(),
-                    );
+                AgentControlMessage::StderrChunk(agent_protocol::messages::StderrChunkRecord {
+                    exec_id: chunk_exec_id,
+                    ..
+                }) if chunk_exec_id == exec_id => {
+                    self.send_flow_credits(agent_protocol::messages::FlowCreditRequest {
+                        exec_id,
+                        stream: agent_protocol::messages::StreamName::Stderr,
+                        credits: 1,
+                    })?;
                 }
-                HostEvent::Wait | HostEvent::Ready => {}
+                AgentControlMessage::Error(_) => return Ok(message),
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for exec terminal message for exec_id={exec_id}"
+                ));
             }
         }
     }
@@ -122,6 +292,27 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         self.inbound.push_back(message);
         Ok(())
     }
+
+    fn handle_host_event(&mut self, event: HostEvent) -> Result<(), String> {
+        match event {
+            HostEvent::Data(payload) => {
+                let message = decode_control_message(&payload)?;
+                if self.inbound.len() == self.max_inbound_queue {
+                    return Err("inbound agent queue reached configured bound".to_string());
+                }
+                self.inbound.push_back(message);
+                Ok(())
+            }
+            HostEvent::Error(code) => Err(format!(
+                "control-session broker sent Error with code {code}"
+            )),
+            HostEvent::Reset { .. } => Err(
+                "control-session reset observed while waiting for agent control message"
+                    .to_string(),
+            ),
+            HostEvent::Wait | HostEvent::Ready => Ok(()),
+        }
+    }
 }
 
 pub fn missing_ready_error() -> ServiceError {
@@ -135,12 +326,32 @@ fn control_error(error: SessionError) -> String {
     format!("control-session transport error: {error}")
 }
 
+fn decode_control_message(payload: &[u8]) -> Result<AgentControlMessage, String> {
+    let record = InnerRecord::decode(payload).map_err(|error| {
+        format!("failed to decode inner record from control payload: {error:?}")
+    })?;
+    if record.kind != InnerRecordKind::Control {
+        return Err(format!(
+            "expected control inner record from agent, got {:?}",
+            record.kind
+        ));
+    }
+    serde_json::from_slice::<AgentControlMessage>(&record.payload)
+        .map_err(|error| format!("failed to decode agent control message: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control_session::{HostControlSession, Record, RecordType, encode};
+    use agent_protocol::mapping::{
+        CanonicalHostMappingRoot, MappingContainmentPolicy, SymlinkContainmentPolicy,
+    };
+    use agent_protocol::messages::{CapabilityProofMaterial, NetworkMode, NetworkSetupState};
     use agent_protocol::messages::{LaunchIdentity, ReadyStatus, SERVICE_IDENTITY};
+    use std::collections::VecDeque;
     use std::io::{Cursor, Read, Write};
+    use std::sync::{Arc, Mutex};
 
     struct MockDuplex {
         read: Cursor<Vec<u8>>,
@@ -240,5 +451,299 @@ mod tests {
             .recv_agent_control(Duration::from_secs(1))
             .expect("decoded message");
         assert!(matches!(decoded, AgentControlMessage::Ready { .. }));
+    }
+
+    #[test]
+    fn fixture_broker_round_trips_auth_configure_and_health_over_outer_data() {
+        let capability = [0x9A; 32];
+        let fixture = Arc::new(Mutex::new(ClientFixtureBroker::new(capability)));
+        let session = HostControlSession::new(ClientFixtureEndpoint::new(fixture.clone()));
+        let mut client = MxcAgentClient::new(session);
+        let launch = LaunchIdentity {
+            generation: 22,
+            nonce: [0xAB; 16],
+        };
+
+        client
+            .authenticate_launch(
+                capability,
+                HostControlMessage::HostHello {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: 1,
+                    launch,
+                    capability_proof: CapabilityProofMaterial::try_from(capability.to_vec())
+                        .expect("capability proof"),
+                },
+                Duration::from_secs(1),
+            )
+            .expect("authenticated");
+
+        let root = CanonicalHostMappingRoot::parse("/sandbox-root".to_string()).expect("root");
+        client
+            .send_configure(HostControlMessage::Configure {
+                launch,
+                root,
+                mappings: vec![],
+                containment: MappingContainmentPolicy {
+                    symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                    reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                },
+            })
+            .expect("configure request");
+        let ready = client.wait_ready(Duration::from_secs(1)).expect("ready");
+        assert!(matches!(ready, AgentControlMessage::Ready { .. }));
+
+        let health = client
+            .request_health(Duration::from_secs(1))
+            .expect("health");
+        assert!(matches!(
+            health,
+            AgentControlMessage::Health(agent_protocol::messages::HealthStatus {
+                quiesced: false,
+                ..
+            })
+        ));
+    }
+
+    #[derive(Clone)]
+    struct ClientFixtureBroker {
+        capability: [u8; 32],
+        instance_id: [u8; 16],
+        epoch: u64,
+        host_sequence: u64,
+        server_sequence: u64,
+        inbound: VecDeque<u8>,
+    }
+
+    impl ClientFixtureBroker {
+        fn new(capability: [u8; 32]) -> Self {
+            Self {
+                capability,
+                instance_id: [0x5A; 16],
+                epoch: 3,
+                host_sequence: 0,
+                server_sequence: 0,
+                inbound: VecDeque::new(),
+            }
+        }
+
+        fn handle_write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            let record = agent_protocol::control_session::decode_exact(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            match record.record_type {
+                RecordType::HostAttach => {
+                    if record.payload != self.capability {
+                        self.push_record(Record::session(
+                            RecordType::Error,
+                            self.instance_id,
+                            self.epoch,
+                            self.server_sequence,
+                            1_u32.to_le_bytes().to_vec(),
+                        ))?;
+                        self.server_sequence += 1;
+                        return Ok(());
+                    }
+                    self.push_record(Record::session(
+                        RecordType::Wait,
+                        self.instance_id,
+                        self.epoch,
+                        self.server_sequence,
+                        vec![],
+                    ))?;
+                    self.server_sequence += 1;
+                    self.push_record(Record::session(
+                        RecordType::Ready,
+                        self.instance_id,
+                        self.epoch,
+                        self.server_sequence,
+                        vec![],
+                    ))?;
+                    self.server_sequence += 1;
+                }
+                RecordType::Data => {
+                    if record.sequence != self.host_sequence {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "host data sequence mismatch",
+                        ));
+                    }
+                    self.host_sequence += 1;
+                    let inner = InnerRecord::decode(&record.payload).map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("inner decode failed: {error:?}"),
+                        )
+                    })?;
+                    let host_message: HostControlMessage = serde_json::from_slice(&inner.payload)
+                        .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("host message decode failed: {error}"),
+                        )
+                    })?;
+                    self.respond_to_host_message(host_message)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn respond_to_host_message(&mut self, message: HostControlMessage) -> std::io::Result<()> {
+            let response = match message {
+                HostControlMessage::HostHello { launch, .. } => AgentControlMessage::Ready {
+                    launch,
+                    status: ReadyStatus {
+                        service: SERVICE_IDENTITY.to_string(),
+                        protocol_version: 1,
+                        build: agent_protocol::messages::BuildStatus {
+                            agent_version: "test".to_string(),
+                            kernel_release: "test".to_string(),
+                            profile: "mxc-prototype".to_string(),
+                        },
+                        network: agent_protocol::messages::NetworkStatus {
+                            mode: NetworkMode::NoNic,
+                            setup_state: NetworkSetupState::Ready,
+                            interface: None,
+                            default_gateway: None,
+                            dns: agent_protocol::messages::DnsStatus {
+                                ready: true,
+                                servers: vec![],
+                            },
+                            failure: None,
+                        },
+                        isolation: agent_protocol::messages::IsolationStatus {
+                            pid_namespace: true,
+                            mount_namespace: true,
+                            uts_namespace: true,
+                            ipc_namespace: true,
+                            private_proc: true,
+                            private_dev: true,
+                            private_devpts: true,
+                            private_shm: true,
+                            read_only_sys: true,
+                            capabilities_dropped: true,
+                            no_new_privs: true,
+                            cgroup_separation: true,
+                            orphan_reaping: true,
+                        },
+                        workload_identity:
+                            agent_protocol::messages::WorkloadIdentityStatus::mxc_fixed(),
+                    },
+                },
+                HostControlMessage::Configure { launch, .. } => AgentControlMessage::Ready {
+                    launch,
+                    status: ReadyStatus {
+                        service: SERVICE_IDENTITY.to_string(),
+                        protocol_version: 1,
+                        build: agent_protocol::messages::BuildStatus {
+                            agent_version: "test".to_string(),
+                            kernel_release: "test".to_string(),
+                            profile: "mxc-prototype".to_string(),
+                        },
+                        network: agent_protocol::messages::NetworkStatus {
+                            mode: NetworkMode::NoNic,
+                            setup_state: NetworkSetupState::Ready,
+                            interface: None,
+                            default_gateway: None,
+                            dns: agent_protocol::messages::DnsStatus {
+                                ready: true,
+                                servers: vec![],
+                            },
+                            failure: None,
+                        },
+                        isolation: agent_protocol::messages::IsolationStatus {
+                            pid_namespace: true,
+                            mount_namespace: true,
+                            uts_namespace: true,
+                            ipc_namespace: true,
+                            private_proc: true,
+                            private_dev: true,
+                            private_devpts: true,
+                            private_shm: true,
+                            read_only_sys: true,
+                            capabilities_dropped: true,
+                            no_new_privs: true,
+                            cgroup_separation: true,
+                            orphan_reaping: true,
+                        },
+                        workload_identity:
+                            agent_protocol::messages::WorkloadIdentityStatus::mxc_fixed(),
+                    },
+                },
+                HostControlMessage::Health => {
+                    AgentControlMessage::Health(agent_protocol::messages::HealthStatus {
+                        agent_state: agent_protocol::messages::AgentSessionState::Active,
+                        quiesced: false,
+                        launch_admitted: true,
+                        shutting_down: false,
+                        channel_generation: 1,
+                        active_exec_id: None,
+                        filesystem: None,
+                        network: None,
+                        last_failure: None,
+                    })
+                }
+                _ => return Ok(()),
+            };
+            let inner = InnerRecord::control(&response)
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?
+                .encode()
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            self.push_record(Record::session(
+                RecordType::Data,
+                self.instance_id,
+                self.epoch,
+                self.server_sequence,
+                inner,
+            ))?;
+            self.server_sequence += 1;
+            Ok(())
+        }
+
+        fn push_record(&mut self, record: Record) -> std::io::Result<()> {
+            let encoded = encode(&record)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            self.inbound.extend(encoded);
+            Ok(())
+        }
+    }
+
+    struct ClientFixtureEndpoint {
+        fixture: Arc<Mutex<ClientFixtureBroker>>,
+    }
+
+    impl ClientFixtureEndpoint {
+        fn new(fixture: Arc<Mutex<ClientFixtureBroker>>) -> Self {
+            Self { fixture }
+        }
+    }
+
+    impl Read for ClientFixtureEndpoint {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut broker = self.fixture.lock().expect("fixture");
+            let mut read = 0usize;
+            while read < buf.len() {
+                let Some(byte) = broker.inbound.pop_front() else {
+                    break;
+                };
+                buf[read] = byte;
+                read += 1;
+            }
+            if read == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "idle"));
+            }
+            Ok(read)
+        }
+    }
+
+    impl Write for ClientFixtureEndpoint {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.fixture.lock().expect("fixture").handle_write(buf)?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

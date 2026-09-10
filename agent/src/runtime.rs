@@ -20,13 +20,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use agent_protocol::{
     AccessMode, AgentControlMessage, AuthenticateChannelRequest, BuildStatus, CancelReason,
     ChannelReadResult, ConfigureSessionRequest, CreateProcessRequest, DnsStatus,
-    GuestControlSession, GuestEvent, HVC1_DEVICE_PATH, HostControlMessage, LaunchBinding,
-    LaunchIdentity, MAX_SHUTDOWN_GRACE_TIMEOUT_MS, MappingContainmentPolicy, MxcControlService,
-    NetworkFailureCode, NetworkFailureStatus, NetworkInterfaceStatus, NetworkLinkState,
-    NetworkMode, NetworkSetupState, NetworkStatus, OPENVMM_OUTER_FRAME_OVERHEAD_BYTES,
-    PROTOCOL_VERSION, ProcessSupervisor, ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus,
-    SERVICE_IDENTITY, ServiceError, ServiceErrorCode, SessionConfiguration, WaitReadyRequest,
-    WorkloadIdentityStatus,
+    GuestControlSession, GuestEvent, HostControlMessage, LaunchBinding, LaunchIdentity,
+    MAX_SHUTDOWN_GRACE_TIMEOUT_MS, MappingContainmentPolicy, MxcControlService, NetworkFailureCode,
+    NetworkFailureStatus, NetworkInterfaceStatus, NetworkLinkState, NetworkMode, NetworkSetupState,
+    NetworkStatus, OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, PROTOCOL_VERSION, ProcessSupervisor,
+    ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, ServiceError,
+    ServiceErrorCode, SessionConfiguration, WaitReadyRequest, WorkloadIdentityStatus,
 };
 
 use crate::config::{GuestMountRoot, SessionConfiguration as AgentSessionConfiguration};
@@ -38,8 +37,10 @@ use crate::mappings::{
 use crate::supervisor::LinuxProcessSupervisor;
 
 const LOOP_SLEEP: Duration = Duration::from_millis(10);
+const CONTROL_SESSION_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GUEST_MAPPING_ROOT: &str = "/mnt/virtiofs";
 const DEFAULT_WORKLOAD_CGROUP_PATH: &str = "/sys/fs/cgroup/nvx.workload";
+const BOOT_DIAGNOSTIC_TTY: &str = "hvc1";
 const OUTBOUND_PENDING_LIMIT: usize = 256;
 const FREEZE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const NETWORK_READY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -85,8 +86,9 @@ pub fn run_runtime() -> Result<()> {
     let mut writable_mapping_paths: Vec<String> = Vec::new();
 
     loop {
-        let file = open_hvc1_raw_nonblocking(HVC1_DEVICE_PATH)?;
-        let control_transport = GuestControlTransport::connect(file)?;
+        let file = open_control_tty_raw_nonblocking(&launch_config.control_tty_device_path)?;
+        let control_transport =
+            GuestControlTransport::connect(file, CONTROL_SESSION_ATTACH_TIMEOUT)?;
         let mut channel = agent_protocol::HvcFramedChannel::new(control_transport);
 
         loop {
@@ -1149,6 +1151,7 @@ fn assert_conservative_openvmm_overhead() -> Result<()> {
 struct LaunchRuntimeConfig {
     binding: LaunchBinding,
     expected_capability: [u8; 32],
+    control_tty_device_path: String,
 }
 
 struct HostRecordOutcome {
@@ -1494,6 +1497,7 @@ fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
         &cmdline,
         &["nvx.launch_capability", "nvx_launch_capability"],
     )?;
+    let control_tty_device_path = parse_required_control_tty_arg(&cmdline)?;
     Ok(LaunchRuntimeConfig {
         binding: LaunchBinding {
             protocol_version: PROTOCOL_VERSION,
@@ -1505,6 +1509,7 @@ fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
             channel_generation,
         },
         expected_capability,
+        control_tty_device_path,
     })
 }
 
@@ -1519,6 +1524,24 @@ fn parse_required_hex_32_arg(cmdline: &str, keys: &[&str]) -> Result<[u8; 32]> {
     let (key, value) = extract_unique_cmdline_value(cmdline, keys)?;
     parse_hex_32(&value)
         .map_err(|error| AgentError::config(format!("invalid {key} value: {error}")))
+}
+
+fn parse_required_control_tty_arg(cmdline: &str) -> Result<String> {
+    let (_, tty_name) = extract_unique_cmdline_value(cmdline, &["nvx_control_tty"])?;
+    if tty_name == BOOT_DIAGNOSTIC_TTY {
+        return Err(AgentError::config(
+            "nvx_control_tty must differ from boot diagnostics tty hvc1",
+        ));
+    }
+    if !tty_name.starts_with("hvc")
+        || tty_name.len() <= 3
+        || !tty_name[3..].chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err(AgentError::config(format!(
+            "nvx_control_tty must use hvcN form, got {tty_name}"
+        )));
+    }
+    Ok(format!("/dev/{tty_name}"))
 }
 
 fn extract_unique_cmdline_value(cmdline: &str, keys: &[&str]) -> Result<(String, String)> {
@@ -1884,7 +1907,99 @@ fn install_sigchld_wakeup_handler() -> Result<()> {
     Ok(())
 }
 
-fn open_hvc1_raw_nonblocking(path: &str) -> Result<File> {
+struct GuestControlTransport {
+    session: GuestControlSession<File>,
+    read_buffer: VecDeque<u8>,
+    eof_after_reset: bool,
+}
+
+impl GuestControlTransport {
+    fn connect(file: File, attach_timeout: Duration) -> Result<Self> {
+        let mut session = GuestControlSession::new(file);
+        let deadline = Instant::now()
+            .checked_add(attach_timeout)
+            .ok_or_else(|| AgentError::internal("control-session attach deadline overflow"))?;
+        session.attach_with_deadline(deadline).map_err(|error| {
+            AgentError::internal(format!("control-session attach failed: {error}"))
+        })?;
+        Ok(Self {
+            session,
+            read_buffer: VecDeque::new(),
+            eof_after_reset: false,
+        })
+    }
+
+    fn fill_read_buffer(&mut self) -> io::Result<()> {
+        if self.eof_after_reset {
+            return Ok(());
+        }
+        match self.session.try_recv_event() {
+            Ok(Some(GuestEvent::Data(payload))) => {
+                self.read_buffer.extend(payload);
+                Ok(())
+            }
+            Ok(Some(GuestEvent::Reset { .. })) => {
+                self.eof_after_reset = true;
+                Ok(())
+            }
+            Ok(None) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "control-session idle",
+            )),
+            Err(error) => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                error.to_string(),
+            )),
+        }
+    }
+}
+
+impl Read for GuestControlTransport {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.eof_after_reset {
+            return Ok(0);
+        }
+        if self.read_buffer.is_empty() {
+            self.fill_read_buffer()?;
+            if self.eof_after_reset {
+                return Ok(0);
+            }
+        }
+        let mut read = 0usize;
+        while read < buf.len() {
+            let Some(byte) = self.read_buffer.pop_front() else {
+                break;
+            };
+            buf[read] = byte;
+            read += 1;
+        }
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "control-session idle",
+            ));
+        }
+        Ok(read)
+    }
+}
+
+impl Write for GuestControlTransport {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.session
+            .send_data(buf.to_vec())
+            .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn open_control_tty_raw_nonblocking(path: &str) -> Result<File> {
     let c_path = std::ffi::CString::new(path)
         .map_err(|_| AgentError::config("hvc path contains interior NUL"))?;
     // SAFETY: open called with a valid NUL-terminated path and constant flags.
@@ -1900,95 +2015,6 @@ fn open_hvc1_raw_nonblocking(path: &str) -> Result<File> {
             io::Error::last_os_error(),
         ));
     }
-
-    struct GuestControlTransport {
-        session: GuestControlSession<File>,
-        read_buffer: VecDeque<u8>,
-        eof_after_reset: bool,
-    }
-
-    impl GuestControlTransport {
-        fn connect(file: File) -> Result<Self> {
-            let mut session = GuestControlSession::new(file);
-            session.attach().map_err(|error| {
-                AgentError::internal(format!("control-session attach failed: {error}"))
-            })?;
-            Ok(Self {
-                session,
-                read_buffer: VecDeque::new(),
-                eof_after_reset: false,
-            })
-        }
-
-        fn fill_read_buffer(&mut self) -> io::Result<()> {
-            if self.eof_after_reset {
-                return Ok(());
-            }
-            match self.session.try_recv_event() {
-                Ok(Some(GuestEvent::Data(payload))) => {
-                    self.read_buffer.extend(payload);
-                    Ok(())
-                }
-                Ok(Some(GuestEvent::Reset { .. })) => {
-                    self.eof_after_reset = true;
-                    Ok(())
-                }
-                Ok(None) => Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "control-session idle",
-                )),
-                Err(error) => Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    error.to_string(),
-                )),
-            }
-        }
-    }
-
-    impl Read for GuestControlTransport {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if self.eof_after_reset {
-                return Ok(0);
-            }
-            if self.read_buffer.is_empty() {
-                self.fill_read_buffer()?;
-                if self.eof_after_reset {
-                    return Ok(0);
-                }
-            }
-            let mut read = 0usize;
-            while read < buf.len() {
-                let Some(byte) = self.read_buffer.pop_front() else {
-                    break;
-                };
-                buf[read] = byte;
-                read += 1;
-            }
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "control-session idle",
-                ));
-            }
-            Ok(read)
-        }
-    }
-
-    impl Write for GuestControlTransport {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            self.session
-                .send_data(buf.to_vec())
-                .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))?;
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
     configure_fd_raw_nonblocking(fd)?;
     // SAFETY: fd is newly opened and transferred to File ownership.
     Ok(unsafe { File::from_raw_fd(fd as RawFd) })
@@ -1999,7 +2025,7 @@ fn configure_fd_raw_nonblocking(fd: i32) -> Result<()> {
     // SAFETY: termios points to writable memory.
     if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
         return Err(AgentError::io(
-            "tcgetattr on /dev/hvc1",
+            "tcgetattr on control tty",
             io::Error::last_os_error(),
         ));
     }
@@ -2010,7 +2036,7 @@ fn configure_fd_raw_nonblocking(fd: i32) -> Result<()> {
     // SAFETY: tcsetattr writes the configured termios to the same fd.
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios as *const libc::termios) } != 0 {
         return Err(AgentError::io(
-            "tcsetattr raw mode on /dev/hvc1",
+            "tcsetattr raw mode on control tty",
             io::Error::last_os_error(),
         ));
     }
@@ -2018,14 +2044,14 @@ fn configure_fd_raw_nonblocking(fd: i32) -> Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(AgentError::io(
-            "fcntl(F_GETFL) on /dev/hvc1",
+            "fcntl(F_GETFL) on control tty",
             io::Error::last_os_error(),
         ));
     }
     // SAFETY: F_SETFL writes descriptor flags.
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
         return Err(AgentError::io(
-            "fcntl(F_SETFL O_NONBLOCK) on /dev/hvc1",
+            "fcntl(F_SETFL O_NONBLOCK) on control tty",
             io::Error::last_os_error(),
         ));
     }
@@ -2076,6 +2102,15 @@ mod tests {
     }
 
     #[test]
+    fn control_tty_parser_accepts_reserved_hvc_device_and_rejects_boot_console() {
+        let control = parse_required_control_tty_arg("quiet nvx_control_tty=hvc2")
+            .expect("expected hvc2 to be accepted");
+        assert_eq!(control, "/dev/hvc2");
+        assert!(parse_required_control_tty_arg("quiet nvx_control_tty=hvc1").is_err());
+        assert!(parse_required_control_tty_arg("quiet nvx_control_tty=ttyS0").is_err());
+    }
+
+    #[test]
     fn cgroup_frozen_parser_accepts_and_rejects_expected_shapes() {
         assert!(parse_cgroup_frozen_flag("populated 1\nfrozen 1\n").unwrap());
         assert!(!parse_cgroup_frozen_flag("frozen 0\n").unwrap());
@@ -2086,7 +2121,7 @@ mod tests {
     #[test]
     fn openvmm_overhead_constant_remains_conservative() {
         assert!(assert_conservative_openvmm_overhead().is_ok());
-        assert_eq!(OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, 64);
+        assert_eq!(OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, 44);
     }
 
     #[test]

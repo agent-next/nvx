@@ -62,6 +62,7 @@ pub mod client;
 pub mod control_session;
 pub mod launch;
 pub mod named_pipe;
+#[cfg(not(target_os = "linux"))]
 pub mod scenarios;
 
 const REPORT_SCHEMA: &str = "nvx.mxc.agent.harness.report.v1";
@@ -494,7 +495,7 @@ fn run_scenario(
 }
 
 fn run_live_mode_scenario(
-    options: &HarnessOptions,
+    _options: &HarnessOptions,
     definition: ScenarioDefinition,
 ) -> ScenarioResult {
     #[cfg(target_os = "linux")]
@@ -514,7 +515,7 @@ fn run_live_mode_scenario(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let live_outcome = scenarios::run_live_requirement(options, definition);
+        let live_outcome = scenarios::run_live_requirement(_options, definition);
         make_report_result(
             definition,
             live_outcome.evidence_source,

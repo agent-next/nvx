@@ -5,8 +5,10 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 
 ## What is live now
 
-- PID1 opens `/dev/hvc1` read/write, switches the device to raw mode, and now
-  speaks the frozen OpenVMM outer control-session wire contract (`NVXS` magic,
+- PID1 discovers the reserved control tty from `nvx_control_tty=<hvcN>` on
+  `/proc/cmdline`, rejects any boot-console overlap (`hvc1`), opens that
+  `/dev/hvcN` device read/write in raw nonblocking mode, and now speaks the
+  frozen OpenVMM outer control-session wire contract (`NVXS` magic,
   version 1, fixed 44-byte little-endian header, record types 1..8). The guest
   control leg sends `GuestAttach`, waits for `Reset`, acknowledges exactly
   after `Reset`, then carries inner MXC records through outer `Data`.
@@ -113,6 +115,13 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 
 - OpenVMM outer-frame accounting now uses the exact frozen header size
   (`OPENVMM_OUTER_FRAME_OVERHEAD_BYTES = 44`) instead of a guessed reserve.
+- On Windows, the live harness launcher uses native `CreateProcessW` with
+  `EXTENDED_STARTUPINFO_PRESENT` and `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
+  The inherited handle list contains exactly the control-auth read handle plus
+  explicitly managed stdio redirection handles used for the OpenVMM process log.
+  The auth pipe write end is non-inheritable and closed after writing the exact
+  32-byte capability. The OpenVMM process is assigned to a KILL_ON_CLOSE job
+  object for teardown.
 - Stream payload and stdin queue bounds are pinned to one protocol-safe limit:
   `PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES` (currently 65,452 bytes), derived from
   the conservative OpenVMM outer-record cap after inner-record framing.

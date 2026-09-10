@@ -87,11 +87,12 @@ fn run_single_requirement(vm: &mut LaunchedVm, definition: ScenarioDefinition) -
     }
     #[cfg(windows)]
     {
-        let _pid = vm.process_id();
+        let pid = vm.process_id();
         let expected_image = vm.plan.artifacts.openvmm_exe.to_string_lossy().into_owned();
         let control = NamedPipeClient::connect(
             &vm.plan.control_pipe_name,
             Duration::from_secs(5),
+            Some(pid),
             Some(expected_image.as_str()),
         );
         let control = match control {
