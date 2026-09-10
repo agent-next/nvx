@@ -329,26 +329,9 @@ pub fn execute_harness(options: HarnessOptions) -> Result<HarnessRun, String> {
     let mut scenarios = Vec::with_capacity(CANONICAL_SCENARIOS.len());
     let mut trusted_attestation_by_requirement = BTreeMap::new();
     let mut trusted_transcript_by_requirement = BTreeMap::new();
-    let mut stop_after: Option<String> = None;
     for definition in CANONICAL_SCENARIOS {
         let scenario_start = Instant::now();
-        let mut result = if let Some(reason) = stop_after.as_ref() {
-            ScenarioResult {
-                requirement_number: definition.requirement_number,
-                id: definition.id.to_string(),
-                name: definition.name.to_string(),
-                status: ScenarioStatus::Skipped,
-                check_status: EvidenceCheckStatus::NotRun,
-                evidence_source: EvidenceSource::None,
-                required_evidence_source: required_evidence_source(definition),
-                duration_ms: 0,
-                error: Some(format!("skipped because a prior scenario failed: {reason}")),
-                evidence: vec![],
-                attestations: vec![],
-            }
-        } else {
-            run_scenario(&options, definition, &mut diagnostics)
-        };
+        let mut result = run_scenario(&options, definition, &mut diagnostics);
         if let Some(kind) = trusted_attestation_kind(definition, &result) {
             let transcript_id = format!(
                 "{}:req{:02}:{}",
@@ -365,13 +348,6 @@ pub fn execute_harness(options: HarnessOptions) -> Result<HarnessRun, String> {
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        if stop_after.is_none() && result.status == ScenarioStatus::Fail {
-            stop_after = Some(format!(
-                "{} ({}) finished with {:?}",
-                result.id, result.name, result.status
-            ));
-            diagnostics.push(format!("halting subsequent scenarios after {}", result.id));
-        }
         scenarios.push(result);
     }
 
@@ -2637,9 +2613,15 @@ impl Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     static HARNESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_harness_test() -> MutexGuard<'static, ()> {
+        HARNESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn canonical_scenarios_are_unique_and_ordered() {
@@ -2660,7 +2642,7 @@ mod tests {
 
     #[test]
     fn static_mode_never_satisfies_live_gate() {
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let root = std::env::temp_dir().join("nvx-agent-harness-static-gate");
         let _ = std::fs::remove_dir_all(&root);
         let run = execute_harness(HarnessOptions {
@@ -2689,7 +2671,7 @@ mod tests {
 
     #[test]
     fn live_mode_without_live_whp_evidence_cannot_pass_conformance() {
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let root = std::env::temp_dir().join("nvx-agent-harness-live-prereq");
         let _ = std::fs::remove_dir_all(&root);
         let run = execute_harness(HarnessOptions {
@@ -2716,7 +2698,7 @@ mod tests {
 
     #[test]
     fn privileged_requirements_remain_blocked_without_live_whp_evidence() {
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let root = std::env::temp_dir().join("nvx-agent-harness-privileged-blocked");
         let _ = std::fs::remove_dir_all(&root);
         let run = execute_harness(HarnessOptions {
@@ -2739,7 +2721,7 @@ mod tests {
 
     #[test]
     fn static_mode_req10_to_req12_are_not_run_and_non_passing() {
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let root = std::env::temp_dir().join("nvx-agent-harness-static-runtime-req10-12");
         let _ = std::fs::remove_dir_all(&root);
         let run = execute_harness(HarnessOptions {
@@ -2764,7 +2746,7 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn non_linux_live_mode_reports_not_live_or_blocked() {
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let root = std::env::temp_dir().join("nvx-agent-harness-live-non-linux");
         let _ = std::fs::remove_dir_all(&root);
         let run = execute_harness(HarnessOptions {
@@ -2788,7 +2770,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn local_linux_runtime_executes_3_to_6_and_10_to_12_but_remains_non_conformant() {
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let root = std::env::temp_dir().join("nvx-agent-harness-local-linux-runtime");
         let _ = std::fs::remove_dir_all(&root);
         let run = execute_harness(HarnessOptions {
@@ -2971,7 +2953,7 @@ mod tests {
 
     #[test]
     fn fabricated_report_without_trusted_attestation_fails() {
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let mut run = forged_passing_run();
         run.trusted.attestation_by_requirement.clear();
         assert!(!is_passing_report(&run));
@@ -2979,7 +2961,7 @@ mod tests {
 
     #[test]
     fn canonical_gate_rejects_adversarial_attestation_and_artifact_mutations() {
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let run = forged_passing_run();
         assert!(is_passing_report(&run));
         assert_eq!(report_exit_code(&run), ExitCode::SUCCESS);
@@ -3013,7 +2995,7 @@ mod tests {
 
     #[test]
     fn canonical_gate_rejects_adversarial_top_level_fields() {
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let run = forged_passing_run();
         assert!(is_passing_report(&run));
         assert_eq!(report_exit_code(&run), ExitCode::SUCCESS);
@@ -3073,7 +3055,7 @@ mod tests {
 
     #[test]
     fn canonical_gate_rejects_missing_modified_truncated_swapped_and_tampered_artifacts() {
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let missing = forged_passing_run();
         assert!(is_passing_report(&missing));
         std::fs::remove_file(&missing.diagnostics_path).expect("remove diagnostics");
@@ -3159,7 +3141,7 @@ mod tests {
     fn canonical_gate_rejects_unix_manifest_symlink_replacement_with_valid_bytes() {
         use std::os::unix::fs::symlink;
 
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let run = forged_passing_run();
         assert!(is_passing_report(&run));
         let output_dir = run.report_path.parent().expect("output dir");
@@ -3181,7 +3163,7 @@ mod tests {
     fn artifact_reader_rejects_unix_final_symlink_and_component_symlink() {
         use std::os::unix::fs::symlink;
 
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let run = forged_passing_run();
         assert!(is_passing_report(&run));
 
@@ -3218,7 +3200,7 @@ mod tests {
         use std::os::windows::fs::symlink_file;
         use std::process::Command;
 
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
 
         let symlink_run = forged_passing_run();
         assert!(is_passing_report(&symlink_run));
@@ -3295,7 +3277,7 @@ mod tests {
         use std::os::windows::fs::{symlink_dir, symlink_file};
         use std::process::Command;
 
-        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let _guard = lock_harness_test();
         let run = forged_passing_run();
         assert!(is_passing_report(&run));
         let output_dir = run.report_path.parent().expect("output dir").to_path_buf();

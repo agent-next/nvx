@@ -7,7 +7,7 @@ use crate::{
 };
 #[cfg(windows)]
 use crate::{
-    control_session::{HostAttachStatus, HostControlSession},
+    control_session::{HostAttachStatus, HostControlSession, HostEvent},
     named_pipe::NamedPipeClient,
 };
 
@@ -116,15 +116,30 @@ fn run_single_requirement(vm: &mut LaunchedVm, definition: ScenarioDefinition) -
                     vm.plan.control_pipe_name
                 )];
                 evidence.push(format!("broker attach response: {attach:?}"));
-                if attach == HostAttachStatus::Wait {
-                    CheckOutcome {
-                        check_status: EvidenceCheckStatus::Pass,
-                        evidence_source: EvidenceSource::LiveWhp,
-                        error: None,
-                        evidence,
+                if attach != HostAttachStatus::Wait {
+                    return fail_check(
+                        "expected Wait before guest Ack during host attach".to_string(),
+                    );
+                }
+                match session.recv_event_blocking() {
+                    Ok(HostEvent::Ready) => {
+                        evidence.push(
+                            "received Ready after guest attach; live orchestrator readiness confirmed"
+                                .to_string(),
+                        );
+                        CheckOutcome {
+                            check_status: EvidenceCheckStatus::Pass,
+                            evidence_source: EvidenceSource::LiveWhp,
+                            error: None,
+                            evidence,
+                        }
                     }
-                } else {
-                    fail_check("expected Wait before guest Ack during host attach".to_string())
+                    Ok(event) => fail_check(format!(
+                        "expected Ready event after Wait during host attach, got {event:?}"
+                    )),
+                    Err(error) => fail_check(format!(
+                        "failed waiting for Ready event after Wait during host attach: {error}"
+                    )),
                 }
             }
             2..=12 => fail_check(format!(
