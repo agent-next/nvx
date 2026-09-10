@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -16,8 +16,17 @@ const DEFAULT_POLL_SLEEP: Duration = Duration::from_millis(5);
 pub enum ClientError {
     Control(SessionError),
     Timeout(&'static str),
-    QueueOverflow { queue: &'static str, bound: usize },
+    QueueOverflow(QueueOverflowDiagnostics),
+    ClientInvalidated(QueueOverflowDiagnostics),
     Protocol(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueOverflowDiagnostics {
+    pub queue: &'static str,
+    pub bound: usize,
+    pub dropped_count: usize,
+    pub dropped_by_type: BTreeMap<&'static str, usize>,
 }
 
 impl core::fmt::Display for ClientError {
@@ -27,8 +36,25 @@ impl core::fmt::Display for ClientError {
             Self::Timeout(operation) => {
                 write!(f, "timed out waiting for {operation}")
             }
-            Self::QueueOverflow { queue, bound } => {
-                write!(f, "{queue} queue reached configured bound {bound}")
+            Self::QueueOverflow(diagnostics) => {
+                write!(
+                    f,
+                    "{} queue reached configured bound {} and dropped {} message(s) [{}]",
+                    diagnostics.queue,
+                    diagnostics.bound,
+                    diagnostics.dropped_count,
+                    format_dropped_types(&diagnostics.dropped_by_type)
+                )
+            }
+            Self::ClientInvalidated(diagnostics) => {
+                write!(
+                    f,
+                    "client invalidated after {} queue overflow at bound {}; dropped {} message(s) [{}]",
+                    diagnostics.queue,
+                    diagnostics.bound,
+                    diagnostics.dropped_count,
+                    format_dropped_types(&diagnostics.dropped_by_type)
+                )
             }
             Self::Protocol(message) => write!(f, "{message}"),
         }
@@ -50,6 +76,7 @@ pub struct MxcAgentClient<T: std::io::Read + std::io::Write> {
     control: HostControlSession<T>,
     inbound: VecDeque<AgentControlMessage>,
     max_inbound_queue: usize,
+    overflow_diagnostics: Option<QueueOverflowDiagnostics>,
 }
 
 impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
@@ -58,6 +85,7 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
             control,
             inbound: VecDeque::new(),
             max_inbound_queue: DEFAULT_MAX_INBOUND_QUEUE,
+            overflow_diagnostics: None,
         }
     }
 
@@ -67,6 +95,7 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         hello: HostControlMessage,
         timeout: Duration,
     ) -> Result<(), ClientError> {
+        self.ensure_valid()?;
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(ClientError::Protocol(
@@ -105,21 +134,17 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
             }
         }
         self.send_host_control(hello)?;
-        let response = self.recv_matching_until(deadline, |message| {
-            matches!(
-                message,
-                AgentControlMessage::Ready { .. } | AgentControlMessage::Error(_)
-            )
-        })?;
-        if matches!(response, AgentControlMessage::Ready { .. }) {
-            return Ok(());
+        let maybe_response = self.poll_agent_control(Duration::ZERO)?;
+        if let Some(response) = maybe_response {
+            return Err(ClientError::Protocol(format!(
+                "unexpected response after HostHello; production does not send one before Configure: {response:?}"
+            )));
         }
-        Err(ClientError::Protocol(format!(
-            "expected Ready during authentication, got {response:?}"
-        )))
+        Ok(())
     }
 
     pub fn send_host_control(&mut self, message: HostControlMessage) -> Result<u64, ClientError> {
+        self.ensure_valid()?;
         let record = InnerRecord::control(&message).map_err(|error| {
             ClientError::Protocol(format!("failed to encode host control record: {error:?}"))
         })?;
@@ -133,6 +158,7 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         &mut self,
         timeout: Duration,
     ) -> Result<AgentControlMessage, ClientError> {
+        self.ensure_valid()?;
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(ClientError::Protocol(
@@ -146,6 +172,7 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         deadline: Instant,
         operation: &'static str,
     ) -> Result<AgentControlMessage, ClientError> {
+        self.ensure_valid()?;
         if let Some(message) = self.inbound.pop_front() {
             return Ok(message);
         }
@@ -176,6 +203,7 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<AgentControlMessage>, ClientError> {
+        self.ensure_valid()?;
         if let Some(message) = self.inbound.pop_front() {
             return Ok(Some(message));
         }
@@ -413,6 +441,7 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         &mut self,
         message: AgentControlMessage,
     ) -> Result<(), ClientError> {
+        self.ensure_valid()?;
         self.push_inbound(message)
     }
 
@@ -435,25 +464,30 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
 
     fn push_inbound(&mut self, message: AgentControlMessage) -> Result<(), ClientError> {
         if self.inbound.len() == self.max_inbound_queue {
-            return Err(ClientError::QueueOverflow {
-                queue: "inbound",
-                bound: self.max_inbound_queue,
-            });
+            return Err(self.invalidate_queue_overflow(
+                "inbound",
+                self.max_inbound_queue,
+                vec![message],
+            ));
         }
         self.inbound.push_back(message);
         Ok(())
     }
 
     fn push_deferred(
-        &self,
+        &mut self,
         deferred: &mut VecDeque<AgentControlMessage>,
         message: AgentControlMessage,
     ) -> Result<(), ClientError> {
         if deferred.len() == self.max_inbound_queue {
-            return Err(ClientError::QueueOverflow {
-                queue: "deferred",
-                bound: self.max_inbound_queue,
-            });
+            let mut dropped: Vec<AgentControlMessage> =
+                std::mem::take(deferred).into_iter().collect();
+            dropped.push(message);
+            return Err(self.invalidate_queue_overflow(
+                "deferred",
+                self.max_inbound_queue,
+                dropped,
+            ));
         }
         deferred.push_back(message);
         Ok(())
@@ -465,15 +499,73 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
     ) -> Result<(), ClientError> {
         while let Some(message) = deferred.pop_back() {
             if self.inbound.len() == self.max_inbound_queue {
-                return Err(ClientError::QueueOverflow {
-                    queue: "inbound",
-                    bound: self.max_inbound_queue,
-                });
+                let mut dropped = vec![message];
+                dropped.extend(deferred);
+                return Err(self.invalidate_queue_overflow(
+                    "inbound",
+                    self.max_inbound_queue,
+                    dropped,
+                ));
             }
             self.inbound.push_front(message);
         }
         Ok(())
     }
+
+    fn ensure_valid(&self) -> Result<(), ClientError> {
+        if let Some(diagnostics) = self.overflow_diagnostics.clone() {
+            return Err(ClientError::ClientInvalidated(diagnostics));
+        }
+        Ok(())
+    }
+
+    fn invalidate_queue_overflow(
+        &mut self,
+        queue: &'static str,
+        bound: usize,
+        dropped_messages: Vec<AgentControlMessage>,
+    ) -> ClientError {
+        let mut dropped_by_type = BTreeMap::new();
+        for message in &dropped_messages {
+            let key = message_type_name(message);
+            *dropped_by_type.entry(key).or_insert(0) += 1;
+        }
+        let diagnostics = QueueOverflowDiagnostics {
+            queue,
+            bound,
+            dropped_count: dropped_messages.len(),
+            dropped_by_type,
+        };
+        self.inbound.clear();
+        self.overflow_diagnostics = Some(diagnostics.clone());
+        ClientError::QueueOverflow(diagnostics)
+    }
+}
+
+fn message_type_name(message: &AgentControlMessage) -> &'static str {
+    match message {
+        AgentControlMessage::Ready { .. } => "Ready",
+        AgentControlMessage::Error(_) => "Error",
+        AgentControlMessage::Health(_) => "Health",
+        AgentControlMessage::Quiesced => "Quiesced",
+        AgentControlMessage::Resumed => "Resumed",
+        AgentControlMessage::ShuttingDown => "ShuttingDown",
+        AgentControlMessage::StdoutChunk(_) => "StdoutChunk",
+        AgentControlMessage::StdoutEof(_) => "StdoutEof",
+        AgentControlMessage::StderrChunk(_) => "StderrChunk",
+        AgentControlMessage::StderrEof(_) => "StderrEof",
+        AgentControlMessage::StreamDrained { .. } => "StreamDrained",
+        AgentControlMessage::DescendantsCleaned { .. } => "DescendantsCleaned",
+        AgentControlMessage::ExecTerminal { .. } => "ExecTerminal",
+    }
+}
+
+fn format_dropped_types(dropped_by_type: &BTreeMap<&'static str, usize>) -> String {
+    dropped_by_type
+        .iter()
+        .map(|(kind, count)| format!("{kind}:{count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub fn missing_ready_error() -> ServiceError {
@@ -554,12 +646,19 @@ mod tests {
                 .expect("within bound");
         }
         let overflow = client.queue_agent_message_for_test(AgentControlMessage::Resumed);
+        let details = match overflow {
+            Err(ClientError::QueueOverflow(details)) => details,
+            other => panic!("expected inbound queue overflow, got {other:?}"),
+        };
+        assert_eq!(details.queue, "inbound");
+        assert_eq!(details.bound, DEFAULT_MAX_INBOUND_QUEUE);
+        assert_eq!(details.dropped_count, 1);
+        assert_eq!(details.dropped_by_type.get("Resumed"), Some(&1));
+
+        let invalidated = client.queue_agent_message_for_test(AgentControlMessage::Quiesced);
         assert!(matches!(
-            overflow,
-            Err(ClientError::QueueOverflow {
-                queue: "inbound",
-                ..
-            })
+            invalidated,
+            Err(ClientError::ClientInvalidated(_))
         ));
     }
 
@@ -643,6 +742,11 @@ mod tests {
                 Duration::from_secs(1),
             )
             .expect("authenticated");
+
+        let auth_phase_ready = client
+            .wait_ready(Duration::from_millis(10))
+            .expect_err("ready must not arrive before configure");
+        assert!(matches!(auth_phase_ready, ClientError::Timeout(_)));
 
         let root = CanonicalHostMappingRoot::parse("/sandbox-root".to_string()).expect("root");
         client
@@ -808,13 +912,28 @@ mod tests {
             .expect("queue 3");
         client.max_inbound_queue = 2;
         let result = client.wait_ready(Duration::from_millis(10));
-        assert!(matches!(
-            result,
-            Err(ClientError::QueueOverflow {
-                queue: "deferred",
-                bound: 2
-            })
-        ));
+        let overflow = match result {
+            Err(ClientError::QueueOverflow(details)) => details,
+            other => panic!("expected queue overflow, got {other:?}"),
+        };
+        assert_eq!(overflow.queue, "deferred");
+        assert_eq!(overflow.bound, 2);
+        assert_eq!(overflow.dropped_count, 3);
+        assert_eq!(overflow.dropped_by_type.get("Quiesced"), Some(&2));
+        assert_eq!(overflow.dropped_by_type.get("Resumed"), Some(&1));
+
+        let start = Instant::now();
+        let invalidated = client.wait_ready(Duration::from_secs(1));
+        let elapsed = start.elapsed();
+        let invalidated_details = match invalidated {
+            Err(ClientError::ClientInvalidated(details)) => details,
+            other => panic!("expected invalidated client error, got {other:?}"),
+        };
+        assert_eq!(invalidated_details, overflow);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "invalidated client must fail immediately, took {elapsed:?}"
+        );
     }
 
     fn sample_health_status() -> agent_protocol::messages::HealthStatus {
@@ -929,46 +1048,7 @@ mod tests {
 
         fn respond_to_host_message(&mut self, message: HostControlMessage) -> std::io::Result<()> {
             let response = match message {
-                HostControlMessage::HostHello { launch, .. } => AgentControlMessage::Ready {
-                    launch,
-                    status: ReadyStatus {
-                        service: SERVICE_IDENTITY.to_string(),
-                        protocol_version: 1,
-                        build: agent_protocol::messages::BuildStatus {
-                            agent_version: "test".to_string(),
-                            kernel_release: "test".to_string(),
-                            profile: "mxc-prototype".to_string(),
-                        },
-                        network: agent_protocol::messages::NetworkStatus {
-                            mode: NetworkMode::NoNic,
-                            setup_state: NetworkSetupState::Ready,
-                            interface: None,
-                            default_gateway: None,
-                            dns: agent_protocol::messages::DnsStatus {
-                                ready: true,
-                                servers: vec![],
-                            },
-                            failure: None,
-                        },
-                        isolation: agent_protocol::messages::IsolationStatus {
-                            pid_namespace: true,
-                            mount_namespace: true,
-                            uts_namespace: true,
-                            ipc_namespace: true,
-                            private_proc: true,
-                            private_dev: true,
-                            private_devpts: true,
-                            private_shm: true,
-                            read_only_sys: true,
-                            capabilities_dropped: true,
-                            no_new_privs: true,
-                            cgroup_separation: true,
-                            orphan_reaping: true,
-                        },
-                        workload_identity:
-                            agent_protocol::messages::WorkloadIdentityStatus::mxc_fixed(),
-                    },
-                },
+                HostControlMessage::HostHello { .. } => return Ok(()),
                 HostControlMessage::Configure { launch, .. } => AgentControlMessage::Ready {
                     launch,
                     status: ReadyStatus {
