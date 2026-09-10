@@ -815,6 +815,7 @@ mod tests {
             .queue_agent_message_for_test(AgentControlMessage::ExecTerminal {
                 exec_id: 9,
                 disposition: agent_protocol::messages::ExecDisposition::ExitCode(0),
+                termination: None,
             })
             .expect("queue terminal");
         client
@@ -851,6 +852,7 @@ mod tests {
             .queue_agent_message_for_test(AgentControlMessage::ExecTerminal {
                 exec_id: 7,
                 disposition: agent_protocol::messages::ExecDisposition::ExitCode(0),
+                termination: None,
             })
             .expect("queue target terminal");
 

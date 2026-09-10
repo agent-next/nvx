@@ -21,7 +21,7 @@ use crate::messages::{
     FlowCreditRequest, HealthFailureStatus, IsolationStatus, LaunchIdentity, NetworkMode,
     NetworkSetupState, NetworkStatus, ProtocolErrorCode, ReadyStatus, SERVICE_IDENTITY,
     StderrChunkRecord, StderrEofRecord, StdinChunkRecord, StdinEofRecord, StdoutChunkRecord,
-    StdoutEofRecord, StreamName, WorkloadIdentityStatus,
+    StdoutEofRecord, StreamName, TerminationOutcome, WorkloadIdentityStatus,
 };
 use crate::state::{
     ActiveExecEvent, AgentProtocolState, CHANNEL_LOSS_CLEANUP_DEADLINE_SECS, LaunchAdmissionInput,
@@ -295,8 +295,14 @@ pub enum SupervisorEvent {
     StderrChunk(Vec<u8>),
     StderrEof,
     DescendantsCleaned,
-    Exited(i32),
-    Signaled(i32),
+    Exited {
+        exit_code: i32,
+        termination: Option<TerminationOutcome>,
+    },
+    Signaled {
+        signal: i32,
+        termination: Option<TerminationOutcome>,
+    },
 }
 
 pub struct HvcFramedChannel<T: Read + Write> {
@@ -1372,69 +1378,118 @@ fn apply_supervisor_event(
             out.push(AgentControlMessage::DescendantsCleaned { exec_id });
             maybe_terminal
         }
-        SupervisorEvent::Exited(exit_code) => {
+        SupervisorEvent::Exited {
+            exit_code,
+            termination,
+        } => {
+            if service
+                .active_exec
+                .as_ref()
+                .is_some_and(|exec| (exec.cancelled || exec.timed_out) && termination.is_none())
+            {
+                let reason = format!(
+                    "terminated execution {exec_id} missing termination outcome metadata (event=Exited)"
+                );
+                service.enter_fatal_session(reason.clone());
+                return Err(ServiceError::new(ServiceErrorCode::FatalSession, reason));
+            }
+            let maybe_terminal_from_termination = if let Some(termination) = termination {
+                apply_exec_event_for_supervisor(
+                    &mut service.protocol_state,
+                    exec_id,
+                    ActiveExecEvent::TerminationOutcome(termination),
+                )?
+            } else {
+                None
+            };
             if service
                 .active_exec
                 .as_ref()
                 .is_some_and(|exec| exec.cancelled || exec.timed_out)
             {
-                return Ok(());
-            }
-            let disposition = if service
-                .active_exec
-                .as_ref()
-                .is_some_and(|exec| exec.cancelled)
-            {
-                ExecDisposition::Cancelled
-            } else if service
-                .active_exec
-                .as_ref()
-                .is_some_and(|exec| exec.timed_out)
-            {
-                ExecDisposition::TimedOut
+                maybe_terminal_from_termination
             } else {
-                ExecDisposition::ExitCode(exit_code)
-            };
-            apply_exec_event_for_supervisor(
-                &mut service.protocol_state,
-                exec_id,
-                ActiveExecEvent::Disposition(disposition),
-            )?
+                let disposition = if service
+                    .active_exec
+                    .as_ref()
+                    .is_some_and(|exec| exec.cancelled)
+                {
+                    ExecDisposition::Cancelled
+                } else if service
+                    .active_exec
+                    .as_ref()
+                    .is_some_and(|exec| exec.timed_out)
+                {
+                    ExecDisposition::TimedOut
+                } else {
+                    ExecDisposition::ExitCode(exit_code)
+                };
+                apply_exec_event_for_supervisor(
+                    &mut service.protocol_state,
+                    exec_id,
+                    ActiveExecEvent::Disposition(disposition),
+                )?
+            }
         }
-        SupervisorEvent::Signaled(signal) => {
+        SupervisorEvent::Signaled {
+            signal,
+            termination,
+        } => {
+            if service
+                .active_exec
+                .as_ref()
+                .is_some_and(|exec| (exec.cancelled || exec.timed_out) && termination.is_none())
+            {
+                let reason = format!(
+                    "terminated execution {exec_id} missing termination outcome metadata (event=Signaled)"
+                );
+                service.enter_fatal_session(reason.clone());
+                return Err(ServiceError::new(ServiceErrorCode::FatalSession, reason));
+            }
+            let maybe_terminal_from_termination = if let Some(termination) = termination {
+                apply_exec_event_for_supervisor(
+                    &mut service.protocol_state,
+                    exec_id,
+                    ActiveExecEvent::TerminationOutcome(termination),
+                )?
+            } else {
+                None
+            };
             if service
                 .active_exec
                 .as_ref()
                 .is_some_and(|exec| exec.cancelled || exec.timed_out)
             {
-                return Ok(());
-            }
-            let disposition = if service
-                .active_exec
-                .as_ref()
-                .is_some_and(|exec| exec.cancelled)
-            {
-                ExecDisposition::Cancelled
-            } else if service
-                .active_exec
-                .as_ref()
-                .is_some_and(|exec| exec.timed_out)
-            {
-                ExecDisposition::TimedOut
+                maybe_terminal_from_termination
             } else {
-                ExecDisposition::Signaled(signal)
-            };
-            apply_exec_event_for_supervisor(
-                &mut service.protocol_state,
-                exec_id,
-                ActiveExecEvent::Disposition(disposition),
-            )?
+                let disposition = if service
+                    .active_exec
+                    .as_ref()
+                    .is_some_and(|exec| exec.cancelled)
+                {
+                    ExecDisposition::Cancelled
+                } else if service
+                    .active_exec
+                    .as_ref()
+                    .is_some_and(|exec| exec.timed_out)
+                {
+                    ExecDisposition::TimedOut
+                } else {
+                    ExecDisposition::Signaled(signal)
+                };
+                apply_exec_event_for_supervisor(
+                    &mut service.protocol_state,
+                    exec_id,
+                    ActiveExecEvent::Disposition(disposition),
+                )?
+            }
         }
     };
     if let Some(terminal) = maybe_terminal {
         out.push(AgentControlMessage::ExecTerminal {
             exec_id: terminal.exec_id,
             disposition: terminal.disposition,
+            termination: terminal.termination,
         });
         service.active_exec = None;
     }
@@ -2827,7 +2882,10 @@ mod tests {
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
-        supervisor.events.push_back(SupervisorEvent::Exited(0));
+        supervisor.events.push_back(SupervisorEvent::Exited {
+            exit_code: 0,
+            termination: None,
+        });
         let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         assert!(matches!(
             messages.last(),
@@ -2930,14 +2988,20 @@ mod tests {
     fn terminal_emits_once_when_disposition_and_cleanup_arrive_before_final_drains() {
         let permutations = [
             vec![
-                SupervisorEvent::Exited(0),
+                SupervisorEvent::Exited {
+                    exit_code: 0,
+                    termination: None,
+                },
                 SupervisorEvent::DescendantsCleaned,
                 SupervisorEvent::StdoutEof,
                 SupervisorEvent::StderrEof,
             ],
             vec![
                 SupervisorEvent::DescendantsCleaned,
-                SupervisorEvent::Signaled(9),
+                SupervisorEvent::Signaled {
+                    signal: 9,
+                    termination: None,
+                },
                 SupervisorEvent::StderrEof,
                 SupervisorEvent::StdoutEof,
             ],
@@ -3037,7 +3101,10 @@ mod tests {
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
-        supervisor.events.push_back(SupervisorEvent::Exited(0));
+        supervisor.events.push_back(SupervisorEvent::Exited {
+            exit_code: 0,
+            termination: None,
+        });
         let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         let terminals: Vec<u32> = messages
             .iter()
@@ -3164,7 +3231,10 @@ mod tests {
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
-        supervisor.events.push_back(SupervisorEvent::Exited(0));
+        supervisor.events.push_back(SupervisorEvent::Exited {
+            exit_code: 0,
+            termination: None,
+        });
         let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         assert!(matches!(
             &messages[0],
@@ -3220,7 +3290,10 @@ mod tests {
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
-        supervisor.events.push_back(SupervisorEvent::Signaled(15));
+        supervisor.events.push_back(SupervisorEvent::Signaled {
+            signal: 15,
+            termination: Some(TerminationOutcome::GracefulTerm),
+        });
         let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         let terminals: Vec<_> = messages
             .iter()
@@ -3231,6 +3304,7 @@ mod tests {
             terminals[0],
             AgentControlMessage::ExecTerminal {
                 disposition: ExecDisposition::Cancelled,
+                termination: Some(TerminationOutcome::GracefulTerm),
                 ..
             }
         ));
@@ -3302,15 +3376,73 @@ mod tests {
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
-        supervisor.events.push_back(SupervisorEvent::Signaled(9));
+        supervisor.events.push_back(SupervisorEvent::Signaled {
+            signal: 9,
+            termination: Some(TerminationOutcome::ForcedKill),
+        });
         let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         assert!(matches!(
             messages.last(),
             Some(AgentControlMessage::ExecTerminal {
                 disposition: ExecDisposition::TimedOut,
+                termination: Some(TerminationOutcome::ForcedKill),
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn timeout_terminal_missing_termination_metadata_fails_closed() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor::default();
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 53,
+                    argv: vec!["/bin/sleep".to_string(), "10".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: Some(1),
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        service
+            .cancel_exec(53, CancelReason::TimedOut, &mut supervisor)
+            .unwrap();
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 53,
+                stream: StreamName::Stdout,
+                credits: 1,
+            })
+            .unwrap();
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 53,
+                stream: StreamName::Stderr,
+                credits: 1,
+            })
+            .unwrap();
+        supervisor.events.push_back(SupervisorEvent::StdoutEof);
+        supervisor.events.push_back(SupervisorEvent::StderrEof);
+        supervisor
+            .events
+            .push_back(SupervisorEvent::DescendantsCleaned);
+        supervisor.events.push_back(SupervisorEvent::Signaled {
+            signal: 9,
+            termination: None,
+        });
+
+        let failed = service.pump_supervisor(&mut supervisor);
+        let error = failed.expect_err("missing termination metadata must fail closed");
+        assert_eq!(error.code, ServiceErrorCode::FatalSession);
+        assert!(
+            error
+                .message
+                .contains("missing termination outcome metadata")
+        );
+        assert!(service.health().shutting_down);
     }
 
     #[test]
@@ -3344,13 +3476,17 @@ mod tests {
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
-        supervisor.events.push_back(SupervisorEvent::Signaled(15));
+        supervisor.events.push_back(SupervisorEvent::Signaled {
+            signal: 15,
+            termination: None,
+        });
         let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         assert!(matches!(
             messages.last(),
             Some(AgentControlMessage::ExecTerminal {
                 exec_id: 520,
                 disposition: ExecDisposition::Signaled(15),
+                ..
             })
         ));
     }
@@ -3625,7 +3761,10 @@ mod tests {
             .push_back(SupervisorEvent::StdoutChunk(vec![120]));
         supervisor.events.push_back(SupervisorEvent::StdoutEof);
         supervisor.events.push_back(SupervisorEvent::StderrEof);
-        supervisor.events.push_back(SupervisorEvent::Exited(0));
+        supervisor.events.push_back(SupervisorEvent::Exited {
+            exit_code: 0,
+            termination: None,
+        });
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
@@ -3943,7 +4082,10 @@ mod tests {
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
-        supervisor.events.push_back(SupervisorEvent::Exited(0));
+        supervisor.events.push_back(SupervisorEvent::Exited {
+            exit_code: 0,
+            termination: None,
+        });
 
         let mut channel = HvcFramedChannel::new(Cursor::new(Vec::<u8>::new()));
         channel.write_credits = 0;
@@ -4007,7 +4149,10 @@ mod tests {
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
-        supervisor.events.push_back(SupervisorEvent::Exited(0));
+        supervisor.events.push_back(SupervisorEvent::Exited {
+            exit_code: 0,
+            termination: None,
+        });
 
         let mut channel = HvcFramedChannel::new(Cursor::new(Vec::<u8>::new()));
         channel.write_credits = 64;

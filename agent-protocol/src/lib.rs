@@ -39,8 +39,8 @@ pub use crate::messages::{
     NetworkInterfaceStatus, NetworkLinkState, NetworkMode, NetworkSetupState, NetworkStatus,
     ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, StderrChunkRecord,
     StderrEofRecord, StdinChunkRecord, StdinEofRecord, StdoutChunkRecord, StdoutEofRecord,
-    StreamName, WORKLOAD_GID_MXC, WORKLOAD_GROUP_MXC, WORKLOAD_UID_MXC, WORKLOAD_USER_MXC,
-    WorkloadIdentityStatus,
+    StreamName, TerminationOutcome, WORKLOAD_GID_MXC, WORKLOAD_GROUP_MXC, WORKLOAD_UID_MXC,
+    WORKLOAD_USER_MXC, WorkloadIdentityStatus,
 };
 pub use crate::service::{
     AuthenticateChannelRequest, CancelReason, ChannelReadResult, ConfigureSessionRequest,

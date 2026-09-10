@@ -104,6 +104,11 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   state, the session is promoted to `FatalSession`; recoverable timeout
   enforcement failures retain timeout state for retry instead of being silently
   cleared.
+- Terminal outcomes now carry explicit termination metadata when cancellation or
+  timeout requested process-tree termination: `gracefulTerm` means the tree
+  exited after TERM without escalation, and `forcedKill` means SIGKILL/cgroup.kill
+  escalation was successfully initiated. Normal/signal exits that were not
+  termination-managed report no termination metadata.
 - Quiesce/resume now drives cgroup freezer state (`cgroup.freeze` +
   `cgroup.events:frozen`) with bounded waits and fail-closed transitions.
   Current explicit policy: quiesce is rejected when an exec is active; callers

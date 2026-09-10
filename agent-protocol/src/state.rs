@@ -12,7 +12,7 @@ use crate::messages::{
     AgentControlMessage, AgentSessionState, BuildStatus, CapabilityProofMaterial, DnsStatus,
     ExecDisposition, HealthStatus, IsolationStatus, LaunchIdentity, NetworkMode, NetworkSetupState,
     NetworkStatus, ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY,
-    StreamName, WorkloadIdentityStatus,
+    StreamName, TerminationOutcome, WorkloadIdentityStatus,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -27,6 +27,7 @@ pub struct FlowControlWindow {
 pub struct ExecTerminalEvent {
     pub exec_id: u32,
     pub disposition: ExecDisposition,
+    pub termination: Option<TerminationOutcome>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +42,7 @@ pub enum ActiveExecEvent {
     StreamDrained { stream: StreamName },
     DescendantsCleaned,
     Disposition(ExecDisposition),
+    TerminationOutcome(TerminationOutcome),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +159,16 @@ pub enum StateError {
     MissingTerminalPrerequisites {
         exec_id: u32,
     },
+    TerminationOutcomeConflict {
+        exec_id: u32,
+        current: TerminationOutcome,
+        attempted: TerminationOutcome,
+    },
+    UnexpectedTerminationOutcomeForDisposition {
+        exec_id: u32,
+        disposition: ExecDisposition,
+        termination: TerminationOutcome,
+    },
     ChannelAuthenticationRequired,
 }
 
@@ -210,6 +222,12 @@ impl StateError {
             Self::DescendantsAlreadyCleaned { .. } => ProtocolErrorCode::DescendantsAlreadyCleaned,
             Self::DispositionAlreadySet { .. } => ProtocolErrorCode::DispositionAlreadySet,
             Self::MissingTerminalPrerequisites { .. } => {
+                ProtocolErrorCode::MissingTerminalPrerequisites
+            }
+            Self::TerminationOutcomeConflict { .. } => {
+                ProtocolErrorCode::MissingTerminalPrerequisites
+            }
+            Self::UnexpectedTerminationOutcomeForDisposition { .. } => {
                 ProtocolErrorCode::MissingTerminalPrerequisites
             }
             Self::ChannelAuthenticationRequired => ProtocolErrorCode::ChannelAuthenticationRequired,
@@ -522,11 +540,13 @@ impl AgentProtocolState {
         exec.apply(event)?;
 
         if exec.has_required_terminal_prerequisites() && exec.can_emit_terminal() {
+            exec.validate_terminal_termination_outcome()?;
             let terminal = ExecTerminalEvent {
                 exec_id,
                 disposition: exec
                     .disposition
                     .expect("disposition must exist when terminal is emitted"),
+                termination: exec.termination_outcome,
             };
             exec.terminal_emitted = true;
             launch_state.active_exec = None;
@@ -710,6 +730,7 @@ struct ExecState {
     stderr_drained: bool,
     descendants_cleaned: bool,
     disposition: Option<ExecDisposition>,
+    termination_outcome: Option<TerminationOutcome>,
     terminal_emitted: bool,
     stdin_window: FlowControlWindow,
     stdout_window: FlowControlWindow,
@@ -730,6 +751,7 @@ impl ExecState {
             stderr_drained: false,
             descendants_cleaned: false,
             disposition: None,
+            termination_outcome: None,
             terminal_emitted: false,
             stdin_window: FlowControlWindow {
                 available_credits: 0,
@@ -763,6 +785,9 @@ impl ExecState {
             ActiveExecEvent::StreamDrained { stream } => self.apply_stream_drained(stream),
             ActiveExecEvent::DescendantsCleaned => self.apply_descendants_cleaned(),
             ActiveExecEvent::Disposition(disposition) => self.apply_disposition(disposition),
+            ActiveExecEvent::TerminationOutcome(termination) => {
+                self.apply_termination_outcome(termination)
+            }
         }
     }
 
@@ -830,6 +855,36 @@ impl ExecState {
             self.stdin_closed = true;
         }
         self.disposition = Some(disposition);
+        Ok(())
+    }
+
+    fn apply_termination_outcome(
+        &mut self,
+        termination: TerminationOutcome,
+    ) -> Result<(), StateError> {
+        if matches!(
+            self.disposition,
+            Some(ExecDisposition::ExitCode(_) | ExecDisposition::Signaled(_))
+        ) {
+            return Err(StateError::UnexpectedTerminationOutcomeForDisposition {
+                exec_id: self.exec_id,
+                disposition: self
+                    .disposition
+                    .expect("checked above to be present for non-termination dispositions"),
+                termination,
+            });
+        }
+        if let Some(current) = self.termination_outcome {
+            if current == termination {
+                return Ok(());
+            }
+            return Err(StateError::TerminationOutcomeConflict {
+                exec_id: self.exec_id,
+                current,
+                attempted: termination,
+            });
+        }
+        self.termination_outcome = Some(termination);
         Ok(())
     }
 
@@ -935,7 +990,30 @@ impl ExecState {
     }
 
     fn can_emit_terminal(&self) -> bool {
-        !self.terminal_emitted && self.has_required_terminal_prerequisites()
+        !self.terminal_emitted
+            && self.has_required_terminal_prerequisites()
+            && matches!(
+                self.disposition,
+                Some(ExecDisposition::Cancelled | ExecDisposition::TimedOut)
+            ) == self.termination_outcome.is_some()
+    }
+
+    fn validate_terminal_termination_outcome(&self) -> Result<(), StateError> {
+        let disposition = self
+            .disposition
+            .expect("disposition must exist when validating terminal");
+        match (disposition, self.termination_outcome) {
+            (ExecDisposition::Cancelled | ExecDisposition::TimedOut, Some(_)) => Ok(()),
+            (ExecDisposition::Cancelled | ExecDisposition::TimedOut, None) => Ok(()),
+            (ExecDisposition::ExitCode(_) | ExecDisposition::Signaled(_), None) => Ok(()),
+            (ExecDisposition::ExitCode(_) | ExecDisposition::Signaled(_), Some(termination)) => {
+                Err(StateError::UnexpectedTerminationOutcomeForDisposition {
+                    exec_id: self.exec_id,
+                    disposition,
+                    termination,
+                })
+            }
+        }
     }
 }
 
@@ -1486,6 +1564,12 @@ mod tests {
         state
             .apply_exec_event(28, ActiveExecEvent::Disposition(ExecDisposition::Cancelled))
             .expect("cancelled disposition");
+        state
+            .apply_exec_event(
+                28,
+                ActiveExecEvent::TerminationOutcome(TerminationOutcome::GracefulTerm),
+            )
+            .expect("graceful termination outcome");
 
         assert!(matches!(
             state.apply_exec_event(28, ActiveExecEvent::StdinChunk { sequence: 0 }),
@@ -1662,6 +1746,12 @@ mod tests {
         state
             .apply_exec_event(24, ActiveExecEvent::DescendantsCleaned)
             .expect("cleaned");
+        state
+            .apply_exec_event(
+                24,
+                ActiveExecEvent::TerminationOutcome(TerminationOutcome::ForcedKill),
+            )
+            .expect("forced termination outcome");
         let terminal = state
             .apply_exec_event(24, ActiveExecEvent::Disposition(ExecDisposition::Cancelled))
             .expect("disposition")
@@ -1670,7 +1760,8 @@ mod tests {
             terminal,
             ExecTerminalEvent {
                 exec_id: 24,
-                disposition: ExecDisposition::Cancelled
+                disposition: ExecDisposition::Cancelled,
+                termination: Some(TerminationOutcome::ForcedKill),
             }
         );
     }
@@ -1700,6 +1791,12 @@ mod tests {
         state
             .apply_exec_event(25, ActiveExecEvent::Disposition(ExecDisposition::TimedOut))
             .expect("disposition");
+        state
+            .apply_exec_event(
+                25,
+                ActiveExecEvent::TerminationOutcome(TerminationOutcome::ForcedKill),
+            )
+            .expect("forced timeout termination outcome");
         assert!(
             state
                 .apply_exec_event(25, ActiveExecEvent::StdoutEof { sequence: 0 })
@@ -1739,6 +1836,125 @@ mod tests {
         assert!(matches!(
             state.apply_exec_event(25, ActiveExecEvent::Disposition(ExecDisposition::TimedOut)),
             Err(StateError::UnknownExecId { exec_id: 25 })
+        ));
+    }
+
+    #[test]
+    fn timeout_terminal_waits_until_termination_outcome_arrives() {
+        let mut state = ready_state(10);
+        state.create_exec(26).expect("exec");
+        state
+            .apply_exec_event(26, ActiveExecEvent::Disposition(ExecDisposition::TimedOut))
+            .expect("disposition");
+        state
+            .apply_exec_event(26, ActiveExecEvent::StdoutEof { sequence: 0 })
+            .expect("stdout eof");
+        state
+            .apply_exec_event(26, ActiveExecEvent::StderrEof { sequence: 0 })
+            .expect("stderr eof");
+        state
+            .apply_exec_event(
+                26,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stdout,
+                },
+            )
+            .expect("stdout drained");
+        state
+            .apply_exec_event(
+                26,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stderr,
+                },
+            )
+            .expect("stderr drained");
+        let before_termination = state
+            .apply_exec_event(26, ActiveExecEvent::DescendantsCleaned)
+            .expect("descendants cleaned");
+        assert!(before_termination.is_none());
+    }
+
+    #[test]
+    fn terminal_waits_for_termination_outcome_and_emits_once() {
+        let mut state = ready_state(13);
+        state.create_exec(29).expect("exec");
+        state
+            .apply_exec_event(29, ActiveExecEvent::Disposition(ExecDisposition::TimedOut))
+            .expect("disposition");
+        state
+            .apply_exec_event(29, ActiveExecEvent::StdoutEof { sequence: 0 })
+            .expect("stdout eof");
+        state
+            .apply_exec_event(29, ActiveExecEvent::StderrEof { sequence: 0 })
+            .expect("stderr eof");
+        state
+            .apply_exec_event(
+                29,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stdout,
+                },
+            )
+            .expect("stdout drained");
+        state
+            .apply_exec_event(
+                29,
+                ActiveExecEvent::StreamDrained {
+                    stream: StreamName::Stderr,
+                },
+            )
+            .expect("stderr drained");
+        let before_termination = state
+            .apply_exec_event(29, ActiveExecEvent::DescendantsCleaned)
+            .expect("descendants cleaned");
+        assert!(before_termination.is_none());
+
+        let terminal = state
+            .apply_exec_event(
+                29,
+                ActiveExecEvent::TerminationOutcome(TerminationOutcome::ForcedKill),
+            )
+            .expect("termination outcome")
+            .expect("terminal");
+        assert_eq!(
+            terminal,
+            ExecTerminalEvent {
+                exec_id: 29,
+                disposition: ExecDisposition::TimedOut,
+                termination: Some(TerminationOutcome::ForcedKill),
+            }
+        );
+        assert!(matches!(
+            state.apply_exec_event(
+                29,
+                ActiveExecEvent::TerminationOutcome(TerminationOutcome::ForcedKill)
+            ),
+            Err(StateError::UnknownExecId { exec_id: 29 })
+        ));
+    }
+
+    #[test]
+    fn non_terminated_exit_rejects_termination_outcome_metadata() {
+        let mut state = ready_state(11);
+        state.create_exec(27).expect("exec");
+        state
+            .apply_exec_event(
+                27,
+                ActiveExecEvent::Disposition(ExecDisposition::ExitCode(0)),
+            )
+            .expect("disposition");
+        let error = state
+            .apply_exec_event(
+                27,
+                ActiveExecEvent::TerminationOutcome(TerminationOutcome::ForcedKill),
+            )
+            .expect_err("normal exit must not carry termination metadata");
+        assert!(matches!(
+            error,
+            StateError::UnexpectedTerminationOutcomeForDisposition {
+                exec_id: 27,
+                disposition: ExecDisposition::ExitCode(0),
+                termination: TerminationOutcome::ForcedKill
+            }
         ));
     }
 

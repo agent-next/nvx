@@ -18,6 +18,7 @@ use agent_protocol::messages::{
     AgentControlMessage, CapabilityProofMaterial, ExecDisposition, FlowCreditRequest,
     HostControlMessage, LaunchIdentity, NetworkSetupState, ProtocolErrorCode, ProtocolErrorDetail,
     ReadyStatus, SERVICE_IDENTITY, StdinChunkRecord, StdinEofRecord, StreamName,
+    TerminationOutcome,
 };
 #[cfg(windows)]
 use agent_protocol::{PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES, PROTOCOL_VERSION};
@@ -54,6 +55,7 @@ struct ExecObservation {
     stderr: Vec<u8>,
     messages: Vec<AgentControlMessage>,
     disposition: Option<ExecDisposition>,
+    termination: Option<TerminationOutcome>,
     stdout_chunk_max: usize,
     stderr_chunk_max: usize,
 }
@@ -688,10 +690,12 @@ fn run_req6_terminal_semantics(state: &mut LiveHarnessState) -> CheckOutcome {
         };
     let stdin_eof_ok = stdin_observed.stdout == b"stdin-eof-observed\n"
         && stdin_observed.disposition == Some(ExecDisposition::ExitCode(0))
+        && stdin_observed.termination.is_none()
         && terminal_order_ok(
             &stdin_observed.messages,
             stdin_exec,
             ExecDisposition::ExitCode(0),
+            None,
         );
 
     let normal_ok = match run_exec_terminal_check(
@@ -730,7 +734,7 @@ fn run_req6_terminal_semantics(state: &mut LiveHarnessState) -> CheckOutcome {
     if stdin_eof_ok && normal_ok && signal_ok && graceful_cancel && forced_cancel && timeout_tree {
         pass_check(vec![
             "stdin EOF reached live workload, which acknowledged EOF before clean terminal completion".to_string(),
-            "normal exit, signaled exit, graceful cancel, forced-cancel escalation, and timeout dispositions were all observed".to_string(),
+            "normal/signal terminals carried no forced metadata; cancel reported Graceful when TERM completed, Forced when SIGKILL escalation was initiated, and timeout+SIGTERM-ignore reported forced timeout escalation".to_string(),
             "each terminal arrived exactly once and only after stdout/stderr EOF plus descendants-cleaned; child+grandchild PIDs were gone before cancel/timeout completion".to_string(),
         ])
     } else {
@@ -751,7 +755,8 @@ fn run_exec_terminal_check(
     grant_stream(session, exec_id, StreamName::Stderr, 1)?;
     let observed = collect_exec_until_terminal(session, exec_id, Duration::from_secs(10), true)?;
     Ok(observed.disposition == Some(expected)
-        && terminal_order_ok(&observed.messages, exec_id, expected))
+        && observed.termination.is_none()
+        && terminal_order_ok(&observed.messages, exec_id, expected, None))
 }
 
 #[cfg(windows)]
@@ -806,7 +811,22 @@ fn run_cancelled_tree_exec(
         .map_err(|error| format!("cancel execution failed: {error}"))?;
     let observed = collect_exec_until_terminal(session, exec_id, Duration::from_secs(12), true)?;
     if observed.disposition != Some(ExecDisposition::Cancelled)
-        || !terminal_order_ok(&observed.messages, exec_id, ExecDisposition::Cancelled)
+        || observed.termination
+            != Some(if ignore_term {
+                TerminationOutcome::ForcedKill
+            } else {
+                TerminationOutcome::GracefulTerm
+            })
+        || !terminal_order_ok(
+            &observed.messages,
+            exec_id,
+            ExecDisposition::Cancelled,
+            Some(if ignore_term {
+                TerminationOutcome::ForcedKill
+            } else {
+                TerminationOutcome::GracefulTerm
+            }),
+        )
     {
         return Ok(false);
     }
@@ -866,7 +886,13 @@ fn run_timeout_tree_exec(
     };
     let observed = collect_exec_until_terminal(session, exec_id, Duration::from_secs(12), true)?;
     if observed.disposition != Some(ExecDisposition::TimedOut)
-        || !terminal_order_ok(&observed.messages, exec_id, ExecDisposition::TimedOut)
+        || observed.termination != Some(TerminationOutcome::ForcedKill)
+        || !terminal_order_ok(
+            &observed.messages,
+            exec_id,
+            ExecDisposition::TimedOut,
+            Some(TerminationOutcome::ForcedKill),
+        )
     {
         return Ok(false);
     }
@@ -1034,6 +1060,7 @@ fn collect_exec_until_terminal(
     let mut stderr = Vec::new();
     let mut messages = Vec::new();
     let mut disposition = None;
+    let mut termination = None;
     let mut stdout_chunk_max = 0_usize;
     let mut stderr_chunk_max = 0_usize;
     while Instant::now() < deadline {
@@ -1078,13 +1105,16 @@ fn collect_exec_until_terminal(
             AgentControlMessage::ExecTerminal {
                 exec_id: terminal_exec_id,
                 disposition: terminal_disposition,
+                termination: terminal_termination,
             } => {
                 messages.push(AgentControlMessage::ExecTerminal {
                     exec_id: terminal_exec_id,
                     disposition: terminal_disposition,
+                    termination: terminal_termination,
                 });
                 if terminal_exec_id == exec_id {
                     disposition = Some(terminal_disposition);
+                    termination = terminal_termination;
                     break;
                 }
             }
@@ -1109,6 +1139,7 @@ fn collect_exec_until_terminal(
         stderr,
         messages,
         disposition,
+        termination,
         stdout_chunk_max,
         stderr_chunk_max,
     })
@@ -1119,6 +1150,7 @@ fn terminal_order_ok(
     messages: &[AgentControlMessage],
     exec_id: u32,
     expected: ExecDisposition,
+    expected_termination: Option<TerminationOutcome>,
 ) -> bool {
     let terminal_positions: Vec<usize> = messages
         .iter()
@@ -1127,7 +1159,13 @@ fn terminal_order_ok(
             AgentControlMessage::ExecTerminal {
                 exec_id: id,
                 disposition,
-            } if *id == exec_id && *disposition == expected => Some(index),
+                termination,
+            } if *id == exec_id
+                && *disposition == expected
+                && *termination == expected_termination =>
+            {
+                Some(index)
+            }
             _ => None,
         })
         .collect();

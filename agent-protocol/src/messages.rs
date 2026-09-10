@@ -29,6 +29,13 @@ pub enum ExecDisposition {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub enum TerminationOutcome {
+    GracefulTerm,
+    ForcedKill,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum StreamName {
     Stdin,
     Stdout,
@@ -195,6 +202,7 @@ pub enum AgentControlMessage {
     ExecTerminal {
         exec_id: u32,
         disposition: ExecDisposition,
+        termination: Option<TerminationOutcome>,
     },
 }
 
@@ -483,6 +491,7 @@ mod tests {
         let terminal = AgentControlMessage::ExecTerminal {
             exec_id: 9,
             disposition: ExecDisposition::Cancelled,
+            termination: Some(TerminationOutcome::ForcedKill),
         };
         let encoded_terminal = serde_json::to_vec(&terminal).expect("serialize");
         let decoded_terminal: AgentControlMessage =

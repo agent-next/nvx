@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use agent_protocol::{
     CreateProcessRequest, DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES,
     DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_RECORDS, DEFAULT_STDIN_QUEUE_LIMIT_BYTES, ProcessSupervisor,
-    ServiceError, ServiceErrorCode, SupervisorEvent,
+    ServiceError, ServiceErrorCode, SupervisorEvent, TerminationOutcome,
 };
 
 use crate::launcher::{self, LauncherConfig};
@@ -938,9 +938,13 @@ fn maybe_report_exit(active: &mut ActiveProcess) -> Result<(), ServiceError> {
         return Ok(());
     };
     let terminal = match read_holder_wait_status(active)? {
-        HolderWaitStatusRead::Ready(wait_status) => terminal_event_from_wait_status(wait_status),
+        HolderWaitStatusRead::Ready(wait_status) => {
+            terminal_event_from_wait_status(wait_status, terminal_termination_outcome(active))
+        }
         HolderWaitStatusRead::Pending => return Ok(()),
-        HolderWaitStatusRead::EofBeforePayload => terminal_event_from_exit_status(status),
+        HolderWaitStatusRead::EofBeforePayload => {
+            terminal_event_from_exit_status(status, terminal_termination_outcome(active))
+        }
     };
     active.pending_terminal_event = Some(terminal);
     active.exit_status_reported = true;
@@ -1069,24 +1073,58 @@ fn read_holder_wait_status(
     Ok(HolderWaitStatusRead::Ready(i32::from_ne_bytes(bytes)))
 }
 
-fn terminal_event_from_wait_status(wait_status: i32) -> SupervisorEvent {
-    if libc::WIFEXITED(wait_status) {
-        return SupervisorEvent::Exited(libc::WEXITSTATUS(wait_status));
+fn terminal_termination_outcome(active: &ActiveProcess) -> Option<TerminationOutcome> {
+    if active.kill_sent {
+        return Some(TerminationOutcome::ForcedKill);
     }
-    if libc::WIFSIGNALED(wait_status) {
-        return SupervisorEvent::Signaled(libc::WTERMSIG(wait_status));
+    if active.terminate_sent_at.is_some() {
+        return Some(TerminationOutcome::GracefulTerm);
     }
-    SupervisorEvent::Exited(1)
+    None
 }
 
-fn terminal_event_from_exit_status(status: std::process::ExitStatus) -> SupervisorEvent {
+fn terminal_event_from_wait_status(
+    wait_status: i32,
+    termination: Option<TerminationOutcome>,
+) -> SupervisorEvent {
+    if libc::WIFEXITED(wait_status) {
+        return SupervisorEvent::Exited {
+            exit_code: libc::WEXITSTATUS(wait_status),
+            termination,
+        };
+    }
+    if libc::WIFSIGNALED(wait_status) {
+        return SupervisorEvent::Signaled {
+            signal: libc::WTERMSIG(wait_status),
+            termination,
+        };
+    }
+    SupervisorEvent::Exited {
+        exit_code: 1,
+        termination,
+    }
+}
+
+fn terminal_event_from_exit_status(
+    status: std::process::ExitStatus,
+    termination: Option<TerminationOutcome>,
+) -> SupervisorEvent {
     if let Some(code) = status.code() {
-        return SupervisorEvent::Exited(code);
+        return SupervisorEvent::Exited {
+            exit_code: code,
+            termination,
+        };
     }
     if let Some(signal) = status.signal() {
-        return SupervisorEvent::Signaled(signal);
+        return SupervisorEvent::Signaled {
+            signal,
+            termination,
+        };
     }
-    SupervisorEvent::Exited(1)
+    SupervisorEvent::Exited {
+        exit_code: 1,
+        termination,
+    }
 }
 
 fn can_refresh_streams(active: &ActiveProcess) -> bool {
@@ -2054,7 +2092,7 @@ mod tests {
             .unwrap();
         supervisor.terminate(2).unwrap();
         let signaled = wait_for_event(&mut supervisor, 2, Duration::from_secs(3), |event| {
-            matches!(event, SupervisorEvent::Signaled(_))
+            matches!(event, SupervisorEvent::Signaled { .. })
         });
         assert!(signaled.is_some(), "expected signaled event");
         let cleaned = wait_for_event(&mut supervisor, 2, Duration::from_secs(1), |event| {
@@ -2257,12 +2295,17 @@ mod tests {
                 continue;
             };
             match event {
-                SupervisorEvent::Signaled(signal) => {
+                SupervisorEvent::Signaled {
+                    signal,
+                    termination,
+                } => {
                     terminal_count = terminal_count.saturating_add(1);
                     assert_eq!(signal, libc::SIGTERM);
+                    assert_eq!(termination, Some(TerminationOutcome::GracefulTerm));
                 }
-                SupervisorEvent::Exited(_) => {
+                SupervisorEvent::Exited { termination, .. } => {
                     terminal_count = terminal_count.saturating_add(1);
+                    assert_eq!(termination, Some(TerminationOutcome::GracefulTerm));
                 }
                 SupervisorEvent::DescendantsCleaned => {
                     cleaned_count = cleaned_count.saturating_add(1);
@@ -2334,12 +2377,17 @@ mod tests {
                 continue;
             };
             match event {
-                SupervisorEvent::Signaled(signal) => {
+                SupervisorEvent::Signaled {
+                    signal,
+                    termination,
+                } => {
                     terminal_count = terminal_count.saturating_add(1);
                     assert_eq!(signal, libc::SIGKILL);
+                    assert_eq!(termination, Some(TerminationOutcome::ForcedKill));
                 }
-                SupervisorEvent::Exited(_) => {
+                SupervisorEvent::Exited { termination, .. } => {
                     terminal_count = terminal_count.saturating_add(1);
+                    assert_eq!(termination, Some(TerminationOutcome::ForcedKill));
                 }
                 SupervisorEvent::DescendantsCleaned => {
                     cleaned_count = cleaned_count.saturating_add(1);
@@ -2754,7 +2802,7 @@ mod tests {
 
         supervisor.terminate(exec_id).expect("terminate");
         let signaled = wait_for_event(&mut supervisor, exec_id, Duration::from_secs(2), |event| {
-            matches!(event, SupervisorEvent::Signaled(_))
+            matches!(event, SupervisorEvent::Signaled { .. })
         });
         assert!(
             signaled.is_some(),
@@ -3355,7 +3403,10 @@ mod tests {
         maybe_report_descendants_cleaned(&mut active, None).expect("second removal attempt");
         assert!(matches!(
             active.event_queue.pop_front(),
-            Some(SupervisorEvent::Exited(0))
+            Some(SupervisorEvent::Exited {
+                exit_code: 0,
+                termination: Some(TerminationOutcome::ForcedKill)
+            })
         ));
         assert!(matches!(
             active.event_queue.pop_front(),
@@ -3555,10 +3606,16 @@ mod tests {
             })
             .expect("spawn");
         let signal = wait_for_event(&mut supervisor, exec_id, Duration::from_secs(3), |event| {
-            matches!(event, SupervisorEvent::Signaled(_))
+            matches!(event, SupervisorEvent::Signaled { .. })
         });
         assert!(
-            matches!(signal, Some(SupervisorEvent::Signaled(libc::SIGTERM))),
+            matches!(
+                signal,
+                Some(SupervisorEvent::Signaled {
+                    signal: libc::SIGTERM,
+                    termination: None
+                })
+            ),
             "holder wrapper must preserve inner signal status"
         );
     }

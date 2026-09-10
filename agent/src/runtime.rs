@@ -2507,7 +2507,10 @@ mod tests {
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
-        supervisor.events.push_back(SupervisorEvent::Exited(0));
+        supervisor.events.push_back(SupervisorEvent::Exited {
+            exit_code: 0,
+            termination: None,
+        });
 
         let writes = Rc::new(RefCell::new(Vec::new()));
         let mut channel = agent_protocol::HvcFramedChannel::new(RuntimeTestIo::new(writes.clone()));
