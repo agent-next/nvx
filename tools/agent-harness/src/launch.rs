@@ -323,7 +323,7 @@ pub fn launch_whp_vm(plan: LaunchPlan) -> Result<LaunchedVm, String> {
     let args = vec![
         "--single-process".to_string(),
         "--machine".to_string(),
-        "microvm-v2".to_string(),
+        "microvm".to_string(),
         "--hypervisor".to_string(),
         "whp".to_string(),
         "--memory".to_string(),

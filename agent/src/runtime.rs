@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io;
 use std::io::Read;
@@ -54,6 +55,8 @@ const NETWORK_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const NETWORK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CONTROL_TTY_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_TTY_OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const CONTROL_TTY_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
+const CONTROL_TTY_DIAGNOSTIC_MAX_ENTRIES: usize = 64;
 const MAX_NETWORK_METADATA_ITEMS: usize = 8;
 const MAX_NETWORK_METADATA_STRING_BYTES: usize = 128;
 const MAX_PROC_TEXT_BYTES: usize = 64 * 1024;
@@ -1507,6 +1510,7 @@ fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
         &["nvx.channel_generation", "nvx_channel_generation"],
     )?;
     let control_tty_device_path = parse_required_control_tty_arg(&cmdline)?;
+    ensure_virtiofs_mapping_root_mounted(&cmdline)?;
     Ok(LaunchRuntimeConfig {
         binding: LaunchBinding {
             protocol_version: PROTOCOL_VERSION,
@@ -1519,6 +1523,55 @@ fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
         },
         control_tty_device_path,
     })
+}
+
+fn ensure_virtiofs_mapping_root_mounted(cmdline: &str) -> Result<()> {
+    let (_, mount_target) = extract_unique_cmdline_value(cmdline, &["virtfs_dir"])?;
+    let (_, tag) = extract_unique_cmdline_value(cmdline, &["virtfs_tag"])?;
+    let (_, mode) = extract_unique_cmdline_value(cmdline, &["virtfs_mode"])?;
+    if mount_target != DEFAULT_GUEST_MAPPING_ROOT {
+        return Err(AgentError::config(format!(
+            "virtfs_dir must be {DEFAULT_GUEST_MAPPING_ROOT}, got {mount_target}"
+        )));
+    }
+    let flags = match mode.as_str() {
+        "rw" => 0,
+        "ro" => libc::MS_RDONLY,
+        _ => {
+            return Err(AgentError::config(format!(
+                "virtfs_mode must be rw or ro, got {mode}"
+            )));
+        }
+    };
+
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| AgentError::io("reading /proc/self/mountinfo", error))?;
+    if let Some(fs_type) = mount_fstype_for_mountpoint(&mountinfo, DEFAULT_GUEST_MAPPING_ROOT) {
+        if fs_type == "virtiofs" {
+            return Ok(());
+        }
+        return Err(AgentError::fail_closed(format!(
+            "{DEFAULT_GUEST_MAPPING_ROOT} is already mounted as {fs_type}, expected virtiofs"
+        )));
+    }
+
+    std::fs::create_dir_all(DEFAULT_GUEST_MAPPING_ROOT).map_err(|error| {
+        AgentError::io(
+            format!("creating mapping root {DEFAULT_GUEST_MAPPING_ROOT}"),
+            error,
+        )
+    })?;
+    mount_filesystem_with_flags(&tag, DEFAULT_GUEST_MAPPING_ROOT, "virtiofs", flags)?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| AgentError::io("re-reading /proc/self/mountinfo", error))?;
+    if mount_fstype_for_mountpoint(&mountinfo, DEFAULT_GUEST_MAPPING_ROOT).as_deref()
+        != Some("virtiofs")
+    {
+        return Err(AgentError::fail_closed(format!(
+            "virtiofs mount on {DEFAULT_GUEST_MAPPING_ROOT} did not appear in mountinfo"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1685,6 +1738,15 @@ fn mount_startup_pseudofs(requirement: PseudoFsRequirement) -> Result<()> {
 }
 
 fn mount_filesystem(source: &str, target: &str, fstype: &str) -> Result<()> {
+    mount_filesystem_with_flags(source, target, fstype, 0)
+}
+
+fn mount_filesystem_with_flags(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+) -> Result<()> {
     let source_label = source.to_string();
     let target_label = target.to_string();
     let fstype_label = fstype.to_string();
@@ -1700,7 +1762,7 @@ fn mount_filesystem(source: &str, target: &str, fstype: &str) -> Result<()> {
             source.as_ptr(),
             target.as_ptr(),
             fstype.as_ptr(),
-            0,
+            flags,
             std::ptr::null(),
         )
     };
@@ -2140,6 +2202,7 @@ fn install_sigchld_wakeup_handler() -> Result<()> {
 struct GuestControlTransport {
     session: GuestControlSession<File>,
     read_buffer: VecDeque<u8>,
+    write_buffer: Vec<u8>,
     eof_after_reset: bool,
 }
 
@@ -2155,6 +2218,7 @@ impl GuestControlTransport {
         Ok(Self {
             session,
             read_buffer: VecDeque::new(),
+            write_buffer: Vec::new(),
             eof_after_reset: false,
         })
     }
@@ -2165,7 +2229,7 @@ impl GuestControlTransport {
         }
         match self.session.try_recv_event() {
             Ok(Some(GuestEvent::Data(payload))) => {
-                self.read_buffer.extend(payload);
+                append_hvc_frame(&mut self.read_buffer, &payload)?;
                 Ok(())
             }
             Ok(Some(GuestEvent::Reset { .. })) => {
@@ -2218,15 +2282,59 @@ impl Write for GuestControlTransport {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.session
-            .send_data(buf.to_vec())
-            .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))?;
+        let frames = accept_hvc_framed_bytes(&mut self.write_buffer, buf)?;
+        for frame in frames {
+            self.session
+                .send_data(frame)
+                .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))?;
+        }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+fn append_hvc_frame(buffer: &mut VecDeque<u8>, payload: &[u8]) -> io::Result<()> {
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "broker payload is too large"))?;
+    buffer.extend(payload_len.to_be_bytes());
+    buffer.extend(payload);
+    Ok(())
+}
+
+fn accept_hvc_framed_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    const MAX_PAYLOAD_BYTES: usize =
+        agent_protocol::OPENVMM_OUTER_RECORD_MAX_BYTES - OPENVMM_OUTER_FRAME_OVERHEAD_BYTES;
+
+    buffer.extend_from_slice(bytes);
+    let mut frames = Vec::new();
+    loop {
+        if buffer.len() < std::mem::size_of::<u32>() {
+            break;
+        }
+        let payload_len =
+            u32::from_be_bytes(buffer[..4].try_into().expect("length header")) as usize;
+        if payload_len > MAX_PAYLOAD_BYTES {
+            buffer.clear();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "HVC payload length {payload_len} exceeds broker limit {MAX_PAYLOAD_BYTES}"
+                ),
+            ));
+        }
+        let frame_len = std::mem::size_of::<u32>()
+            .checked_add(payload_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "HVC frame overflow"))?;
+        if buffer.len() < frame_len {
+            break;
+        }
+        frames.push(buffer[4..frame_len].to_vec());
+        buffer.drain(..frame_len);
+    }
+    Ok(frames)
 }
 
 fn open_control_tty_raw_nonblocking(path: &str) -> Result<File> {
@@ -2257,7 +2365,199 @@ fn open_control_tty_raw_nonblocking(path: &str) -> Result<File> {
             thread::sleep(CONTROL_TTY_OPEN_RETRY_INTERVAL);
             continue;
         }
+        emit_control_tty_open_diagnostics(path, &error);
         return Err(AgentError::io(format!("opening {path}"), error));
+    }
+}
+
+fn emit_control_tty_open_diagnostics(path: &str, open_error: &io::Error) {
+    let diagnostics = collect_control_tty_open_diagnostics(Path::new("/"), path, open_error);
+    eprintln!("NVX-AGENT-CONTROL-TTY-DIAGNOSTICS-BEGIN");
+    eprint!("{diagnostics}");
+    eprintln!("NVX-AGENT-CONTROL-TTY-DIAGNOSTICS-END");
+}
+
+fn collect_control_tty_open_diagnostics(root: &Path, path: &str, open_error: &io::Error) -> String {
+    let mut output = String::new();
+    let errno = open_error
+        .raw_os_error()
+        .map_or_else(|| "unknown".to_string(), |value| value.to_string());
+    let _ = writeln!(
+        output,
+        "control_tty_path={path} open_errno={errno} open_error={open_error}"
+    );
+    append_diagnostic_file(
+        &mut output,
+        "proc_cmdline",
+        &root.join("proc/cmdline"),
+        true,
+    );
+    append_matching_directory_entries(&mut output, "dev_hvc", &root.join("dev"), "hvc");
+    append_diagnostic_file(
+        &mut output,
+        "proc_tty_drivers",
+        &root.join("proc/tty/drivers"),
+        false,
+    );
+    append_virtio_diagnostics(&mut output, &root.join("sys/bus/virtio/devices"));
+    append_tty_sysfs_diagnostics(&mut output, &root.join("sys/class/tty"));
+    output
+}
+
+fn append_diagnostic_file(output: &mut String, label: &str, path: &Path, redact: bool) {
+    match read_diagnostic_text(path) {
+        Ok(value) => {
+            let value = if redact {
+                redact_cmdline_secrets(&value)
+            } else {
+                value
+            };
+            let _ = writeln!(output, "{label}={}", value.trim_end());
+        }
+        Err(error) => {
+            let _ = writeln!(output, "{label}=<unavailable: {error}>");
+        }
+    }
+}
+
+fn read_diagnostic_text(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(CONTROL_TTY_DIAGNOSTIC_MAX_BYTES as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn redact_cmdline_secrets(cmdline: &str) -> String {
+    cmdline
+        .split_whitespace()
+        .map(|token| {
+            let Some((name, _)) = token.split_once('=') else {
+                return token.to_string();
+            };
+            let lower = name.to_ascii_lowercase();
+            if [
+                "secret",
+                "token",
+                "password",
+                "passwd",
+                "nonce",
+                "capability",
+                "auth",
+            ]
+            .iter()
+            .any(|sensitive| lower.contains(sensitive))
+            {
+                format!("{name}=<redacted>")
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sorted_directory_entries(path: &Path) -> io::Result<Vec<std::fs::DirEntry>> {
+    let mut entries = std::fs::read_dir(path)?
+        .take(CONTROL_TTY_DIAGNOSTIC_MAX_ENTRIES)
+        .collect::<io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+fn append_matching_directory_entries(output: &mut String, label: &str, path: &Path, prefix: &str) {
+    match sorted_directory_entries(path) {
+        Ok(entries) => {
+            let names = entries
+                .into_iter()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.starts_with(prefix))
+                .collect::<Vec<_>>();
+            let _ = writeln!(
+                output,
+                "{label}={}",
+                if names.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    names.join(",")
+                }
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(output, "{label}=<unavailable: {error}>");
+        }
+    }
+}
+
+fn append_virtio_diagnostics(output: &mut String, devices_path: &Path) {
+    let entries = match sorted_directory_entries(devices_path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let _ = writeln!(output, "virtio_devices=<unavailable: {error}>");
+            return;
+        }
+    };
+    if entries.is_empty() {
+        let _ = writeln!(output, "virtio_devices=<none>");
+        return;
+    }
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let device_path = entry.path();
+        append_diagnostic_file(
+            output,
+            &format!("virtio_device.{name}.modalias"),
+            &device_path.join("modalias"),
+            false,
+        );
+        append_diagnostic_file(
+            output,
+            &format!("virtio_device.{name}.status"),
+            &device_path.join("status"),
+            false,
+        );
+        let driver = std::fs::read_link(device_path.join("driver"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "<none>".to_string());
+        let _ = writeln!(output, "virtio_device.{name}.driver={driver}");
+    }
+}
+
+fn append_tty_sysfs_diagnostics(output: &mut String, tty_path: &Path) {
+    let entries = match sorted_directory_entries(tty_path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let _ = writeln!(output, "tty_sysfs=<unavailable: {error}>");
+            return;
+        }
+    };
+    let mut found = false;
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("hvc") {
+            continue;
+        }
+        found = true;
+        append_diagnostic_file(
+            output,
+            &format!("tty.{name}.dev"),
+            &entry.path().join("dev"),
+            false,
+        );
+        append_diagnostic_file(
+            output,
+            &format!("tty.{name}.uevent"),
+            &entry.path().join("device/uevent"),
+            false,
+        );
+    }
+    if !found {
+        let _ = writeln!(output, "tty_sysfs=<no hvc entries>");
     }
 }
 
@@ -2595,6 +2895,110 @@ mod tests {
         assert_eq!(control, "/dev/hvc2");
         assert!(parse_required_control_tty_arg("quiet nvx_control_tty=hvc1").is_err());
         assert!(parse_required_control_tty_arg("quiet nvx_control_tty=ttyS0").is_err());
+    }
+
+    #[test]
+    fn control_tty_open_diagnostics_report_device_state_and_redact_secrets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for path in [
+            "proc/tty",
+            "dev",
+            "sys/bus/virtio/devices/virtio0",
+            "sys/class/tty/hvc2/device",
+        ] {
+            std::fs::create_dir_all(temp.path().join(path)).expect("create diagnostic path");
+        }
+        std::fs::write(
+            temp.path().join("proc/cmdline"),
+            "console=hvc1 nvx_control_tty=hvc2 launch_nonce=secret\n",
+        )
+        .expect("write cmdline");
+        std::fs::write(
+            temp.path().join("proc/tty/drivers"),
+            "hvc /dev/hvc 229 0-7\n",
+        )
+        .expect("write tty drivers");
+        std::fs::write(temp.path().join("dev/hvc2"), "").expect("write hvc node");
+        std::fs::write(
+            temp.path().join("sys/bus/virtio/devices/virtio0/modalias"),
+            "virtio:d00000003v00001AF4\n",
+        )
+        .expect("write modalias");
+        std::fs::write(
+            temp.path().join("sys/bus/virtio/devices/virtio0/status"),
+            "0x0000000f\n",
+        )
+        .expect("write status");
+        std::fs::write(temp.path().join("sys/class/tty/hvc2/dev"), "229:2\n")
+            .expect("write tty dev");
+        std::fs::write(
+            temp.path().join("sys/class/tty/hvc2/device/uevent"),
+            "DRIVER=virtio_console\n",
+        )
+        .expect("write tty uevent");
+
+        let diagnostics = collect_control_tty_open_diagnostics(
+            temp.path(),
+            "/dev/hvc2",
+            &io::Error::from_raw_os_error(libc::ENODEV),
+        );
+
+        assert!(diagnostics.contains("proc_cmdline=console=hvc1 nvx_control_tty=hvc2"));
+        assert!(diagnostics.contains("launch_nonce=<redacted>"));
+        assert!(!diagnostics.contains("launch_nonce=secret"));
+        assert!(diagnostics.contains("dev_hvc=hvc2"));
+        assert!(diagnostics.contains("virtio_device.virtio0.modalias=virtio:d00000003"));
+        assert!(diagnostics.contains("virtio_device.virtio0.status=0x0000000f"));
+        assert!(diagnostics.contains("tty.hvc2.dev=229:2"));
+        assert!(diagnostics.contains("tty.hvc2.uevent=DRIVER=virtio_console"));
+    }
+
+    #[test]
+    fn guest_control_transport_adapts_hvc_frames_to_broker_records() {
+        let first = b"first-inner-record";
+        let second = b"second-inner-record";
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(first.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(first);
+        encoded.extend_from_slice(&(second.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(second);
+
+        let mut pending = Vec::new();
+        assert!(
+            accept_hvc_framed_bytes(&mut pending, &encoded[..7])
+                .expect("accept partial frame")
+                .is_empty()
+        );
+        let frames =
+            accept_hvc_framed_bytes(&mut pending, &encoded[7..]).expect("accept complete frames");
+
+        assert_eq!(frames, [first.to_vec(), second.to_vec()]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn guest_control_transport_prepends_hvc_frame_length_to_broker_data() {
+        let payload = b"encoded-inner-record";
+        let mut framed = VecDeque::new();
+        append_hvc_frame(&mut framed, payload).expect("frame broker data");
+
+        let framed = framed.into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            u32::from_be_bytes(framed[..4].try_into().expect("length")) as usize,
+            payload.len()
+        );
+        assert_eq!(&framed[4..], payload);
+    }
+
+    #[test]
+    fn guest_control_transport_rejects_oversized_hvc_frame() {
+        let oversized = (agent_protocol::OPENVMM_OUTER_RECORD_MAX_BYTES as u32).to_be_bytes();
+        let mut pending = Vec::new();
+        let error = accept_hvc_framed_bytes(&mut pending, &oversized)
+            .expect_err("oversized frame must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(pending.is_empty());
     }
 
     #[test]

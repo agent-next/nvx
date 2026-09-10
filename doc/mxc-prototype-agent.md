@@ -172,9 +172,21 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   `build/vmlinux`, and `build/initramfs-mxc-agent.cpio.gz` (unless overrides
   are supplied). Missing inputs fail with machine-readable
   `missing-prerequisite` errors.
-- Live launcher machine profile is `--machine microvm-v2` so OpenVMM owns
+- Live launcher machine profile is the pinned OpenVMM-compatible
+  `--machine microvm`; this canonical profile owns
   control-console enumeration and publishes `nvx_control_tty` for the fixed
   control device; NVX does not inject a duplicate control-tty token.
+- The guest kernel pins the boot console at `hvc1` and the authenticated
+  control console at `hvc2` from their fixed MMIO identities. This avoids
+  probe-order races that can swap the channels even when command-line device
+  discovery is ordered.
+- PID1 mounts the fixed `virtfs_tag=microvm` export at the OpenVMM-owned
+  `virtfs_dir` before accepting configuration, and adapts the service's
+  length-prefixed HVC frames to the broker's one-inner-record-per-`Data`
+  contract in both directions.
+- OpenVMM preserves a connected but not-yet-observed host endpoint across the
+  Linux driver's initial virtio reset. Established broker sessions retain the
+  existing reset behavior and require a fresh attachment.
 - The harness always writes a machine-readable JSON report and bounded
   diagnostics to `build/mxc-agent-harness` (or `--output-dir` override),
   including a PID/image-attested, asynchronous, one-MiB/30-second bounded

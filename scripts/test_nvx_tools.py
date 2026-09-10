@@ -2228,7 +2228,7 @@ class SandboxTests(unittest.TestCase):
             ),
             [
                 "--machine",
-                "microvm-v2",
+                "microvm",
                 "--virtio-console",
                 f"listen={Path.cwd() / 'boot.sock'}",
                 "--microvm-control-console",

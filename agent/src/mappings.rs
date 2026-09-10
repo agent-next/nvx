@@ -51,7 +51,9 @@ pub struct MappingResolver {
 }
 
 #[cfg(target_os = "linux")]
-const MAPPING_ROOT_TMPFS_DATA: &str = "mode=755,nosuid,nodev";
+const MAPPING_ROOT_TMPFS_DATA: &str = "mode=755";
+#[cfg(target_os = "linux")]
+const MAPPING_ROOT_TMPFS_FLAGS: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV;
 
 impl MappingResolver {
     pub fn new(guest_root: impl Into<PathBuf>, mappings: Vec<ChildMapping>) -> Result<Self> {
@@ -178,7 +180,7 @@ fn install_resolved_mappings_in_child(
         "tmpfs",
         guest_root_path,
         "tmpfs",
-        0,
+        MAPPING_ROOT_TMPFS_FLAGS,
         Some(MAPPING_ROOT_TMPFS_DATA),
         "hiding raw mapping export with private tmpfs root",
     )?;
@@ -711,6 +713,13 @@ mod tests {
     use ::agent_protocol::{AccessMode, ChildMapping, RelativeChildPath};
 
     use super::*;
+
+    #[test]
+    fn mapping_root_tmpfs_uses_vfs_security_flags() {
+        assert_eq!(MAPPING_ROOT_TMPFS_DATA, "mode=755");
+        assert_ne!(MAPPING_ROOT_TMPFS_FLAGS & libc::MS_NOSUID, 0);
+        assert_ne!(MAPPING_ROOT_TMPFS_FLAGS & libc::MS_NODEV, 0);
+    }
 
     fn mapping(child: &str, access: AccessMode) -> ChildMapping {
         ChildMapping {

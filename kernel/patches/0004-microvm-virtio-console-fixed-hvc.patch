@@ -1,0 +1,78 @@
+From: NVX maintainers
+Subject: [PATCH] virtio_console: pin microVM console HVC numbers
+
+The OpenVMM microVM ABI assigns the boot and control consoles fixed MMIO
+addresses and publishes console=hvc1 plus nvx_control_tty=hvc2.  The generic
+virtio-console driver allocates vterm numbers in probe order, but virtio
+devices can bind in an order different from their command-line registration
+order.  Pin the two ABI consoles by MMIO identity so probe timing cannot swap
+the boot and authenticated control channels.
+
+--- a/drivers/char/virtio_console.c
++++ b/drivers/char/virtio_console.c
+@@ -14,6 +14,7 @@
+ #include <linux/idr.h>
+ #include <linux/init.h>
+ #include <linux/list.h>
++#include <linux/platform_device.h>
+ #include <linux/poll.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+@@ -1187,6 +1188,47 @@ static const struct hv_ops hv_ops = {
+ 	.notifier_hangup = notifier_del_vio,
+ };
+ 
++#ifdef CONFIG_VIRTIO_MMIO_SHARED_STATUS
++#define MICROVM_VIRTIO_BOOT_CONSOLE_MMIO_BASE	0xd0002000
++#define MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE	0xd0007000
++
++static int alloc_console_vtermno(struct port *port)
++{
++	struct device *parent = port->portdev->vdev->dev.parent;
++	struct platform_device *pdev;
++	struct resource *resource;
++	int vtermno = 0;
++
++	if (!parent || parent->bus != &platform_bus_type)
++		goto allocate_dynamic;
++
++	pdev = to_platform_device(parent);
++	if (strcmp(pdev->name, "virtio-mmio"))
++		goto allocate_dynamic;
++
++	resource = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!resource)
++		goto allocate_dynamic;
++
++	if (resource->start == MICROVM_VIRTIO_BOOT_CONSOLE_MMIO_BASE)
++		vtermno = 1;
++	else if (resource->start == MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE)
++		vtermno = 2;
++	else
++		goto allocate_dynamic;
++
++	return ida_alloc_range(&vtermno_ida, vtermno, vtermno, GFP_KERNEL);
++
++allocate_dynamic:
++	return ida_alloc_min(&vtermno_ida, 1, GFP_KERNEL);
++}
++#else
++static int alloc_console_vtermno(struct port *port)
++{
++	return ida_alloc_min(&vtermno_ida, 1, GFP_KERNEL);
++}
++#endif
++
+ static int init_port_console(struct port *port)
+ {
+ 	int ret;
+@@ -1212,7 +1253,7 @@ static int init_port_console(struct port *port)
+ 	 * put_chars() get_chars(), notifier_add() and notifier_del()
+ 	 * pointers.  The final argument is the output buffer size: we
+ 	 * can do any size, so we put PAGE_SIZE here.
+ 	 */
+-	ret = ida_alloc_min(&vtermno_ida, 1, GFP_KERNEL);
++	ret = alloc_console_vtermno(port);
+ 	if (ret < 0)
+ 		return ret;
+ 

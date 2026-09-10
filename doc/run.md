@@ -157,7 +157,7 @@ python3 scripts/nvx.py sandbox \
   --scratch /var/lib/nvx/scratch.ext4
 ```
 
-The command selects `initramfs-agent.cpio.gz`, OpenVMM `microvm-v2`, the
+The command selects `initramfs-agent.cpio.gz`, OpenVMM `microvm`, the
 ordinary boot console, and a separate authenticated control console. OpenVMM
 owns console enumeration and adds the single reserved
 `nvx_control_tty=hvc2` token; the package does not hardcode an HVC device.

@@ -5,7 +5,7 @@
     "version": "0.1.0"
   },
   "openvmm": {
-    "source_revision": "c89081b7673d63c32021fa00d9611acfbcb116b9",
+    "source_revision": "473d72255cdab99f8ff331daa09f8ce7865a5922",
     "microvm_abi_version": 2,
     "control_session_protocol_version": 1,
     "control_contract_revision": "nvx-microvm-v2-control-v1"
@@ -21,7 +21,8 @@
     "patches": [
       "kernel/patches/0001-microvm-xe9-earlycon.patch",
       "kernel/patches/0002-microvm-hvc-xe9.patch",
-      "kernel/patches/0003-microvm-virtio-mmio-shared-status.patch"
+      "kernel/patches/0003-microvm-virtio-mmio-shared-status.patch",
+      "kernel/patches/0004-microvm-virtio-console-fixed-hvc.patch"
     ]
   },
   "alpine": {
