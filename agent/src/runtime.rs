@@ -664,8 +664,14 @@ fn enforce_active_timeout<S: ProcessSupervisor>(
         Err(error) if error.code == ServiceErrorCode::FatalSession => {
             let detail = protocol_error_from_service(error);
             let reason = detail.message.clone();
-            enqueue_outbound(pending_outbound, AgentControlMessage::Error(detail))?;
             start_fatal_shutdown(service, supervisor, fatal_shutdown, reason, Instant::now());
+            if let Err(delivery_error) =
+                enqueue_outbound(pending_outbound, AgentControlMessage::Error(detail))
+            {
+                eprintln!(
+                    "NVX-AGENT-FATAL-DELIVERY-BEST-EFFORT: failed to queue fatal-session protocol error: {delivery_error}"
+                );
+            }
             Ok(())
         }
         Err(error) => {
@@ -1970,6 +1976,65 @@ mod tests {
                 code: ProtocolErrorCode::FatalSession,
                 ..
             }))
+        ));
+    }
+
+    #[test]
+    fn timeout_enforcement_fatal_failure_with_full_pending_queue_still_starts_cleanup_and_deadline_stop()
+     {
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+        let mut supervisor = RuntimeTestSupervisor {
+            fail_next_terminate: Some(ServiceError {
+                code: ServiceErrorCode::FatalSession,
+                message: "injected terminate uncertainty".to_string(),
+            }),
+            ..RuntimeTestSupervisor::default()
+        };
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 207,
+                    argv: vec!["/bin/sleep".to_string(), "10".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: Some(1),
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        let mut active_timeout = Some((207, Instant::now() - Duration::from_millis(1)));
+        let mut pending_outbound = VecDeque::new();
+        for _ in 0..OUTBOUND_PENDING_LIMIT {
+            pending_outbound.push_back(AgentControlMessage::Error(ProtocolErrorDetail {
+                code: ProtocolErrorCode::InvalidLifecycleTransition,
+                message: "prefill".to_string(),
+            }));
+        }
+        let mut fatal_shutdown = None;
+
+        enforce_active_timeout(
+            &mut service,
+            &mut supervisor,
+            &mut active_timeout,
+            &mut pending_outbound,
+            &mut fatal_shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(supervisor.cleanup_for_disconnect_calls, 1);
+        assert_eq!(service.active_exec_id(), None);
+        assert_eq!(
+            pending_outbound.len(),
+            OUTBOUND_PENDING_LIMIT,
+            "fatal delivery must remain best-effort under pending queue saturation"
+        );
+        let state = fatal_shutdown.as_ref().expect("fatal shutdown state");
+        assert!(should_stop_after_fatal_delivery(
+            state,
+            false,
+            true,
+            state.delivery_deadline + Duration::from_millis(1),
         ));
     }
 
