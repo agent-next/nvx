@@ -23,6 +23,7 @@ pub enum ErrorCode {
     BadRequest,
     WorkloadBusy,
     FreezeFailed,
+    FailClosed,
     QuiesceFailed,
     CheckpointTimeout,
 }
@@ -53,6 +54,8 @@ pub enum AgentError {
     Quiesce(String),
     /// The container cgroup did not reach the requested freeze state in time.
     CheckpointTimeout(String),
+    /// The agent observed uncertain runtime state and must fail closed.
+    FailClosed(String),
     /// The agent itself failed.
     Internal(String),
     /// Mandatory isolation controls are unavailable.
@@ -108,6 +111,11 @@ impl AgentError {
         Self::CheckpointTimeout(message.into())
     }
 
+    /// Builds a fail-closed runtime failure.
+    pub fn fail_closed(message: impl Into<String>) -> Self {
+        Self::FailClosed(message.into())
+    }
+
     /// Builds an internal failure.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
@@ -128,9 +136,15 @@ impl AgentError {
             Self::BadRequest(_) => ErrorCode::BadRequest,
             Self::WorkloadBusy(_) => ErrorCode::WorkloadBusy,
             Self::Freeze(_) => ErrorCode::FreezeFailed,
+            Self::FailClosed(_) => ErrorCode::FailClosed,
             Self::Quiesce(_) => ErrorCode::QuiesceFailed,
             Self::CheckpointTimeout(_) => ErrorCode::CheckpointTimeout,
         }
+    }
+
+    /// Returns true when the runtime must immediately stop serving and power off.
+    pub fn requires_fail_closed_action(&self) -> bool {
+        matches!(self, Self::FailClosed(_))
     }
 }
 
@@ -144,6 +158,7 @@ impl fmt::Display for AgentError {
             | Self::BadRequest(message)
             | Self::WorkloadBusy(message)
             | Self::Freeze(message)
+            | Self::FailClosed(message)
             | Self::Quiesce(message)
             | Self::CheckpointTimeout(message)
             | Self::Internal(message)
@@ -180,6 +195,7 @@ mod tests {
             AgentError::checkpoint_timeout("x").code(),
             ErrorCode::CheckpointTimeout
         );
+        assert_eq!(AgentError::fail_closed("x").code(), ErrorCode::FailClosed);
         assert_eq!(
             AgentError::io("reading", io::Error::other("boom")).code(),
             ErrorCode::Internal
@@ -191,5 +207,11 @@ mod tests {
     fn includes_context_in_io_failures() {
         let error = AgentError::io("mounting scratch", io::Error::other("boom"));
         assert_eq!(format!("{error}"), "mounting scratch: boom");
+    }
+
+    #[test]
+    fn fail_closed_marker_is_explicit() {
+        assert!(AgentError::fail_closed("x").requires_fail_closed_action());
+        assert!(!AgentError::freeze("x").requires_fail_closed_action());
     }
 }

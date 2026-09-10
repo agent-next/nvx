@@ -136,7 +136,15 @@ pub fn run_runtime() -> Result<()> {
                         &mut pending_hello,
                         &mut active_timeout,
                         record,
-                    )?;
+                    );
+                    let outbound = match outbound {
+                        Ok(messages) => messages,
+                        Err(error) if error.requires_fail_closed_action() => {
+                            fail_closed_cleanup_and_stop(&mut service, &mut supervisor, &error);
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    };
                     for message in outbound {
                         if matches!(message, AgentControlMessage::ShuttingDown) {
                             shutdown_requested = true;
@@ -185,11 +193,25 @@ fn handle_host_record<S: ProcessSupervisor>(
             protocol_error_from_service(error),
         )]),
         Err(HostDispatchError::Agent(error)) => {
+            if error.requires_fail_closed_action() {
+                return Err(error);
+            }
             Ok(vec![AgentControlMessage::Error(ProtocolErrorDetail {
                 code: ProtocolErrorCode::InvalidLifecycleTransition,
                 message: error.to_string(),
             })])
         }
+    }
+}
+
+fn fail_closed_cleanup_and_stop<S: ProcessSupervisor>(
+    service: &mut MxcControlService,
+    supervisor: &mut S,
+    reason: &AgentError,
+) {
+    eprintln!("NVX-AGENT-FAIL-CLOSED: {reason}");
+    if let Err(error) = service.begin_disconnect_cleanup(now_secs(), supervisor) {
+        eprintln!("NVX-AGENT-FAIL-CLOSED-CLEANUP: {error}");
     }
 }
 
@@ -692,25 +714,111 @@ fn set_workload_frozen(cgroup_dir: &Path, freeze: bool, timeout: Duration) -> Re
             cgroup_dir.display()
         )));
     }
-    std::fs::write(&freeze_path, if freeze { "1\n" } else { "0\n" })
-        .map_err(|error| AgentError::io(format!("writing {}", freeze_path.display()), error))?;
+    let original = read_cgroup_freeze_value(&freeze_path)?;
+    let context = cgroup_dir.display().to_string();
+    let mut read_current = || read_cgroup_freeze_value(&freeze_path);
+    let mut write_current = |value: bool| {
+        std::fs::write(&freeze_path, if value { "1\n" } else { "0\n" })
+            .map_err(|error| AgentError::io(format!("writing {}", freeze_path.display()), error))
+    };
+    let mut read_events = || {
+        std::fs::read_to_string(&events_path)
+            .map_err(|error| AgentError::io(format!("reading {}", events_path.display()), error))
+    };
+    let mut sleep = |duration: Duration| thread::sleep(duration);
+    let mut ops = FreezerOps {
+        context: &context,
+        read_current: &mut read_current,
+        write_current: &mut write_current,
+        read_events: &mut read_events,
+        sleep: &mut sleep,
+    };
+    set_workload_frozen_with_ops(freeze, original, timeout, &mut ops)
+}
+
+struct FreezerOps<'a> {
+    context: &'a str,
+    read_current: &'a mut dyn FnMut() -> Result<bool>,
+    write_current: &'a mut dyn FnMut(bool) -> Result<()>,
+    read_events: &'a mut dyn FnMut() -> Result<String>,
+    sleep: &'a mut dyn FnMut(Duration),
+}
+
+fn set_workload_frozen_with_ops(
+    freeze: bool,
+    original: bool,
+    timeout: Duration,
+    ops: &mut FreezerOps<'_>,
+) -> Result<()> {
+    (ops.write_current)(freeze)?;
+    match wait_for_frozen_state(freeze, timeout, ops) {
+        Ok(()) => Ok(()),
+        Err(verify_error) => {
+            rollback_cgroup_freeze(original, timeout, ops).map_err(|rollback_error| {
+                AgentError::fail_closed(format!(
+                    "post-write freezer state uncertainty in {}: verification error ({verify_error}); rollback failed: {rollback_error}",
+                    ops.context
+                ))
+            })?;
+            Err(verify_error)
+        }
+    }
+}
+
+fn rollback_cgroup_freeze(
+    original: bool,
+    timeout: Duration,
+    ops: &mut FreezerOps<'_>,
+) -> Result<()> {
+    (ops.write_current)(original)?;
+    wait_for_frozen_state(original, timeout, ops)?;
+    let observed = (ops.read_current)()?;
+    if observed != original {
+        return Err(AgentError::freeze(format!(
+            "rollback verification mismatch in {}: expected cgroup.freeze={} observed={}",
+            ops.context,
+            if original { 1 } else { 0 },
+            if observed { 1 } else { 0 }
+        )));
+    }
+    Ok(())
+}
+
+fn wait_for_frozen_state(
+    expected: bool,
+    timeout: Duration,
+    ops: &mut FreezerOps<'_>,
+) -> Result<()> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| AgentError::freeze("freeze deadline overflow"))?;
     loop {
-        let events = std::fs::read_to_string(&events_path)
-            .map_err(|error| AgentError::io(format!("reading {}", events_path.display()), error))?;
-        if parse_cgroup_frozen_flag(&events)? == freeze {
+        let events = (ops.read_events)()?;
+        if parse_cgroup_frozen_flag(&events)? == expected {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(AgentError::checkpoint_timeout(format!(
                 "timed out waiting for cgroup.freeze={} in {}",
-                if freeze { 1 } else { 0 },
-                cgroup_dir.display()
+                if expected { 1 } else { 0 },
+                ops.context
             )));
         }
-        thread::sleep(Duration::from_millis(10));
+        (ops.sleep)(Duration::from_millis(10));
+    }
+}
+
+fn read_cgroup_freeze_value(path: &Path) -> Result<bool> {
+    let value = std::fs::read_to_string(path)
+        .map_err(|error| AgentError::io(format!("reading {}", path.display()), error))?;
+    parse_cgroup_freeze_value(&value)
+}
+
+fn parse_cgroup_freeze_value(value: &str) -> Result<bool> {
+    match value.trim() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(AgentError::freeze("cgroup.freeze value must be 0 or 1")),
     }
 }
 
@@ -1235,6 +1343,148 @@ mod tests {
         assert!(service.health().quiesced);
         resume_transactional(&mut service, |_| Ok(())).unwrap();
         assert!(!service.health().quiesced);
+    }
+
+    #[derive(Default)]
+    struct FakeFreezer {
+        freeze_value: bool,
+        writes: Vec<bool>,
+        event_reads: VecDeque<Result<String>>,
+    }
+
+    impl FakeFreezer {
+        fn with_original(original: bool) -> Self {
+            Self {
+                freeze_value: original,
+                writes: Vec::new(),
+                event_reads: VecDeque::new(),
+            }
+        }
+    }
+
+    fn run_fake_set_workload_frozen(
+        freezer: Rc<RefCell<FakeFreezer>>,
+        requested: bool,
+        timeout: Duration,
+    ) -> Result<()> {
+        let original = freezer.borrow().freeze_value;
+        let mut read_current = {
+            let freezer = Rc::clone(&freezer);
+            move || Ok(freezer.borrow().freeze_value)
+        };
+        let mut write_current = {
+            let freezer = Rc::clone(&freezer);
+            move |value: bool| {
+                let mut freezer = freezer.borrow_mut();
+                freezer.freeze_value = value;
+                freezer.writes.push(value);
+                Ok(())
+            }
+        };
+        let mut read_events = {
+            let freezer = Rc::clone(&freezer);
+            move || {
+                let mut freezer = freezer.borrow_mut();
+                if let Some(next) = freezer.event_reads.pop_front() {
+                    return next;
+                }
+                Ok(format!(
+                    "frozen {}\n",
+                    if freezer.freeze_value { 1 } else { 0 }
+                ))
+            }
+        };
+        let mut sleep = |_duration: Duration| {};
+        let mut ops = FreezerOps {
+            context: "fake-freezer",
+            read_current: &mut read_current,
+            write_current: &mut write_current,
+            read_events: &mut read_events,
+            sleep: &mut sleep,
+        };
+        set_workload_frozen_with_ops(requested, original, timeout, &mut ops)
+    }
+
+    #[test]
+    fn fake_freezer_timeout_after_write_rolls_back_and_retry_succeeds() {
+        let freezer = Rc::new(RefCell::new(FakeFreezer::with_original(false)));
+        freezer
+            .borrow_mut()
+            .event_reads
+            .push_back(Ok("frozen 0\n".to_string()));
+        let error =
+            run_fake_set_workload_frozen(freezer.clone(), true, Duration::ZERO).unwrap_err();
+        assert_eq!(error.code(), crate::error::ErrorCode::CheckpointTimeout);
+        assert!(!error.requires_fail_closed_action());
+        assert!(!freezer.borrow().freeze_value);
+        assert_eq!(freezer.borrow().writes, vec![true, false]);
+
+        run_fake_set_workload_frozen(freezer.clone(), true, Duration::from_millis(20)).unwrap();
+        assert!(freezer.borrow().freeze_value);
+    }
+
+    #[test]
+    fn fake_freezer_read_error_after_write_rolls_back_and_retry_succeeds() {
+        let freezer = Rc::new(RefCell::new(FakeFreezer::with_original(false)));
+        freezer
+            .borrow_mut()
+            .event_reads
+            .push_back(Err(AgentError::io(
+                "reading fake cgroup.events",
+                io::Error::other("injected read failure"),
+            )));
+        let error = run_fake_set_workload_frozen(freezer.clone(), true, Duration::from_millis(20))
+            .unwrap_err();
+        assert_eq!(error.code(), crate::error::ErrorCode::Internal);
+        assert!(!error.requires_fail_closed_action());
+        assert!(!freezer.borrow().freeze_value);
+        assert_eq!(freezer.borrow().writes, vec![true, false]);
+
+        run_fake_set_workload_frozen(freezer.clone(), true, Duration::from_millis(20)).unwrap();
+        assert!(freezer.borrow().freeze_value);
+    }
+
+    #[test]
+    fn fake_freezer_parse_error_after_write_rolls_back_and_retry_succeeds() {
+        let freezer = Rc::new(RefCell::new(FakeFreezer::with_original(false)));
+        freezer
+            .borrow_mut()
+            .event_reads
+            .push_back(Ok("frozen maybe\n".to_string()));
+        let error = run_fake_set_workload_frozen(freezer.clone(), true, Duration::from_millis(20))
+            .unwrap_err();
+        assert_eq!(error.code(), crate::error::ErrorCode::FreezeFailed);
+        assert!(!error.requires_fail_closed_action());
+        assert!(!freezer.borrow().freeze_value);
+        assert_eq!(freezer.borrow().writes, vec![true, false]);
+
+        run_fake_set_workload_frozen(freezer.clone(), true, Duration::from_millis(20)).unwrap();
+        assert!(freezer.borrow().freeze_value);
+    }
+
+    #[test]
+    fn fake_freezer_rollback_verification_failure_returns_fail_closed_error() {
+        let freezer = Rc::new(RefCell::new(FakeFreezer::with_original(false)));
+        freezer
+            .borrow_mut()
+            .event_reads
+            .push_back(Err(AgentError::io(
+                "reading fake cgroup.events",
+                io::Error::other("injected read failure"),
+            )));
+        freezer
+            .borrow_mut()
+            .event_reads
+            .push_back(Err(AgentError::io(
+                "reading fake cgroup.events",
+                io::Error::other("injected rollback verification failure"),
+            )));
+        let error = run_fake_set_workload_frozen(freezer.clone(), true, Duration::from_millis(20))
+            .unwrap_err();
+        assert!(error.requires_fail_closed_action());
+        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
+        assert!(!freezer.borrow().freeze_value);
+        assert_eq!(freezer.borrow().writes, vec![true, false]);
     }
 
     fn runtime_test_binding() -> LaunchBinding {
