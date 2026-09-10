@@ -65,11 +65,25 @@ fn normalize_local_pipe_path(path: &str) -> Result<String, NamedPipeError> {
             message: "pipe path must include a pipe name".to_string(),
         });
     }
-    Ok(format!(
-        "{}{}",
-        PIPE_PREFIX_WIN32,
-        suffix.replace('/', "\\")
-    ))
+    if suffix == "." || suffix == ".." {
+        return Err(NamedPipeError {
+            message: "pipe path must include exactly one non-traversal component".to_string(),
+        });
+    }
+    if suffix.contains('/') || suffix.contains('\\') || suffix.contains('\0') {
+        return Err(NamedPipeError {
+            message: "pipe path suffix must be a single component without separators".to_string(),
+        });
+    }
+    if !suffix
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(NamedPipeError {
+            message: "pipe path suffix must use OpenVMM-safe ASCII ([A-Za-z0-9._-])".to_string(),
+        });
+    }
+    Ok(format!("{}{}", PIPE_PREFIX_WIN32, suffix))
 }
 
 #[cfg(windows)]
@@ -351,6 +365,20 @@ mod tests {
     #[test]
     fn normalize_local_pipe_path_rejects_missing_pipe_name() {
         assert!(normalize_local_pipe_path("//./pipe/").is_err());
+    }
+
+    #[test]
+    fn normalize_local_pipe_path_rejects_traversal_and_device_namespace_escapes() {
+        assert!(normalize_local_pipe_path("//./pipe/../NUL").is_err());
+        assert!(normalize_local_pipe_path(r"\\.\pipe\..\NUL").is_err());
+        assert!(normalize_local_pipe_path("//./pipe/.").is_err());
+        assert!(normalize_local_pipe_path("//./pipe/..").is_err());
+    }
+
+    #[test]
+    fn normalize_local_pipe_path_rejects_embedded_separators() {
+        assert!(normalize_local_pipe_path("//./pipe/foo/bar").is_err());
+        assert!(normalize_local_pipe_path(r"\\.\pipe\foo\bar").is_err());
     }
 
     #[cfg(not(windows))]
