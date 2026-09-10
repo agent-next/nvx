@@ -258,21 +258,40 @@ fn bind_mount_mapping_source(source: &str, target: &Path, kind: MappingEntryKind
 
 #[cfg(target_os = "linux")]
 fn harden_read_only_recursive(target: &Path) -> Result<()> {
-    let mut mount_points = collect_mount_points_under(target)?;
-    mount_points.sort_by(|left, right| {
+    let mut mount_entries = collect_mount_points_under(target)?;
+    if !mount_entries
+        .iter()
+        .any(|entry| entry.mount_point == target)
+    {
+        mount_entries.push(MountInfoEntry {
+            mount_point: target.to_path_buf(),
+            read_only: false,
+        });
+    }
+    mount_entries.sort_by(|left, right| {
         right
+            .mount_point
             .components()
             .count()
-            .cmp(&left.components().count())
-            .then_with(|| right.as_os_str().len().cmp(&left.as_os_str().len()))
+            .cmp(&left.mount_point.components().count())
+            .then_with(|| {
+                right
+                    .mount_point
+                    .as_os_str()
+                    .len()
+                    .cmp(&left.mount_point.as_os_str().len())
+            })
     });
-    if mount_points.is_empty() {
-        mount_points.push(target.to_path_buf());
-    }
-    for mount_point in mount_points {
+    mount_entries.dedup_by(|left, right| left.mount_point == right.mount_point);
+    let expected_points: Vec<PathBuf> = mount_entries
+        .iter()
+        .map(|entry| entry.mount_point.clone())
+        .collect();
+    for mount_entry in &mount_entries {
+        let mount_point = &mount_entry.mount_point;
         mount_call(
             "none",
-            &mount_point,
+            mount_point,
             "",
             libc::MS_BIND
                 | libc::MS_REMOUNT
@@ -284,26 +303,134 @@ fn harden_read_only_recursive(target: &Path) -> Result<()> {
             format!("remounting {} read-only", mount_point.display()),
         )?;
     }
+    let hardened_mounts = collect_mount_points_under(target)?;
+    for expected_point in expected_points {
+        let hardened = hardened_mounts
+            .iter()
+            .find(|entry| entry.mount_point == expected_point)
+            .ok_or_else(|| {
+                AgentError::mount(format!(
+                    "mountpoint {} disappeared while enforcing read-only mappings",
+                    expected_point.display(),
+                ))
+            })?;
+        if !hardened.read_only {
+            return Err(AgentError::mount(format!(
+                "mountpoint {} remained writable after read-only hardening",
+                expected_point.display(),
+            )));
+        }
+    }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn collect_mount_points_under(root: &Path) -> Result<Vec<PathBuf>> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MountInfoEntry {
+    mount_point: PathBuf,
+    read_only: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn collect_mount_points_under(root: &Path) -> Result<Vec<MountInfoEntry>> {
     let mountinfo = ::std::fs::read_to_string("/proc/self/mountinfo")
         .map_err(|error| AgentError::io("reading /proc/self/mountinfo", error))?;
+    collect_mount_points_under_from_mountinfo(root, &mountinfo)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_mount_points_under_from_mountinfo(
+    root: &Path,
+    mountinfo: &str,
+) -> Result<Vec<MountInfoEntry>> {
     let mut points = Vec::new();
     for line in mountinfo.lines() {
-        let pre = line.split(" - ").next().unwrap_or_default();
-        let fields: Vec<&str> = pre.split_whitespace().collect();
-        if fields.len() < 5 {
-            continue;
-        }
-        let mount_point = PathBuf::from(fields[4]);
-        if mount_point == root || mount_point.starts_with(root) {
-            points.push(mount_point);
+        let entry = parse_mountinfo_entry(line)?;
+        if entry.mount_point == root || entry.mount_point.starts_with(root) {
+            points.push(entry);
         }
     }
     Ok(points)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_mountinfo_entry(line: &str) -> Result<MountInfoEntry> {
+    let mut fields = line
+        .split(" - ")
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let _mount_id = fields
+        .next()
+        .ok_or_else(|| AgentError::mount(format!("mountinfo line missing mount id: {line}")))?;
+    let _parent_id = fields
+        .next()
+        .ok_or_else(|| AgentError::mount(format!("mountinfo line missing parent id: {line}")))?;
+    let _major_minor = fields.next().ok_or_else(|| {
+        AgentError::mount(format!("mountinfo line missing major:minor id: {line}"))
+    })?;
+    let root_raw = fields
+        .next()
+        .ok_or_else(|| AgentError::mount(format!("mountinfo line missing root path: {line}")))?;
+    let mount_point_raw = fields.next().ok_or_else(|| {
+        AgentError::mount(format!("mountinfo line missing mount point path: {line}"))
+    })?;
+    let mount_options = fields.next().ok_or_else(|| {
+        AgentError::mount(format!("mountinfo line missing mount options: {line}"))
+    })?;
+    let _decoded_root = decode_mountinfo_path_field(root_raw)?;
+    let decoded_mount_point = decode_mountinfo_path_field(mount_point_raw)?;
+    let mount_point = PathBuf::from(decoded_mount_point);
+    if !mount_point.is_absolute() {
+        return Err(AgentError::mount(format!(
+            "mountinfo mount point must be absolute: {line}",
+        )));
+    }
+    let read_only = mount_options.split(',').any(|option| option == "ro");
+    Ok(MountInfoEntry {
+        mount_point,
+        read_only,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mountinfo_path_field(encoded: &str) -> Result<String> {
+    let mut decoded = String::with_capacity(encoded.len());
+    let mut bytes = encoded.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            decoded.push(byte as char);
+            continue;
+        }
+        let first = bytes.next().ok_or_else(|| {
+            AgentError::mount(format!(
+                "mountinfo path contains malformed escape (truncated): {encoded}",
+            ))
+        })?;
+        let second = bytes.next().ok_or_else(|| {
+            AgentError::mount(format!(
+                "mountinfo path contains malformed escape (truncated): {encoded}",
+            ))
+        })?;
+        let third = bytes.next().ok_or_else(|| {
+            AgentError::mount(format!(
+                "mountinfo path contains malformed escape (truncated): {encoded}",
+            ))
+        })?;
+        match [first, second, third] {
+            [b'0', b'4', b'0'] => decoded.push(' '),
+            [b'0', b'1', b'1'] => decoded.push('\t'),
+            [b'0', b'1', b'2'] => decoded.push('\n'),
+            [b'1', b'3', b'4'] => decoded.push('\\'),
+            [a, b, c] => {
+                return Err(AgentError::mount(format!(
+                    "mountinfo path contains unsupported escape \\{}{}{}: {encoded}",
+                    a as char, b as char, c as char
+                )));
+            }
+        }
+    }
+    Ok(decoded)
 }
 
 #[cfg(target_os = "linux")]
@@ -675,6 +802,147 @@ mod tests {
             .resolve_declared_raw("safe/../escape")
             .expect_err("dot-dot must fail");
         assert!(format!("{error}").contains("invalid mapping path"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn decodes_mountinfo_space_tab_newline_and_backslash_escapes() {
+        let decoded = decode_mountinfo_path_field("/mnt/space\\040tab\\011line\\012slash\\134name")
+            .expect("decoded");
+        assert_eq!(decoded, "/mnt/space tab\tline\nslash\\name");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_mountinfo_truncated_escape() {
+        let error = decode_mountinfo_path_field("/mnt/bad\\04").expect_err("must reject");
+        assert!(format!("{error}").contains("malformed escape"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_mountinfo_unknown_escape() {
+        let error = decode_mountinfo_path_field("/mnt/bad\\141").expect_err("must reject");
+        assert!(format!("{error}").contains("unsupported escape"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn collect_mount_points_decodes_paths_before_prefix_comparison() {
+        let mountinfo = concat!(
+            "21 19 0:19 / / rw,relatime - tmpfs tmpfs rw\n",
+            "82 21 0:47 / /mapping\\040root rw,nosuid,nodev - tmpfs tmpfs rw\n",
+            "83 82 0:48 / /mapping\\040root/nested\\011tab ro,nosuid,nodev - tmpfs tmpfs rw\n",
+            "84 82 0:49 / /mapping\\040root/nested\\134slash ro,nosuid,nodev - tmpfs tmpfs rw\n",
+            "85 82 0:50 / /mapping\\040root/other rw,nosuid,nodev - tmpfs tmpfs rw\n",
+            "86 82 0:51 / /mapping\\040other rw,nosuid,nodev - tmpfs tmpfs rw\n",
+        );
+        let entries =
+            collect_mount_points_under_from_mountinfo(Path::new("/mapping root"), mountinfo)
+                .expect("parsed");
+        let points: Vec<PathBuf> = entries
+            .iter()
+            .map(|entry| entry.mount_point.clone())
+            .collect();
+        assert_eq!(
+            points,
+            vec![
+                PathBuf::from("/mapping root"),
+                PathBuf::from("/mapping root/nested\ttab"),
+                PathBuf::from("/mapping root/nested\\slash"),
+                PathBuf::from("/mapping root/other"),
+            ]
+        );
+        assert!(!entries[0].read_only);
+        assert!(entries[1].read_only);
+        assert!(entries[2].read_only);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN and private mount namespace"]
+    fn harden_read_only_recursive_handles_nested_mounts_under_space_path() {
+        struct MountedPathGuard {
+            mounted_paths: Vec<PathBuf>,
+        }
+
+        impl MountedPathGuard {
+            fn new() -> Self {
+                Self {
+                    mounted_paths: Vec::new(),
+                }
+            }
+
+            fn push(&mut self, path: PathBuf) {
+                self.mounted_paths.push(path);
+            }
+        }
+
+        impl Drop for MountedPathGuard {
+            fn drop(&mut self) {
+                for path in self.mounted_paths.iter().rev() {
+                    if let Ok(c_path) = CString::new(path.to_string_lossy().as_bytes()) {
+                        // SAFETY: best-effort cleanup for mounts created by this test.
+                        let _ = unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) };
+                    }
+                }
+            }
+        }
+
+        fn mount_tmpfs(target: &Path) -> Result<()> {
+            mount_call(
+                "tmpfs",
+                target,
+                "tmpfs",
+                0,
+                Some("mode=755"),
+                "mounting tmpfs for test",
+            )
+        }
+
+        // SAFETY: unshare called with CLONE_NEWNS to isolate this test's mount mutations.
+        let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+        if rc != 0 {
+            panic!(
+                "unshare(CLONE_NEWNS) failed: {}",
+                ::std::io::Error::last_os_error()
+            );
+        }
+        mount_call(
+            "none",
+            Path::new("/"),
+            "",
+            libc::MS_PRIVATE | libc::MS_REC,
+            None,
+            "making root private for mount test",
+        )
+        .expect("private root");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("mapping root");
+        let nested = root.join("nested mount");
+        ::std::fs::create_dir_all(&nested).expect("create nested mount points");
+
+        let mut guard = MountedPathGuard::new();
+        mount_tmpfs(&root).expect("mount root tmpfs");
+        guard.push(root.clone());
+        mount_tmpfs(&nested).expect("mount nested tmpfs");
+        guard.push(nested.clone());
+
+        harden_read_only_recursive(&root).expect("harden mounts");
+
+        let mountinfo = ::std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+        let entries = collect_mount_points_under_from_mountinfo(&root, &mountinfo).expect("parse");
+        let root_entry = entries
+            .iter()
+            .find(|entry| entry.mount_point == root)
+            .expect("root entry");
+        let nested_entry = entries
+            .iter()
+            .find(|entry| entry.mount_point == nested)
+            .expect("nested entry");
+        assert!(root_entry.read_only, "root mount remained writable");
+        assert!(nested_entry.read_only, "nested mount remained writable");
     }
 
     #[cfg(not(target_os = "linux"))]
