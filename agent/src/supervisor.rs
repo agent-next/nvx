@@ -61,6 +61,10 @@ thread_local! {
 }
 #[cfg(test)]
 thread_local! {
+    static CGROUP_KILL_EXISTS_PROBE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+}
+#[cfg(test)]
+thread_local! {
     static PROCESS_GROUP_SIGNAL_FAILPOINT: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -243,6 +247,22 @@ fn cgroup_kill_write_failpoint_now() -> bool {
 
 #[cfg(not(test))]
 fn cgroup_kill_write_failpoint_now() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn cgroup_kill_exists_probe_failpoint_now() -> bool {
+    CGROUP_KILL_EXISTS_PROBE_FAILPOINT.with(|flag| {
+        let current = flag.get();
+        if current {
+            flag.set(false);
+        }
+        current
+    })
+}
+
+#[cfg(not(test))]
+fn cgroup_kill_exists_probe_failpoint_now() -> bool {
     false
 }
 
@@ -1084,20 +1104,31 @@ fn kill_exec_descendants(active: &ActiveProcess, signal: i32) -> Result<(), Serv
 }
 
 fn maybe_write_cgroup_kill(cgroup_dir: &Path, signal: i32) -> io::Result<()> {
+    let path = cgroup_dir.join("cgroup.kill");
+    if cgroup_kill_exists_probe_failpoint_now() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected cgroup.kill existence probe failure",
+        ));
+    }
+    if !path.try_exists()? {
+        return Ok(());
+    }
     if signal != libc::SIGKILL {
         return Ok(());
     }
-    let path = cgroup_dir.join("cgroup.kill");
-    if path.exists() {
-        if cgroup_kill_write_failpoint_now() {
-            return Err(io::Error::other("injected cgroup.kill write failure"));
+    if cgroup_kill_write_failpoint_now() {
+        return Err(io::Error::other("injected cgroup.kill write failure"));
+    }
+    if let Err(error) = fs::write(&path, "1\n") {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOENT) | Some(libc::ENOTDIR)
+        ) || error.kind() == io::ErrorKind::NotFound
+        {
+            return Ok(());
         }
-        if let Err(error) = fs::write(&path, "1\n") {
-            if error.kind() == io::ErrorKind::NotFound {
-                return Ok(());
-            }
-            return Err(error);
-        }
+        return Err(error);
     }
     Ok(())
 }
@@ -1563,6 +1594,7 @@ mod tests {
             ROLLBACK_CHILD_KILL_FAILPOINT.with(|flag| flag.set(false));
             ROLLBACK_CHILD_WAIT_FAILPOINT.with(|flag| flag.set(false));
             CGROUP_KILL_WRITE_FAILPOINT.with(|flag| flag.set(false));
+            CGROUP_KILL_EXISTS_PROBE_FAILPOINT.with(|flag| flag.set(false));
             PROCESS_GROUP_SIGNAL_FAILPOINT.with(|flag| flag.set(false));
             Self
         }
@@ -1577,6 +1609,7 @@ mod tests {
             ROLLBACK_CHILD_KILL_FAILPOINT.with(|flag| flag.set(false));
             ROLLBACK_CHILD_WAIT_FAILPOINT.with(|flag| flag.set(false));
             CGROUP_KILL_WRITE_FAILPOINT.with(|flag| flag.set(false));
+            CGROUP_KILL_EXISTS_PROBE_FAILPOINT.with(|flag| flag.set(false));
             PROCESS_GROUP_SIGNAL_FAILPOINT.with(|flag| flag.set(false));
         }
     }
@@ -2648,6 +2681,124 @@ mod tests {
         assert_eq!(failed.code, ServiceErrorCode::FatalSession);
         assert!(failed.message.contains("termination state uncertain"));
         assert!(failed.message.contains("injected signal failure"));
+        assert!(service.health().shutting_down);
+
+        let retry = service.create_process(
+            CreateProcessRequest {
+                exec_id: exec_id + 1,
+                argv: vec!["/bin/echo".to_string(), "blocked".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            &mut supervisor,
+        );
+        assert_eq!(
+            retry.expect_err("fatal session must reject new exec").code,
+            ServiceErrorCode::FatalSession
+        );
+
+        cleanup_active_exec(&mut supervisor, exec_id);
+    }
+
+    #[test]
+    fn cancel_exec_cgroup_existence_probe_uncertainty_sets_fatal_session_and_blocks_new_exec() {
+        let _scope = TestFailpointScope::new();
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().expect("activate");
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let exec_id = 813;
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id,
+                    argv: vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        "sleep 10".to_string(),
+                    ],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: Some(5_000),
+                },
+                &mut supervisor,
+            )
+            .expect("create");
+
+        let temp = tempdir().expect("tempdir");
+        supervisor.active.as_mut().expect("active").cgroup_dir = Some(temp.path().to_path_buf());
+        CGROUP_KILL_EXISTS_PROBE_FAILPOINT.with(|flag| flag.set(true));
+
+        let failed = service
+            .cancel_exec(exec_id, CancelReason::Cancelled, &mut supervisor)
+            .expect_err("cancel must fail closed");
+        assert_eq!(failed.code, ServiceErrorCode::FatalSession);
+        assert!(failed.message.contains("termination state uncertain"));
+        assert!(failed.message.contains("cgroup.kill"));
+        assert!(
+            failed
+                .message
+                .contains("injected cgroup.kill existence probe failure")
+        );
+        assert!(service.health().shutting_down);
+
+        let retry = service.create_process(
+            CreateProcessRequest {
+                exec_id: exec_id + 1,
+                argv: vec!["/bin/echo".to_string(), "blocked".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            &mut supervisor,
+        );
+        assert_eq!(
+            retry.expect_err("fatal session must reject new exec").code,
+            ServiceErrorCode::FatalSession
+        );
+
+        cleanup_active_exec(&mut supervisor, exec_id);
+    }
+
+    #[test]
+    fn timeout_cancel_cgroup_existence_probe_uncertainty_sets_fatal_session_and_blocks_new_exec() {
+        let _scope = TestFailpointScope::new();
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().expect("activate");
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let exec_id = 814;
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id,
+                    argv: vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        "sleep 10".to_string(),
+                    ],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: Some(5),
+                },
+                &mut supervisor,
+            )
+            .expect("create");
+
+        let temp = tempdir().expect("tempdir");
+        supervisor.active.as_mut().expect("active").cgroup_dir = Some(temp.path().to_path_buf());
+        CGROUP_KILL_EXISTS_PROBE_FAILPOINT.with(|flag| flag.set(true));
+
+        let failed = service
+            .cancel_exec(exec_id, CancelReason::TimedOut, &mut supervisor)
+            .expect_err("timeout cancel must fail closed");
+        assert_eq!(failed.code, ServiceErrorCode::FatalSession);
+        assert!(failed.message.contains("termination state uncertain"));
+        assert!(failed.message.contains("cgroup.kill"));
+        assert!(
+            failed
+                .message
+                .contains("injected cgroup.kill existence probe failure")
+        );
         assert!(service.health().shutting_down);
 
         let retry = service.create_process(
