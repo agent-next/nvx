@@ -1,0 +1,9 @@
+[package]
+name = "nvx-agent-probe"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Guest workload helper for live MXC-prototype conformance probes."
+
+[dependencies]
+libc = "0.2"

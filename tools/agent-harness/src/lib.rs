@@ -2381,7 +2381,11 @@ fn trusted_attestation_kind(
     definition: ScenarioDefinition,
     result: &ScenarioResult,
 ) -> Option<AttestationKind> {
-    if result.check_status != EvidenceCheckStatus::Pass {
+    if result.check_status != EvidenceCheckStatus::Pass
+        || result.status != ScenarioStatus::Pass
+        || result.evidence_source != EvidenceSource::LiveWhp
+        || result.required_evidence_source != EvidenceSource::LiveWhp
+    {
         return None;
     }
     expected_attestation_kind(definition.requirement_number)
@@ -2790,7 +2794,7 @@ mod tests {
             if scenario.check_status == EvidenceCheckStatus::Pass {
                 assert_eq!(scenario.evidence_source, EvidenceSource::LocalLinuxRuntime);
                 assert_eq!(scenario.status, ScenarioStatus::NotLive);
-                assert_eq!(scenario.attestations.len(), 1);
+                assert_eq!(scenario.attestations.len(), 0);
             } else {
                 assert_eq!(
                     scenario.check_status,

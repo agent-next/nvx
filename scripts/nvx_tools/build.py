@@ -95,6 +95,10 @@ GUEST_AGENT_INSTALLED_PATH = f"/sbin/{GUEST_AGENT_ARTIFACT_NAME}"
 MXC_GUEST_AGENT_ARTIFACT_NAME = "nvx-agent-mxc-prototype"
 MXC_GUEST_AGENT_SHA256_NAME = f"{MXC_GUEST_AGENT_ARTIFACT_NAME}.sha256"
 MXC_GUEST_AGENT_PROVENANCE_NAME = f"{MXC_GUEST_AGENT_ARTIFACT_NAME}.provenance.json"
+MXC_GUEST_PROBE_ARTIFACT_NAME = "nvx-agent-probe-mxc-prototype"
+MXC_GUEST_PROBE_SHA256_NAME = f"{MXC_GUEST_PROBE_ARTIFACT_NAME}.sha256"
+MXC_GUEST_PROBE_PROVENANCE_NAME = f"{MXC_GUEST_PROBE_ARTIFACT_NAME}.provenance.json"
+MXC_GUEST_PROBE_INSTALLED_PATH = "/sbin/nvx-agent-probe"
 GUEST_AGENT_TARGET = "x86_64-unknown-linux-musl"
 GUEST_AGENT_MAXIMUM_BYTES = 16 * 1024 * 1024
 GUEST_AGENT_SOURCE_REVISION = "865984883584ae5569b1936981921fbe59c1f6e8"
@@ -462,6 +466,80 @@ def build_mxc_prototype_guest_agent(
         sha256,
         {
             "path": GUEST_AGENT_INSTALLED_PATH,
+            "sha256": sha256,
+            "size": size,
+            "source_revision": provenance["source_revision"],
+            "source_authority": provenance["source_authority"],
+            "build_id": None,
+            "origin": "in-repo-workspace",
+        },
+    )
+
+
+def build_mxc_prototype_probe_helper(
+    *,
+    allow_gitless_env_provenance: bool = False,
+) -> tuple[Path, str, dict[str, object]]:
+    """Build and stage the in-repo Rust workload probe helper for MXC profile tests."""
+    require_tool("cargo")
+    source = source_provenance(
+        allow_environment_without_git=allow_gitless_env_provenance
+    )
+    run_checked(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "--manifest-path",
+            REPO_ROOT / "tools" / "nvx-agent-probe" / "Cargo.toml",
+            "--target",
+            GUEST_AGENT_TARGET,
+        ],
+        cwd=REPO_ROOT,
+    )
+    built_probe = require_file(
+        REPO_ROOT
+        / "target"
+        / GUEST_AGENT_TARGET
+        / "release"
+        / "nvx-agent-probe",
+        "built in-repo MXC prototype workload probe",
+    )
+    validate_static_x86_64_elf(built_probe)
+    size = built_probe.stat().st_size
+    if size > GUEST_AGENT_MAXIMUM_BYTES:
+        raise ScriptError(
+            f"in-repo MXC workload probe exceeds the 16-MiB release limit: {size} bytes"
+        )
+    destination = REPO_ROOT / "build" / MXC_GUEST_PROBE_ARTIFACT_NAME
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(built_probe, destination)
+    destination.chmod(0o755)
+    sha256 = sha256_file(destination)
+    (REPO_ROOT / "build" / MXC_GUEST_PROBE_SHA256_NAME).write_text(
+        f"{sha256}\n",
+        encoding="ascii",
+    )
+    provenance = {
+        "format": 1,
+        "profile": MXC_PROTOTYPE_TRANSPORT,
+        "target": GUEST_AGENT_TARGET,
+        "source_revision": source.revision,
+        "source_clean": source.clean,
+        "source_authority": source.authority,
+        "sha256": sha256,
+        "size": size,
+    }
+    (REPO_ROOT / "build" / MXC_GUEST_PROBE_PROVENANCE_NAME).write_text(
+        json.dumps(provenance, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return (
+        destination,
+        sha256,
+        {
+            "path": MXC_GUEST_PROBE_INSTALLED_PATH,
             "sha256": sha256,
             "size": size,
             "source_revision": provenance["source_revision"],
@@ -872,7 +950,11 @@ def native_initramfs_work_directory(profile: str) -> Path:
     return (base / profile).resolve()
 
 
-def _prepare_agent_root(work: Path, agent_source: Path) -> Path:
+def _prepare_agent_root(
+    work: Path,
+    agent_source: Path,
+    helper_sources: dict[str, Path] | None = None,
+) -> Path:
     root = Path(tempfile.mkdtemp(prefix="agent-root-", dir=work))
     root.chmod(0o755)
     etc = root / "etc"
@@ -890,6 +972,10 @@ def _prepare_agent_root(work: Path, agent_source: Path) -> Path:
     agent = sbin / GUEST_AGENT_ARTIFACT_NAME
     shutil.copyfile(agent_source, agent)
     agent.chmod(0o755)
+    for helper_name, helper_source in (helper_sources or {}).items():
+        helper = sbin / helper_name
+        shutil.copyfile(helper_source, helper)
+        helper.chmod(0o755)
     (root / "init").symlink_to(f"sbin/{GUEST_AGENT_ARTIFACT_NAME}")
     return root
 
@@ -1397,8 +1483,16 @@ def _validated_initramfs_entries(
     return entries
 
 
-def verify_agent_initramfs(path: Path, expected_sha256: str) -> None:
+def verify_agent_initramfs(
+    path: Path,
+    expected_sha256: str,
+    expected_helpers: dict[str, str] | None = None,
+) -> None:
     entries = _validated_initramfs_entries(path, agent_profile=True)
+    helper_entries = {
+        helper_path.removeprefix("/")
+        for helper_path in (expected_helpers or {}).keys()
+    }
     expected_entries = {
         ".",
         "etc",
@@ -1407,7 +1501,7 @@ def verify_agent_initramfs(path: Path, expected_sha256: str) -> None:
         "init",
         "sbin",
         "sbin/nvx-agent",
-    }
+    } | helper_entries
     if set(entries) != expected_entries:
         raise ScriptError(
             f"{path} agent profile contains unexpected entries: "
@@ -1432,6 +1526,28 @@ def verify_agent_initramfs(path: Path, expected_sha256: str) -> None:
             f"embedded NVX guest-agent SHA-256 is {actual_sha256}, "
             f"expected {expected_sha256}"
         )
+    for helper_path, helper_sha256 in (expected_helpers or {}).items():
+        normalized = helper_path.removeprefix("/")
+        helper_entry = entries.get(normalized)
+        if helper_entry is None:
+            raise ScriptError(
+                f"{path} missing expected helper entry {helper_path!r}"
+            )
+        if (
+            stat.S_IFMT(helper_entry.mode) != stat.S_IFREG
+            or stat.S_IMODE(helper_entry.mode) != 0o755
+            or helper_entry.uid != 0
+            or helper_entry.gid != 0
+            or helper_entry.nlink != 1
+        ):
+            raise ScriptError(
+                f"{path} contains helper {helper_path!r} with the wrong mode"
+            )
+        if helper_entry.data_sha256 != helper_sha256:
+            raise ScriptError(
+                f"{path} embedded helper {helper_path!r} SHA-256 is "
+                f"{helper_entry.data_sha256}, expected {helper_sha256}"
+            )
     if (
         stat.S_IFMT(init_entry.mode) != stat.S_IFLNK
         or stat.S_IMODE(init_entry.mode) != 0o777
@@ -1490,12 +1606,22 @@ def build_initramfs(config: AlpineBuildConfig) -> None:
     agent_source: Path | None = None
     agent_sha256: str | None = None
     guest_agent_manifest: dict[str, object] | None = None
+    mxc_helper_source: Path | None = None
+    mxc_helper_sha256: str | None = None
+    mxc_helper_manifest: dict[str, object] | None = None
     if config.profile == MXC_PROTOTYPE_TRANSPORT:
         (
             agent_source,
             agent_sha256,
             guest_agent_manifest,
         ) = build_mxc_prototype_guest_agent(
+            allow_gitless_env_provenance=config.allow_gitless_env_provenance
+        )
+        (
+            mxc_helper_source,
+            mxc_helper_sha256,
+            mxc_helper_manifest,
+        ) = build_mxc_prototype_probe_helper(
             allow_gitless_env_provenance=config.allow_gitless_env_provenance
         )
     elif config.agent_enabled:
@@ -1509,8 +1635,19 @@ def build_initramfs(config: AlpineBuildConfig) -> None:
         }
     if config.agent_enabled or config.profile == MXC_PROTOTYPE_TRANSPORT:
         assert agent_source is not None
-        root = _prepare_agent_root(config.work, agent_source)
+        helper_sources: dict[str, Path] = {}
         helpers: dict[str, dict[str, str]] = {}
+        expected_helpers: dict[str, str] = {}
+        if config.profile == MXC_PROTOTYPE_TRANSPORT:
+            assert mxc_helper_source is not None
+            assert mxc_helper_sha256 is not None
+            assert mxc_helper_manifest is not None
+            helper_sources["nvx-agent-probe"] = mxc_helper_source
+            helpers["nvx-agent-probe"] = {
+                key: str(value) for key, value in mxc_helper_manifest.items()
+            }
+            expected_helpers[MXC_GUEST_PROBE_INSTALLED_PATH] = mxc_helper_sha256
+        root = _prepare_agent_root(config.work, agent_source, helper_sources)
         trusted_owners: dict[str, tuple[int, int]] = {}
     else:
         root = _prepare_alpine_root(config)
@@ -1590,7 +1727,11 @@ def build_initramfs(config: AlpineBuildConfig) -> None:
     _pack_initramfs(root, native_output, trusted_owners)
     _bind_apk_manifest_to_initramfs(native_output)
     if agent_sha256 is not None:
-        verify_agent_initramfs(native_output, agent_sha256)
+        verify_agent_initramfs(
+            native_output,
+            agent_sha256,
+            expected_helpers if config.profile == MXC_PROTOTYPE_TRANSPORT else None,
+        )
     else:
         verify_legacy_initramfs(native_output)
     _publish_initramfs_output(native_output, config.output)

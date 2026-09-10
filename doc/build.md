@@ -127,9 +127,10 @@ python3 scripts/nvx.py build-mxc-prototype-initramfs --native
 ```
 
 The output path is `build/initramfs-mxc-agent.cpio.gz` with `/init` linked to
-`/sbin/nvx-agent`. This profile remains separate from both `legacy` and
-`broker-ttrpc`, and is intentionally not an operational MXC runtime agent in
-Phase 0.
+`/sbin/nvx-agent`. The MXC profile also embeds `/sbin/nvx-agent-probe` (a
+static conformance workload helper), and verification binds both binaries by
+path + SHA-256. This profile remains separate from both `legacy` and
+`broker-ttrpc`.
 
 Source provenance authority is explicit for this profile. If the build reads
 Git metadata in the current workspace, the agent provenance records
