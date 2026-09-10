@@ -116,11 +116,6 @@ impl MappingResolver {
 }
 
 #[cfg(target_os = "linux")]
-pub fn procfd_mount_source(fd: &OwnedFd) -> String {
-    format!("/proc/self/fd/{}", fd.as_raw_fd())
-}
-
-#[cfg(target_os = "linux")]
 pub fn install_resolved_mappings_in_holder_mount_namespace(
     holder_pid: libc::pid_t,
     guest_root: &str,
@@ -132,18 +127,30 @@ pub fn install_resolved_mappings_in_holder_mount_namespace(
         )));
     }
     let mount_ns_fd = open_namespace_fd(holder_pid, "mnt")?;
+    let pid_ns_fd = match open_namespace_fd(holder_pid, "pid") {
+        Ok(fd) => fd,
+        Err(error) => {
+            close_fd(mount_ns_fd);
+            return Err(error);
+        }
+    };
     // SAFETY: fork is used to isolate setns+mount operations from the main runtime process.
     let child_pid = unsafe { libc::fork() };
     if child_pid < 0 {
         close_fd(mount_ns_fd);
+        close_fd(pid_ns_fd);
         return Err(AgentError::io(
             "forking mapping installer helper",
             ::std::io::Error::last_os_error(),
         ));
     }
     if child_pid == 0 {
-        let exit_code = match install_resolved_mappings_in_child(mount_ns_fd, guest_root, mappings)
-        {
+        let exit_code = match install_resolved_mappings_in_child(
+            mount_ns_fd,
+            pid_ns_fd,
+            guest_root,
+            mappings,
+        ) {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("NVX-MAPPING-INSTALL-ERROR: {error}");
@@ -154,21 +161,70 @@ pub fn install_resolved_mappings_in_holder_mount_namespace(
         unsafe { libc::_exit(exit_code) };
     }
     close_fd(mount_ns_fd);
+    close_fd(pid_ns_fd);
     wait_pid_success(child_pid, "mapping installer helper")
 }
 
 #[cfg(target_os = "linux")]
 fn install_resolved_mappings_in_child(
     mount_ns_fd: i32,
+    pid_ns_fd: i32,
     guest_root: &str,
     mappings: &[ResolvedMapping],
 ) -> Result<()> {
+    let detached_mounts = mappings
+        .iter()
+        .map(|mapping| {
+            let detached_mount = clone_mapping_mount(&mapping.guest_fd, mapping.entry_kind)?;
+            if mapping.access == AccessMode::ReadOnly {
+                harden_detached_mount_read_only(&detached_mount)?;
+            }
+            Ok(detached_mount)
+        })
+        .collect::<Result<Vec<_>>>()?;
     setns_checked(
         mount_ns_fd,
         libc::CLONE_NEWNS,
         "joining holder mount namespace",
     )?;
     close_fd(mount_ns_fd);
+    setns_checked(
+        pid_ns_fd,
+        libc::CLONE_NEWPID,
+        "joining holder pid namespace for mountinfo-aware hardening",
+    )?;
+    close_fd(pid_ns_fd);
+    // CLONE_NEWPID setns applies only to subsequently forked children.
+    // Spawn one worker in the holder PID namespace so /proc/self/* paths
+    // (including mountinfo reads during read-only hardening) resolve correctly.
+    let worker_pid = unsafe { libc::fork() };
+    if worker_pid < 0 {
+        return Err(AgentError::io(
+            "forking mapping installer worker",
+            ::std::io::Error::last_os_error(),
+        ));
+    }
+    if worker_pid == 0 {
+        let exit_code =
+            match install_resolved_mappings_worker(guest_root, mappings, detached_mounts) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("NVX-MAPPING-INSTALL-ERROR: {error}");
+                    1
+                }
+            };
+        // SAFETY: child must exit without unwinding parent state after fork.
+        unsafe { libc::_exit(exit_code) };
+    }
+    wait_pid_success(worker_pid, "mapping installer worker")
+}
+
+#[cfg(target_os = "linux")]
+fn install_resolved_mappings_worker(
+    guest_root: &str,
+    mappings: &[ResolvedMapping],
+    detached_mounts: Vec<OwnedFd>,
+) -> Result<()> {
     let guest_root_path = Path::new(guest_root);
     ::std::fs::create_dir_all(guest_root_path).map_err(|error| {
         AgentError::io(
@@ -185,14 +241,11 @@ fn install_resolved_mappings_in_child(
         "hiding raw mapping export with private tmpfs root",
     )?;
 
-    for mapping in mappings {
+    for (mapping, detached_mount) in mappings.iter().zip(detached_mounts) {
         let target_path = guest_root_path.join(mapping.child.as_str());
         prepare_mapping_target(&target_path, mapping.entry_kind)?;
-        let source = procfd_mount_source(&mapping.guest_fd);
-        bind_mount_mapping_source(&source, &target_path, mapping.entry_kind)?;
-        if mapping.access == AccessMode::ReadOnly {
-            harden_read_only_recursive(&target_path)?;
-        }
+        let target_fd = open_mapping_target(&target_path, mapping.entry_kind)?;
+        attach_detached_mount(&detached_mount, &target_fd, &target_path)?;
     }
     Ok(())
 }
@@ -239,23 +292,152 @@ fn prepare_mapping_target(target: &Path, kind: MappingEntryKind) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn bind_mount_mapping_source(source: &str, target: &Path, kind: MappingEntryKind) -> Result<()> {
-    let flags = if kind == MappingEntryKind::Directory {
-        libc::MS_BIND | libc::MS_REC
-    } else {
-        libc::MS_BIND
+fn clone_mapping_mount(source: &OwnedFd, kind: MappingEntryKind) -> Result<OwnedFd> {
+    const OPEN_TREE_CLONE: u32 = 1;
+    const OPEN_TREE_CLOEXEC: u32 = libc::O_CLOEXEC as u32;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    const AT_RECURSIVE: u32 = 0x8000;
+
+    let flags = OPEN_TREE_CLONE
+        | OPEN_TREE_CLOEXEC
+        | AT_EMPTY_PATH
+        | if kind == MappingEntryKind::Directory {
+            AT_RECURSIVE
+        } else {
+            0
+        };
+    let empty_path = c"";
+    // SAFETY: source is open and empty_path is a valid NUL-terminated string.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            source.as_raw_fd(),
+            empty_path.as_ptr(),
+            flags,
+        ) as i32
     };
-    mount_call(
-        source,
-        target,
-        "",
-        flags,
-        None,
-        format!(
-            "bind-mounting mapping source {source} to {}",
+    if fd < 0 {
+        return Err(AgentError::io(
+            format!(
+                "cloning resolved mapping descriptor {} into a detached mount",
+                source.as_raw_fd()
+            ),
+            ::std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: fd is newly returned by open_tree and owned by this function.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_mapping_target(target: &Path, kind: MappingEntryKind) -> Result<OwnedFd> {
+    let c_target = CString::new(target.to_string_lossy().as_bytes())
+        .map_err(|_| AgentError::mount("mapping target contains NUL byte"))?;
+    let flags = libc::O_PATH
+        | libc::O_NOFOLLOW
+        | libc::O_CLOEXEC
+        | if kind == MappingEntryKind::Directory {
+            libc::O_DIRECTORY
+        } else {
+            0
+        };
+    // SAFETY: c_target is valid and flags open the target without dereferencing a symlink.
+    let fd = unsafe { libc::open(c_target.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(AgentError::io(
+            format!("opening mapping target {}", target.display()),
+            ::std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: fd is newly returned by open and owned by this function.
+    let target_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if mapping_kind(target_fd.as_raw_fd())? != kind {
+        return Err(AgentError::mount(format!(
+            "mapping target {} changed type before mount attachment",
             target.display()
-        ),
-    )
+        )));
+    }
+    Ok(target_fd)
+}
+
+#[cfg(target_os = "linux")]
+fn attach_detached_mount(
+    detached_mount: &OwnedFd,
+    target: &OwnedFd,
+    target_path: &Path,
+) -> Result<()> {
+    const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x0000_0004;
+    const MOVE_MOUNT_T_EMPTY_PATH: u32 = 0x0000_0040;
+
+    let empty_path = c"";
+    // SAFETY: both descriptors remain open and empty paths address them directly.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            detached_mount.as_raw_fd(),
+            empty_path.as_ptr(),
+            target.as_raw_fd(),
+            empty_path.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        ) as i32
+    };
+    if rc != 0 {
+        return Err(AgentError::io(
+            format!(
+                "attaching detached mapping mount to {}",
+                target_path.display()
+            ),
+            ::std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn harden_detached_mount_read_only(detached_mount: &OwnedFd) -> Result<()> {
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    const AT_RECURSIVE: u32 = 0x8000;
+    const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+    const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
+    const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
+    const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
+
+    #[repr(C)]
+    struct MountAttr {
+        attr_set: u64,
+        attr_clr: u64,
+        propagation: u64,
+        userns_fd: u64,
+    }
+
+    let attributes = MountAttr {
+        attr_set: MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let empty_path = c"";
+    // SAFETY: detached_mount and attributes remain valid for the syscall.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            detached_mount.as_raw_fd(),
+            empty_path.as_ptr(),
+            AT_EMPTY_PATH | AT_RECURSIVE,
+            &attributes as *const MountAttr,
+            size_of::<MountAttr>(),
+        ) as i32
+    };
+    if rc != 0 {
+        return Err(AgentError::io(
+            format!(
+                "hardening detached mapping mount descriptor {} read-only",
+                detached_mount.as_raw_fd()
+            ),
+            ::std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -714,6 +896,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn mapping_root_tmpfs_uses_vfs_security_flags() {
         assert_eq!(MAPPING_ROOT_TMPFS_DATA, "mode=755");
@@ -762,7 +945,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn returns_descriptor_that_is_not_redirected_by_path_swap() {
-        use ::std::io::Read;
+        use ::std::os::unix::fs::MetadataExt;
         use ::std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -784,18 +967,31 @@ mod tests {
             .resolve_declared_raw("safe/payload.txt")
             .expect("resolved");
         assert_eq!(resolved.entry_kind, MappingEntryKind::File);
+        let held_inode = descriptor_inode(resolved.guest_fd.as_raw_fd());
 
         ::std::fs::remove_file(&inside_file).expect("remove inside");
         symlink(&outside_file, &inside_file).expect("replace with symlink");
 
-        let mut text = String::new();
-        let mut file: ::std::fs::File = resolved.guest_fd.try_clone().expect("clone").into();
-        file.read_to_string(&mut text).expect("read held fd");
-        assert_eq!(text, "inside");
         assert_eq!(
             ::std::fs::read_to_string(&inside_file).expect("path"),
             "outside"
         );
+        assert_eq!(held_inode, descriptor_inode(resolved.guest_fd.as_raw_fd()));
+        assert_ne!(
+            held_inode,
+            ::std::fs::metadata(&outside_file)
+                .expect("outside metadata")
+                .ino()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn descriptor_inode(fd: RawFd) -> u64 {
+        let mut stat_buffer = ::std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: stat_buffer is valid writable storage and fd is open for the test.
+        assert_eq!(unsafe { libc::fstat(fd, stat_buffer.as_mut_ptr()) }, 0);
+        // SAFETY: fstat succeeded and initialized stat_buffer.
+        unsafe { stat_buffer.assume_init().st_ino }
     }
 
     #[cfg(target_os = "linux")]
@@ -811,6 +1007,100 @@ mod tests {
             .resolve_declared_raw("safe/../escape")
             .expect_err("dot-dot must fail");
         assert!(format!("{error}").contains("invalid mapping path"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_target_open_rejects_symlink_replacement() {
+        use ::std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_target = temp.path().join("real");
+        let replaced_target = temp.path().join("target");
+        ::std::fs::create_dir(&real_target).expect("real target");
+        symlink(&real_target, &replaced_target).expect("target symlink");
+
+        let error = open_mapping_target(&replaced_target, MappingEntryKind::Directory)
+            .expect_err("symlink target must fail closed");
+        assert!(format!("{error}").contains("opening mapping target"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN and a private mount namespace"]
+    fn detached_mapping_mount_survives_source_path_hiding() {
+        struct MountGuard(Vec<PathBuf>);
+
+        impl Drop for MountGuard {
+            fn drop(&mut self) {
+                for path in self.0.iter().rev() {
+                    if let Ok(c_path) = CString::new(path.to_string_lossy().as_bytes()) {
+                        // SAFETY: best-effort cleanup of mounts created by this test.
+                        let _ = unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) };
+                    }
+                }
+            }
+        }
+
+        // SAFETY: the test requires CAP_SYS_ADMIN and isolates all mount mutations.
+        let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+        assert_eq!(
+            rc,
+            0,
+            "unshare(CLONE_NEWNS) failed: {}",
+            ::std::io::Error::last_os_error()
+        );
+        mount_call(
+            "none",
+            Path::new("/"),
+            "",
+            libc::MS_PRIVATE | libc::MS_REC,
+            None,
+            "making test root private",
+        )
+        .expect("private root");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_root = temp.path().join("source-root");
+        let source = source_root.join("mapping");
+        let target = temp.path().join("target");
+        ::std::fs::create_dir_all(&source).expect("source");
+        ::std::fs::write(source.join("payload"), "held-by-mount-fd").expect("payload");
+
+        let resolver = MappingResolver::new(
+            source_root.clone(),
+            vec![mapping("mapping", AccessMode::ReadWrite)],
+        )
+        .expect("resolver");
+        let resolved = resolver.resolve_declared_raw("mapping").expect("resolved");
+        let detached =
+            clone_mapping_mount(&resolved.guest_fd, resolved.entry_kind).expect("detached mount");
+        harden_detached_mount_read_only(&detached).expect("read-only attributes");
+
+        mount_call(
+            "tmpfs",
+            &source_root,
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+            Some("mode=755"),
+            "hiding original mapping source path",
+        )
+        .expect("hide source");
+        let mut mounts = MountGuard(vec![source_root]);
+
+        prepare_mapping_target(&target, MappingEntryKind::Directory).expect("target");
+        let target_fd =
+            open_mapping_target(&target, MappingEntryKind::Directory).expect("target fd");
+        attach_detached_mount(&detached, &target_fd, &target).expect("attach detached mount");
+        mounts.0.push(target.clone());
+
+        assert_eq!(
+            ::std::fs::read_to_string(target.join("payload")).expect("attached payload"),
+            "held-by-mount-fd"
+        );
+        let error =
+            ::std::fs::write(target.join("new-file"), "must fail").expect_err("read-only mount");
+        assert_eq!(error.raw_os_error(), Some(libc::EROFS));
     }
 
     #[cfg(target_os = "linux")]
@@ -952,6 +1242,189 @@ mod tests {
             .expect("nested entry");
         assert!(root_entry.read_only, "root mount remained writable");
         assert!(nested_entry.read_only, "nested mount remained writable");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN and namespace creation"]
+    fn mapping_installation_works_after_joining_holder_pid_and_mount_namespaces() {
+        struct HolderGuard {
+            pid: libc::pid_t,
+        }
+
+        impl Drop for HolderGuard {
+            fn drop(&mut self) {
+                // SAFETY: best-effort termination of helper process created by this test.
+                let _ = unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let declared_root = temp.path().join("declared-root");
+        let source_dir = declared_root.join("rw");
+        let source_file = source_dir.join("payload.txt");
+        let guest_root = temp.path().join("guest-mapping-root");
+        ::std::fs::create_dir_all(&source_dir).expect("source dir");
+        ::std::fs::write(&source_file, b"payload").expect("source payload");
+
+        let resolver = MappingResolver::new(
+            declared_root.clone(),
+            vec![mapping("rw", AccessMode::ReadWrite)],
+        )
+        .expect("resolver");
+        let resolved = resolver
+            .resolve_declared_raw("rw")
+            .expect("resolved mapping");
+
+        let mut report_pipe = [0_i32; 2];
+        // SAFETY: report_pipe points to writable memory for two descriptors.
+        let rc = unsafe { libc::pipe2(report_pipe.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(rc, 0, "pipe2 failed: {}", ::std::io::Error::last_os_error());
+        let report_read = report_pipe[0];
+        let report_write = report_pipe[1];
+
+        // SAFETY: fork creates a disposable process for namespace setup.
+        let stage_one_pid = unsafe { libc::fork() };
+        assert!(
+            stage_one_pid >= 0,
+            "fork failed: {}",
+            ::std::io::Error::last_os_error()
+        );
+        if stage_one_pid == 0 {
+            close_fd(report_read);
+            // SAFETY: unshare called with constant namespace flags in disposable child.
+            if unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID) } != 0 {
+                let _ = write_all_fd(report_write, &0_i32.to_ne_bytes());
+                close_fd(report_write);
+                // SAFETY: child exits immediately on setup failure.
+                unsafe { libc::_exit(1) };
+            }
+            // SAFETY: second fork enters the new pid namespace.
+            let holder_pid = unsafe { libc::fork() };
+            if holder_pid < 0 {
+                let _ = write_all_fd(report_write, &0_i32.to_ne_bytes());
+                close_fd(report_write);
+                // SAFETY: child exits immediately on setup failure.
+                unsafe { libc::_exit(1) };
+            }
+            if holder_pid > 0 {
+                let _ = write_all_fd(report_write, &(holder_pid as i32).to_ne_bytes());
+                close_fd(report_write);
+                // SAFETY: stage-one helper exits after reporting outer holder pid.
+                unsafe { libc::_exit(0) };
+            }
+
+            close_fd(report_write);
+            if let Ok(root_cstr) = CString::new("/") {
+                // SAFETY: best-effort mount propagation isolation in holder helper.
+                let _ = unsafe {
+                    libc::mount(
+                        root_cstr.as_ptr(),
+                        root_cstr.as_ptr(),
+                        ::std::ptr::null(),
+                        libc::MS_PRIVATE | libc::MS_REC,
+                        ::std::ptr::null(),
+                    )
+                };
+            }
+            if let (Ok(source), Ok(target), Ok(fstype)) = (
+                CString::new("proc"),
+                CString::new("/proc"),
+                CString::new("proc"),
+            ) {
+                // SAFETY: best-effort private procfs mount for holder pid namespace.
+                let _ = unsafe {
+                    libc::mount(
+                        source.as_ptr(),
+                        target.as_ptr(),
+                        fstype.as_ptr(),
+                        0,
+                        ::std::ptr::null(),
+                    )
+                };
+            }
+            loop {
+                // SAFETY: pause waits for a signal in helper process.
+                unsafe { libc::pause() };
+            }
+        }
+
+        close_fd(report_write);
+        let mut holder_pid_raw = [0_u8; 4];
+        let bytes_read = read_exact_fd(report_read, &mut holder_pid_raw).expect("holder pid read");
+        close_fd(report_read);
+        assert_eq!(bytes_read, 4, "holder pid report size");
+        wait_pid_success(stage_one_pid, "stage-one namespace helper").expect("stage-one exit");
+        let holder_pid = i32::from_ne_bytes(holder_pid_raw) as libc::pid_t;
+        assert!(holder_pid > 1, "invalid holder pid reported: {holder_pid}");
+        let _holder_guard = HolderGuard { pid: holder_pid };
+
+        install_resolved_mappings_in_holder_mount_namespace(
+            holder_pid,
+            guest_root.to_str().expect("guest root utf8"),
+            &[resolved],
+        )
+        .expect("mapping installation");
+
+        let guest_file = PathBuf::from(format!("/proc/{holder_pid}/root"))
+            .join(guest_root.strip_prefix("/").expect("absolute guest root"))
+            .join("rw")
+            .join("payload.txt");
+        assert_eq!(
+            ::std::fs::read_to_string(&guest_file).expect("guest file"),
+            "payload"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_exact_fd(fd: i32, buffer: &mut [u8]) -> Result<usize> {
+        let mut offset = 0usize;
+        while offset < buffer.len() {
+            // SAFETY: buffer points to writable memory for read; fd is process-owned.
+            let rc = unsafe {
+                libc::read(
+                    fd,
+                    buffer[offset..].as_mut_ptr().cast(),
+                    (buffer.len() - offset) as libc::size_t,
+                )
+            };
+            if rc < 0 {
+                let error = ::std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(AgentError::io("reading helper report pipe", error));
+            }
+            if rc == 0 {
+                break;
+            }
+            offset += rc as usize;
+        }
+        Ok(offset)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_all_fd(fd: i32, buffer: &[u8]) -> Result<()> {
+        let mut offset = 0usize;
+        while offset < buffer.len() {
+            // SAFETY: buffer points to readable memory for write; fd is process-owned.
+            let rc = unsafe {
+                libc::write(
+                    fd,
+                    buffer[offset..].as_ptr().cast(),
+                    (buffer.len() - offset) as libc::size_t,
+                )
+            };
+            if rc < 0 {
+                let error = ::std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(AgentError::io("writing helper report pipe", error));
+            }
+            offset += rc as usize;
+        }
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]
