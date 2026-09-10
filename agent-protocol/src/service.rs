@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -285,7 +285,7 @@ pub trait ProcessSupervisor {
     fn cleanup_for_disconnect(
         &mut self,
         exec_id: u32,
-        deadline: Duration,
+        absolute_deadline: Instant,
     ) -> Result<bool, ServiceError>;
 }
 
@@ -1002,25 +1002,26 @@ impl MxcControlService {
         now_secs: u64,
         supervisor: &mut impl ProcessSupervisor,
     ) -> Result<(), ServiceError> {
-        self.begin_disconnect_cleanup_with_timeout(
-            now_secs,
-            supervisor,
-            Duration::from_secs(CHANNEL_LOSS_CLEANUP_DEADLINE_SECS),
-        )
+        let now = Instant::now();
+        let absolute_deadline = now
+            .checked_add(Duration::from_secs(CHANNEL_LOSS_CLEANUP_DEADLINE_SECS))
+            .unwrap_or(now);
+        self.begin_disconnect_cleanup_with_deadline(now_secs, supervisor, absolute_deadline)
     }
 
-    pub fn begin_disconnect_cleanup_with_timeout(
+    pub fn begin_disconnect_cleanup_with_deadline(
         &mut self,
         now_secs: u64,
         supervisor: &mut impl ProcessSupervisor,
-        cleanup_timeout: Duration,
+        absolute_deadline: Instant,
     ) -> Result<(), ServiceError> {
+        let cleanup_timeout = absolute_deadline.saturating_duration_since(Instant::now());
         self.disconnect_cleanup_in_progress = true;
         self.protocol_state
             .begin_channel_loss_cleanup(now_secs, cleanup_timeout)?;
         if let Some(active) = self.active_exec.as_ref() {
             let cleaned = supervisor
-                .cleanup_for_disconnect(active.exec_id, cleanup_timeout)
+                .cleanup_for_disconnect(active.exec_id, absolute_deadline)
                 .map_err(|error| {
                     self.enter_fatal_session(format!(
                         "channel-loss cleanup supervisor failure: {}",
@@ -2403,7 +2404,7 @@ mod tests {
         terminated: u32,
         killed: u32,
         cleanup_ok: bool,
-        cleanup_deadline: Option<Duration>,
+        cleanup_deadline: Option<Instant>,
     }
 
     impl ProcessSupervisor for FakeSupervisor {
@@ -2481,9 +2482,9 @@ mod tests {
         fn cleanup_for_disconnect(
             &mut self,
             _exec_id: u32,
-            deadline: Duration,
+            absolute_deadline: Instant,
         ) -> Result<bool, ServiceError> {
-            self.cleanup_deadline = Some(deadline);
+            self.cleanup_deadline = Some(absolute_deadline);
             Ok(self.cleanup_ok)
         }
     }
@@ -2779,10 +2780,12 @@ mod tests {
             )
             .expect("create");
         let timeout = Duration::from_millis(7);
+        let start = Instant::now();
+        let deadline = start.checked_add(timeout).unwrap_or(start);
         service
-            .begin_disconnect_cleanup_with_timeout(77, &mut supervisor, timeout)
+            .begin_disconnect_cleanup_with_deadline(77, &mut supervisor, deadline)
             .expect("cleanup");
-        assert_eq!(supervisor.cleanup_deadline, Some(timeout));
+        assert_eq!(supervisor.cleanup_deadline, Some(deadline));
     }
 
     #[test]

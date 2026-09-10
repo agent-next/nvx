@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::hash::{Hash, Hasher};
 #[cfg(target_os = "linux")]
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(target_os = "linux")]
@@ -39,9 +39,12 @@ use nvx_agent::runtime::{
     harness_should_complete_shutdown_when_writer_blocked,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const REPORT_SCHEMA: &str = "nvx.mxc.agent.harness.report.v1";
 const REPORT_VERSION: u32 = 1;
+const ATTESTATION_MANIFEST_SCHEMA: &str = "nvx.mxc.agent.harness.attestation-manifest.v1";
+const ATTESTATION_MANIFEST_VERSION: u32 = 1;
 const MAX_DIAGNOSTIC_LINES: usize = 200;
 const DEFAULT_IMAGE_VERSION: &str = "mxc-prototype-v1";
 
@@ -206,6 +209,22 @@ pub struct HarnessReport {
     pub diagnostics_tail: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttestationManifest {
+    pub schema: String,
+    pub version: u32,
+    pub run_id: String,
+    pub artifacts: Vec<AttestedArtifact>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttestedArtifact {
+    pub kind: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AttestationKind {
@@ -241,6 +260,7 @@ pub struct HarnessRun {
     pub report: HarnessReport,
     pub report_path: PathBuf,
     pub diagnostics_path: PathBuf,
+    pub attestation_manifest_path: PathBuf,
     trusted: TrustedEvidence,
 }
 
@@ -248,8 +268,10 @@ pub struct HarnessRun {
 struct TrustedEvidence {
     attestation_by_requirement: BTreeMap<u8, AttestationKind>,
     transcript_by_requirement: BTreeMap<u8, String>,
-    artifact_hashes: BTreeMap<String, String>,
     artifact_paths: BTreeMap<String, String>,
+    artifact_sizes: BTreeMap<String, u64>,
+    artifact_sha256: BTreeMap<String, String>,
+    run_id: String,
 }
 
 impl HarnessRun {
@@ -355,35 +377,74 @@ pub fn execute_harness(options: HarnessOptions) -> Result<HarnessRun, String> {
         diagnostics_tail: diagnostics.snapshot(),
     };
 
-    let diagnostics_path = options.output_dir.join("diagnostics.log");
-    let report_path = options.output_dir.join("report.json");
-    write_text_atomic(&diagnostics_path, &report.diagnostics_tail.join("\n"))?;
+    let diagnostics_rel = PathBuf::from("diagnostics.log");
+    let report_rel = PathBuf::from("report.json");
+    let manifest_rel = PathBuf::from("attestation-manifest.json");
+    let diagnostics_path = options.output_dir.join(&diagnostics_rel);
+    let report_path = options.output_dir.join(&report_rel);
+    let attestation_manifest_path = options.output_dir.join(&manifest_rel);
+    let diagnostics_bytes = report.diagnostics_tail.join("\n").into_bytes();
+    write_bytes_atomic(&diagnostics_path, &diagnostics_bytes)?;
+    let diagnostics_sha256 = content_sha256_hex_bytes(&diagnostics_bytes);
     report
         .artifact_paths
-        .insert("report".to_string(), report_path.display().to_string());
+        .insert("report".to_string(), rel_artifact_path(&report_rel)?);
     report.artifact_paths.insert(
         "diagnostics".to_string(),
-        diagnostics_path.display().to_string(),
+        rel_artifact_path(&diagnostics_rel)?,
+    );
+    report.artifact_hashes.insert(
+        "report".to_string(),
+        "attested-via-attestation-manifest".to_string(),
     );
     report
         .artifact_hashes
-        .insert("report".to_string(), run_transcript_id.clone());
-    let diagnostics_hash = content_hash_hex_file(&diagnostics_path)?;
-    report
-        .artifact_hashes
-        .insert("diagnostics".to_string(), diagnostics_hash.clone());
-    write_json_atomic(&report_path, &report)?;
+        .insert("diagnostics".to_string(), diagnostics_sha256.clone());
+    let report_bytes = serde_json::to_vec_pretty(&report)
+        .map_err(|error| format!("failed to serialize report: {error}"))?;
+    write_bytes_atomic(&report_path, &report_bytes)?;
+
+    let report_sha256 = content_sha256_hex_bytes(&report_bytes);
+    let manifest = AttestationManifest {
+        schema: ATTESTATION_MANIFEST_SCHEMA.to_string(),
+        version: ATTESTATION_MANIFEST_VERSION,
+        run_id: run_transcript_id.clone(),
+        artifacts: vec![
+            AttestedArtifact {
+                kind: "report".to_string(),
+                path: rel_artifact_path(&report_rel)?,
+                size_bytes: report_bytes.len() as u64,
+                sha256: report_sha256.clone(),
+            },
+            AttestedArtifact {
+                kind: "diagnostics".to_string(),
+                path: rel_artifact_path(&diagnostics_rel)?,
+                size_bytes: diagnostics_bytes.len() as u64,
+                sha256: diagnostics_sha256.clone(),
+            },
+        ],
+    };
+    write_json_atomic(&attestation_manifest_path, &manifest)?;
 
     let trusted = TrustedEvidence {
         attestation_by_requirement: trusted_attestation_by_requirement,
         transcript_by_requirement: trusted_transcript_by_requirement,
-        artifact_hashes: report.artifact_hashes.clone(),
         artifact_paths: report.artifact_paths.clone(),
+        artifact_sizes: BTreeMap::from([
+            ("report".to_string(), report_bytes.len() as u64),
+            ("diagnostics".to_string(), diagnostics_bytes.len() as u64),
+        ]),
+        artifact_sha256: BTreeMap::from([
+            ("report".to_string(), report_sha256),
+            ("diagnostics".to_string(), diagnostics_sha256),
+        ]),
+        run_id: run_transcript_id,
     };
     Ok(HarnessRun {
         report,
         report_path,
         diagnostics_path,
+        attestation_manifest_path,
         trusted,
     })
 }
@@ -2028,14 +2089,10 @@ fn fail(definition: ScenarioDefinition, error: &str) -> ScenarioResult {
     }
 }
 
-fn write_json_atomic(path: &Path, report: &HarnessReport) -> Result<(), String> {
-    let payload = serde_json::to_vec_pretty(report)
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    let payload = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("failed to serialize harness report: {error}"))?;
     write_bytes_atomic(path, &payload)
-}
-
-fn write_text_atomic(path: &Path, text: &str) -> Result<(), String> {
-    write_bytes_atomic(path, text.as_bytes())
 }
 
 fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -2054,16 +2111,49 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
-fn content_hash_hex_file(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|error| {
-        format!(
-            "failed to read artifact for hashing {}: {error}",
+fn content_sha256_hex_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn rel_artifact_path(path: &Path) -> Result<String, String> {
+    if path.is_absolute() {
+        return Err(format!(
+            "artifact path must be relative, got {}",
             path.display()
-        )
-    })?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Ok(format!("{:016x}", hasher.finish()))
+        ));
+    }
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        ) {
+            return Err(format!(
+                "artifact path escapes output directory: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn read_artifact_checked(
+    output_dir: &Path,
+    relative_path: &str,
+) -> Result<(PathBuf, Vec<u8>), String> {
+    let relative = PathBuf::from(relative_path);
+    let checked = rel_artifact_path(&relative)?;
+    let full_path = output_dir.join(&checked);
+    let mut file = fs::File::open(&full_path)
+        .map_err(|error| format!("failed to open artifact {}: {error}", full_path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read artifact {}: {error}", full_path.display()))?;
+    Ok((full_path, bytes))
 }
 
 fn unix_ms_now() -> u128 {
@@ -2147,10 +2237,7 @@ pub fn is_passing_report(run: &HarnessRun) -> bool {
     if report.started_unix_ms == 0 || report.finished_unix_ms < report.started_unix_ms {
         return false;
     }
-    if report.artifact_paths.len() != 2 {
-        return false;
-    }
-    if report.artifact_hashes.len() != 2 {
+    if report.artifact_paths.len() != 2 || report.artifact_hashes.len() != 2 {
         return false;
     }
     if report
@@ -2181,9 +2268,7 @@ pub fn is_passing_report(run: &HarnessRun) -> bool {
     {
         return false;
     }
-    if report.artifact_paths != run.trusted.artifact_paths
-        || report.artifact_hashes != run.trusted.artifact_hashes
-    {
+    if report.artifact_paths != run.trusted.artifact_paths {
         return false;
     }
     if report.diagnostics_tail.len() > MAX_DIAGNOSTIC_LINES {
@@ -2231,6 +2316,78 @@ pub fn is_passing_report(run: &HarnessRun) -> bool {
         }
         let serialized = &scenario.attestations[0];
         if serialized.kind != expected_kind || &serialized.transcript_id != trusted_transcript {
+            return false;
+        }
+    }
+    validate_attestation_artifacts(run)
+}
+
+fn validate_attestation_artifacts(run: &HarnessRun) -> bool {
+    let Some(output_dir) = run.report_path.parent() else {
+        return false;
+    };
+    if run.diagnostics_path.parent() != Some(output_dir)
+        || run.attestation_manifest_path.parent() != Some(output_dir)
+    {
+        return false;
+    }
+    let manifest_bytes = match fs::read(&run.attestation_manifest_path) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let manifest: AttestationManifest = match serde_json::from_slice(&manifest_bytes) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if manifest.schema != ATTESTATION_MANIFEST_SCHEMA
+        || manifest.version != ATTESTATION_MANIFEST_VERSION
+        || manifest.run_id != run.trusted.run_id
+        || manifest.artifacts.len() != 2
+    {
+        return false;
+    }
+    let mut manifest_by_kind: BTreeMap<&str, &AttestedArtifact> = BTreeMap::new();
+    for artifact in &manifest.artifacts {
+        if manifest_by_kind
+            .insert(artifact.kind.as_str(), artifact)
+            .is_some()
+        {
+            return false;
+        }
+    }
+    for kind in ["report", "diagnostics"] {
+        let Some(artifact) = manifest_by_kind.get(kind).copied() else {
+            return false;
+        };
+        let Some(expected_path) = run.trusted.artifact_paths.get(kind) else {
+            return false;
+        };
+        let Some(expected_size) = run.trusted.artifact_sizes.get(kind) else {
+            return false;
+        };
+        let Some(expected_sha256) = run.trusted.artifact_sha256.get(kind) else {
+            return false;
+        };
+        if &artifact.path != expected_path
+            || artifact.size_bytes != *expected_size
+            || artifact.sha256 != *expected_sha256
+        {
+            return false;
+        }
+        let (full_path, bytes) = match read_artifact_checked(output_dir, &artifact.path) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        if kind == "report" && full_path != run.report_path {
+            return false;
+        }
+        if kind == "diagnostics" && full_path != run.diagnostics_path {
+            return false;
+        }
+        if bytes.len() as u64 != artifact.size_bytes {
+            return false;
+        }
+        if content_sha256_hex_bytes(&bytes) != artifact.sha256 {
             return false;
         }
     }
@@ -2468,12 +2625,22 @@ mod tests {
     }
 
     fn forged_passing_run() -> HarnessRun {
+        let root = std::env::temp_dir().join(format!(
+            "nvx-agent-harness-forged-{}-{}",
+            std::process::id(),
+            unix_ms_now()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create forged root");
         let mut artifact_paths = BTreeMap::new();
         artifact_paths.insert("report".to_string(), "report.json".to_string());
-        artifact_paths.insert("diagnostics".to_string(), "diagnostics.txt".to_string());
+        artifact_paths.insert("diagnostics".to_string(), "diagnostics.log".to_string());
         let mut artifact_hashes = BTreeMap::new();
-        artifact_hashes.insert("report".to_string(), "run-1".to_string());
-        artifact_hashes.insert("diagnostics".to_string(), "deadbeef".to_string());
+        artifact_hashes.insert(
+            "report".to_string(),
+            "attested-via-attestation-manifest".to_string(),
+        );
+        artifact_hashes.insert("diagnostics".to_string(), "present".to_string());
         let mut trusted_attestation_by_requirement = BTreeMap::new();
         let mut trusted_transcript_by_requirement = BTreeMap::new();
         let scenarios = CANONICAL_SCENARIOS
@@ -2522,14 +2689,60 @@ mod tests {
             artifact_hashes,
             diagnostics_tail: vec!["ok".to_string()],
         };
+        let report_path = root.join("report.json");
+        let diagnostics_path = root.join("diagnostics.log");
+        let attestation_manifest_path = root.join("attestation-manifest.json");
+        let diagnostics_bytes = b"ok".to_vec();
+        std::fs::write(&diagnostics_path, &diagnostics_bytes).expect("write diagnostics");
+        let report_bytes = serde_json::to_vec_pretty(&report).expect("serialize report");
+        std::fs::write(&report_path, &report_bytes).expect("write report");
+        let manifest = AttestationManifest {
+            schema: ATTESTATION_MANIFEST_SCHEMA.to_string(),
+            version: ATTESTATION_MANIFEST_VERSION,
+            run_id: "run-1".to_string(),
+            artifacts: vec![
+                AttestedArtifact {
+                    kind: "report".to_string(),
+                    path: "report.json".to_string(),
+                    size_bytes: report_bytes.len() as u64,
+                    sha256: content_sha256_hex_bytes(&report_bytes),
+                },
+                AttestedArtifact {
+                    kind: "diagnostics".to_string(),
+                    path: "diagnostics.log".to_string(),
+                    size_bytes: diagnostics_bytes.len() as u64,
+                    sha256: content_sha256_hex_bytes(&diagnostics_bytes),
+                },
+            ],
+        };
+        std::fs::write(
+            &attestation_manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("manifest bytes"),
+        )
+        .expect("write manifest");
         HarnessRun {
-            report_path: PathBuf::from("report.json"),
-            diagnostics_path: PathBuf::from("diagnostics.txt"),
+            report_path,
+            diagnostics_path,
+            attestation_manifest_path,
             trusted: TrustedEvidence {
                 attestation_by_requirement: trusted_attestation_by_requirement,
                 transcript_by_requirement: trusted_transcript_by_requirement,
-                artifact_hashes: report.artifact_hashes.clone(),
                 artifact_paths: report.artifact_paths.clone(),
+                artifact_sizes: BTreeMap::from([
+                    ("report".to_string(), report_bytes.len() as u64),
+                    ("diagnostics".to_string(), diagnostics_bytes.len() as u64),
+                ]),
+                artifact_sha256: BTreeMap::from([
+                    (
+                        "report".to_string(),
+                        content_sha256_hex_bytes(&report_bytes),
+                    ),
+                    (
+                        "diagnostics".to_string(),
+                        content_sha256_hex_bytes(&diagnostics_bytes),
+                    ),
+                ]),
+                run_id: "run-1".to_string(),
             },
             report,
         }
@@ -2537,6 +2750,7 @@ mod tests {
 
     #[test]
     fn fabricated_report_without_trusted_attestation_fails() {
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
         let mut run = forged_passing_run();
         run.trusted.attestation_by_requirement.clear();
         assert!(!is_passing_report(&run));
@@ -2544,6 +2758,7 @@ mod tests {
 
     #[test]
     fn canonical_gate_rejects_adversarial_attestation_and_artifact_mutations() {
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
         let run = forged_passing_run();
         assert!(is_passing_report(&run));
         assert_eq!(report_exit_code(&run), ExitCode::SUCCESS);
@@ -2567,16 +2782,17 @@ mod tests {
             "forged".to_string();
         assert!(!is_passing_report(&mismatch_transcript));
 
-        let mut artifact_mismatch = run.clone();
-        artifact_mismatch
+        let mut artifact_path_mismatch = run.clone();
+        artifact_path_mismatch
             .report
-            .artifact_hashes
-            .insert("diagnostics".to_string(), "forged".to_string());
-        assert!(!is_passing_report(&artifact_mismatch));
+            .artifact_paths
+            .insert("diagnostics".to_string(), "forged.log".to_string());
+        assert!(!is_passing_report(&artifact_path_mismatch));
     }
 
     #[test]
     fn canonical_gate_rejects_adversarial_top_level_fields() {
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
         let run = forged_passing_run();
         assert!(is_passing_report(&run));
         assert_eq!(report_exit_code(&run), ExitCode::SUCCESS);
@@ -2632,5 +2848,88 @@ mod tests {
         let mut bad_diagnostics = run.clone();
         bad_diagnostics.report.diagnostics_tail = vec!["x".to_string(); MAX_DIAGNOSTIC_LINES + 1];
         assert!(!is_passing_report(&bad_diagnostics));
+    }
+
+    #[test]
+    fn canonical_gate_rejects_missing_modified_truncated_swapped_and_tampered_artifacts() {
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let missing = forged_passing_run();
+        assert!(is_passing_report(&missing));
+        std::fs::remove_file(&missing.diagnostics_path).expect("remove diagnostics");
+        assert!(!is_passing_report(&missing));
+
+        let modified = forged_passing_run();
+        assert!(is_passing_report(&modified));
+        std::fs::write(&modified.diagnostics_path, b"ok\nforged").expect("modify diagnostics");
+        assert!(!is_passing_report(&modified));
+
+        let truncated = forged_passing_run();
+        assert!(is_passing_report(&truncated));
+        std::fs::write(&truncated.report_path, b"{}").expect("truncate report");
+        assert!(!is_passing_report(&truncated));
+
+        let swapped = forged_passing_run();
+        assert!(is_passing_report(&swapped));
+        let report_bytes = std::fs::read(&swapped.report_path).expect("read report");
+        let diagnostics_bytes = std::fs::read(&swapped.diagnostics_path).expect("read diagnostics");
+        std::fs::write(&swapped.report_path, &diagnostics_bytes).expect("swap report");
+        std::fs::write(&swapped.diagnostics_path, &report_bytes).expect("swap diagnostics");
+        assert!(!is_passing_report(&swapped));
+
+        let escaped = forged_passing_run();
+        assert!(is_passing_report(&escaped));
+        let escaped_manifest = AttestationManifest {
+            schema: ATTESTATION_MANIFEST_SCHEMA.to_string(),
+            version: ATTESTATION_MANIFEST_VERSION,
+            run_id: escaped.trusted.run_id.clone(),
+            artifacts: vec![
+                AttestedArtifact {
+                    kind: "report".to_string(),
+                    path: "../report.json".to_string(),
+                    size_bytes: *escaped.trusted.artifact_sizes.get("report").expect("size"),
+                    sha256: escaped
+                        .trusted
+                        .artifact_sha256
+                        .get("report")
+                        .expect("sha")
+                        .clone(),
+                },
+                AttestedArtifact {
+                    kind: "diagnostics".to_string(),
+                    path: "diagnostics.log".to_string(),
+                    size_bytes: *escaped
+                        .trusted
+                        .artifact_sizes
+                        .get("diagnostics")
+                        .expect("size"),
+                    sha256: escaped
+                        .trusted
+                        .artifact_sha256
+                        .get("diagnostics")
+                        .expect("sha")
+                        .clone(),
+                },
+            ],
+        };
+        std::fs::write(
+            &escaped.attestation_manifest_path,
+            serde_json::to_vec_pretty(&escaped_manifest).expect("escape manifest bytes"),
+        )
+        .expect("write escaped manifest");
+        assert!(!is_passing_report(&escaped));
+
+        let tampered_manifest = forged_passing_run();
+        assert!(is_passing_report(&tampered_manifest));
+        let mut manifest: AttestationManifest = serde_json::from_slice(
+            &std::fs::read(&tampered_manifest.attestation_manifest_path).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        manifest.run_id = "forged-run".to_string();
+        std::fs::write(
+            &tampered_manifest.attestation_manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("tampered manifest bytes"),
+        )
+        .expect("write tampered manifest");
+        assert!(!is_passing_report(&tampered_manifest));
     }
 }

@@ -55,8 +55,6 @@ fn run() -> Result<()> {
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 fn deliberate_poweroff() -> Result<()> {
-    // SAFETY: sync has no memory-safety preconditions.
-    unsafe { libc::sync() };
     // SAFETY: reboot syscall is invoked with a constant Linux power-off command.
     let rc = unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
     if rc != 0 {

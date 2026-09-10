@@ -1,23 +1,27 @@
 // Copyright(c) The microvm authors.
 // Licensed under the MIT License.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::io::Read;
+use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{FromRawFd, RawFd};
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_protocol::{
-    AgentControlMessage, AuthenticateChannelRequest, BuildStatus, CancelReason, ChannelReadResult,
-    ConfigureSessionRequest, CreateProcessRequest, DnsStatus, HVC1_DEVICE_PATH, HostControlMessage,
-    LaunchBinding, LaunchIdentity, MAX_SHUTDOWN_GRACE_TIMEOUT_MS, MappingContainmentPolicy,
-    MxcControlService, NetworkFailureCode, NetworkFailureStatus, NetworkInterfaceStatus,
-    NetworkLinkState, NetworkMode, NetworkSetupState, NetworkStatus,
+    AccessMode, AgentControlMessage, AuthenticateChannelRequest, BuildStatus, CancelReason,
+    ChannelReadResult, ConfigureSessionRequest, CreateProcessRequest, DnsStatus, HVC1_DEVICE_PATH,
+    HostControlMessage, LaunchBinding, LaunchIdentity, MAX_SHUTDOWN_GRACE_TIMEOUT_MS,
+    MappingContainmentPolicy, MxcControlService, NetworkFailureCode, NetworkFailureStatus,
+    NetworkInterfaceStatus, NetworkLinkState, NetworkMode, NetworkSetupState, NetworkStatus,
     OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, PROTOCOL_VERSION, ProcessSupervisor, ProtocolErrorCode,
     ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, ServiceError, ServiceErrorCode,
     SessionConfiguration, WaitReadyRequest, WorkloadIdentityStatus,
@@ -46,6 +50,8 @@ const MAX_PROC_TEXT_BYTES: usize = 64 * 1024;
 const FATAL_SESSION_DELIVERY_DEADLINE: Duration = Duration::from_millis(250);
 
 static SIGCHLD_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static SYNC_HELPER_BLOCK_MS: AtomicU64 = AtomicU64::new(0);
 
 pub fn run_runtime() -> Result<()> {
     assert_conservative_openvmm_overhead()?;
@@ -72,6 +78,7 @@ pub fn run_runtime() -> Result<()> {
     let mut pending_outbound = VecDeque::new();
     let mut graceful_shutdown: Option<GracefulShutdownState> = None;
     let mut fatal_shutdown: Option<FatalSessionShutdown> = None;
+    let mut writable_mapping_paths: Vec<String> = Vec::new();
 
     loop {
         let file = open_hvc1_raw_nonblocking(HVC1_DEVICE_PATH)?;
@@ -110,11 +117,12 @@ pub fn run_runtime() -> Result<()> {
             if let Some(state) = graceful_shutdown.as_mut()
                 && !state.cleanup_started
             {
-                let remaining = state
-                    .absolute_deadline
-                    .saturating_duration_since(Instant::now());
                 service
-                    .begin_disconnect_cleanup_with_timeout(now_secs(), &mut supervisor, remaining)
+                    .begin_disconnect_cleanup_with_deadline(
+                        now_secs(),
+                        &mut supervisor,
+                        state.absolute_deadline,
+                    )
                     .map_err(|error| AgentError::fail_closed(error.to_string()))?;
                 state.cleanup_started = true;
             }
@@ -126,8 +134,12 @@ pub fn run_runtime() -> Result<()> {
                 if Instant::now() >= state.absolute_deadline {
                     return Ok(());
                 }
-                // SAFETY: sync has no memory-safety preconditions.
-                unsafe { libc::sync() };
+                if let Err(error) = bounded_sync_writable_mappings_until_deadline(
+                    state.absolute_deadline,
+                    &state.writable_mapping_paths,
+                ) {
+                    eprintln!("NVX-AGENT-FAIL-CLOSED-SYNC: {error}");
+                }
                 state.sync_done = true;
             }
 
@@ -171,18 +183,21 @@ pub fn run_runtime() -> Result<()> {
                     pending_outbound.clear();
                     active_timeout = None;
                     graceful_shutdown = None;
+                    writable_mapping_paths.clear();
                     break;
                 }
                 ChannelReadResult::Record(record) => {
-                    let outbound = handle_host_record(
-                        &binding,
-                        &mut service,
-                        &mut supervisor,
-                        &mut pending_hello,
-                        &mut active_timeout,
+                    let receipt_instant = Instant::now();
+                    let mut dispatch = HostDispatchContext {
+                        service: &mut service,
+                        supervisor: &mut supervisor,
+                        pending_hello: &mut pending_hello,
+                        active_timeout: &mut active_timeout,
+                        writable_mapping_paths: &mut writable_mapping_paths,
                         isolation_holder_pid,
-                        record,
-                    );
+                        received_at: receipt_instant,
+                    };
+                    let outbound = handle_host_record(&binding, &mut dispatch, record);
                     let outbound = match outbound {
                         Ok(messages) => messages,
                         Err(error) if error.requires_fail_closed_action() => {
@@ -210,28 +225,19 @@ pub fn run_runtime() -> Result<()> {
                             );
                         }
                     }
+                    if let Some(deadline) = outbound.shutdown_deadline {
+                        graceful_shutdown = Some(GracefulShutdownState {
+                            absolute_deadline: deadline,
+                            cleanup_started: false,
+                            sync_done: false,
+                            writable_mapping_paths: writable_mapping_paths
+                                .iter()
+                                .cloned()
+                                .map(std::path::PathBuf::from)
+                                .collect(),
+                        });
+                    }
                     for message in outbound.messages {
-                        if matches!(message, AgentControlMessage::ShuttingDown) {
-                            let grace_timeout_ms =
-                                service.shutdown_grace_timeout_ms().ok_or_else(|| {
-                                    AgentError::fail_closed(
-                                        "shutdown transition missing caller grace timeout"
-                                            .to_string(),
-                                    )
-                                })?;
-                            let deadline = Instant::now()
-                                .checked_add(Duration::from_millis(grace_timeout_ms))
-                                .ok_or_else(|| {
-                                    AgentError::bad_request(format!(
-                                        "grace_timeout_ms cannot be represented as a runtime deadline ({grace_timeout_ms})"
-                                    ))
-                                })?;
-                            graceful_shutdown = Some(GracefulShutdownState {
-                                absolute_deadline: deadline,
-                                cleanup_started: false,
-                                sync_done: false,
-                            });
-                        }
                         enqueue_outbound(&mut pending_outbound, message)?;
                     }
                 }
@@ -242,11 +248,7 @@ pub fn run_runtime() -> Result<()> {
 
 fn handle_host_record<S: ProcessSupervisor>(
     binding: &LaunchBinding,
-    service: &mut MxcControlService,
-    supervisor: &mut S,
-    pending_hello: &mut Option<AuthenticateChannelRequest>,
-    active_timeout: &mut Option<(u32, Instant)>,
-    isolation_holder_pid: libc::pid_t,
+    dispatch: &mut HostDispatchContext<'_, S>,
     record: agent_protocol::InnerRecord,
 ) -> Result<HostRecordOutcome> {
     if record.kind != agent_protocol::InnerRecordKind::Control {
@@ -256,6 +258,7 @@ fn handle_host_record<S: ProcessSupervisor>(
                 message: "non-control record on control channel".to_string(),
             })],
             fatal_session: false,
+            shutdown_deadline: None,
         });
     }
     let host_message: HostControlMessage = match serde_json::from_slice(&record.payload) {
@@ -267,21 +270,15 @@ fn handle_host_record<S: ProcessSupervisor>(
                     message: format!("invalid host control payload: {error}"),
                 })],
                 fatal_session: false,
+                shutdown_deadline: None,
             });
         }
     };
-    match handle_host_message(
-        binding,
-        service,
-        supervisor,
-        pending_hello,
-        active_timeout,
-        isolation_holder_pid,
-        host_message,
-    ) {
-        Ok(messages) => Ok(HostRecordOutcome {
-            messages,
+    match handle_host_message(binding, dispatch, host_message) {
+        Ok(outcome) => Ok(HostRecordOutcome {
+            messages: outcome.messages,
             fatal_session: false,
+            shutdown_deadline: outcome.shutdown_deadline,
         }),
         Err(HostDispatchError::Service(error)) => {
             let detail = protocol_error_from_service(error);
@@ -289,6 +286,7 @@ fn handle_host_record<S: ProcessSupervisor>(
             Ok(HostRecordOutcome {
                 messages: vec![AgentControlMessage::Error(detail)],
                 fatal_session,
+                shutdown_deadline: None,
             })
         }
         Err(HostDispatchError::Agent(error)) => {
@@ -301,6 +299,7 @@ fn handle_host_record<S: ProcessSupervisor>(
                     message: error.to_string(),
                 })],
                 fatal_session: false,
+                shutdown_deadline: None,
             })
         }
     }
@@ -320,6 +319,21 @@ fn fail_closed_cleanup_and_stop<S: ProcessSupervisor>(
 enum HostDispatchError {
     Service(ServiceError),
     Agent(AgentError),
+}
+
+struct HostDispatchOutcome {
+    messages: Vec<AgentControlMessage>,
+    shutdown_deadline: Option<Instant>,
+}
+
+struct HostDispatchContext<'a, S: ProcessSupervisor> {
+    service: &'a mut MxcControlService,
+    supervisor: &'a mut S,
+    pending_hello: &'a mut Option<AuthenticateChannelRequest>,
+    active_timeout: &'a mut Option<(u32, Instant)>,
+    writable_mapping_paths: &'a mut Vec<String>,
+    isolation_holder_pid: libc::pid_t,
+    received_at: Instant,
 }
 
 impl From<ServiceError> for HostDispatchError {
@@ -352,13 +366,9 @@ fn protocol_error_from_service(error: ServiceError) -> ProtocolErrorDetail {
 
 fn handle_host_message<S: ProcessSupervisor>(
     binding: &LaunchBinding,
-    service: &mut MxcControlService,
-    supervisor: &mut S,
-    pending_hello: &mut Option<AuthenticateChannelRequest>,
-    active_timeout: &mut Option<(u32, Instant)>,
-    isolation_holder_pid: libc::pid_t,
+    dispatch: &mut HostDispatchContext<'_, S>,
     message: HostControlMessage,
-) -> std::result::Result<Vec<AgentControlMessage>, HostDispatchError> {
+) -> std::result::Result<HostDispatchOutcome, HostDispatchError> {
     match message {
         HostControlMessage::HostHello {
             service: remote_service,
@@ -367,25 +377,34 @@ fn handle_host_message<S: ProcessSupervisor>(
             capability_proof,
         } => {
             if remote_service != SERVICE_IDENTITY {
-                return Ok(vec![AgentControlMessage::Error(ProtocolErrorDetail {
-                    code: ProtocolErrorCode::UnsupportedService,
-                    message: format!("unsupported service identity {remote_service}"),
-                })]);
+                return Ok(HostDispatchOutcome {
+                    messages: vec![AgentControlMessage::Error(ProtocolErrorDetail {
+                        code: ProtocolErrorCode::UnsupportedService,
+                        message: format!("unsupported service identity {remote_service}"),
+                    })],
+                    shutdown_deadline: None,
+                });
             }
             if protocol_version != PROTOCOL_VERSION {
-                return Ok(vec![AgentControlMessage::Error(ProtocolErrorDetail {
-                    code: ProtocolErrorCode::UnsupportedProtocolVersion,
-                    message: format!("unsupported protocol version {protocol_version}"),
-                })]);
+                return Ok(HostDispatchOutcome {
+                    messages: vec![AgentControlMessage::Error(ProtocolErrorDetail {
+                        code: ProtocolErrorCode::UnsupportedProtocolVersion,
+                        message: format!("unsupported protocol version {protocol_version}"),
+                    })],
+                    shutdown_deadline: None,
+                });
             }
-            *pending_hello = Some(AuthenticateChannelRequest {
+            *dispatch.pending_hello = Some(AuthenticateChannelRequest {
                 service: remote_service,
                 protocol_version,
                 launch,
                 channel_generation: binding.channel_generation,
                 capability_proof: capability_proof.to_bytes(),
             });
-            Ok(Vec::new())
+            Ok(HostDispatchOutcome {
+                messages: Vec::new(),
+                shutdown_deadline: None,
+            })
         }
         HostControlMessage::Configure {
             launch,
@@ -393,15 +412,22 @@ fn handle_host_message<S: ProcessSupervisor>(
             mappings,
             containment,
         } => {
-            let Some(authentication) = pending_hello.clone() else {
-                return Ok(vec![AgentControlMessage::Error(ProtocolErrorDetail {
-                    code: ProtocolErrorCode::ChannelAuthenticationRequired,
-                    message: "host hello is required before configure".to_string(),
-                })]);
+            let Some(authentication) = dispatch.pending_hello.clone() else {
+                return Ok(HostDispatchOutcome {
+                    messages: vec![AgentControlMessage::Error(ProtocolErrorDetail {
+                        code: ProtocolErrorCode::ChannelAuthenticationRequired,
+                        message: "host hello is required before configure".to_string(),
+                    })],
+                    shutdown_deadline: None,
+                });
             };
             let network = detect_network_status();
             let guest_mount_root = GuestMountRoot::parse(DEFAULT_GUEST_MAPPING_ROOT.to_string())?;
-            let _ = service.authenticate_channel(authentication, now_secs(), network.clone())?;
+            let _ = dispatch.service.authenticate_channel(
+                authentication,
+                now_secs(),
+                network.clone(),
+            )?;
             let resolved_mappings = resolve_declared_mappings(&guest_mount_root, &mappings)?;
             let configuration = session_configuration_from_host(
                 launch,
@@ -410,16 +436,18 @@ fn handle_host_message<S: ProcessSupervisor>(
                 containment,
                 network.clone(),
             )?;
-            service.configure_session(ConfigureSessionRequest {
-                protocol_version: binding.protocol_version,
-                image_version: binding.image_version.clone(),
-                launch,
-                channel_generation: binding.channel_generation,
-                idempotent_replay: false,
-                configuration,
-            })?;
+            dispatch
+                .service
+                .configure_session(ConfigureSessionRequest {
+                    protocol_version: binding.protocol_version,
+                    image_version: binding.image_version.clone(),
+                    launch,
+                    channel_generation: binding.channel_generation,
+                    idempotent_replay: false,
+                    configuration,
+                })?;
             install_resolved_mappings_in_holder_mount_namespace(
-                isolation_holder_pid,
+                dispatch.isolation_holder_pid,
                 guest_mount_root.as_str(),
                 &resolved_mappings,
             )
@@ -428,17 +456,25 @@ fn handle_host_message<S: ProcessSupervisor>(
                     "mapping installation failed after configuration commit: {error}"
                 ))
             })?;
-            service.activate_full_lifecycle()?;
-            let _ = service.wait_ready(WaitReadyRequest {
+            dispatch.service.activate_full_lifecycle()?;
+            *dispatch.writable_mapping_paths = resolved_mappings
+                .iter()
+                .filter(|mapping| mapping.access == AccessMode::ReadWrite)
+                .map(|mapping| mapping.guest_path.display().to_string())
+                .collect();
+            let _ = dispatch.service.wait_ready(WaitReadyRequest {
                 protocol_version: binding.protocol_version,
                 image_version: binding.image_version.clone(),
                 launch,
                 channel_generation: binding.channel_generation,
             });
-            Ok(vec![AgentControlMessage::Ready {
-                launch,
-                status: ready_status(service, network),
-            }])
+            Ok(HostDispatchOutcome {
+                messages: vec![AgentControlMessage::Ready {
+                    launch,
+                    status: ready_status(dispatch.service, network),
+                }],
+                shutdown_deadline: None,
+            })
         }
         HostControlMessage::CreateProcess {
             exec_id,
@@ -459,7 +495,7 @@ fn handle_host_message<S: ProcessSupervisor>(
                         })
                 })
                 .transpose()?;
-            service.create_process(
+            dispatch.service.create_process(
                 CreateProcessRequest {
                     exec_id,
                     argv,
@@ -467,33 +503,50 @@ fn handle_host_message<S: ProcessSupervisor>(
                     env,
                     timeout_ms,
                 },
-                supervisor,
+                dispatch.supervisor,
             )?;
             if let Some(deadline) = timeout_deadline {
-                *active_timeout = Some((exec_id, deadline));
+                *dispatch.active_timeout = Some((exec_id, deadline));
             }
-            Ok(Vec::new())
+            Ok(HostDispatchOutcome {
+                messages: Vec::new(),
+                shutdown_deadline: None,
+            })
         }
         HostControlMessage::CancelExecution { exec_id } => {
-            service.cancel_exec(exec_id, CancelReason::Cancelled, supervisor)?;
-            Ok(Vec::new())
+            dispatch
+                .service
+                .cancel_exec(exec_id, CancelReason::Cancelled, dispatch.supervisor)?;
+            Ok(HostDispatchOutcome {
+                messages: Vec::new(),
+                shutdown_deadline: None,
+            })
         }
         HostControlMessage::FlowCredits(request) => {
-            service.grant_flow_credits(request)?;
-            Ok(Vec::new())
+            dispatch.service.grant_flow_credits(request)?;
+            Ok(HostDispatchOutcome {
+                messages: Vec::new(),
+                shutdown_deadline: None,
+            })
         }
         HostControlMessage::StdinChunk(record) => {
-            service.stdin_chunk(record, supervisor)?;
-            Ok(Vec::new())
+            dispatch.service.stdin_chunk(record, dispatch.supervisor)?;
+            Ok(HostDispatchOutcome {
+                messages: Vec::new(),
+                shutdown_deadline: None,
+            })
         }
         HostControlMessage::StdinEof(record) => {
-            service.stdin_eof(record, supervisor)?;
-            Ok(Vec::new())
+            dispatch.service.stdin_eof(record, dispatch.supervisor)?;
+            Ok(HostDispatchOutcome {
+                messages: Vec::new(),
+                shutdown_deadline: None,
+            })
         }
         HostControlMessage::Health => {
-            let snapshot = service.health();
-            Ok(vec![AgentControlMessage::Health(
-                agent_protocol::HealthStatus {
+            let snapshot = dispatch.service.health();
+            Ok(HostDispatchOutcome {
+                messages: vec![AgentControlMessage::Health(agent_protocol::HealthStatus {
                     agent_state: snapshot.agent_state,
                     quiesced: snapshot.quiesced,
                     launch_admitted: snapshot.launch_admitted,
@@ -508,33 +561,35 @@ fn handle_host_message<S: ProcessSupervisor>(
                     }),
                     network: snapshot.network,
                     last_failure: snapshot.last_failure,
-                },
-            )])
+                })],
+                shutdown_deadline: None,
+            })
         }
         HostControlMessage::Quiesce => {
-            service.ensure_supported_operation("Quiesce")?;
-            Ok(vec![quiesce_transactional(service, |freeze| {
-                // SAFETY: sync has no memory-safety preconditions.
-                unsafe { libc::sync() };
-                set_workload_frozen(
-                    Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
-                    freeze,
-                    FREEZE_WAIT_TIMEOUT,
-                )?;
-                // SAFETY: sync has no memory-safety preconditions.
-                unsafe { libc::sync() };
-                Ok(())
-            })?])
+            dispatch.service.ensure_supported_operation("Quiesce")?;
+            Ok(HostDispatchOutcome {
+                messages: vec![quiesce_transactional(dispatch.service, |freeze| {
+                    set_workload_frozen(
+                        Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
+                        freeze,
+                        FREEZE_WAIT_TIMEOUT,
+                    )
+                })?],
+                shutdown_deadline: None,
+            })
         }
         HostControlMessage::Resume => {
-            service.ensure_supported_operation("Resume")?;
-            Ok(vec![resume_transactional(service, |freeze| {
-                set_workload_frozen(
-                    Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
-                    freeze,
-                    FREEZE_WAIT_TIMEOUT,
-                )
-            })?])
+            dispatch.service.ensure_supported_operation("Resume")?;
+            Ok(HostDispatchOutcome {
+                messages: vec![resume_transactional(dispatch.service, |freeze| {
+                    set_workload_frozen(
+                        Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
+                        freeze,
+                        FREEZE_WAIT_TIMEOUT,
+                    )
+                })?],
+                shutdown_deadline: None,
+            })
         }
         HostControlMessage::Shutdown { grace_timeout_ms } => {
             if grace_timeout_ms == 0 {
@@ -553,7 +608,23 @@ fn handle_host_message<S: ProcessSupervisor>(
                 }
                 .into());
             }
-            Ok(vec![service.shutdown_with_grace_timeout(grace_timeout_ms)?])
+            let deadline = dispatch
+                .received_at
+                .checked_add(Duration::from_millis(grace_timeout_ms))
+                .ok_or_else(|| ServiceError {
+                    code: ServiceErrorCode::InvalidInput,
+                    message: format!(
+                        "grace_timeout_ms cannot be represented as a runtime deadline ({grace_timeout_ms})"
+                    ),
+                })?;
+            Ok(HostDispatchOutcome {
+                messages: vec![
+                    dispatch
+                        .service
+                        .shutdown_with_grace_timeout(grace_timeout_ms)?,
+                ],
+                shutdown_deadline: Some(deadline),
+            })
         }
     }
 }
@@ -1048,6 +1119,7 @@ struct LaunchRuntimeConfig {
 struct HostRecordOutcome {
     messages: Vec<AgentControlMessage>,
     fatal_session: bool,
+    shutdown_deadline: Option<Instant>,
 }
 
 struct FatalSessionShutdown {
@@ -1058,6 +1130,112 @@ struct GracefulShutdownState {
     absolute_deadline: Instant,
     cleanup_started: bool,
     sync_done: bool,
+    writable_mapping_paths: Vec<PathBuf>,
+}
+
+fn bounded_sync_writable_mappings_until_deadline(
+    absolute_deadline: Instant,
+    writable_mapping_paths: &[PathBuf],
+) -> Result<()> {
+    if writable_mapping_paths.is_empty() {
+        return Ok(());
+    }
+    if Instant::now() >= absolute_deadline {
+        return Err(AgentError::fail_closed(
+            "mapping sync skipped because shutdown deadline is already elapsed".to_string(),
+        ));
+    }
+    // SAFETY: fork is used to isolate potentially blocking sync syscalls from PID1.
+    let helper_pid = unsafe { libc::fork() };
+    if helper_pid < 0 {
+        return Err(AgentError::io(
+            "forking mapping sync helper",
+            io::Error::last_os_error(),
+        ));
+    }
+    if helper_pid == 0 {
+        let code = run_mapping_sync_helper(writable_mapping_paths);
+        // SAFETY: child exits immediately without unwinding parent state.
+        unsafe { libc::_exit(code) };
+    }
+    loop {
+        let mut status = 0;
+        // SAFETY: helper_pid is a live child or already exited.
+        let wait_rc = unsafe { libc::waitpid(helper_pid, &mut status, libc::WNOHANG) };
+        if wait_rc == helper_pid {
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                return Ok(());
+            }
+            return Err(AgentError::fail_closed(format!(
+                "mapping sync helper failed (status={status})"
+            )));
+        }
+        if wait_rc < 0 {
+            return Err(AgentError::io(
+                "waiting for mapping sync helper",
+                io::Error::last_os_error(),
+            ));
+        }
+        if Instant::now() >= absolute_deadline {
+            // SAFETY: helper_pid refers to the bounded sync helper child.
+            let _ = unsafe { libc::kill(helper_pid, libc::SIGKILL) };
+            // SAFETY: reap the killed helper to avoid orphan/zombie retention.
+            let _ = unsafe { libc::waitpid(helper_pid, &mut status, 0) };
+            return Err(AgentError::fail_closed(
+                "mapping sync helper exceeded shutdown deadline and was killed".to_string(),
+            ));
+        }
+        thread::sleep(LOOP_SLEEP);
+    }
+}
+
+fn run_mapping_sync_helper(writable_mapping_paths: &[PathBuf]) -> i32 {
+    #[cfg(test)]
+    {
+        let block_ms = SYNC_HELPER_BLOCK_MS.load(Ordering::SeqCst);
+        if block_ms > 0 {
+            thread::sleep(Duration::from_millis(block_ms));
+        }
+    }
+    let mut synced_devices = HashSet::new();
+    for path in writable_mapping_paths {
+        let bytes = path.as_os_str().as_bytes();
+        let c_path = match std::ffi::CString::new(bytes) {
+            Ok(value) => value,
+            Err(_) => return 1,
+        };
+        // SAFETY: c_path is NUL-terminated and flags are constant.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return 1;
+        }
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fd is valid and stat points to initialized storage for fstat.
+        let stat_rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+        if stat_rc != 0 {
+            // SAFETY: best-effort close for owned descriptor.
+            let _ = unsafe { libc::close(fd) };
+            return 1;
+        }
+        // SAFETY: fstat succeeded and initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        if synced_devices.insert(stat.st_dev) {
+            // SAFETY: fd is valid and owned by this helper process.
+            let sync_rc = unsafe { libc::syncfs(fd) };
+            if sync_rc != 0 {
+                // SAFETY: fallback to per-inode fsync when syncfs is unavailable/fails.
+                let fsync_rc = unsafe { libc::fsync(fd) };
+                if fsync_rc != 0 {
+                    // SAFETY: best-effort close for owned descriptor.
+                    let _ = unsafe { libc::close(fd) };
+                    return 1;
+                }
+            }
+        }
+        // SAFETY: best-effort close for owned descriptor.
+        let _ = unsafe { libc::close(fd) };
+    }
+    0
 }
 
 fn start_fatal_shutdown<S: ProcessSupervisor>(
@@ -1123,6 +1301,7 @@ pub fn harness_should_complete_shutdown_when_writer_blocked(
         absolute_deadline: deadline,
         cleanup_started: true,
         sync_done: true,
+        writable_mapping_paths: Vec::new(),
     };
     should_complete_shutdown(Some(&shutdown), active_exec_id, false, true, now)
 }
@@ -1378,11 +1557,7 @@ pub fn harness_quiesce_transactional(
     cgroup_dir: &Path,
 ) -> std::result::Result<(), String> {
     quiesce_transactional(service, |freeze| {
-        // SAFETY: sync has no memory-safety preconditions.
-        unsafe { libc::sync() };
         set_workload_frozen(cgroup_dir, freeze, FREEZE_WAIT_TIMEOUT)?;
-        // SAFETY: sync has no memory-safety preconditions.
-        unsafe { libc::sync() };
         Ok(())
     })
     .map(|_| ())
@@ -1845,7 +2020,7 @@ mod tests {
         fn cleanup_for_disconnect(
             &mut self,
             _exec_id: u32,
-            _deadline: Duration,
+            _absolute_deadline: Instant,
         ) -> std::result::Result<bool, agent_protocol::ServiceError> {
             self.cleanup_for_disconnect_calls = self.cleanup_for_disconnect_calls.saturating_add(1);
             Ok(true)
@@ -2376,6 +2551,7 @@ mod tests {
         let mut supervisor = RuntimeTestSupervisor::default();
         let mut pending_hello = None;
         let mut active_timeout = None;
+        let mut writable_mapping_paths = Vec::new();
 
         let baseline_health = service.health();
         let baseline_active_exec = service.active_exec_id();
@@ -2412,16 +2588,17 @@ mod tests {
         ];
 
         for operation in operations {
-            let outbound = handle_host_record(
-                &binding,
-                &mut service,
-                &mut supervisor,
-                &mut pending_hello,
-                &mut active_timeout,
-                4242,
-                control_record(&operation),
-            )
-            .expect("dispatch");
+            let mut dispatch = HostDispatchContext {
+                service: &mut service,
+                supervisor: &mut supervisor,
+                pending_hello: &mut pending_hello,
+                active_timeout: &mut active_timeout,
+                writable_mapping_paths: &mut writable_mapping_paths,
+                isolation_holder_pid: 4242,
+                received_at: Instant::now(),
+            };
+            let outbound = handle_host_record(&binding, &mut dispatch, control_record(&operation))
+                .expect("dispatch");
             assert!(!outbound.fatal_session);
             assert_eq!(outbound.messages.len(), 1);
             assert!(matches!(
@@ -2453,14 +2630,20 @@ mod tests {
         };
         let mut pending_hello = None;
         let mut active_timeout = None;
+        let mut writable_mapping_paths = Vec::new();
+        let mut dispatch = HostDispatchContext {
+            service: &mut service,
+            supervisor: &mut supervisor,
+            pending_hello: &mut pending_hello,
+            active_timeout: &mut active_timeout,
+            writable_mapping_paths: &mut writable_mapping_paths,
+            isolation_holder_pid: 4242,
+            received_at: Instant::now(),
+        };
 
         let outbound = handle_host_record(
             &binding,
-            &mut service,
-            &mut supervisor,
-            &mut pending_hello,
-            &mut active_timeout,
-            4242,
+            &mut dispatch,
             control_record(&HostControlMessage::CreateProcess {
                 exec_id: 89,
                 argv: vec![
@@ -2708,5 +2891,47 @@ mod tests {
         assert!(harness_should_complete_shutdown_when_writer_blocked(
             None, 10, 11
         ));
+    }
+
+    #[test]
+    fn mapping_sync_helper_deadline_timeout_is_bounded_and_fail_closed() {
+        let root = std::env::temp_dir().join("nvx-agent-runtime-sync-timeout");
+        let _ = std::fs::create_dir_all(&root);
+        SYNC_HELPER_BLOCK_MS.store(300, Ordering::SeqCst);
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(50))
+            .unwrap_or(started);
+        let result = bounded_sync_writable_mappings_until_deadline(deadline, &[root]);
+        SYNC_HELPER_BLOCK_MS.store(0, Ordering::SeqCst);
+        assert!(
+            result.is_err(),
+            "blocked helper must fail closed at deadline"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "pid1 wait must remain bounded by caller deadline",
+        );
+    }
+
+    #[test]
+    fn mapping_sync_helper_honors_very_short_valid_deadline() {
+        let root = std::env::temp_dir().join("nvx-agent-runtime-sync-short");
+        let _ = std::fs::create_dir_all(&root);
+        SYNC_HELPER_BLOCK_MS.store(200, Ordering::SeqCst);
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(1))
+            .unwrap_or(started);
+        let result = bounded_sync_writable_mappings_until_deadline(deadline, &[root]);
+        SYNC_HELPER_BLOCK_MS.store(0, Ordering::SeqCst);
+        assert!(
+            result.is_err(),
+            "very short deadline must fail closed quickly"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "sync helper wait exceeded very short caller deadline bound",
+        );
     }
 }

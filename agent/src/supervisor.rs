@@ -728,7 +728,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
     fn cleanup_for_disconnect(
         &mut self,
         exec_id: u32,
-        deadline: Duration,
+        absolute_deadline: Instant,
     ) -> Result<bool, ServiceError> {
         let holder_root = self.holder.as_ref().map(|holder| holder.cgroup_dir.clone());
         let active = self.require_active(exec_id)?;
@@ -738,10 +738,9 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
         active.stdin = None;
         send_terminate(active)?;
         let start = Instant::now();
-        let deadline_at = start
-            .checked_add(deadline)
-            .ok_or_else(|| supervisor_error("disconnect deadline overflow"))?;
-        let (term_grace_budget, post_kill_budget) = partition_disconnect_budget(deadline);
+        let disconnect_budget = absolute_deadline.saturating_duration_since(start);
+        let (term_grace_budget, post_kill_budget) = partition_disconnect_budget(disconnect_budget);
+        let deadline_at = absolute_deadline;
         let kill_phase_deadline = deadline_at.checked_sub(post_kill_budget).unwrap_or(start);
         let term_phase_deadline = start
             .checked_add(term_grace_budget)
@@ -2019,8 +2018,9 @@ mod tests {
             .expect("spawn");
         let budget = Duration::from_millis(700);
         let started = Instant::now();
+        let deadline = started.checked_add(budget).unwrap_or(started);
         let cleaned = supervisor
-            .cleanup_for_disconnect(exec_id, budget)
+            .cleanup_for_disconnect(exec_id, deadline)
             .expect("disconnect cleanup");
         let elapsed = started.elapsed();
         assert!(cleaned, "cleanup should succeed via SIGKILL escalation");
@@ -2064,8 +2064,10 @@ mod tests {
                 .is_some_and(|active| !active.event_queue.is_empty()),
             "expected non-empty queue before disconnect cleanup"
         );
+        let now = Instant::now();
+        let deadline = now.checked_add(Duration::from_secs(2)).unwrap_or(now);
         let cleaned = supervisor
-            .cleanup_for_disconnect(exec_id, Duration::from_secs(2))
+            .cleanup_for_disconnect(exec_id, deadline)
             .expect("disconnect cleanup");
         assert!(cleaned, "cleanup must finish with queued output present");
         assert_eq!(supervisor.queue_usage().event_queue_records, 0);

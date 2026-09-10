@@ -51,18 +51,24 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 - `Shutdown.grace_timeout_ms` is now strictly validated: it must be greater
   than zero and no larger than `MAX_SHUTDOWN_GRACE_TIMEOUT_MS` (30,000 ms).
   Runtime shutdown derives one absolute deadline from this caller value and
-  spends that remaining budget across disconnect cleanup, sync, best-effort
+  spends that remaining budget across admission stop, disconnect cleanup
+  (TERM→KILL→verification/output discard), bounded mapping sync, best-effort
   acknowledgement delivery, and runtime stop; no fixed post-deadline extension
-  is applied.
+  is applied, and each phase uses the same absolute deadline rooted at request
+  receipt.
 - Disconnect cleanup now uses deterministic TERM→KILL budget partitioning under
   one absolute deadline, always reserves post-KILL verification/drain time, and
   enters bounded output-discard mode on channel loss (clears queued events,
   drains stdout/stderr to EOF under byte/time caps, escalates to KILL on
   overflow, and fails closed if termination/cleanup cannot be verified).
 - Harness conformance gating now uses typed per-requirement probe attestations
-  plus retained artifact metadata (paths + validated report/diagnostic IDs and
-  hashes) produced in-memory by the harness runtime; user-crafted JSON strings
-  cannot satisfy `is_passing_report`.
+  plus cryptographic artifact attestation. The harness writes a detached
+  `attestation-manifest.json` (schema/version, run id, relative artifact paths,
+  sizes, SHA-256 digests for the exact `report.json` and `diagnostics.log`
+  bytes) and keeps trusted digests/sizes/run-id in-memory. Canonical exit
+  validation reopens `report.json`, `diagnostics.log`, and the manifest and
+  rejects missing/modified/truncated/swapped/path-escaped/manifest-tampered
+  artifacts; user-crafted JSON strings cannot satisfy `is_passing_report`.
 - Runtime `Health` now returns typed session state (`phase0/active/quiesced/
   shutting-down/cleanup-in-progress/fatal-session`), channel generation, active
   exec id, last failure detail, and configured filesystem/network snapshots.
