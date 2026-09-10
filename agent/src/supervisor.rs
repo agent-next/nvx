@@ -147,7 +147,14 @@ struct ActiveProcess {
     event_queue_bytes: usize,
     prefer_stdout_next: bool,
     holder_wait_status: Option<fs::File>,
+    holder_wait_status_buffer: Vec<u8>,
     pending_terminal_event: Option<SupervisorEvent>,
+}
+
+enum HolderWaitStatusRead {
+    Ready(i32),
+    Pending,
+    EofBeforePayload,
 }
 
 impl LinuxProcessSupervisor {
@@ -380,6 +387,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             event_queue_bytes: 0,
             prefer_stdout_next: true,
             holder_wait_status,
+            holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
         });
         Ok(())
@@ -599,23 +607,12 @@ fn maybe_report_exit(active: &mut ActiveProcess) -> Result<(), ServiceError> {
     else {
         return Ok(());
     };
-    if let Some(wait_status) = read_holder_wait_status(active)? {
-        if libc::WIFEXITED(wait_status) {
-            active.pending_terminal_event =
-                Some(SupervisorEvent::Exited(libc::WEXITSTATUS(wait_status)));
-        } else if libc::WIFSIGNALED(wait_status) {
-            active.pending_terminal_event =
-                Some(SupervisorEvent::Signaled(libc::WTERMSIG(wait_status)));
-        } else {
-            active.pending_terminal_event = Some(SupervisorEvent::Exited(1));
-        }
-    } else if let Some(code) = status.code() {
-        active.pending_terminal_event = Some(SupervisorEvent::Exited(code));
-    } else if let Some(signal) = status.signal() {
-        active.pending_terminal_event = Some(SupervisorEvent::Signaled(signal));
-    } else {
-        active.pending_terminal_event = Some(SupervisorEvent::Exited(1));
-    }
+    let terminal = match read_holder_wait_status(active)? {
+        HolderWaitStatusRead::Ready(wait_status) => terminal_event_from_wait_status(wait_status),
+        HolderWaitStatusRead::Pending => return Ok(()),
+        HolderWaitStatusRead::EofBeforePayload => terminal_event_from_exit_status(status),
+    };
+    active.pending_terminal_event = Some(terminal);
     active.exit_status_reported = true;
     Ok(())
 }
@@ -702,26 +699,64 @@ fn parse_populated_from_cgroup_events(text: &str) -> Option<bool> {
     None
 }
 
-fn read_holder_wait_status(active: &mut ActiveProcess) -> Result<Option<i32>, ServiceError> {
+fn read_holder_wait_status(
+    active: &mut ActiveProcess,
+) -> Result<HolderWaitStatusRead, ServiceError> {
     let Some(mut pipe) = active.holder_wait_status.take() else {
-        return Ok(None);
+        return Ok(HolderWaitStatusRead::EofBeforePayload);
     };
-    let mut bytes = [0_u8; std::mem::size_of::<i32>()];
-    let result = match pipe.read(&mut bytes) {
-        Ok(size) if size == bytes.len() => Ok(Some(i32::from_ne_bytes(bytes))),
-        Ok(0) => Err(supervisor_error(
-            "holder wait status unavailable (pipe closed before status write)",
-        )),
-        Ok(_) => Err(supervisor_error("holder wait status short read")),
-        Err(error) if would_block(&error) => {
-            Err(supervisor_error("holder wait status not yet readable"))
+    let expected = std::mem::size_of::<i32>();
+    while active.holder_wait_status_buffer.len() < expected {
+        let mut scratch = [0_u8; std::mem::size_of::<i32>()];
+        let start = active.holder_wait_status_buffer.len();
+        let remaining = expected.saturating_sub(start);
+        let read_result = pipe.read(&mut scratch[..remaining]);
+        match read_result {
+            Ok(0) => {
+                if active.holder_wait_status_buffer.is_empty() {
+                    return Ok(HolderWaitStatusRead::EofBeforePayload);
+                }
+                return Err(supervisor_error(
+                    "holder wait status malformed (truncated payload)",
+                ));
+            }
+            Ok(size) => {
+                active
+                    .holder_wait_status_buffer
+                    .extend_from_slice(&scratch[..size]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if would_block(&error) => {
+                active.holder_wait_status = Some(pipe);
+                return Ok(HolderWaitStatusRead::Pending);
+            }
+            Err(error) => return Err(supervisor_io("reading holder wait status", error)),
         }
-        Err(error) => Err(supervisor_io("reading holder wait status", error)),
-    };
-    if result.is_err() {
-        active.holder_wait_status = Some(pipe);
     }
-    result
+    let mut bytes = [0_u8; std::mem::size_of::<i32>()];
+    bytes.copy_from_slice(&active.holder_wait_status_buffer[..expected]);
+    active.holder_wait_status_buffer.clear();
+    Ok(HolderWaitStatusRead::Ready(i32::from_ne_bytes(bytes)))
+}
+
+fn terminal_event_from_wait_status(wait_status: i32) -> SupervisorEvent {
+    if libc::WIFEXITED(wait_status) {
+        return SupervisorEvent::Exited(libc::WEXITSTATUS(wait_status));
+    }
+    if libc::WIFSIGNALED(wait_status) {
+        return SupervisorEvent::Signaled(libc::WTERMSIG(wait_status));
+    }
+    SupervisorEvent::Exited(1)
+}
+
+fn terminal_event_from_exit_status(status: std::process::ExitStatus) -> SupervisorEvent {
+    if let Some(code) = status.code() {
+        return SupervisorEvent::Exited(code);
+    }
+    if let Some(signal) = status.signal() {
+        return SupervisorEvent::Signaled(signal);
+    }
+    SupervisorEvent::Exited(1)
 }
 
 fn can_refresh_streams(active: &ActiveProcess) -> bool {
@@ -1280,6 +1315,25 @@ mod tests {
         ))
     }
 
+    fn spawn_signaled_child(signal: i32) -> Child {
+        let script = format!("kill -{signal} $$");
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .spawn()
+            .expect("spawn signaled child")
+    }
+
+    fn eof_holder_status_pipe() -> fs::File {
+        let (read_fd, write_fd) = create_cloexec_pipe().expect("create holder status pipe");
+        // SAFETY: write_fd is owned by this test helper and closed exactly once.
+        unsafe { libc::close(write_fd) };
+        // SAFETY: read fd is uniquely owned and converted into File.
+        let reader = unsafe { fs::File::from_raw_fd(read_fd) };
+        set_nonblocking(reader.as_raw_fd()).expect("set nonblocking holder status pipe");
+        reader
+    }
+
     #[test]
     fn subprocess_stdout_nul_bytes_are_preserved() {
         let mut supervisor = LinuxProcessSupervisor::new();
@@ -1330,6 +1384,213 @@ mod tests {
             matches!(event, SupervisorEvent::DescendantsCleaned)
         });
         assert!(cleaned.is_some(), "expected descendant cleanup event");
+    }
+
+    #[test]
+    fn terminate_with_empty_holder_status_pipe_uses_launcher_signal_once() {
+        let exec_id = 73_u32;
+        let temp = tempdir().expect("tempdir");
+        let exec_dir = temp.path().join("exec-terminate");
+        fs::create_dir_all(&exec_dir).expect("create exec cgroup dir");
+        fs::write(exec_dir.join("cgroup.events"), "populated 0\n").expect("seed populated=0");
+
+        let child = spawn_signaled_child(libc::SIGTERM);
+        let mut supervisor = LinuxProcessSupervisor::new();
+        supervisor.active = Some(ActiveProcess {
+            exec_id,
+            process_group_id: child.id() as i32,
+            child,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            stdout_eof: true,
+            stderr_eof: true,
+            stdin_queue: VecDeque::new(),
+            stdin_queue_bytes: 0,
+            stdin_queue_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_drained_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_offset: 0,
+            stdin_close_requested: false,
+            terminate_sent_at: None,
+            kill_sent: false,
+            exit_status_reported: false,
+            descendants_cleaned_reported: false,
+            descendants_cleanup_started_at: None,
+            cgroup_dir: Some(exec_dir),
+            event_queue: VecDeque::new(),
+            event_queue_bytes: 0,
+            prefer_stdout_next: true,
+            holder_wait_status: Some(eof_holder_status_pipe()),
+            holder_wait_status_buffer: Vec::new(),
+            pending_terminal_event: None,
+        });
+
+        supervisor.terminate(exec_id).expect("terminate");
+        let mut terminal_count = 0usize;
+        let mut cleaned_count = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if supervisor.active.is_none() {
+                break;
+            }
+            let Some(event) = supervisor.poll(exec_id).expect("poll") else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            match event {
+                SupervisorEvent::Signaled(signal) => {
+                    terminal_count = terminal_count.saturating_add(1);
+                    assert_eq!(signal, libc::SIGTERM);
+                }
+                SupervisorEvent::Exited(_) => {
+                    terminal_count = terminal_count.saturating_add(1);
+                }
+                SupervisorEvent::DescendantsCleaned => {
+                    cleaned_count = cleaned_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            supervisor.active.is_none(),
+            "active process must fully clean up"
+        );
+        assert_eq!(terminal_count, 1, "must publish exactly one terminal event");
+        assert_eq!(cleaned_count, 1, "must publish descendants-cleaned once");
+    }
+
+    #[test]
+    fn kill_with_empty_holder_status_pipe_uses_launcher_signal_once() {
+        let exec_id = 74_u32;
+        let temp = tempdir().expect("tempdir");
+        let exec_dir = temp.path().join("exec-kill");
+        fs::create_dir_all(&exec_dir).expect("create exec cgroup dir");
+        fs::write(exec_dir.join("cgroup.events"), "populated 0\n").expect("seed populated=0");
+        fs::write(exec_dir.join("cgroup.kill"), "initial").expect("seed cgroup.kill");
+
+        let child = spawn_signaled_child(libc::SIGKILL);
+        let mut supervisor = LinuxProcessSupervisor::new();
+        supervisor.active = Some(ActiveProcess {
+            exec_id,
+            process_group_id: child.id() as i32,
+            child,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            stdout_eof: true,
+            stderr_eof: true,
+            stdin_queue: VecDeque::new(),
+            stdin_queue_bytes: 0,
+            stdin_queue_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_drained_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_offset: 0,
+            stdin_close_requested: false,
+            terminate_sent_at: None,
+            kill_sent: false,
+            exit_status_reported: false,
+            descendants_cleaned_reported: false,
+            descendants_cleanup_started_at: None,
+            cgroup_dir: Some(exec_dir.clone()),
+            event_queue: VecDeque::new(),
+            event_queue_bytes: 0,
+            prefer_stdout_next: true,
+            holder_wait_status: Some(eof_holder_status_pipe()),
+            holder_wait_status_buffer: Vec::new(),
+            pending_terminal_event: None,
+        });
+
+        supervisor.kill(exec_id).expect("kill");
+        let mut terminal_count = 0usize;
+        let mut cleaned_count = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if supervisor.active.is_none() {
+                break;
+            }
+            let Some(event) = supervisor.poll(exec_id).expect("poll") else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            match event {
+                SupervisorEvent::Signaled(signal) => {
+                    terminal_count = terminal_count.saturating_add(1);
+                    assert_eq!(signal, libc::SIGKILL);
+                }
+                SupervisorEvent::Exited(_) => {
+                    terminal_count = terminal_count.saturating_add(1);
+                }
+                SupervisorEvent::DescendantsCleaned => {
+                    cleaned_count = cleaned_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            supervisor.active.is_none(),
+            "active process must fully clean up"
+        );
+        assert_eq!(terminal_count, 1, "must publish exactly one terminal event");
+        assert_eq!(cleaned_count, 1, "must publish descendants-cleaned once");
+    }
+
+    #[test]
+    fn malformed_nonempty_holder_status_payload_fails_closed() {
+        let child = spawn_signaled_child(libc::SIGTERM);
+        let (read_fd, write_fd) = create_cloexec_pipe().expect("create holder status pipe");
+        // SAFETY: write fd is owned in this scope for test setup.
+        let mut writer = unsafe { fs::File::from_raw_fd(write_fd) };
+        std::io::Write::write_all(&mut writer, &[0x7f]).expect("write partial payload");
+        drop(writer);
+        // SAFETY: read fd is uniquely owned and converted into File.
+        let reader = unsafe { fs::File::from_raw_fd(read_fd) };
+        set_nonblocking(reader.as_raw_fd()).expect("set nonblocking");
+
+        let mut active = ActiveProcess {
+            exec_id: 88,
+            process_group_id: child.id() as i32,
+            child,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            stdout_eof: true,
+            stderr_eof: true,
+            stdin_queue: VecDeque::new(),
+            stdin_queue_bytes: 0,
+            stdin_queue_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_drained_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_offset: 0,
+            stdin_close_requested: false,
+            terminate_sent_at: None,
+            kill_sent: false,
+            exit_status_reported: false,
+            descendants_cleaned_reported: false,
+            descendants_cleanup_started_at: None,
+            cgroup_dir: None,
+            event_queue: VecDeque::new(),
+            event_queue_bytes: 0,
+            prefer_stdout_next: true,
+            holder_wait_status: Some(reader),
+            holder_wait_status_buffer: Vec::new(),
+            pending_terminal_event: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match maybe_report_exit(&mut active) {
+                Ok(()) if !active.exit_status_reported => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(()) => panic!("malformed payload must fail closed"),
+                Err(error) => {
+                    assert!(
+                        error.message.contains("malformed"),
+                        "must reject nonempty truncated payload: {}",
+                        error.message
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("timed out waiting for malformed payload error");
     }
 
     #[test]
@@ -1673,6 +1934,7 @@ mod tests {
             event_queue_bytes: 0,
             prefer_stdout_next: true,
             holder_wait_status: None,
+            holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
         };
 
@@ -1732,6 +1994,7 @@ mod tests {
             event_queue_bytes: 0,
             prefer_stdout_next: true,
             holder_wait_status: None,
+            holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
         };
         let error =
@@ -1774,6 +2037,7 @@ mod tests {
             event_queue_bytes: 0,
             prefer_stdout_next: true,
             holder_wait_status: None,
+            holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
         };
         maybe_report_exit(&mut active).expect("capture terminal disposition");
@@ -1832,6 +2096,7 @@ mod tests {
             event_queue_bytes: 0,
             prefer_stdout_next: true,
             holder_wait_status: None,
+            holder_wait_status_buffer: Vec::new(),
             pending_terminal_event: None,
         };
         maybe_report_exit(&mut active).expect("capture terminal disposition");
