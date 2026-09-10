@@ -39,6 +39,14 @@ thread_local! {
 thread_local! {
     static REMOVE_CGROUP_FAIL_COUNTDOWN: Cell<u32> = const { Cell::new(0) };
 }
+#[cfg(test)]
+thread_local! {
+    static SET_NONBLOCKING_FAIL_CALL: Cell<u32> = const { Cell::new(0) };
+}
+#[cfg(test)]
+thread_local! {
+    static LAST_SPAWNED_PID: Cell<i32> = const { Cell::new(0) };
+}
 
 pub struct LinuxProcessSupervisor {
     active: Option<ActiveProcess>,
@@ -66,6 +74,98 @@ struct PreparedExecCgroup {
     cgroup_procs_path: CString,
     cgroup_procs_fd: i32,
     cleanup_armed: bool,
+}
+
+struct SpawnRollbackGuard {
+    child: Option<Child>,
+    process_group_id: i32,
+    cgroup_dir: Option<PathBuf>,
+    holder_root: Option<PathBuf>,
+    cleanup_armed: bool,
+}
+
+impl SpawnRollbackGuard {
+    fn new(
+        child: Child,
+        cgroup_dir: Option<PathBuf>,
+        holder_root: Option<PathBuf>,
+    ) -> SpawnRollbackGuard {
+        let process_group_id = child.id() as i32;
+        SpawnRollbackGuard {
+            child: Some(child),
+            process_group_id,
+            cgroup_dir,
+            holder_root,
+            cleanup_armed: true,
+        }
+    }
+
+    fn child_mut(&mut self) -> Result<&mut Child, ServiceError> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| supervisor_error("spawn rollback guard child is missing"))
+    }
+
+    fn into_child(mut self) -> Result<Child, ServiceError> {
+        self.cleanup_armed = false;
+        self.child
+            .take()
+            .ok_or_else(|| supervisor_error("spawn rollback guard child is missing"))
+    }
+
+    fn rollback_error(&mut self, primary: ServiceError) -> ServiceError {
+        match self.cleanup_now() {
+            Ok(()) => primary,
+            Err(cleanup_error) => ServiceError {
+                code: primary.code,
+                message: format!(
+                    "{primary}; post-spawn rollback failed: {}",
+                    cleanup_error.message
+                ),
+            },
+        }
+    }
+
+    fn cleanup_now(&mut self) -> Result<(), ServiceError> {
+        if !self.cleanup_armed {
+            return Ok(());
+        }
+        self.cleanup_armed = false;
+        let mut failures = Vec::new();
+        if let Some(cgroup_dir) = self.cgroup_dir.as_deref()
+            && let Err(error) = maybe_write_cgroup_kill(cgroup_dir, libc::SIGKILL)
+        {
+            failures.push(error.message);
+        }
+        // SAFETY: kill is called with a negative process group id to signal the process group.
+        let kill_rc = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
+        if kill_rc != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                failures.push(supervisor_io("signaling spawned process group", error).message);
+            }
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            if let Err(error) = child.wait() {
+                failures.push(supervisor_io("waiting for spawned child rollback", error).message);
+            }
+        }
+        self.child = None;
+        if let Err(error) =
+            remove_exec_cgroup(self.cgroup_dir.as_deref(), self.holder_root.as_deref())
+        {
+            failures.push(error.message);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(supervisor_error(format!(
+                "rollback cleanup actions failed: {}",
+                failures.join("; ")
+            )))
+        }
+    }
 }
 
 impl PreparedExecCgroup {
@@ -294,7 +394,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             command.process_group(0);
         }
 
-        let mut child = match command.spawn() {
+        let child = match command.spawn() {
             Ok(child) => child,
             Err(spawn_error) => {
                 if let Some(fd) = holder_config_write_fd.take() {
@@ -312,6 +412,14 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                 ));
             }
         };
+        #[cfg(test)]
+        LAST_SPAWNED_PID.with(|pid| pid.set(child.id() as i32));
+        let rollback_cgroup_dir = prepared_cgroup
+            .as_ref()
+            .map(|prepared| prepared.cgroup_dir.clone());
+        let holder_root_for_rollback = self.holder.as_ref().map(|holder| holder.cgroup_dir.clone());
+        let mut spawn_guard =
+            SpawnRollbackGuard::new(child, rollback_cgroup_dir, holder_root_for_rollback);
         if let (Some(config), Some(fd)) = (
             holder_launcher_config.as_ref(),
             holder_config_write_fd.take(),
@@ -319,19 +427,19 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             if let Err(error) = launcher::write_launcher_config(fd, config) {
                 // SAFETY: best-effort close for locally created descriptor.
                 let _ = unsafe { libc::close(fd) };
-                let _ = child.kill();
-                let _ = child.wait();
                 close_fds_best_effort(&holder_launch_fds);
                 if let Some(wait_fd) = holder_wait_status_write_fd.take() {
                     // SAFETY: best-effort close for locally created descriptor.
                     let _ = unsafe { libc::close(wait_fd) };
                 }
-                return Err(report_spawn_failure_with_cgroup_cleanup(
-                    prepared_cgroup.take(),
-                    io::Error::other(format!(
-                        "writing launcher config to inherited pipe failed: {error}"
+                return Err(
+                    spawn_guard.rollback_error(report_spawn_failure_with_cgroup_cleanup(
+                        prepared_cgroup.take(),
+                        io::Error::other(format!(
+                            "writing launcher config to inherited pipe failed: {error}"
+                        )),
                     )),
-                ));
+                );
             }
             // SAFETY: best-effort close for locally created descriptor.
             let _ = unsafe { libc::close(fd) };
@@ -341,18 +449,24 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             let _ = unsafe { libc::close(fd) };
         }
         close_fds_best_effort(&holder_launch_fds);
-        let pid = child.id() as i32;
-        let mut stdin = child.stdin.take();
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
-        if let Some(stdin_ref) = stdin.as_mut() {
-            set_nonblocking(stdin_ref.as_raw_fd())?;
+        let pid = spawn_guard.child_mut()?.id() as i32;
+        let mut stdin = spawn_guard.child_mut()?.stdin.take();
+        let mut stdout = spawn_guard.child_mut()?.stdout.take();
+        let mut stderr = spawn_guard.child_mut()?.stderr.take();
+        if let Some(stdin_ref) = stdin.as_mut()
+            && let Err(error) = set_nonblocking(stdin_ref.as_raw_fd())
+        {
+            return Err(spawn_guard.rollback_error(error));
         }
-        if let Some(stdout_ref) = stdout.as_mut() {
-            set_nonblocking(stdout_ref.as_raw_fd())?;
+        if let Some(stdout_ref) = stdout.as_mut()
+            && let Err(error) = set_nonblocking(stdout_ref.as_raw_fd())
+        {
+            return Err(spawn_guard.rollback_error(error));
         }
-        if let Some(stderr_ref) = stderr.as_mut() {
-            set_nonblocking(stderr_ref.as_raw_fd())?;
+        if let Some(stderr_ref) = stderr.as_mut()
+            && let Err(error) = set_nonblocking(stderr_ref.as_raw_fd())
+        {
+            return Err(spawn_guard.rollback_error(error));
         }
 
         let stdin_queue_bytes_atomic = Arc::new(AtomicUsize::new(0));
@@ -366,6 +480,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
         } else {
             try_prepare_workload_cgroup(request.exec_id, pid)
         };
+        let child = spawn_guard.into_child()?;
         self.active = Some(ActiveProcess {
             exec_id: request.exec_id,
             child,
@@ -992,6 +1107,22 @@ fn pump_stdin(active: &mut ActiveProcess) -> Result<(), ServiceError> {
 }
 
 fn set_nonblocking(fd: i32) -> Result<(), ServiceError> {
+    #[cfg(test)]
+    {
+        let fail_now = SET_NONBLOCKING_FAIL_CALL.with(|fail_call| {
+            let current = fail_call.get();
+            if current == 0 {
+                return false;
+            }
+            fail_call.set(current - 1);
+            current == 1
+        });
+        if fail_now {
+            return Err(supervisor_error(
+                "injected failure setting descriptor nonblocking mode",
+            ));
+        }
+    }
     // SAFETY: fcntl with F_GETFL reads flags for a valid descriptor.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
@@ -1296,6 +1427,8 @@ mod tests {
         fn new() -> Self {
             PREPARE_CGROUP_FAILPOINT.with(|failpoint| failpoint.set(false));
             REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(0));
+            SET_NONBLOCKING_FAIL_CALL.with(|fail_call| fail_call.set(0));
+            LAST_SPAWNED_PID.with(|pid| pid.set(0));
             Self
         }
     }
@@ -1304,6 +1437,8 @@ mod tests {
         fn drop(&mut self) {
             PREPARE_CGROUP_FAILPOINT.with(|failpoint| failpoint.set(false));
             REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(0));
+            SET_NONBLOCKING_FAIL_CALL.with(|fail_call| fail_call.set(0));
+            LAST_SPAWNED_PID.with(|pid| pid.set(0));
         }
     }
 
@@ -1709,6 +1844,52 @@ mod tests {
             supervisor.active.is_none(),
             "failed cgroup setup must not leave an active child"
         );
+    }
+
+    #[test]
+    fn post_spawn_nonblocking_failure_rolls_back_child_and_clears_active_state() {
+        let _scope = TestFailpointScope::new();
+        SET_NONBLOCKING_FAIL_CALL.with(|fail_call| fail_call.set(1));
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let spawn_result = supervisor.spawn(&CreateProcessRequest {
+            exec_id: 707,
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 5".to_string(),
+            ],
+            cwd: Some("/".to_string()),
+            env: vec![],
+            timeout_ms: None,
+        });
+        let error = spawn_result.expect_err("nonblocking setup failure must rollback");
+        assert!(
+            error
+                .message
+                .contains("injected failure setting descriptor nonblocking mode"),
+            "expected injected failure to surface: {}",
+            error.message
+        );
+        assert!(
+            supervisor.active.is_none(),
+            "failed post-spawn setup must not leave active process state"
+        );
+        let spawned_pid = LAST_SPAWNED_PID.with(|pid| pid.get());
+        assert!(spawned_pid > 0, "spawned pid must be captured");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            // SAFETY: kill with signal 0 probes whether pid exists and is accessible.
+            let rc = unsafe { libc::kill(spawned_pid, 0) };
+            if rc != 0 {
+                let os_error = io::Error::last_os_error();
+                if os_error.raw_os_error() == Some(libc::ESRCH) {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("rolled-back spawned child pid {spawned_pid} still appears alive");
     }
 
     #[test]

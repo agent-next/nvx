@@ -30,6 +30,11 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
 pub const MAX_LABEL_COUNT: usize = 32;
 pub const MAX_MAP_ENTRIES: usize = 32;
 pub const MAX_STRING_BYTES: usize = 256;
+/// Maximum execution timeout accepted by `CreateProcessRequest::timeout_ms`.
+///
+/// The protocol enforces a bounded timeout so runtime deadline arithmetic remains
+/// representable and a caller request can never be silently downgraded.
+pub const MAX_EXEC_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 pub const HVC1_DEVICE_PATH: &str = "/dev/hvc1";
 /// Conservative fixed cap for OpenVMM outer framing bytes.
 ///
@@ -974,7 +979,14 @@ impl MxcControlService {
             let protocol_snapshot = self.protocol_state.clone();
             let active_snapshot = self.active_exec.clone();
             let mut messages = Vec::new();
-            apply_supervisor_event(self, exec_id, event, &mut messages)?;
+            if let Err(error) = apply_supervisor_event(self, exec_id, event, &mut messages) {
+                self.protocol_state = protocol_snapshot;
+                self.active_exec = active_snapshot;
+                if error.code == ServiceErrorCode::Backpressure {
+                    return Ok(PumpSupervisorResult::WouldBlock);
+                }
+                return Err(error);
+            }
             let payloads = match channel.reserve_control_messages(&messages) {
                 Ok(payloads) => payloads,
                 Err(error) if error.code == ServiceErrorCode::Backpressure => {
@@ -1078,7 +1090,7 @@ fn apply_supervisor_event(
     event: SupervisorEvent,
     out: &mut Vec<AgentControlMessage>,
 ) -> Result<(), ServiceError> {
-    match event {
+    let maybe_terminal = match event {
         SupervisorEvent::StdoutChunk(chunk) => {
             if chunk.len() > max_stream_chunk_cap() {
                 return Err(ServiceError::new(
@@ -1093,9 +1105,11 @@ fn apply_supervisor_event(
                 .ok_or_else(|| {
                     ServiceError::new(ServiceErrorCode::LifecycleError, "active exec missing")
                 })?;
-            service
-                .protocol_state
-                .apply_exec_event(exec_id, ActiveExecEvent::StdoutChunk { sequence })?;
+            let maybe_terminal = apply_exec_event_for_supervisor(
+                &mut service.protocol_state,
+                exec_id,
+                ActiveExecEvent::StdoutChunk { sequence },
+            )?;
             if let Some(active_exec) = service.active_exec.as_mut() {
                 active_exec.stdout_next_sequence =
                     active_exec.stdout_next_sequence.saturating_add(1);
@@ -1105,6 +1119,7 @@ fn apply_supervisor_event(
                 sequence,
                 chunk,
             }));
+            maybe_terminal
         }
         SupervisorEvent::StdoutEof => {
             let sequence = service
@@ -1114,9 +1129,11 @@ fn apply_supervisor_event(
                 .ok_or_else(|| {
                     ServiceError::new(ServiceErrorCode::LifecycleError, "active exec missing")
                 })?;
-            service
-                .protocol_state
-                .apply_exec_event(exec_id, ActiveExecEvent::StdoutEof { sequence })?;
+            let _ = apply_exec_event_for_supervisor(
+                &mut service.protocol_state,
+                exec_id,
+                ActiveExecEvent::StdoutEof { sequence },
+            )?;
             if let Some(active_exec) = service.active_exec.as_mut() {
                 active_exec.stdout_next_sequence =
                     active_exec.stdout_next_sequence.saturating_add(1);
@@ -1125,7 +1142,8 @@ fn apply_supervisor_event(
                 exec_id,
                 sequence,
             }));
-            service.protocol_state.apply_exec_event(
+            let maybe_terminal = apply_exec_event_for_supervisor(
+                &mut service.protocol_state,
                 exec_id,
                 ActiveExecEvent::StreamDrained {
                     stream: StreamName::Stdout,
@@ -1135,6 +1153,7 @@ fn apply_supervisor_event(
                 exec_id,
                 stream: StreamName::Stdout,
             });
+            maybe_terminal
         }
         SupervisorEvent::StderrChunk(chunk) => {
             if chunk.len() > max_stream_chunk_cap() {
@@ -1150,9 +1169,11 @@ fn apply_supervisor_event(
                 .ok_or_else(|| {
                     ServiceError::new(ServiceErrorCode::LifecycleError, "active exec missing")
                 })?;
-            service
-                .protocol_state
-                .apply_exec_event(exec_id, ActiveExecEvent::StderrChunk { sequence })?;
+            let maybe_terminal = apply_exec_event_for_supervisor(
+                &mut service.protocol_state,
+                exec_id,
+                ActiveExecEvent::StderrChunk { sequence },
+            )?;
             if let Some(active_exec) = service.active_exec.as_mut() {
                 active_exec.stderr_next_sequence =
                     active_exec.stderr_next_sequence.saturating_add(1);
@@ -1162,6 +1183,7 @@ fn apply_supervisor_event(
                 sequence,
                 chunk,
             }));
+            maybe_terminal
         }
         SupervisorEvent::StderrEof => {
             let sequence = service
@@ -1171,9 +1193,11 @@ fn apply_supervisor_event(
                 .ok_or_else(|| {
                     ServiceError::new(ServiceErrorCode::LifecycleError, "active exec missing")
                 })?;
-            service
-                .protocol_state
-                .apply_exec_event(exec_id, ActiveExecEvent::StderrEof { sequence })?;
+            let _ = apply_exec_event_for_supervisor(
+                &mut service.protocol_state,
+                exec_id,
+                ActiveExecEvent::StderrEof { sequence },
+            )?;
             if let Some(active_exec) = service.active_exec.as_mut() {
                 active_exec.stderr_next_sequence =
                     active_exec.stderr_next_sequence.saturating_add(1);
@@ -1182,7 +1206,8 @@ fn apply_supervisor_event(
                 exec_id,
                 sequence,
             }));
-            service.protocol_state.apply_exec_event(
+            let maybe_terminal = apply_exec_event_for_supervisor(
+                &mut service.protocol_state,
                 exec_id,
                 ActiveExecEvent::StreamDrained {
                     stream: StreamName::Stderr,
@@ -1192,21 +1217,16 @@ fn apply_supervisor_event(
                 exec_id,
                 stream: StreamName::Stderr,
             });
+            maybe_terminal
         }
         SupervisorEvent::DescendantsCleaned => {
-            if let Some(terminal) = service
-                .protocol_state
-                .apply_exec_event(exec_id, ActiveExecEvent::DescendantsCleaned)?
-            {
-                out.push(AgentControlMessage::DescendantsCleaned { exec_id });
-                out.push(AgentControlMessage::ExecTerminal {
-                    exec_id: terminal.exec_id,
-                    disposition: terminal.disposition,
-                });
-                service.active_exec = None;
-            } else {
-                out.push(AgentControlMessage::DescendantsCleaned { exec_id });
-            }
+            let maybe_terminal = apply_exec_event_for_supervisor(
+                &mut service.protocol_state,
+                exec_id,
+                ActiveExecEvent::DescendantsCleaned,
+            )?;
+            out.push(AgentControlMessage::DescendantsCleaned { exec_id });
+            maybe_terminal
         }
         SupervisorEvent::Exited(exit_code) => {
             if service
@@ -1231,16 +1251,11 @@ fn apply_supervisor_event(
             } else {
                 ExecDisposition::ExitCode(exit_code)
             };
-            if let Some(terminal) = service
-                .protocol_state
-                .apply_exec_event(exec_id, ActiveExecEvent::Disposition(disposition))?
-            {
-                out.push(AgentControlMessage::ExecTerminal {
-                    exec_id: terminal.exec_id,
-                    disposition: terminal.disposition,
-                });
-                service.active_exec = None;
-            }
+            apply_exec_event_for_supervisor(
+                &mut service.protocol_state,
+                exec_id,
+                ActiveExecEvent::Disposition(disposition),
+            )?
         }
         SupervisorEvent::Signaled(signal) => {
             if service
@@ -1265,19 +1280,42 @@ fn apply_supervisor_event(
             } else {
                 ExecDisposition::Signaled(signal)
             };
-            if let Some(terminal) = service
-                .protocol_state
-                .apply_exec_event(exec_id, ActiveExecEvent::Disposition(disposition))?
-            {
-                out.push(AgentControlMessage::ExecTerminal {
-                    exec_id: terminal.exec_id,
-                    disposition: terminal.disposition,
-                });
-                service.active_exec = None;
-            }
+            apply_exec_event_for_supervisor(
+                &mut service.protocol_state,
+                exec_id,
+                ActiveExecEvent::Disposition(disposition),
+            )?
         }
+    };
+    if let Some(terminal) = maybe_terminal {
+        out.push(AgentControlMessage::ExecTerminal {
+            exec_id: terminal.exec_id,
+            disposition: terminal.disposition,
+        });
+        service.active_exec = None;
     }
     Ok(())
+}
+
+fn apply_exec_event_for_supervisor(
+    protocol_state: &mut AgentProtocolState,
+    exec_id: u32,
+    event: ActiveExecEvent,
+) -> Result<Option<crate::state::ExecTerminalEvent>, ServiceError> {
+    protocol_state
+        .apply_exec_event(exec_id, event)
+        .map_err(map_exec_state_error_for_supervisor_event)
+}
+
+fn map_exec_state_error_for_supervisor_event(error: crate::state::StateError) -> ServiceError {
+    use crate::state::StateError;
+    match error {
+        StateError::FlowControlCreditExhausted { stream, exec_id } => ServiceError::new(
+            ServiceErrorCode::Backpressure,
+            format!("flow-control credits exhausted for {stream:?} on exec {exec_id}"),
+        ),
+        other => other.into(),
+    }
 }
 
 impl<T: Read + Write> HvcFramedChannel<T> {
@@ -1518,7 +1556,20 @@ impl<T: Read + Write> HvcFramedChannel<T> {
                     ));
                 }
                 if self.read_buffer.len() < frame_len {
-                    // Need more bytes.
+                    let remaining = frame_len.saturating_sub(self.read_buffer.len());
+                    let mut scratch = vec![0_u8; remaining.min(4096)];
+                    let size = match self.io.read(&mut scratch) {
+                        Ok(size) => size,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            return Ok(ChannelReadResult::WouldBlock);
+                        }
+                        Err(error) => return Err(channel_io_error(error)),
+                    };
+                    if size == 0 {
+                        return Ok(ChannelReadResult::Closed);
+                    }
+                    self.read_buffer.extend_from_slice(&scratch[..size]);
+                    continue;
                 } else {
                     let payload = self.read_buffer[4..frame_len].to_vec();
                     self.read_buffer.drain(0..frame_len);
@@ -1527,7 +1578,7 @@ impl<T: Read + Write> HvcFramedChannel<T> {
                 }
             }
 
-            let mut scratch = [0_u8; 4096];
+            let mut scratch = [0_u8; 4];
             let size = match self.io.read(&mut scratch) {
                 Ok(size) => size,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1539,12 +1590,6 @@ impl<T: Read + Write> HvcFramedChannel<T> {
                 return Ok(ChannelReadResult::Closed);
             }
             self.read_buffer.extend_from_slice(&scratch[..size]);
-            if self.read_buffer.len() > self.max_frame_bytes {
-                return Err(ServiceError::new(
-                    ServiceErrorCode::ProtocolFrameError,
-                    "decoder buffer exceeded bounded allocation",
-                ));
-            }
         }
     }
 }
@@ -1677,6 +1722,20 @@ fn validate_create_process_request(request: &CreateProcessRequest) -> Result<(),
             return Err(ServiceError::new(
                 ServiceErrorCode::InvalidInput,
                 "env key must not be empty",
+            ));
+        }
+    }
+    if let Some(timeout_ms) = request.timeout_ms {
+        if timeout_ms == 0 {
+            return Err(ServiceError::new(
+                ServiceErrorCode::InvalidInput,
+                "timeout_ms must be greater than zero",
+            ));
+        }
+        if timeout_ms > MAX_EXEC_TIMEOUT_MS {
+            return Err(ServiceError::new(
+                ServiceErrorCode::InvalidInput,
+                format!("timeout_ms exceeds maximum supported value {MAX_EXEC_TIMEOUT_MS}"),
             ));
         }
     }
@@ -2595,6 +2654,104 @@ mod tests {
     }
 
     #[test]
+    fn create_process_timeout_validation_rejects_zero_and_oversized() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor::default();
+
+        let zero = service.create_process(
+            CreateProcessRequest {
+                exec_id: 701,
+                argv: vec!["/bin/echo".to_string(), "ok".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: Some(0),
+            },
+            &mut supervisor,
+        );
+        assert_eq!(zero.unwrap_err().code, ServiceErrorCode::InvalidInput);
+
+        let oversized = service.create_process(
+            CreateProcessRequest {
+                exec_id: 702,
+                argv: vec!["/bin/echo".to_string(), "ok".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: Some(MAX_EXEC_TIMEOUT_MS + 1),
+            },
+            &mut supervisor,
+        );
+        assert_eq!(oversized.unwrap_err().code, ServiceErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn terminal_emits_once_when_disposition_and_cleanup_arrive_before_final_drains() {
+        let permutations = [
+            vec![
+                SupervisorEvent::Exited(0),
+                SupervisorEvent::DescendantsCleaned,
+                SupervisorEvent::StdoutEof,
+                SupervisorEvent::StderrEof,
+            ],
+            vec![
+                SupervisorEvent::DescendantsCleaned,
+                SupervisorEvent::Signaled(9),
+                SupervisorEvent::StderrEof,
+                SupervisorEvent::StdoutEof,
+            ],
+        ];
+
+        for (index, events) in permutations.into_iter().enumerate() {
+            let mut service = authenticated_service();
+            let mut supervisor = FakeSupervisor::default();
+            let exec_id = 710 + index as u32;
+            service
+                .create_process(
+                    CreateProcessRequest {
+                        exec_id,
+                        argv: vec!["/bin/echo".to_string(), "ok".to_string()],
+                        cwd: Some("/".to_string()),
+                        env: vec![],
+                        timeout_ms: None,
+                    },
+                    &mut supervisor,
+                )
+                .unwrap();
+            for event in events {
+                supervisor.events.push_back(event);
+            }
+
+            let messages = drain_supervisor_messages(&mut service, &mut supervisor);
+            let terminal_positions: Vec<usize> = messages
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, message)| {
+                    matches!(message, AgentControlMessage::ExecTerminal { .. }).then_some(idx)
+                })
+                .collect();
+            assert_eq!(terminal_positions.len(), 1, "permutation {index}");
+            let terminal_index = terminal_positions[0];
+            let drained_count = messages
+                .iter()
+                .filter(|message| matches!(message, AgentControlMessage::StreamDrained { .. }))
+                .count();
+            assert_eq!(drained_count, 2, "permutation {index}");
+            let last_drained = messages
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, message)| {
+                    matches!(message, AgentControlMessage::StreamDrained { .. }).then_some(idx)
+                })
+                .max()
+                .expect("stream drained messages");
+            assert!(
+                terminal_index > last_drained,
+                "terminal must be emitted after both stream drains (permutation {index})"
+            );
+            assert_eq!(service.active_exec_id(), None, "permutation {index}");
+        }
+    }
+
+    #[test]
     fn spawn_failure_rolls_back_exec_state_and_allows_retry() {
         let mut service = authenticated_service();
         let mut supervisor = FakeSupervisor {
@@ -3290,6 +3447,64 @@ mod tests {
     }
 
     #[test]
+    fn framed_decoder_accepts_consecutive_max_valid_frames() {
+        let payload_len = MAX_INNER_RECORD_BYTES_FOR_OPENVMM - INNER_RECORD_HEADER_BYTES;
+        let first = InnerRecord {
+            exec_id: 91,
+            kind: InnerRecordKind::Stdout,
+            end_of_stream: false,
+            sequence: 0,
+            payload: vec![0x11; payload_len],
+        }
+        .encode()
+        .expect("encode first max frame");
+        let second = InnerRecord {
+            exec_id: 92,
+            kind: InnerRecordKind::Stderr,
+            end_of_stream: false,
+            sequence: 1,
+            payload: vec![0x22; payload_len],
+        }
+        .encode()
+        .expect("encode second max frame");
+
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(first.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&first);
+        framed.extend_from_slice(&(second.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&second);
+
+        let mut channel = HvcFramedChannel::new(Cursor::new(framed));
+        let first_out = channel
+            .read_next_inner_record()
+            .expect("decode first frame")
+            .expect("first record");
+        let second_out = channel
+            .read_next_inner_record()
+            .expect("decode second frame")
+            .expect("second record");
+        assert_eq!(first_out.exec_id, 91);
+        assert_eq!(second_out.exec_id, 92);
+        assert_eq!(first_out.payload.len(), payload_len);
+        assert_eq!(second_out.payload.len(), payload_len);
+    }
+
+    #[test]
+    fn framed_decoder_rejects_invalid_advertised_lengths_before_payload_allocation() {
+        let invalid = (MAX_INNER_RECORD_BYTES_FOR_OPENVMM + 1) as u32;
+        let mut channel = HvcFramedChannel::new(Cursor::new(invalid.to_be_bytes().to_vec()));
+        let error = channel
+            .try_read_next_inner_record()
+            .expect_err("must reject oversized advertised payload");
+        assert_eq!(error.code, ServiceErrorCode::ProtocolFrameError);
+        assert!(
+            error.message.contains("exceeds conservative cap"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+
+    #[test]
     fn pump_supervisor_to_channel_backpressure_keeps_front_until_credit_and_capacity() {
         let mut service = authenticated_service();
         let mut supervisor = FakeSupervisor::default();
@@ -3365,6 +3580,80 @@ mod tests {
             .filter(|message| matches!(message, AgentControlMessage::ExecTerminal { .. }))
             .count();
         assert_eq!(terminal_count, 1);
+    }
+
+    #[test]
+    fn pump_supervisor_to_channel_treats_missing_flow_credits_as_backpressure() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor::default();
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 66,
+                    argv: vec!["/bin/cat".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        supervisor
+            .events
+            .push_back(SupervisorEvent::StdoutChunk(vec![9, 0, 9]));
+        supervisor.events.push_back(SupervisorEvent::StdoutEof);
+        supervisor.events.push_back(SupervisorEvent::StderrEof);
+        supervisor
+            .events
+            .push_back(SupervisorEvent::DescendantsCleaned);
+        supervisor.events.push_back(SupervisorEvent::Exited(0));
+
+        let mut channel = HvcFramedChannel::new(Cursor::new(Vec::<u8>::new()));
+        channel.write_credits = 64;
+        let blocked = service
+            .pump_supervisor_to_channel(&mut supervisor, &mut channel)
+            .expect("flow-credit stall should not be fatal");
+        assert_eq!(blocked, PumpSupervisorResult::WouldBlock);
+        assert!(matches!(
+            supervisor.events.front(),
+            Some(SupervisorEvent::StdoutChunk(chunk)) if chunk == &vec![9, 0, 9]
+        ));
+        assert_eq!(service.active_exec_id(), Some(66));
+
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 66,
+                stream: StreamName::Stdout,
+                credits: 1,
+            })
+            .unwrap();
+        while service
+            .pump_supervisor_to_channel(&mut supervisor, &mut channel)
+            .unwrap()
+            == PumpSupervisorResult::WouldBlock
+        {}
+        while channel.flush_once().unwrap() {}
+
+        let mut readback = HvcFramedChannel::new(Cursor::new(channel.io.into_inner()));
+        let mut observed = Vec::new();
+        while let Some(record) = readback.read_next_inner_record().unwrap() {
+            observed.push(serde_json::from_slice::<AgentControlMessage>(&record.payload).unwrap());
+        }
+        assert!(matches!(
+            observed.first(),
+            Some(AgentControlMessage::StdoutChunk(StdoutChunkRecord { chunk, .. }))
+                if chunk == &vec![9, 0, 9]
+        ));
+        assert!(observed.iter().any(|message| {
+            matches!(
+                message,
+                AgentControlMessage::ExecTerminal {
+                    disposition: ExecDisposition::ExitCode(0),
+                    ..
+                }
+            )
+        }));
+        assert_eq!(service.active_exec_id(), None);
     }
 
     #[test]

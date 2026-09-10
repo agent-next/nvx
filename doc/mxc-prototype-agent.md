@@ -21,7 +21,10 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   fixed `mxc` identity execution.
 - Process execution is supervised with one active exec at a time, unlimited
   sequential execs, argv/env/cwd execution without shell expansion, bounded
-  stdin queueing, and non-destructive credit-aware output streaming.
+  stdin queueing, and non-destructive credit-aware output streaming. Output
+  credit exhaustion is handled as explicit backpressure (WouldBlock) until
+  `FlowCredits` arrives; PID1 stays alive and replays the same front event
+  losslessly.
 - `tools/agent-harness` reports explicit evidence source tiers
   (`unit-static`, `local-linux-runtime`, `live-whp`) and a separate conformance
   status. Static or local-runtime evidence can satisfy subchecks, but canonical
@@ -48,6 +51,9 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 - Stream payload and stdin queue bounds are pinned to one protocol-safe limit:
   `PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES` (currently 65,452 bytes), derived from
   the conservative OpenVMM outer-record cap after inner-record framing.
+- `CreateProcess.timeout_ms` is now strictly validated: it must be greater than
+  zero and no larger than `MAX_EXEC_TIMEOUT_MS` (24h / 86,400,000 ms). Invalid
+  values are rejected before spawn/state mutation.
 - Security boundary: launch capability trust comes only from mxc profile boot
   configuration; host control traffic proves possession but cannot redefine the
   trusted expected value.

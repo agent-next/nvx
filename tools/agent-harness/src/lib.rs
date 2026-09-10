@@ -211,7 +211,7 @@ pub struct HarnessRun {
 
 impl HarnessRun {
     pub fn exit_code(&self) -> ExitCode {
-        if has_all_scenarios_passed(&self.report) {
+        if is_passing_report(&self.report) {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
@@ -805,10 +805,11 @@ fn local_linux_backpressure() -> CheckOutcome {
     ) {
         return check_fail(format!("credit probe create_process failed: {error}"));
     }
-    let credit_exhausted = wait_for_lifecycle_error(&mut service, &mut supervisor, credit_exec);
+    let credit_exhausted =
+        wait_for_output_credit_backpressure(&mut service, &mut supervisor, credit_exec);
     if !credit_exhausted {
         return check_fail(
-            "expected stdout flow-credit exhaustion before granting stdout credits".to_string(),
+            "expected stdout flow-credit backpressure before granting stdout credits".to_string(),
         );
     }
 
@@ -1268,7 +1269,7 @@ fn check_fail(error: String) -> CheckOutcome {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_lifecycle_error(
+fn wait_for_output_credit_backpressure(
     service: &mut MxcControlService,
     supervisor: &mut LinuxProcessSupervisor,
     exec_id: u32,
@@ -1278,7 +1279,7 @@ fn wait_for_lifecycle_error(
         match service.pump_supervisor(supervisor) {
             Ok(_) => {}
             Err(ServiceError {
-                code: ServiceErrorCode::LifecycleError,
+                code: ServiceErrorCode::Backpressure,
                 ..
             }) => return true,
             Err(_) => return false,
@@ -1576,6 +1577,38 @@ pub fn is_passing_report(report: &HarnessReport) -> bool {
     if report.platform != "windows" {
         return false;
     }
+    if report.service_identity != SERVICE_IDENTITY {
+        return false;
+    }
+    if report.protocol_version != PROTOCOL_VERSION {
+        return false;
+    }
+    if report.build_identity != env!("CARGO_PKG_VERSION") {
+        return false;
+    }
+    if report.started_unix_ms == 0 || report.finished_unix_ms < report.started_unix_ms {
+        return false;
+    }
+    if report.artifact_paths.len() != 2 {
+        return false;
+    }
+    if report
+        .artifact_paths
+        .get("report")
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return false;
+    }
+    if report
+        .artifact_paths
+        .get("diagnostics")
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return false;
+    }
+    if report.diagnostics_tail.len() > MAX_DIAGNOSTIC_LINES {
+        return false;
+    }
     if report.scenarios.len() != CANONICAL_SCENARIOS.len() {
         return false;
     }
@@ -1598,26 +1631,11 @@ pub fn is_passing_report(report: &HarnessReport) -> bool {
 }
 
 pub fn has_all_scenarios_passed(report: &HarnessReport) -> bool {
-    if report.scenarios.len() != CANONICAL_SCENARIOS.len() {
-        return false;
-    }
-    for (scenario, canonical) in report.scenarios.iter().zip(CANONICAL_SCENARIOS.iter()) {
-        if scenario.requirement_number != canonical.requirement_number
-            || scenario.id != canonical.id
-            || scenario.name != canonical.name
-            || scenario.status != ScenarioStatus::Pass
-            || scenario.check_status != EvidenceCheckStatus::Pass
-            || scenario.evidence_source != EvidenceSource::LiveWhp
-            || scenario.required_evidence_source != EvidenceSource::LiveWhp
-        {
-            return false;
-        }
-    }
-    true
+    is_passing_report(report)
 }
 
 pub fn report_exit_code(report: &HarnessReport) -> ExitCode {
-    if has_all_scenarios_passed(report) {
+    if is_passing_report(report) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -1789,5 +1807,98 @@ mod tests {
             assert_eq!(scenario.status, ScenarioStatus::NotLive);
         }
         assert_eq!(run.exit_code(), ExitCode::FAILURE);
+    }
+
+    fn forged_passing_report() -> HarnessReport {
+        let mut artifact_paths = BTreeMap::new();
+        artifact_paths.insert("report".to_string(), "report.json".to_string());
+        artifact_paths.insert("diagnostics".to_string(), "diagnostics.txt".to_string());
+        HarnessReport {
+            schema: REPORT_SCHEMA.to_string(),
+            version: REPORT_VERSION,
+            mode: HarnessMode::LiveWhp,
+            platform: "windows".to_string(),
+            backend: HarnessBackend::Whp.as_str().to_string(),
+            service_identity: "nvx.mxc.agent.v1".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            build_identity: env!("CARGO_PKG_VERSION").to_string(),
+            started_unix_ms: 1,
+            finished_unix_ms: 2,
+            scenarios: CANONICAL_SCENARIOS
+                .iter()
+                .map(|scenario| ScenarioResult {
+                    requirement_number: scenario.requirement_number,
+                    id: scenario.id.to_string(),
+                    name: scenario.name.to_string(),
+                    status: ScenarioStatus::Pass,
+                    check_status: EvidenceCheckStatus::Pass,
+                    evidence_source: EvidenceSource::LiveWhp,
+                    required_evidence_source: EvidenceSource::LiveWhp,
+                    error: None,
+                    evidence: vec![],
+                    duration_ms: 1,
+                })
+                .collect(),
+            artifact_paths,
+            diagnostics_tail: vec!["ok".to_string()],
+        }
+    }
+
+    #[test]
+    fn canonical_gate_rejects_adversarial_top_level_fields() {
+        let report = forged_passing_report();
+        assert!(is_passing_report(&report));
+        assert_eq!(report_exit_code(&report), ExitCode::SUCCESS);
+
+        let mut bad_schema = report.clone();
+        bad_schema.schema = "forged.schema".to_string();
+        assert!(!is_passing_report(&bad_schema));
+        assert_eq!(report_exit_code(&bad_schema), ExitCode::FAILURE);
+
+        let mut bad_version = report.clone();
+        bad_version.version = report.version + 1;
+        assert!(!is_passing_report(&bad_version));
+
+        let mut bad_mode = report.clone();
+        bad_mode.mode = HarnessMode::StaticOnly;
+        assert!(!is_passing_report(&bad_mode));
+
+        let mut bad_platform = report.clone();
+        bad_platform.platform = "linux".to_string();
+        assert!(!is_passing_report(&bad_platform));
+
+        let mut bad_backend = report.clone();
+        bad_backend.backend = "lxc".to_string();
+        assert!(!is_passing_report(&bad_backend));
+
+        let mut bad_protocol = report.clone();
+        bad_protocol.protocol_version = report.protocol_version + 1;
+        assert!(!is_passing_report(&bad_protocol));
+
+        let mut bad_service = report.clone();
+        bad_service.service_identity = "forged.service".to_string();
+        assert!(!is_passing_report(&bad_service));
+
+        let mut bad_started = report.clone();
+        bad_started.started_unix_ms = 0;
+        assert!(!is_passing_report(&bad_started));
+
+        let mut bad_finished = report.clone();
+        bad_finished.finished_unix_ms = 0;
+        assert!(!is_passing_report(&bad_finished));
+
+        let mut bad_build = report.clone();
+        bad_build.build_identity = "forged-build".to_string();
+        assert!(!is_passing_report(&bad_build));
+
+        let mut bad_artifacts = report.clone();
+        bad_artifacts
+            .artifact_paths
+            .insert("forged".to_string(), "value".to_string());
+        assert!(!is_passing_report(&bad_artifacts));
+
+        let mut bad_diagnostics = report.clone();
+        bad_diagnostics.diagnostics_tail = vec!["x".to_string(); MAX_DIAGNOSTIC_LINES + 1];
+        assert!(!is_passing_report(&bad_diagnostics));
     }
 }

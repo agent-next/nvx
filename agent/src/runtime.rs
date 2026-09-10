@@ -350,6 +350,18 @@ fn handle_host_message<S: ProcessSupervisor>(
             env,
             timeout_ms,
         } => {
+            let timeout_deadline = timeout_ms
+                .map(|timeout| {
+                    Instant::now()
+                        .checked_add(Duration::from_millis(timeout))
+                        .ok_or_else(|| ServiceError {
+                            code: ServiceErrorCode::InvalidInput,
+                            message: format!(
+                                "timeout_ms cannot be represented as a runtime deadline ({timeout})"
+                            ),
+                        })
+                })
+                .transpose()?;
             service.create_process(
                 CreateProcessRequest {
                     exec_id,
@@ -360,9 +372,7 @@ fn handle_host_message<S: ProcessSupervisor>(
                 },
                 supervisor,
             )?;
-            if let Some(timeout) = timeout_ms
-                && let Some(deadline) = Instant::now().checked_add(Duration::from_millis(timeout))
-            {
+            if let Some(deadline) = timeout_deadline {
                 *active_timeout = Some((exec_id, deadline));
             }
             Ok(Vec::new())
@@ -1292,6 +1302,91 @@ mod tests {
             }
         ));
         assert_eq!(supervisor.acked_events, 2);
+    }
+
+    #[test]
+    fn runtime_supervisor_pump_waits_for_delayed_flow_credits_without_failing_pid1() {
+        let mut service = runtime_test_service();
+        let mut supervisor = RuntimeTestSupervisor::default();
+        service.activate_full_lifecycle().unwrap();
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 66,
+                    argv: vec!["/bin/cat".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        supervisor
+            .events
+            .push_back(SupervisorEvent::StdoutChunk(vec![1, 0, 2, 0, 3]));
+        supervisor.events.push_back(SupervisorEvent::StdoutEof);
+        supervisor.events.push_back(SupervisorEvent::StderrEof);
+        supervisor
+            .events
+            .push_back(SupervisorEvent::DescendantsCleaned);
+        supervisor.events.push_back(SupervisorEvent::Exited(0));
+
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let mut channel = agent_protocol::HvcFramedChannel::new(RuntimeTestIo::new(writes.clone()));
+
+        pump_supervisor_to_channel_lossless(&mut service, &mut supervisor, &mut channel).unwrap();
+        assert!(matches!(
+            supervisor.events.front(),
+            Some(SupervisorEvent::StdoutChunk(chunk)) if chunk == &vec![1, 0, 2, 0, 3]
+        ));
+        assert_eq!(
+            supervisor.acked_events, 0,
+            "front event must not be consumed"
+        );
+        assert_eq!(
+            service.active_exec_id(),
+            Some(66),
+            "runtime service must stay alive"
+        );
+
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 66,
+                stream: StreamName::Stdout,
+                credits: 1,
+            })
+            .unwrap();
+        while matches!(
+            service
+                .pump_supervisor_to_channel(&mut supervisor, &mut channel)
+                .unwrap(),
+            agent_protocol::service::PumpSupervisorResult::WouldBlock
+        ) {}
+        while channel.flush_once().unwrap() {}
+
+        let mut readback =
+            agent_protocol::HvcFramedChannel::new(Cursor::new(writes.borrow().clone()));
+        let mut observed = Vec::new();
+        while let Some(record) = readback.read_next_inner_record().unwrap() {
+            observed.push(serde_json::from_slice::<AgentControlMessage>(&record.payload).unwrap());
+        }
+        assert!(matches!(
+            observed.first(),
+            Some(AgentControlMessage::StdoutChunk(agent_protocol::StdoutChunkRecord {
+                chunk,
+                ..
+            })) if chunk == &vec![1, 0, 2, 0, 3]
+        ));
+        assert!(observed.iter().any(|message| {
+            matches!(
+                message,
+                AgentControlMessage::ExecTerminal {
+                    disposition: agent_protocol::ExecDisposition::ExitCode(0),
+                    ..
+                }
+            )
+        }));
+        assert_eq!(service.active_exec_id(), None);
     }
 
     #[test]

@@ -213,12 +213,12 @@ const PROBE_ORPHAN_REAPING: u32 = 1 << 12;
 const PROBE_WORKLOAD_IDENTITY_MXC: u32 = 1 << 13;
 
 #[cfg(target_os = "linux")]
-const CAPABILITY_FIELDS: [&str; 4] = [
-    "CapInh:\t0000000000000000",
-    "CapPrm:\t0000000000000000",
-    "CapEff:\t0000000000000000",
-    "CapAmb:\t0000000000000000",
-];
+const CAPABILITY_STATUS_KEYS: [&str; 5] = ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"];
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static DROP_BOUNDING_CAP_FAIL_AT: ::std::cell::Cell<i32> = const { ::std::cell::Cell::new(-1) };
+}
 
 #[cfg(target_os = "linux")]
 const REPORT_ERROR_UNSHARE: u32 = 1;
@@ -621,6 +621,12 @@ fn drop_bounding_and_ambient_capabilities() -> Result<()> {
     let last_cap = read_last_capability_index()?;
     let mut cap = 0_i32;
     while cap <= last_cap {
+        #[cfg(all(test, target_os = "linux"))]
+        if DROP_BOUNDING_CAP_FAIL_AT.with(|slot| slot.get() == cap) {
+            return Err(AgentError::isolation(format!(
+                "injected failure dropping capability {cap} from bounding set"
+            )));
+        }
         // SAFETY: prctl drop with valid cap index; kernel validates support.
         let drop_result = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
         if drop_result != 0 {
@@ -1190,10 +1196,11 @@ fn parse_status_value<'a>(status: &'a str, key: &str) -> Option<&'a str> {
 
 #[cfg(target_os = "linux")]
 fn capabilities_are_zero(status: &str) -> bool {
-    CAPABILITY_FIELDS.iter().all(|field| status.contains(field))
-        && parse_status_value(status, "CapBnd:")
+    CAPABILITY_STATUS_KEYS.iter().all(|key| {
+        parse_status_value(status, key)
             .map(|value| value == "0000000000000000")
             .unwrap_or(false)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1411,6 +1418,47 @@ mod tests {
         let probe = execute_setup_steps_with_executor(&mut context, &mut executor).expect("probe");
         assert!(probe.no_new_privs);
         assert_eq!(executor.seen.len(), setup_step_sequence().len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capabilities_are_zero_requires_all_five_capability_sets() {
+        let baseline = [
+            "CapInh:\t0000000000000000",
+            "CapPrm:\t0000000000000000",
+            "CapEff:\t0000000000000000",
+            "CapBnd:\t0000000000000000",
+            "CapAmb:\t0000000000000000",
+        ]
+        .join("\n");
+        assert!(capabilities_are_zero(&baseline));
+
+        for key in CAPABILITY_STATUS_KEYS {
+            let mutated = baseline.replace(
+                &format!("{key}\t0000000000000000"),
+                &format!("{key}\t0000000000000001"),
+            );
+            assert!(
+                !capabilities_are_zero(&mutated),
+                "{key} must be zero in /proc/self/status"
+            );
+        }
+        assert!(!capabilities_are_zero("CapInh:\t0000000000000000"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_bounding_failure_is_fatal() {
+        DROP_BOUNDING_CAP_FAIL_AT.with(|slot| slot.set(0));
+        let result = drop_bounding_and_ambient_capabilities();
+        DROP_BOUNDING_CAP_FAIL_AT.with(|slot| slot.set(-1));
+        let error = result.expect_err("bounding-set drop failure must be fatal");
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure dropping capability 0"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(target_os = "linux")]

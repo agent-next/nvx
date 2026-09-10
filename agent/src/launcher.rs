@@ -574,11 +574,7 @@ fn apply_workload_exec_credentials(plan: Option<ChildCredentialPlan>) -> io::Res
         // SAFETY: prctl validates capability indexes.
         let rc = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) };
         if rc != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EPERM) {
-                return Err(error);
-            }
-            break;
+            return Err(io::Error::last_os_error());
         }
         capability += 1;
     }
