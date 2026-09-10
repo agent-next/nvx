@@ -697,15 +697,10 @@ fn prepare_exec_cgroup(root: &Path, exec_id: u32) -> Result<PreparedExecCgroup, 
 }
 
 fn move_self_to_cgroup_fd(cgroup_procs_fd: i32) -> io::Result<()> {
-    let payload = std::process::id().to_string();
-    // SAFETY: payload pointer is valid for payload bytes.
-    let write_pid = unsafe { libc::write(cgroup_procs_fd, payload.as_ptr().cast(), payload.len()) };
-    // SAFETY: "\n" literal has static lifetime and length 1.
-    let write_newline = unsafe { libc::write(cgroup_procs_fd, b"\n".as_ptr().cast(), 1) };
-    if write_pid < 0 || write_newline < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    let mut payload = [0_u8; 32];
+    let pid = unsafe { libc::getpid() };
+    let encoded = encode_pid_line(pid, &mut payload)?;
+    write_all_fd(cgroup_procs_fd, encoded)
 }
 
 fn move_pid_to_exec_cgroup(cgroup_procs_path: &CString, pid: i32) -> io::Result<()> {
@@ -714,15 +709,62 @@ fn move_pid_to_exec_cgroup(cgroup_procs_path: &CString, pid: i32) -> io::Result<
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let payload = pid.to_string();
-    // SAFETY: payload pointer is valid for payload bytes.
-    let write_pid = unsafe { libc::write(fd, payload.as_ptr().cast(), payload.len()) };
-    // SAFETY: "\n" literal has static lifetime and length 1.
-    let write_newline = unsafe { libc::write(fd, b"\n".as_ptr().cast(), 1) };
+    let mut payload = [0_u8; 32];
+    let encoded = encode_pid_line(pid, &mut payload)?;
+    let write_result = write_all_fd(fd, encoded);
     // SAFETY: best-effort close for opened descriptor.
     let _ = unsafe { libc::close(fd) };
-    if write_pid < 0 || write_newline < 0 {
-        return Err(io::Error::last_os_error());
+    write_result
+}
+
+fn encode_pid_line<'a>(pid: i32, scratch: &'a mut [u8; 32]) -> io::Result<&'a [u8]> {
+    if pid < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pid must be non-negative",
+        ));
+    }
+    let mut value = pid as u32;
+    let mut cursor = scratch.len();
+    cursor -= 1;
+    scratch[cursor] = b'\n';
+    if value == 0 {
+        cursor -= 1;
+        scratch[cursor] = b'0';
+        return Ok(&scratch[cursor..]);
+    }
+    while value > 0 {
+        if cursor == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pid line buffer overflow",
+            ));
+        }
+        cursor -= 1;
+        scratch[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    Ok(&scratch[cursor..])
+}
+
+fn write_all_fd(fd: i32, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        // SAFETY: bytes points to a valid memory range for the current slice.
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short write while updating cgroup.procs",
+            ));
+        }
+        bytes = &bytes[written as usize..];
     }
     Ok(())
 }
@@ -904,6 +946,7 @@ mod tests {
     use super::*;
     use agent_protocol::CreateProcessRequest;
     use std::fs;
+    use std::io::Read;
     use tempfile::tempdir;
 
     fn wait_for_event(
@@ -1124,5 +1167,29 @@ mod tests {
                 .cgroup_dir,
             holder_cgroup
         );
+    }
+
+    #[test]
+    fn cgroup_pid_line_encoder_returns_single_pid_newline_buffer() {
+        let mut scratch = [0_u8; 32];
+        let encoded = encode_pid_line(4242, &mut scratch).expect("encode pid");
+        assert_eq!(encoded, b"4242\n");
+    }
+
+    #[test]
+    fn move_pid_to_exec_cgroup_writes_atomic_pid_line() {
+        let temp = tempdir().expect("tempdir");
+        let cgroup_procs = temp.path().join("cgroup.procs");
+        fs::File::create(&cgroup_procs).expect("create cgroup.procs");
+        let c_path = CString::new(cgroup_procs.to_string_lossy().as_bytes().to_vec()).unwrap();
+
+        move_pid_to_exec_cgroup(&c_path, 31337).expect("write cgroup.procs");
+
+        let mut content = Vec::new();
+        fs::File::open(&cgroup_procs)
+            .expect("open cgroup.procs")
+            .read_to_end(&mut content)
+            .expect("read content");
+        assert_eq!(content, b"31337\n");
     }
 }

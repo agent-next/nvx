@@ -69,19 +69,11 @@ pub fn run_runtime() -> Result<()> {
                 active_timeout = None;
             }
 
-            if pending_outbound.is_empty() && !channel.is_write_saturated() {
-                for message in service
-                    .pump_supervisor(&mut supervisor)
-                    .map_err(|error| AgentError::internal(error.to_string()))?
-                {
-                    if matches!(message, AgentControlMessage::ExecTerminal { .. }) {
-                        active_timeout = None;
-                    }
-                    enqueue_outbound(&mut pending_outbound, message)?;
-                }
-            }
-
             drain_outbound_to_channel(&mut channel, &mut pending_outbound)?;
+            pump_supervisor_to_channel_lossless(&mut service, &mut supervisor, &mut channel)?;
+            if service.active_exec_id().is_none() {
+                active_timeout = None;
+            }
             while channel
                 .flush_once()
                 .map_err(|error| AgentError::internal(error.to_string()))?
@@ -610,6 +602,20 @@ fn drain_outbound_to_channel<T: io::Read + io::Write>(
     Ok(())
 }
 
+fn pump_supervisor_to_channel_lossless<T: io::Read + io::Write>(
+    service: &mut MxcControlService,
+    supervisor: &mut impl ProcessSupervisor,
+    channel: &mut agent_protocol::HvcFramedChannel<T>,
+) -> Result<()> {
+    match service
+        .pump_supervisor_to_channel(supervisor, channel)
+        .map_err(|error| AgentError::internal(error.to_string()))?
+    {
+        agent_protocol::service::PumpSupervisorResult::Drained
+        | agent_protocol::service::PumpSupervisorResult::WouldBlock => Ok(()),
+    }
+}
+
 fn set_workload_frozen(cgroup_dir: &Path, freeze: bool, timeout: Duration) -> Result<()> {
     let freeze_path = cgroup_dir.join("cgroup.freeze");
     let events_path = cgroup_dir.join("cgroup.events");
@@ -754,6 +760,15 @@ fn configure_fd_raw_nonblocking(fd: i32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_protocol::{
+        AccessMode, AuthenticateChannelRequest, CanonicalHostMappingRoot, ConfigureSessionRequest,
+        CreateProcessRequest, FlowCreditRequest, HealthStatus, LaunchBinding, LaunchIdentity,
+        MappingContainmentPolicy, NetworkMode, NetworkStatus, ProcessSupervisor, SERVICE_IDENTITY,
+        SessionConfiguration, StreamName, SupervisorEvent, SymlinkContainmentPolicy,
+    };
+    use std::cell::RefCell;
+    use std::io::{self, Cursor, Read, Write};
+    use std::rc::Rc;
 
     #[test]
     fn capability_parser_accepts_exact_64_hex_characters() {
@@ -795,5 +810,267 @@ mod tests {
     fn openvmm_overhead_constant_remains_conservative() {
         assert!(assert_conservative_openvmm_overhead().is_ok());
         assert_eq!(OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, 64);
+    }
+
+    #[derive(Default)]
+    struct RuntimeTestSupervisor {
+        exec_id: Option<u32>,
+        events: VecDeque<SupervisorEvent>,
+        acked_events: usize,
+    }
+
+    impl ProcessSupervisor for RuntimeTestSupervisor {
+        fn spawn(
+            &mut self,
+            request: &CreateProcessRequest,
+        ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            self.exec_id = Some(request.exec_id);
+            Ok(())
+        }
+
+        fn queue_stdin(
+            &mut self,
+            _exec_id: u32,
+            _chunk: Vec<u8>,
+        ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            Ok(())
+        }
+
+        fn close_stdin(
+            &mut self,
+            _exec_id: u32,
+        ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            Ok(())
+        }
+
+        fn take_stdin_drain_bytes(
+            &mut self,
+            _exec_id: u32,
+        ) -> std::result::Result<usize, agent_protocol::ServiceError> {
+            Ok(0)
+        }
+
+        fn peek_event(
+            &mut self,
+            exec_id: u32,
+        ) -> std::result::Result<Option<SupervisorEvent>, agent_protocol::ServiceError> {
+            if self.exec_id != Some(exec_id) {
+                return Ok(None);
+            }
+            Ok(self.events.front().cloned())
+        }
+
+        fn ack_event(
+            &mut self,
+            _exec_id: u32,
+        ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            self.events.pop_front();
+            self.acked_events = self.acked_events.saturating_add(1);
+            Ok(())
+        }
+
+        fn terminate(
+            &mut self,
+            _exec_id: u32,
+        ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            Ok(())
+        }
+
+        fn kill(&mut self, _exec_id: u32) -> std::result::Result<(), agent_protocol::ServiceError> {
+            Ok(())
+        }
+
+        fn poll(
+            &mut self,
+            exec_id: u32,
+        ) -> std::result::Result<Option<SupervisorEvent>, agent_protocol::ServiceError> {
+            let event = self.peek_event(exec_id)?;
+            if event.is_some() {
+                self.ack_event(exec_id)?;
+            }
+            Ok(event)
+        }
+
+        fn cleanup_for_disconnect(
+            &mut self,
+            _exec_id: u32,
+            _deadline: Duration,
+        ) -> std::result::Result<bool, agent_protocol::ServiceError> {
+            Ok(true)
+        }
+    }
+
+    #[derive(Clone)]
+    struct RuntimeTestIo {
+        read_cursor: Cursor<Vec<u8>>,
+        writes: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl RuntimeTestIo {
+        fn new(writes: Rc<RefCell<Vec<u8>>>) -> Self {
+            Self {
+                read_cursor: Cursor::new(Vec::new()),
+                writes,
+            }
+        }
+    }
+
+    impl Read for RuntimeTestIo {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.read_cursor.read(buf)
+        }
+    }
+
+    impl Write for RuntimeTestIo {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn runtime_test_service() -> MxcControlService {
+        let launch = LaunchIdentity {
+            generation: 7,
+            nonce: [7; 16],
+        };
+        let binding = LaunchBinding {
+            protocol_version: PROTOCOL_VERSION,
+            image_version: "img-v1".to_string(),
+            launch,
+            channel_generation: 17,
+        };
+        let mut service = MxcControlService::new(binding);
+        service
+            .authenticate_channel(
+                AuthenticateChannelRequest {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    launch,
+                    channel_generation: 17,
+                    capability_proof: [7; 32],
+                },
+                1,
+                NetworkStatus {
+                    mode: NetworkMode::NoNic,
+                    detail: None,
+                },
+            )
+            .unwrap();
+        service
+            .configure_session(ConfigureSessionRequest {
+                protocol_version: PROTOCOL_VERSION,
+                image_version: "img-v1".to_string(),
+                launch,
+                channel_generation: 17,
+                idempotent_replay: false,
+                configuration: SessionConfiguration {
+                    root: CanonicalHostMappingRoot::parse("/sandbox".to_string()).unwrap(),
+                    mappings: vec![agent_protocol::ChildMapping {
+                        child: agent_protocol::RelativeChildPath::parse("runtime".to_string())
+                            .unwrap(),
+                        access: AccessMode::ReadOnly,
+                    }],
+                    containment: MappingContainmentPolicy {
+                        symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                        reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                    },
+                    labels: vec!["runtime".to_string()],
+                    attributes: BTreeMap::new(),
+                    filesystem: agent_protocol::FilesystemStatus {
+                        rootfs_ready: true,
+                        detail: "ready".to_string(),
+                    },
+                    network: NetworkStatus {
+                        mode: NetworkMode::PortableNetwork,
+                        detail: Some("test".to_string()),
+                    },
+                },
+            })
+            .unwrap();
+        service
+    }
+
+    #[test]
+    fn runtime_supervisor_pump_waits_for_full_256_queue_and_replays_once_losslessly() {
+        let mut service = runtime_test_service();
+        let mut supervisor = RuntimeTestSupervisor::default();
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 65,
+                    argv: vec!["/bin/cat".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 65,
+                stream: StreamName::Stdout,
+                credits: 2,
+            })
+            .unwrap();
+
+        supervisor
+            .events
+            .push_back(SupervisorEvent::StdoutChunk(vec![9, 0, 9]));
+        supervisor.events.push_back(SupervisorEvent::StdoutEof);
+
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let mut channel = agent_protocol::HvcFramedChannel::new(RuntimeTestIo::new(writes.clone()));
+        let filler = AgentControlMessage::Health(HealthStatus {
+            quiesced: false,
+            launch_admitted: true,
+        });
+        for _ in 0..256 {
+            channel.queue_control_message(&filler).unwrap();
+        }
+        assert_eq!(
+            channel.queue_control_message(&filler).unwrap_err().code,
+            ServiceErrorCode::Backpressure
+        );
+
+        pump_supervisor_to_channel_lossless(&mut service, &mut supervisor, &mut channel).unwrap();
+        assert!(matches!(
+            supervisor.events.front(),
+            Some(SupervisorEvent::StdoutChunk(chunk)) if chunk == &vec![9, 0, 9]
+        ));
+        assert_eq!(supervisor.acked_events, 0);
+
+        while channel.flush_once().unwrap() {}
+        pump_supervisor_to_channel_lossless(&mut service, &mut supervisor, &mut channel).unwrap();
+        while channel.flush_once().unwrap() {}
+
+        let mut readback =
+            agent_protocol::HvcFramedChannel::new(Cursor::new(writes.borrow().clone()));
+        let mut observed = Vec::new();
+        while let Some(record) = readback.read_next_inner_record().unwrap() {
+            observed.push(serde_json::from_slice::<AgentControlMessage>(&record.payload).unwrap());
+        }
+        let last_three = observed.split_off(observed.len() - 3);
+        assert!(matches!(
+            &last_three[0],
+            AgentControlMessage::StdoutChunk(agent_protocol::StdoutChunkRecord { chunk, .. })
+                if chunk == &vec![9, 0, 9]
+        ));
+        assert!(matches!(
+            &last_three[1],
+            AgentControlMessage::StdoutEof(agent_protocol::StdoutEofRecord { .. })
+        ));
+        assert!(matches!(
+            &last_three[2],
+            AgentControlMessage::StreamDrained {
+                stream: StreamName::Stdout,
+                ..
+            }
+        ));
+        assert_eq!(supervisor.acked_events, 2);
     }
 }
