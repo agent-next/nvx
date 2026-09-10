@@ -694,8 +694,16 @@ impl MxcControlService {
         self.require_supported_operation("Exec")?;
         self.require_configured()?;
         validate_create_process_request(&request)?;
+        let protocol_snapshot = self.protocol_state.clone();
+        let active_snapshot = self.active_exec.clone();
         self.protocol_state.create_exec(request.exec_id)?;
-        supervisor.spawn(&request)?;
+        if let Err(error) = supervisor.spawn(&request) {
+            // Spawn failures are retryable with the same exec id: reserve only after successful
+            // supervisor start by rolling protocol/service state back to the pre-create snapshot.
+            self.protocol_state = protocol_snapshot;
+            self.active_exec = active_snapshot;
+            return Err(error);
+        }
         self.active_exec = Some(ActiveExecution {
             exec_id: request.exec_id,
             stdin_next_sequence: 0,
@@ -2105,6 +2113,7 @@ mod tests {
     struct FakeSupervisor {
         events: VecDeque<SupervisorEvent>,
         spawned: Vec<CreateProcessRequest>,
+        fail_next_spawn: Option<ServiceError>,
         stdin: Vec<Vec<u8>>,
         fail_next_stdin_backpressure: bool,
         stdin_closed: bool,
@@ -2118,6 +2127,9 @@ mod tests {
     impl ProcessSupervisor for FakeSupervisor {
         fn spawn(&mut self, request: &CreateProcessRequest) -> Result<(), ServiceError> {
             self.spawned.push(request.clone());
+            if let Some(error) = self.fail_next_spawn.take() {
+                return Err(error);
+            }
             Ok(())
         }
 
@@ -2469,6 +2481,110 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn missing_executable_rejects_without_reserving_exec_id() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor::default();
+
+        let missing_executable = service.create_process(
+            CreateProcessRequest {
+                exec_id: 70,
+                argv: vec![],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            &mut supervisor,
+        );
+        assert_eq!(
+            missing_executable.unwrap_err().code,
+            ServiceErrorCode::InvalidInput
+        );
+        assert_eq!(service.active_exec_id(), None);
+        assert!(service.pump_supervisor(&mut supervisor).unwrap().is_empty());
+
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 70,
+                    argv: vec!["/bin/echo".to_string(), "ok".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn spawn_failure_rolls_back_exec_state_and_allows_retry() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor {
+            fail_next_spawn: Some(ServiceError::new(
+                ServiceErrorCode::Supervisor,
+                "simulated spawn failure: missing executable",
+            )),
+            ..FakeSupervisor::default()
+        };
+
+        let failed_start = service.create_process(
+            CreateProcessRequest {
+                exec_id: 71,
+                argv: vec!["/bin/missing".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            &mut supervisor,
+        );
+        assert_eq!(failed_start.unwrap_err().code, ServiceErrorCode::Supervisor);
+        assert_eq!(service.active_exec_id(), None);
+        assert!(service.pump_supervisor(&mut supervisor).unwrap().is_empty());
+
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 71,
+                    argv: vec!["/bin/echo".to_string(), "retry".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+
+        supervisor.events.push_back(SupervisorEvent::StdoutEof);
+        supervisor.events.push_back(SupervisorEvent::StderrEof);
+        supervisor
+            .events
+            .push_back(SupervisorEvent::DescendantsCleaned);
+        supervisor.events.push_back(SupervisorEvent::Exited(0));
+        let messages = drain_supervisor_messages(&mut service, &mut supervisor);
+        let terminals: Vec<u32> = messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentControlMessage::ExecTerminal { exec_id, .. } => Some(*exec_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminals, vec![71]);
+
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 72,
+                    argv: vec!["/bin/echo".to_string(), "next".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
     }
 
     #[test]
