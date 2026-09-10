@@ -160,6 +160,7 @@ pub enum ServiceErrorCode {
     UnsupportedOperation,
     AuthenticationFailed,
     WorkloadBusy,
+    FatalSession,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,6 +175,10 @@ impl ServiceError {
             code,
             message: message.into(),
         }
+    }
+
+    pub fn is_fatal_session(&self) -> bool {
+        matches!(self.code, ServiceErrorCode::FatalSession)
     }
 }
 
@@ -208,6 +213,7 @@ pub struct MxcControlService {
     authenticated: bool,
     quiesced: bool,
     shutting_down: bool,
+    fatal_session_reason: Option<String>,
     active_exec: Option<ActiveExecution>,
 }
 
@@ -390,6 +396,7 @@ impl MxcControlService {
             authenticated: false,
             quiesced: false,
             shutting_down: false,
+            fatal_session_reason: None,
             active_exec: None,
         }
     }
@@ -514,6 +521,7 @@ impl MxcControlService {
         now_secs: u64,
         network: NetworkStatus,
     ) -> Result<ReadyStatus, ServiceError> {
+        self.require_not_fatal()?;
         if request.service != SERVICE_IDENTITY {
             return Err(ServiceError::new(
                 ServiceErrorCode::UnsupportedOperation,
@@ -570,6 +578,7 @@ impl MxcControlService {
         &mut self,
         request: ConfigureSessionRequest,
     ) -> Result<(), ServiceError> {
+        self.require_not_fatal()?;
         if !self.authenticated {
             return Err(ServiceError::new(
                 ServiceErrorCode::ConfigurationRequired,
@@ -612,6 +621,7 @@ impl MxcControlService {
     }
 
     pub fn wait_ready(&self, request: WaitReadyRequest) -> Result<ReadySnapshot, ServiceError> {
+        self.require_not_fatal()?;
         if !self.authenticated {
             return Err(ServiceError::new(
                 ServiceErrorCode::ConfigurationRequired,
@@ -667,6 +677,7 @@ impl MxcControlService {
     }
 
     pub fn activate_full_lifecycle(&mut self) -> Result<(), ServiceError> {
+        self.require_not_fatal()?;
         if self.operation_slice == OperationSlice::ExecStreamsCancel {
             return Ok(());
         }
@@ -724,6 +735,10 @@ impl MxcControlService {
         let active_snapshot = self.active_exec.clone();
         self.protocol_state.create_exec(request.exec_id)?;
         if let Err(error) = supervisor.spawn(&request) {
+            if error.is_fatal_session() {
+                self.enter_fatal_session(error.message.clone());
+                return Err(error);
+            }
             // Spawn failures are retryable with the same exec id: reserve only after successful
             // supervisor start by rolling protocol/service state back to the pre-create snapshot.
             self.protocol_state = protocol_snapshot;
@@ -1017,6 +1032,7 @@ impl MxcControlService {
     }
 
     fn require_supported_operation(&self, operation: &str) -> Result<(), ServiceError> {
+        self.require_not_fatal()?;
         if self.operation_slice == OperationSlice::Phase0Readiness {
             return self.unsupported_operation(operation);
         }
@@ -1068,6 +1084,21 @@ impl MxcControlService {
             ));
         }
         Ok(())
+    }
+
+    fn require_not_fatal(&self) -> Result<(), ServiceError> {
+        if let Some(reason) = self.fatal_session_reason.as_deref() {
+            return Err(ServiceError::new(
+                ServiceErrorCode::FatalSession,
+                format!("session is in fatal state and no longer admits work: {reason}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn enter_fatal_session(&mut self, reason: String) {
+        self.fatal_session_reason = Some(reason);
+        self.shutting_down = true;
     }
 }
 
@@ -2817,6 +2848,69 @@ mod tests {
                 &mut supervisor,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn fatal_spawn_failure_keeps_session_failed_and_blocks_subsequent_exec() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor {
+            fail_next_spawn: Some(ServiceError::new(
+                ServiceErrorCode::FatalSession,
+                "Supervisor: spawning process: nonblocking setup failed; post-spawn rollback cleanup uncertainty: rollback cleanup actions failed: waiting for spawned child rollback: injected",
+            )),
+            ..FakeSupervisor::default()
+        };
+
+        let failed_start = service.create_process(
+            CreateProcessRequest {
+                exec_id: 73,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 5".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            &mut supervisor,
+        );
+        let error = failed_start.expect_err("fatal spawn must fail");
+        assert_eq!(error.code, ServiceErrorCode::FatalSession);
+        assert!(
+            error
+                .message
+                .contains("post-spawn rollback cleanup uncertainty")
+        );
+        assert_eq!(service.active_exec_id(), None);
+        assert!(
+            service.health().shutting_down,
+            "fatal spawn must move service into explicit failed/shutdown state"
+        );
+
+        let retry_same = service.create_process(
+            CreateProcessRequest {
+                exec_id: 73,
+                argv: vec!["/bin/echo".to_string(), "retry".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            &mut supervisor,
+        );
+        assert_eq!(retry_same.unwrap_err().code, ServiceErrorCode::FatalSession);
+
+        let retry_new = service.create_process(
+            CreateProcessRequest {
+                exec_id: 74,
+                argv: vec!["/bin/echo".to_string(), "next".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            &mut supervisor,
+        );
+        assert_eq!(retry_new.unwrap_err().code, ServiceErrorCode::FatalSession);
     }
 
     #[test]

@@ -60,6 +60,7 @@ pub fn run_runtime() -> Result<()> {
     let mut pending_outbound = VecDeque::new();
     let mut shutdown_requested = false;
     let mut shutdown_cleanup_started = false;
+    let mut fatal_session_reason: Option<String> = None;
 
     loop {
         let file = open_hvc1_raw_nonblocking(HVC1_DEVICE_PATH)?;
@@ -83,6 +84,17 @@ pub fn run_runtime() -> Result<()> {
                 .map_err(|error| AgentError::internal(error.to_string()))?
             {}
 
+            if let Some(reason) = fatal_session_reason.as_deref()
+                && pending_outbound.is_empty()
+                && !channel.has_queued_writes()
+            {
+                let reason = AgentError::fail_closed(format!(
+                    "fatal session protocol error requires runtime stop: {reason}"
+                ));
+                fail_closed_cleanup_and_stop(&mut service, &mut supervisor, &reason);
+                return Ok(());
+            }
+
             if shutdown_requested && !shutdown_cleanup_started {
                 if let Some(exec_id) = service.active_exec_id() {
                     supervisor
@@ -105,6 +117,11 @@ pub fn run_runtime() -> Result<()> {
 
             if service.active_exec_id().is_none() {
                 isolation::reap_all_children();
+            }
+
+            if fatal_session_reason.is_some() {
+                thread::sleep(LOOP_SLEEP);
+                continue;
             }
 
             match channel
@@ -149,7 +166,18 @@ pub fn run_runtime() -> Result<()> {
                         }
                         Err(error) => return Err(error),
                     };
-                    for message in outbound {
+                    if outbound.fatal_session && fatal_session_reason.is_none() {
+                        fatal_session_reason =
+                            outbound.messages.iter().find_map(|message| match message {
+                                AgentControlMessage::Error(detail)
+                                    if detail.code == ProtocolErrorCode::FatalSession =>
+                                {
+                                    Some(detail.message.clone())
+                                }
+                                _ => None,
+                            });
+                    }
+                    for message in outbound.messages {
                         if matches!(message, AgentControlMessage::ShuttingDown) {
                             shutdown_requested = true;
                         }
@@ -169,20 +197,26 @@ fn handle_host_record<S: ProcessSupervisor>(
     active_timeout: &mut Option<(u32, Instant)>,
     isolation_holder_pid: libc::pid_t,
     record: agent_protocol::InnerRecord,
-) -> Result<Vec<AgentControlMessage>> {
+) -> Result<HostRecordOutcome> {
     if record.kind != agent_protocol::InnerRecordKind::Control {
-        return Ok(vec![AgentControlMessage::Error(ProtocolErrorDetail {
-            code: ProtocolErrorCode::InvalidLifecycleTransition,
-            message: "non-control record on control channel".to_string(),
-        })]);
+        return Ok(HostRecordOutcome {
+            messages: vec![AgentControlMessage::Error(ProtocolErrorDetail {
+                code: ProtocolErrorCode::InvalidLifecycleTransition,
+                message: "non-control record on control channel".to_string(),
+            })],
+            fatal_session: false,
+        });
     }
     let host_message: HostControlMessage = match serde_json::from_slice(&record.payload) {
         Ok(message) => message,
         Err(error) => {
-            return Ok(vec![AgentControlMessage::Error(ProtocolErrorDetail {
-                code: ProtocolErrorCode::InvalidLifecycleTransition,
-                message: format!("invalid host control payload: {error}"),
-            })]);
+            return Ok(HostRecordOutcome {
+                messages: vec![AgentControlMessage::Error(ProtocolErrorDetail {
+                    code: ProtocolErrorCode::InvalidLifecycleTransition,
+                    message: format!("invalid host control payload: {error}"),
+                })],
+                fatal_session: false,
+            });
         }
     };
     match handle_host_message(
@@ -194,18 +228,29 @@ fn handle_host_record<S: ProcessSupervisor>(
         isolation_holder_pid,
         host_message,
     ) {
-        Ok(messages) => Ok(messages),
-        Err(HostDispatchError::Service(error)) => Ok(vec![AgentControlMessage::Error(
-            protocol_error_from_service(error),
-        )]),
+        Ok(messages) => Ok(HostRecordOutcome {
+            messages,
+            fatal_session: false,
+        }),
+        Err(HostDispatchError::Service(error)) => {
+            let detail = protocol_error_from_service(error);
+            let fatal_session = detail.code == ProtocolErrorCode::FatalSession;
+            Ok(HostRecordOutcome {
+                messages: vec![AgentControlMessage::Error(detail)],
+                fatal_session,
+            })
+        }
         Err(HostDispatchError::Agent(error)) => {
             if error.requires_fail_closed_action() {
                 return Err(error);
             }
-            Ok(vec![AgentControlMessage::Error(ProtocolErrorDetail {
-                code: ProtocolErrorCode::InvalidLifecycleTransition,
-                message: error.to_string(),
-            })])
+            Ok(HostRecordOutcome {
+                messages: vec![AgentControlMessage::Error(ProtocolErrorDetail {
+                    code: ProtocolErrorCode::InvalidLifecycleTransition,
+                    message: error.to_string(),
+                })],
+                fatal_session: false,
+            })
         }
     }
 }
@@ -245,6 +290,7 @@ fn protocol_error_from_service(error: ServiceError) -> ProtocolErrorDetail {
         }
         ServiceErrorCode::UnsupportedOperation => ProtocolErrorCode::UnsupportedOperation,
         ServiceErrorCode::WorkloadBusy => ProtocolErrorCode::ActiveExecExists,
+        ServiceErrorCode::FatalSession => ProtocolErrorCode::FatalSession,
         _ => ProtocolErrorCode::InvalidLifecycleTransition,
     };
     ProtocolErrorDetail {
@@ -545,6 +591,11 @@ fn assert_conservative_openvmm_overhead() -> Result<()> {
 struct LaunchRuntimeConfig {
     binding: LaunchBinding,
     expected_capability: [u8; 32],
+}
+
+struct HostRecordOutcome {
+    messages: Vec<AgentControlMessage>,
+    fatal_session: bool,
 }
 
 fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
@@ -980,8 +1031,8 @@ mod tests {
         AccessMode, AuthenticateChannelRequest, CanonicalHostMappingRoot, ConfigureSessionRequest,
         CreateProcessRequest, FlowCreditRequest, HealthStatus, HostControlMessage, InnerRecord,
         LaunchBinding, LaunchIdentity, MappingContainmentPolicy, NetworkMode, NetworkStatus,
-        ProcessSupervisor, ProtocolErrorCode, SERVICE_IDENTITY, SessionConfiguration, StreamName,
-        SupervisorEvent, SymlinkContainmentPolicy,
+        ProcessSupervisor, ProtocolErrorCode, SERVICE_IDENTITY, ServiceError, ServiceErrorCode,
+        SessionConfiguration, StreamName, SupervisorEvent, SymlinkContainmentPolicy,
     };
     use std::cell::RefCell;
     use std::io::{self, Cursor, Read, Write};
@@ -1040,6 +1091,7 @@ mod tests {
         terminate_calls: usize,
         kill_calls: usize,
         cleanup_for_disconnect_calls: usize,
+        fail_next_spawn: Option<ServiceError>,
     }
 
     impl ProcessSupervisor for RuntimeTestSupervisor {
@@ -1047,6 +1099,9 @@ mod tests {
             &mut self,
             request: &CreateProcessRequest,
         ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            if let Some(error) = self.fail_next_spawn.take() {
+                return Err(error);
+            }
             self.exec_id = Some(request.exec_id);
             self.spawn_calls = self.spawn_calls.saturating_add(1);
             Ok(())
@@ -1667,9 +1722,10 @@ mod tests {
                 control_record(&operation),
             )
             .expect("dispatch");
-            assert_eq!(outbound.len(), 1);
+            assert!(!outbound.fatal_session);
+            assert_eq!(outbound.messages.len(), 1);
             assert!(matches!(
-                &outbound[0],
+                &outbound.messages[0],
                 AgentControlMessage::Error(ProtocolErrorDetail {
                     code: ProtocolErrorCode::UnsupportedOperation,
                     ..
@@ -1681,5 +1737,64 @@ mod tests {
             assert!(active_timeout.is_none());
             assert_eq!(supervisor, baseline_supervisor);
         }
+    }
+
+    #[test]
+    fn create_process_fatal_session_error_maps_to_typed_protocol_error_and_stop_signal() {
+        let binding = runtime_test_binding();
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+        let mut supervisor = RuntimeTestSupervisor {
+            fail_next_spawn: Some(ServiceError {
+                code: ServiceErrorCode::FatalSession,
+                message: "Supervisor: spawning process: post-spawn rollback cleanup uncertainty: rollback cleanup actions failed: waiting for spawned child rollback: injected".to_string(),
+            }),
+            ..RuntimeTestSupervisor::default()
+        };
+        let mut pending_hello = None;
+        let mut active_timeout = None;
+
+        let outbound = handle_host_record(
+            &binding,
+            &mut service,
+            &mut supervisor,
+            &mut pending_hello,
+            &mut active_timeout,
+            4242,
+            control_record(&HostControlMessage::CreateProcess {
+                exec_id: 89,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 1".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            }),
+        )
+        .expect("dispatch");
+
+        assert!(outbound.fatal_session);
+        assert!(matches!(
+            outbound.messages.as_slice(),
+            [AgentControlMessage::Error(ProtocolErrorDetail {
+                code: ProtocolErrorCode::FatalSession,
+                ..
+            })]
+        ));
+        let blocked = service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 90,
+                    argv: vec!["/bin/echo".to_string(), "blocked".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .expect_err("fatal service state must block further executions");
+        assert_eq!(blocked.code, ServiceErrorCode::FatalSession);
     }
 }

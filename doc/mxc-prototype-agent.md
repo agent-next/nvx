@@ -42,6 +42,10 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   and graceful shutdown all execute with fail-closed behavior.
 - Quiesce/resume now drives cgroup freezer state (`cgroup.freeze` +
   `cgroup.events:frozen`) with bounded waits and fail-closed transitions.
+- Post-spawn rollback now distinguishes successful cleanup (retryable spawn
+  failure) from cleanup-uncertain rollback failures. Cleanup uncertainty is
+  promoted to a typed fatal-session protocol error and PID1 stops accepting
+  further work before fail-closed shutdown.
 
 ## Scope notes
 

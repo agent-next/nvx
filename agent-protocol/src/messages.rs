@@ -311,6 +311,7 @@ pub enum ProtocolErrorCode {
     IsolationContractViolation,
     MissingTerminalPrerequisites,
     ChannelAuthenticationRequired,
+    FatalSession,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

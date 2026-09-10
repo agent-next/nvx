@@ -47,6 +47,14 @@ thread_local! {
 thread_local! {
     static LAST_SPAWNED_PID: Cell<i32> = const { Cell::new(0) };
 }
+#[cfg(test)]
+thread_local! {
+    static ROLLBACK_CHILD_KILL_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+}
+#[cfg(test)]
+thread_local! {
+    static ROLLBACK_CHILD_WAIT_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+}
 
 pub struct LinuxProcessSupervisor {
     active: Option<ActiveProcess>,
@@ -117,9 +125,9 @@ impl SpawnRollbackGuard {
         match self.cleanup_now() {
             Ok(()) => primary,
             Err(cleanup_error) => ServiceError {
-                code: primary.code,
+                code: ServiceErrorCode::FatalSession,
                 message: format!(
-                    "{primary}; post-spawn rollback failed: {}",
+                    "{primary}; post-spawn rollback cleanup uncertainty: {}",
                     cleanup_error.message
                 ),
             },
@@ -146,8 +154,18 @@ impl SpawnRollbackGuard {
             }
         }
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            if let Err(error) = child.wait() {
+            let kill_injected = rollback_child_kill_failpoint_now();
+            if kill_injected {
+                failures
+                    .push("signaling spawned child rollback: injected kill failure".to_string());
+            } else if let Err(error) = child.kill() {
+                failures.push(supervisor_io("signaling spawned child rollback", error).message);
+            }
+            let wait_injected = rollback_child_wait_failpoint_now();
+            if wait_injected {
+                failures
+                    .push("waiting for spawned child rollback: injected wait failure".to_string());
+            } else if let Err(error) = child.wait() {
                 failures.push(supervisor_io("waiting for spawned child rollback", error).message);
             }
         }
@@ -166,6 +184,38 @@ impl SpawnRollbackGuard {
             )))
         }
     }
+}
+
+#[cfg(test)]
+fn rollback_child_kill_failpoint_now() -> bool {
+    ROLLBACK_CHILD_KILL_FAILPOINT.with(|flag| {
+        let current = flag.get();
+        if current {
+            flag.set(false);
+        }
+        current
+    })
+}
+
+#[cfg(not(test))]
+fn rollback_child_kill_failpoint_now() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn rollback_child_wait_failpoint_now() -> bool {
+    ROLLBACK_CHILD_WAIT_FAILPOINT.with(|flag| {
+        let current = flag.get();
+        if current {
+            flag.set(false);
+        }
+        current
+    })
+}
+
+#[cfg(not(test))]
+fn rollback_child_wait_failpoint_now() -> bool {
+    false
 }
 
 impl PreparedExecCgroup {
@@ -1429,6 +1479,8 @@ mod tests {
             REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(0));
             SET_NONBLOCKING_FAIL_CALL.with(|fail_call| fail_call.set(0));
             LAST_SPAWNED_PID.with(|pid| pid.set(0));
+            ROLLBACK_CHILD_KILL_FAILPOINT.with(|flag| flag.set(false));
+            ROLLBACK_CHILD_WAIT_FAILPOINT.with(|flag| flag.set(false));
             Self
         }
     }
@@ -1439,6 +1491,8 @@ mod tests {
             REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(0));
             SET_NONBLOCKING_FAIL_CALL.with(|fail_call| fail_call.set(0));
             LAST_SPAWNED_PID.with(|pid| pid.set(0));
+            ROLLBACK_CHILD_KILL_FAILPOINT.with(|flag| flag.set(false));
+            ROLLBACK_CHILD_WAIT_FAILPOINT.with(|flag| flag.set(false));
         }
     }
 
@@ -1507,6 +1561,22 @@ mod tests {
             .arg(script)
             .spawn()
             .expect("spawn signaled child")
+    }
+
+    fn assert_pid_eventually_absent(pid: i32, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            // SAFETY: kill with signal 0 probes whether pid exists and is accessible.
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc != 0 {
+                let os_error = io::Error::last_os_error();
+                if os_error.raw_os_error() == Some(libc::ESRCH) {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("rolled-back spawned child pid {pid} still appears alive");
     }
 
     fn eof_holder_status_pipe() -> fs::File {
@@ -1863,6 +1933,11 @@ mod tests {
             timeout_ms: None,
         });
         let error = spawn_result.expect_err("nonblocking setup failure must rollback");
+        assert_eq!(
+            error.code,
+            ServiceErrorCode::Supervisor,
+            "successful rollback must remain a retryable supervisor spawn error"
+        );
         assert!(
             error
                 .message
@@ -1876,20 +1951,118 @@ mod tests {
         );
         let spawned_pid = LAST_SPAWNED_PID.with(|pid| pid.get());
         assert!(spawned_pid > 0, "spawned pid must be captured");
+        assert_pid_eventually_absent(spawned_pid, Duration::from_secs(2));
+    }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            // SAFETY: kill with signal 0 probes whether pid exists and is accessible.
-            let rc = unsafe { libc::kill(spawned_pid, 0) };
-            if rc != 0 {
-                let os_error = io::Error::last_os_error();
-                if os_error.raw_os_error() == Some(libc::ESRCH) {
-                    return;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("rolled-back spawned child pid {spawned_pid} still appears alive");
+    #[test]
+    fn rollback_wait_failure_is_fatal_and_preserves_cleanup_context() {
+        let _scope = TestFailpointScope::new();
+        SET_NONBLOCKING_FAIL_CALL.with(|fail_call| fail_call.set(1));
+        ROLLBACK_CHILD_WAIT_FAILPOINT.with(|flag| flag.set(true));
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let spawn_result = supervisor.spawn(&CreateProcessRequest {
+            exec_id: 708,
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 5".to_string(),
+            ],
+            cwd: Some("/".to_string()),
+            env: vec![],
+            timeout_ms: None,
+        });
+        let error = spawn_result.expect_err("rollback wait failure must fail closed");
+        assert_eq!(error.code, ServiceErrorCode::FatalSession);
+        assert!(
+            error
+                .message
+                .contains("injected failure setting descriptor nonblocking mode"),
+            "primary setup failure context must be preserved: {}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("post-spawn rollback cleanup uncertainty"),
+            "cleanup uncertainty marker must be present: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("injected wait failure"),
+            "cleanup failure context must include wait failure: {}",
+            error.message
+        );
+        assert!(
+            supervisor.active.is_none(),
+            "active process state must be cleared"
+        );
+    }
+
+    #[test]
+    fn rollback_cgroup_removal_failure_is_fatal_and_preserves_cleanup_context() {
+        let _scope = TestFailpointScope::new();
+        let temp = tempdir().expect("tempdir");
+        let holder_root = temp.path().join("nvx.workload");
+        let exec_dir = holder_root.join("exec-709");
+        fs::create_dir_all(&exec_dir).expect("exec cgroup dir");
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .spawn()
+            .expect("spawn child");
+        let spawned_pid = child.id() as i32;
+        let mut guard =
+            SpawnRollbackGuard::new(child, Some(exec_dir.clone()), Some(holder_root.clone()));
+        REMOVE_CGROUP_FAIL_COUNTDOWN.with(|countdown| countdown.set(1));
+        let error = guard.rollback_error(supervisor_error(
+            "injected post-spawn setup failure requiring rollback",
+        ));
+        assert_eq!(error.code, ServiceErrorCode::FatalSession);
+        assert!(
+            error
+                .message
+                .contains("injected post-spawn setup failure requiring rollback")
+        );
+        assert!(
+            error.message.contains("removing per-exec cgroup directory"),
+            "cleanup failure context must include cgroup removal: {}",
+            error.message
+        );
+        assert_pid_eventually_absent(spawned_pid, Duration::from_secs(2));
+        assert!(
+            exec_dir.exists(),
+            "failed rollback must leave per-exec cgroup for diagnostics"
+        );
+    }
+
+    #[test]
+    fn holder_backed_post_spawn_rollback_kills_child_and_removes_exec_cgroup() {
+        let _scope = TestFailpointScope::new();
+        let temp = tempdir().expect("tempdir");
+        let holder_root = temp.path().join("nvx.workload");
+        let exec_dir = holder_root.join("exec-990");
+        fs::create_dir_all(&exec_dir).expect("exec cgroup dir");
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .spawn()
+            .expect("spawn child");
+        let spawned_pid = child.id() as i32;
+        let mut guard =
+            SpawnRollbackGuard::new(child, Some(exec_dir.clone()), Some(holder_root.clone()));
+        let error = guard.rollback_error(supervisor_error(
+            "injected post-spawn setup failure requiring rollback",
+        ));
+        assert_eq!(
+            error.code,
+            ServiceErrorCode::Supervisor,
+            "successful holder rollback must remain retryable"
+        );
+        assert_pid_eventually_absent(spawned_pid, Duration::from_secs(2));
+        assert!(
+            !exec_dir.exists(),
+            "holder rollback must remove the per-exec cgroup directory"
+        );
     }
 
     #[test]
