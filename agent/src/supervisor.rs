@@ -736,8 +736,15 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
         active.event_queue.clear();
         active.event_queue_bytes = 0;
         active.stdin = None;
-        send_terminate(active)?;
         let start = Instant::now();
+        if start >= absolute_deadline {
+            return Err(ServiceError {
+                code: ServiceErrorCode::CleanupTimeout,
+                message: format!(
+                    "disconnect cleanup deadline already expired before SIGTERM (exec_id={exec_id})"
+                ),
+            });
+        }
         let disconnect_budget = absolute_deadline.saturating_duration_since(start);
         let (term_grace_budget, post_kill_budget) = partition_disconnect_budget(disconnect_budget);
         let deadline_at = absolute_deadline;
@@ -746,8 +753,25 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             .checked_add(term_grace_budget)
             .unwrap_or(deadline_at)
             .min(kill_phase_deadline);
+        if Instant::now() >= absolute_deadline {
+            return Err(ServiceError {
+                code: ServiceErrorCode::CleanupTimeout,
+                message: format!(
+                    "disconnect cleanup deadline expired before SIGTERM dispatch (exec_id={exec_id})"
+                ),
+            });
+        }
+        send_terminate(active)?;
 
         while Instant::now() < term_phase_deadline {
+            if Instant::now() >= absolute_deadline {
+                return Err(ServiceError {
+                    code: ServiceErrorCode::CleanupTimeout,
+                    message: format!(
+                        "disconnect cleanup deadline expired before SIGKILL phase (exec_id={exec_id})"
+                    ),
+                });
+            }
             refresh_active_state_for_disconnect(active, holder_root.as_deref())?;
             if active.exit_status_reported
                 && active.descendants_cleaned_reported
@@ -757,10 +781,41 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                 self.active = None;
                 return Ok(true);
             }
-            std::thread::sleep(POLL_SLEEP);
+            let now = Instant::now();
+            let next_deadline = term_phase_deadline.min(absolute_deadline);
+            if now >= next_deadline {
+                break;
+            }
+            std::thread::sleep((next_deadline - now).min(POLL_SLEEP));
+        }
+        let now = Instant::now();
+        if now >= absolute_deadline {
+            return Err(ServiceError {
+                code: ServiceErrorCode::CleanupTimeout,
+                message: format!(
+                    "disconnect cleanup deadline expired before SIGKILL dispatch (exec_id={exec_id})"
+                ),
+            });
+        }
+        let remaining_after_term = absolute_deadline.saturating_duration_since(now);
+        if remaining_after_term < post_kill_budget {
+            return Err(ServiceError {
+                code: ServiceErrorCode::CleanupTimeout,
+                message: format!(
+                    "disconnect cleanup cannot reserve post-SIGKILL verification budget (exec_id={exec_id}, remaining={remaining_after_term:?}, required={post_kill_budget:?})"
+                ),
+            });
         }
         send_kill(active)?;
         while Instant::now() < deadline_at {
+            if Instant::now() >= absolute_deadline {
+                return Err(ServiceError {
+                    code: ServiceErrorCode::CleanupTimeout,
+                    message: format!(
+                        "disconnect cleanup deadline expired during post-SIGKILL verification (exec_id={exec_id})"
+                    ),
+                });
+            }
             refresh_active_state_for_disconnect(active, holder_root.as_deref())?;
             if active.exit_status_reported
                 && active.descendants_cleaned_reported
@@ -770,9 +825,18 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                 self.active = None;
                 return Ok(true);
             }
-            std::thread::sleep(POLL_SLEEP);
+            let now = Instant::now();
+            if now >= deadline_at {
+                break;
+            }
+            std::thread::sleep((deadline_at - now).min(POLL_SLEEP));
         }
-        Ok(false)
+        Err(ServiceError {
+            code: ServiceErrorCode::CleanupTimeout,
+            message: format!(
+                "disconnect cleanup exceeded absolute deadline after SIGKILL verification (exec_id={exec_id})"
+            ),
+        })
     }
 }
 
@@ -2073,6 +2137,69 @@ mod tests {
         assert_eq!(supervisor.queue_usage().event_queue_records, 0);
         assert_eq!(supervisor.queue_usage().event_queue_bytes, 0);
         assert!(supervisor.active.is_none());
+    }
+
+    #[test]
+    fn disconnect_cleanup_deadline_already_expired_fails_before_signals() {
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let exec_id = 92_u32;
+        supervisor
+            .spawn(&CreateProcessRequest {
+                exec_id,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 30".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .expect("spawn");
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap_or_else(Instant::now);
+        let error = supervisor
+            .cleanup_for_disconnect(exec_id, deadline)
+            .expect_err("expired deadline must fail immediately");
+        assert_eq!(error.code, ServiceErrorCode::CleanupTimeout);
+        let active = supervisor.active.as_ref().expect("active process retained");
+        assert!(active.terminate_sent_at.is_none(), "must not send SIGTERM");
+        assert!(!active.kill_sent, "must not send SIGKILL");
+        cleanup_active_exec(&mut supervisor, exec_id);
+    }
+
+    #[test]
+    fn disconnect_cleanup_very_short_deadline_stays_within_budget_tolerance() {
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let exec_id = 93_u32;
+        supervisor
+            .spawn(&CreateProcessRequest {
+                exec_id,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "trap '' TERM; sleep 30".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .expect("spawn");
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(1))
+            .unwrap_or(started);
+        let error = supervisor
+            .cleanup_for_disconnect(exec_id, deadline)
+            .expect_err("very short deadline must fail closed");
+        let elapsed = started.elapsed();
+        assert_eq!(error.code, ServiceErrorCode::CleanupTimeout);
+        assert!(
+            elapsed <= Duration::from_millis(250),
+            "disconnect cleanup must not sleep past a very short deadline (elapsed={elapsed:?})"
+        );
+        cleanup_active_exec(&mut supervisor, exec_id);
     }
 
     #[test]

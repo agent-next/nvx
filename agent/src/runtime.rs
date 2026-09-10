@@ -52,6 +52,8 @@ const FATAL_SESSION_DELIVERY_DEADLINE: Duration = Duration::from_millis(250);
 static SIGCHLD_PENDING: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static SYNC_HELPER_BLOCK_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static SYNC_HELPER_UNREAPABLE_AFTER_KILL: AtomicBool = AtomicBool::new(false);
 
 pub fn run_runtime() -> Result<()> {
     assert_conservative_openvmm_overhead()?;
@@ -111,6 +113,12 @@ pub fn run_runtime() -> Result<()> {
                     Instant::now(),
                 )
             {
+                if let Some(graceful) = graceful_shutdown.as_ref() {
+                    log_unreaped_sync_helpers_fatal_context(
+                        &graceful.pending_sync_helper_pids,
+                        "fatal-session-stop",
+                    );
+                }
                 return Ok(());
             }
 
@@ -131,16 +139,27 @@ pub fn run_runtime() -> Result<()> {
                 && state.cleanup_started
                 && !state.sync_done
             {
+                reap_pending_sync_helpers_nonblocking(&mut state.pending_sync_helper_pids);
                 if Instant::now() >= state.absolute_deadline {
+                    log_unreaped_sync_helpers_fatal_context(
+                        &state.pending_sync_helper_pids,
+                        "graceful-deadline-reached-before-sync",
+                    );
                     return Ok(());
                 }
                 if let Err(error) = bounded_sync_writable_mappings_until_deadline(
                     state.absolute_deadline,
                     &state.writable_mapping_paths,
+                    &mut state.pending_sync_helper_pids,
                 ) {
                     eprintln!("NVX-AGENT-FAIL-CLOSED-SYNC: {error}");
                 }
+                reap_pending_sync_helpers_nonblocking(&mut state.pending_sync_helper_pids);
                 state.sync_done = true;
+            }
+
+            if let Some(state) = graceful_shutdown.as_mut() {
+                reap_pending_sync_helpers_nonblocking(&mut state.pending_sync_helper_pids);
             }
 
             if should_complete_shutdown(
@@ -150,6 +169,12 @@ pub fn run_runtime() -> Result<()> {
                 channel.has_queued_writes(),
                 Instant::now(),
             ) {
+                if let Some(graceful) = graceful_shutdown.as_ref() {
+                    log_unreaped_sync_helpers_fatal_context(
+                        &graceful.pending_sync_helper_pids,
+                        "graceful-stop",
+                    );
+                }
                 return Ok(());
             }
 
@@ -202,6 +227,12 @@ pub fn run_runtime() -> Result<()> {
                         Ok(messages) => messages,
                         Err(error) if error.requires_fail_closed_action() => {
                             fail_closed_cleanup_and_stop(&mut service, &mut supervisor, &error);
+                            if let Some(graceful) = graceful_shutdown.as_ref() {
+                                log_unreaped_sync_helpers_fatal_context(
+                                    &graceful.pending_sync_helper_pids,
+                                    "fail-closed-cleanup-stop",
+                                );
+                            }
                             return Ok(());
                         }
                         Err(error) => return Err(error),
@@ -235,6 +266,7 @@ pub fn run_runtime() -> Result<()> {
                                 .cloned()
                                 .map(std::path::PathBuf::from)
                                 .collect(),
+                            pending_sync_helper_pids: Vec::new(),
                         });
                     }
                     for message in outbound.messages {
@@ -1131,11 +1163,13 @@ struct GracefulShutdownState {
     cleanup_started: bool,
     sync_done: bool,
     writable_mapping_paths: Vec<PathBuf>,
+    pending_sync_helper_pids: Vec<libc::pid_t>,
 }
 
 fn bounded_sync_writable_mappings_until_deadline(
     absolute_deadline: Instant,
     writable_mapping_paths: &[PathBuf],
+    pending_sync_helper_pids: &mut Vec<libc::pid_t>,
 ) -> Result<()> {
     if writable_mapping_paths.is_empty() {
         return Ok(());
@@ -1158,34 +1192,46 @@ fn bounded_sync_writable_mappings_until_deadline(
         // SAFETY: child exits immediately without unwinding parent state.
         unsafe { libc::_exit(code) };
     }
+    if process_is_in_workload_cgroup(helper_pid)? {
+        let _ = unsafe { libc::kill(helper_pid, libc::SIGKILL) };
+        let _ = try_reap_child_nonblocking(helper_pid);
+        return Err(AgentError::fail_closed(format!(
+            "mapping sync helper pid={helper_pid} resolved to workload cgroup; refusing helper/workload identity ambiguity"
+        )));
+    }
     loop {
-        let mut status = 0;
-        // SAFETY: helper_pid is a live child or already exited.
-        let wait_rc = unsafe { libc::waitpid(helper_pid, &mut status, libc::WNOHANG) };
-        if wait_rc == helper_pid {
+        if let Some(status) = try_reap_child_nonblocking(helper_pid)? {
             if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
                 return Ok(());
             }
             return Err(AgentError::fail_closed(format!(
-                "mapping sync helper failed (status={status})"
+                "mapping sync helper failed (status={status}, pid={helper_pid})"
             )));
-        }
-        if wait_rc < 0 {
-            return Err(AgentError::io(
-                "waiting for mapping sync helper",
-                io::Error::last_os_error(),
-            ));
         }
         if Instant::now() >= absolute_deadline {
             // SAFETY: helper_pid refers to the bounded sync helper child.
             let _ = unsafe { libc::kill(helper_pid, libc::SIGKILL) };
-            // SAFETY: reap the killed helper to avoid orphan/zombie retention.
-            let _ = unsafe { libc::waitpid(helper_pid, &mut status, 0) };
-            return Err(AgentError::fail_closed(
-                "mapping sync helper exceeded shutdown deadline and was killed".to_string(),
-            ));
+            if sync_helper_unreapable_after_kill_failpoint() {
+                pending_sync_helper_pids.push(helper_pid);
+                return Err(AgentError::fail_closed(format!(
+                    "mapping sync helper exceeded shutdown deadline; SIGKILL sent; simulated unreaped helper pid={helper_pid} tracked for later nonblocking reap"
+                )));
+            }
+            if try_reap_child_nonblocking(helper_pid)?.is_none() {
+                pending_sync_helper_pids.push(helper_pid);
+                return Err(AgentError::fail_closed(format!(
+                    "mapping sync helper exceeded shutdown deadline; SIGKILL sent; helper pid={helper_pid} still unreaped and tracked for later nonblocking reap"
+                )));
+            }
+            return Err(AgentError::fail_closed(format!(
+                "mapping sync helper exceeded shutdown deadline and was killed (pid={helper_pid})"
+            )));
         }
-        thread::sleep(LOOP_SLEEP);
+        let now = Instant::now();
+        if now >= absolute_deadline {
+            continue;
+        }
+        thread::sleep((absolute_deadline - now).min(LOOP_SLEEP));
     }
 }
 
@@ -1196,6 +1242,9 @@ fn run_mapping_sync_helper(writable_mapping_paths: &[PathBuf]) -> i32 {
         if block_ms > 0 {
             thread::sleep(Duration::from_millis(block_ms));
         }
+    }
+    if !configure_sync_helper_child_safety() {
+        return 2;
     }
     let mut synced_devices = HashSet::new();
     for path in writable_mapping_paths {
@@ -1236,6 +1285,93 @@ fn run_mapping_sync_helper(writable_mapping_paths: &[PathBuf]) -> i32 {
         let _ = unsafe { libc::close(fd) };
     }
     0
+}
+
+fn configure_sync_helper_child_safety() -> bool {
+    let parent_pid = unsafe { libc::getppid() };
+    // SAFETY: PR_SET_PDEATHSIG is called with a fixed integer signal argument.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+        return false;
+    }
+    // SAFETY: best-effort parent liveness race check after PR_SET_PDEATHSIG.
+    if unsafe { libc::getppid() } != parent_pid {
+        return false;
+    }
+    process_is_in_workload_cgroup_for_self()
+        .map(|is_workload| !is_workload)
+        .unwrap_or(false)
+}
+
+fn process_is_in_workload_cgroup_for_self() -> io::Result<bool> {
+    process_is_in_workload_cgroup_by_path(Path::new("/proc/self/cgroup"))
+}
+
+fn process_is_in_workload_cgroup(pid: libc::pid_t) -> Result<bool> {
+    let path = PathBuf::from(format!("/proc/{pid}/cgroup"));
+    process_is_in_workload_cgroup_by_path(path.as_path())
+        .map_err(|error| AgentError::io(format!("reading helper cgroup for pid {pid}"), error))
+}
+
+fn process_is_in_workload_cgroup_by_path(path: &Path) -> io::Result<bool> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.splitn(3, ':').nth(2))
+        .any(|cgroup_path| cgroup_path.contains("/nvx.workload")))
+}
+
+fn try_reap_child_nonblocking(pid: libc::pid_t) -> io::Result<Option<i32>> {
+    let mut status = 0_i32;
+    // SAFETY: waitpid is called with WNOHANG and a writable status pointer.
+    let wait_rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if wait_rc == pid {
+        return Ok(Some(status));
+    }
+    if wait_rc == 0 {
+        return Ok(None);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ECHILD) {
+        return Ok(Some(0));
+    }
+    Err(error)
+}
+
+fn reap_pending_sync_helpers_nonblocking(pending_sync_helper_pids: &mut Vec<libc::pid_t>) {
+    let mut retained = Vec::with_capacity(pending_sync_helper_pids.len());
+    for pid in pending_sync_helper_pids.drain(..) {
+        match try_reap_child_nonblocking(pid) {
+            Ok(Some(_)) => {}
+            Ok(None) => retained.push(pid),
+            Err(error) => {
+                eprintln!(
+                    "NVX-AGENT-FAIL-CLOSED-SYNC: nonblocking reap of mapping sync helper pid={pid} failed: {error}"
+                );
+                retained.push(pid);
+            }
+        }
+    }
+    *pending_sync_helper_pids = retained;
+}
+
+fn log_unreaped_sync_helpers_fatal_context(pending_sync_helper_pids: &[libc::pid_t], reason: &str) {
+    if pending_sync_helper_pids.is_empty() {
+        return;
+    }
+    eprintln!(
+        "NVX-AGENT-FAIL-CLOSED-SYNC: shutdown context={reason} has unreaped mapping sync helper pid(s) {:?}; fail-closed stop proceeds without blocking waitpid",
+        pending_sync_helper_pids
+    );
+}
+
+#[cfg(test)]
+fn sync_helper_unreapable_after_kill_failpoint() -> bool {
+    SYNC_HELPER_UNREAPABLE_AFTER_KILL.load(Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn sync_helper_unreapable_after_kill_failpoint() -> bool {
+    false
 }
 
 fn start_fatal_shutdown<S: ProcessSupervisor>(
@@ -1283,7 +1419,6 @@ fn should_complete_shutdown(
     shutdown.cleanup_started && now >= shutdown.absolute_deadline
 }
 
-#[cfg(feature = "harness-supervisor")]
 #[allow(dead_code)]
 pub fn harness_should_complete_shutdown_when_writer_blocked(
     active_exec_id: Option<u32>,
@@ -1302,6 +1437,7 @@ pub fn harness_should_complete_shutdown_when_writer_blocked(
         cleanup_started: true,
         sync_done: true,
         writable_mapping_paths: Vec::new(),
+        pending_sync_helper_pids: Vec::new(),
     };
     should_complete_shutdown(Some(&shutdown), active_exec_id, false, true, now)
 }
@@ -2898,12 +3034,19 @@ mod tests {
         let root = std::env::temp_dir().join("nvx-agent-runtime-sync-timeout");
         let _ = std::fs::create_dir_all(&root);
         SYNC_HELPER_BLOCK_MS.store(300, Ordering::SeqCst);
+        SYNC_HELPER_UNREAPABLE_AFTER_KILL.store(false, Ordering::SeqCst);
+        let mut pending_sync_helper_pids = Vec::new();
         let started = Instant::now();
         let deadline = started
             .checked_add(Duration::from_millis(50))
             .unwrap_or(started);
-        let result = bounded_sync_writable_mappings_until_deadline(deadline, &[root]);
+        let result = bounded_sync_writable_mappings_until_deadline(
+            deadline,
+            &[root],
+            &mut pending_sync_helper_pids,
+        );
         SYNC_HELPER_BLOCK_MS.store(0, Ordering::SeqCst);
+        reap_pending_sync_helpers_nonblocking(&mut pending_sync_helper_pids);
         assert!(
             result.is_err(),
             "blocked helper must fail closed at deadline"
@@ -2919,12 +3062,19 @@ mod tests {
         let root = std::env::temp_dir().join("nvx-agent-runtime-sync-short");
         let _ = std::fs::create_dir_all(&root);
         SYNC_HELPER_BLOCK_MS.store(200, Ordering::SeqCst);
+        SYNC_HELPER_UNREAPABLE_AFTER_KILL.store(false, Ordering::SeqCst);
+        let mut pending_sync_helper_pids = Vec::new();
         let started = Instant::now();
         let deadline = started
             .checked_add(Duration::from_millis(1))
             .unwrap_or(started);
-        let result = bounded_sync_writable_mappings_until_deadline(deadline, &[root]);
+        let result = bounded_sync_writable_mappings_until_deadline(
+            deadline,
+            &[root],
+            &mut pending_sync_helper_pids,
+        );
         SYNC_HELPER_BLOCK_MS.store(0, Ordering::SeqCst);
+        reap_pending_sync_helpers_nonblocking(&mut pending_sync_helper_pids);
         assert!(
             result.is_err(),
             "very short deadline must fail closed quickly"
@@ -2933,5 +3083,43 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "sync helper wait exceeded very short caller deadline bound",
         );
+    }
+
+    #[test]
+    fn mapping_sync_helper_timeout_tracks_unreaped_helper_without_blocking_pid1() {
+        let root = std::env::temp_dir().join("nvx-agent-runtime-sync-unreapable");
+        let _ = std::fs::create_dir_all(&root);
+        SYNC_HELPER_BLOCK_MS.store(300, Ordering::SeqCst);
+        SYNC_HELPER_UNREAPABLE_AFTER_KILL.store(true, Ordering::SeqCst);
+        let mut pending_sync_helper_pids = Vec::new();
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(20))
+            .unwrap_or(started);
+        let result = bounded_sync_writable_mappings_until_deadline(
+            deadline,
+            &[root],
+            &mut pending_sync_helper_pids,
+        );
+        SYNC_HELPER_UNREAPABLE_AFTER_KILL.store(false, Ordering::SeqCst);
+        SYNC_HELPER_BLOCK_MS.store(0, Ordering::SeqCst);
+        assert!(result.is_err(), "timeout must fail closed");
+        let message = format!(
+            "{}",
+            result.expect_err("sync helper timeout must return error")
+        );
+        assert!(
+            message.contains("tracked"),
+            "must report tracked unreaped helper"
+        );
+        assert!(
+            !pending_sync_helper_pids.is_empty(),
+            "must retain unreaped helper pid for deferred reap"
+        );
+        assert!(
+            started.elapsed() <= Duration::from_millis(400),
+            "deadline path must not block on waitpid after timeout"
+        );
+        reap_pending_sync_helpers_nonblocking(&mut pending_sync_helper_pids);
     }
 }

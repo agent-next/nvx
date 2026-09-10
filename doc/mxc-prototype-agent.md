@@ -56,11 +56,19 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   acknowledgement delivery, and runtime stop; no fixed post-deadline extension
   is applied, and each phase uses the same absolute deadline rooted at request
   receipt.
+- Mapping sync now runs in a disposable helper with parent-death SIGKILL
+  behavior, explicit workload-cgroup exclusion checks, and nonblocking-only
+  reaping on timeout paths. PID1 never performs a blocking `waitpid` after the
+  shutdown deadline; if a helper cannot be reaped in-budget, PID1 logs the
+  unreaped helper PID as fail-closed shutdown context and still proceeds to
+  deadline-bounded stop/poweroff.
 - Disconnect cleanup now uses deterministic TERM→KILL budget partitioning under
   one absolute deadline, always reserves post-KILL verification/drain time, and
   enters bounded output-discard mode on channel loss (clears queued events,
   drains stdout/stderr to EOF under byte/time caps, escalates to KILL on
-  overflow, and fails closed if termination/cleanup cannot be verified).
+  overflow, checks deadline expiry before TERM/KILL and each poll/sleep cycle,
+  and fails closed immediately when budget is exhausted or cleanup state cannot
+  be verified).
 - Harness conformance gating now uses typed per-requirement probe attestations
   plus cryptographic artifact attestation. The harness writes a detached
   `attestation-manifest.json` (schema/version, run id, relative artifact paths,
@@ -69,6 +77,10 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   validation reopens `report.json`, `diagnostics.log`, and the manifest and
   rejects missing/modified/truncated/swapped/path-escaped/manifest-tampered
   artifacts; user-crafted JSON strings cannot satisfy `is_passing_report`.
+  Artifact verification rejects symlinked/reparse components (including
+  junctions where available), opens files without following final links, and
+  verifies canonical containment plus stable file identity under the trusted
+  output directory to fail closed on link-swap races.
 - Runtime `Health` now returns typed session state (`phase0/active/quiesced/
   shutting-down/cleanup-in-progress/fatal-session`), channel generation, active
   exec id, last failure detail, and configured filesystem/network snapshots.

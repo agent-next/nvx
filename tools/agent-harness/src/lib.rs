@@ -3,6 +3,16 @@ use std::fs;
 #[cfg(target_os = "linux")]
 use std::io;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(target_os = "linux")]
@@ -40,6 +50,13 @@ use nvx_agent::runtime::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use windows::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
+};
 
 const REPORT_SCHEMA: &str = "nvx.mxc.agent.harness.report.v1";
 const REPORT_VERSION: u32 = 1;
@@ -2147,13 +2164,190 @@ fn read_artifact_checked(
 ) -> Result<(PathBuf, Vec<u8>), String> {
     let relative = PathBuf::from(relative_path);
     let checked = rel_artifact_path(&relative)?;
-    let full_path = output_dir.join(&checked);
-    let mut file = fs::File::open(&full_path)
-        .map_err(|error| format!("failed to open artifact {}: {error}", full_path.display()))?;
+    let requested_full_path = output_dir.join(&checked);
+    let trusted_output_dir = output_dir.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize trusted output directory {}: {error}",
+            output_dir.display()
+        )
+    })?;
+    let full_path = trusted_output_dir.join(&checked);
+    verify_no_symlink_or_reparse_components(&trusted_output_dir, &relative)?;
+    let full_canonical = full_path.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize artifact path {}: {error}",
+            full_path.display()
+        )
+    })?;
+    if !full_canonical.starts_with(&trusted_output_dir) {
+        return Err(format!(
+            "artifact path escaped trusted output directory: artifact={} trusted={}",
+            full_canonical.display(),
+            trusted_output_dir.display()
+        ));
+    }
+    let mut file = open_artifact_without_following_final_link(&full_path)?;
+    let opened_identity = file_identity(&file)?;
+    let canonical_identity = path_identity(&full_canonical)?;
+    if opened_identity != canonical_identity {
+        return Err(format!(
+            "artifact identity mismatch after open (path={}): possible race or link swap",
+            full_path.display()
+        ));
+    }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|error| format!("failed to read artifact {}: {error}", full_path.display()))?;
-    Ok((full_path, bytes))
+    Ok((requested_full_path, bytes))
+}
+
+fn verify_no_symlink_or_reparse_components(
+    trusted_output_dir: &Path,
+    relative_path: &Path,
+) -> Result<(), String> {
+    let mut current = trusted_output_dir.to_path_buf();
+    for component in relative_path.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        reject_symlink_or_reparse_metadata(&current, trusted_output_dir)?;
+    }
+    Ok(())
+}
+
+fn reject_symlink_or_reparse_metadata(
+    path: &Path,
+    trusted_output_dir: &Path,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "failed to inspect artifact path component {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "artifact path component {} is a symlink, which is forbidden under trusted output directory {}",
+            path.display(),
+            trusted_output_dir.display()
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.file_type().is_socket()
+        || metadata.file_type().is_fifo()
+        || metadata.file_type().is_block_device()
+        || metadata.file_type().is_char_device()
+    {
+        return Err(format!(
+            "artifact path component {} is not a regular file/directory path component",
+            path.display()
+        ));
+    }
+    #[cfg(windows)]
+    {
+        let attributes = metadata.file_attributes();
+        if (attributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0 {
+            return Err(format!(
+                "artifact path component {} is a Windows reparse point, which is forbidden",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn open_artifact_without_following_final_link(path: &Path) -> Result<fs::File, String> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            format!(
+                "artifact path contains interior NUL bytes: {}",
+                path.display()
+            )
+        })?;
+        // SAFETY: c_path is NUL-terminated and flags are constants.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "failed to open artifact {} without following links: {}",
+                path.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: fd is uniquely owned and valid for conversion into File.
+        return Ok(unsafe { fs::File::from_raw_fd(fd) });
+    }
+    #[cfg(windows)]
+    {
+        use std::fs::OpenOptions;
+        return OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(path)
+            .map_err(|error| {
+                format!(
+                    "failed to open artifact {} without following final reparse point: {error}",
+                    path.display()
+                )
+            });
+    }
+    #[allow(unreachable_code)]
+    Err(format!(
+        "artifact path checks are unsupported on this platform: {}",
+        path.display()
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+fn file_identity(file: &fs::File) -> Result<FileIdentity, String> {
+    #[cfg(unix)]
+    {
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("failed to read opened artifact metadata: {error}"))?;
+        return Ok(file_identity_from_metadata(&metadata));
+    }
+    #[cfg(windows)]
+    {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        let handle = HANDLE(file.as_raw_handle());
+        // SAFETY: handle comes from a live File object and `info` points to writable storage.
+        unsafe { GetFileInformationByHandle(handle, &mut info) }
+            .map_err(|error| format!("failed to read opened artifact file identity: {error}"))?;
+        return Ok(FileIdentity {
+            dev: u64::from(info.dwVolumeSerialNumber),
+            ino: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        });
+    }
+    #[allow(unreachable_code)]
+    Err("file identity is unsupported on this platform".to_string())
+}
+
+fn path_identity(path: &Path) -> Result<FileIdentity, String> {
+    let file = open_artifact_without_following_final_link(path)?;
+    file_identity(&file)
+}
+
+#[cfg(unix)]
+fn file_identity_from_metadata(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    }
 }
 
 fn unix_ms_now() -> u128 {
@@ -2931,5 +3125,98 @@ mod tests {
         )
         .expect("write tampered manifest");
         assert!(!is_passing_report(&tampered_manifest));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_reader_rejects_unix_final_symlink_and_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let run = forged_passing_run();
+        assert!(is_passing_report(&run));
+
+        let output_dir = run.report_path.parent().expect("output dir");
+        let outside = output_dir.join("outside-diagnostics.log");
+        let bytes = std::fs::read(&run.diagnostics_path).expect("read diagnostics");
+        std::fs::write(&outside, &bytes).expect("write outside bytes");
+        std::fs::remove_file(&run.diagnostics_path).expect("remove diagnostics");
+        symlink(&outside, &run.diagnostics_path).expect("symlink diagnostics");
+        assert!(
+            !is_passing_report(&run),
+            "final symlink to identical bytes must be rejected"
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "nvx-agent-harness-symlink-component-{}-{}",
+            std::process::id(),
+            unix_ms_now()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("trusted")).expect("trusted dir");
+        std::fs::create_dir_all(root.join("outside")).expect("outside dir");
+        std::fs::write(root.join("outside").join("x.bin"), b"ok").expect("write outside file");
+        symlink(root.join("outside"), root.join("trusted").join("jump")).expect("dir symlink");
+        let error = read_artifact_checked(&root.join("trusted"), "jump/x.bin")
+            .expect_err("component symlink traversal must be rejected");
+        assert!(error.contains("symlink"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn artifact_reader_rejects_windows_reparse_points() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+        use std::process::Command;
+
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let run = forged_passing_run();
+        assert!(is_passing_report(&run));
+        let output_dir = run.report_path.parent().expect("output dir").to_path_buf();
+
+        let outside = output_dir.join("outside-diagnostics.log");
+        let bytes = std::fs::read(&run.diagnostics_path).expect("read diagnostics");
+        std::fs::write(&outside, &bytes).expect("write outside bytes");
+        std::fs::remove_file(&run.diagnostics_path).expect("remove diagnostics");
+        if symlink_file(&outside, &run.diagnostics_path).is_err() {
+            eprintln!("skipping final-link symlink check: no privilege to create symlink");
+        } else {
+            assert!(
+                !is_passing_report(&run),
+                "final file reparse point to identical bytes must be rejected"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "nvx-agent-harness-reparse-component-{}-{}",
+            std::process::id(),
+            unix_ms_now()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("trusted")).expect("trusted dir");
+        std::fs::create_dir_all(root.join("outside")).expect("outside dir");
+        std::fs::write(root.join("outside").join("x.bin"), b"ok").expect("write outside file");
+        let link = root.join("trusted").join("jump");
+        let component_ready = symlink_dir(root.join("outside"), &link).is_ok()
+            || Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &root.join("outside").to_string_lossy(),
+                ])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+        if !component_ready {
+            eprintln!("skipping component reparse-point check: could not create symlink/junction");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let error = read_artifact_checked(&root.join("trusted"), "jump\\x.bin")
+            .expect_err("component reparse traversal must be rejected");
+        assert!(error.contains("reparse") || error.contains("symlink"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
