@@ -890,20 +890,28 @@ impl MxcControlService {
                 "cancel request targets unknown execution",
             ));
         }
+        if let Err(error) = supervisor.close_stdin(exec_id) {
+            if error.is_fatal_session() {
+                self.enter_fatal_session(error.message.clone());
+            }
+            return Err(error);
+        }
+        if let Err(error) = supervisor.terminate(exec_id) {
+            if error.is_fatal_session() {
+                self.enter_fatal_session(error.message.clone());
+            }
+            return Err(error);
+        }
         let disposition = match reason {
-            CancelReason::Cancelled => {
-                active.cancelled = true;
-                ExecDisposition::Cancelled
-            }
-            CancelReason::TimedOut => {
-                active.timed_out = true;
-                ExecDisposition::TimedOut
-            }
+            CancelReason::Cancelled => ExecDisposition::Cancelled,
+            CancelReason::TimedOut => ExecDisposition::TimedOut,
         };
         self.protocol_state
             .apply_exec_event(exec_id, ActiveExecEvent::Disposition(disposition))?;
-        supervisor.close_stdin(exec_id)?;
-        supervisor.terminate(exec_id)?;
+        match reason {
+            CancelReason::Cancelled => active.cancelled = true,
+            CancelReason::TimedOut => active.timed_out = true,
+        }
         Ok(())
     }
 
@@ -2248,6 +2256,8 @@ mod tests {
         events: VecDeque<SupervisorEvent>,
         spawned: Vec<CreateProcessRequest>,
         fail_next_spawn: Option<ServiceError>,
+        fail_next_close_stdin: Option<ServiceError>,
+        fail_next_terminate: Option<ServiceError>,
         stdin: Vec<Vec<u8>>,
         fail_next_stdin_backpressure: bool,
         stdin_closed: bool,
@@ -2281,6 +2291,9 @@ mod tests {
         }
 
         fn close_stdin(&mut self, _exec_id: u32) -> Result<(), ServiceError> {
+            if let Some(error) = self.fail_next_close_stdin.take() {
+                return Err(error);
+            }
             if self.stdin_pending_bytes != 0 {
                 return Err(ServiceError::new(
                     ServiceErrorCode::Backpressure,
@@ -2307,6 +2320,9 @@ mod tests {
         }
 
         fn terminate(&mut self, _exec_id: u32) -> Result<(), ServiceError> {
+            if let Some(error) = self.fail_next_terminate.take() {
+                return Err(error);
+            }
             self.terminated += 1;
             Ok(())
         }
@@ -2856,7 +2872,7 @@ mod tests {
         let mut supervisor = FakeSupervisor {
             fail_next_spawn: Some(ServiceError::new(
                 ServiceErrorCode::FatalSession,
-                "Supervisor: spawning process: nonblocking setup failed; post-spawn rollback cleanup uncertainty: rollback cleanup actions failed: waiting for spawned child rollback: injected",
+                "Supervisor: spawning process: nonblocking setup failed; post-spawn rollback cleanup uncertainty: rollback cleanup actions failed: signaling spawned child rollback: injected kill failure",
             )),
             ..FakeSupervisor::default()
         };
@@ -3099,6 +3115,89 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn timeout_cancel_close_stdin_failure_preserves_nonterminal_state_for_retry() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor {
+            fail_next_close_stdin: Some(ServiceError::new(
+                ServiceErrorCode::Backpressure,
+                "injected stdin close backpressure",
+            )),
+            ..FakeSupervisor::default()
+        };
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 520,
+                    argv: vec!["/bin/sleep".to_string(), "10".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: Some(5),
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+
+        let failed = service.cancel_exec(520, CancelReason::TimedOut, &mut supervisor);
+        assert_eq!(failed.unwrap_err().code, ServiceErrorCode::Backpressure);
+
+        supervisor.events.push_back(SupervisorEvent::StdoutEof);
+        supervisor.events.push_back(SupervisorEvent::StderrEof);
+        supervisor
+            .events
+            .push_back(SupervisorEvent::DescendantsCleaned);
+        supervisor.events.push_back(SupervisorEvent::Signaled(15));
+        let messages = drain_supervisor_messages(&mut service, &mut supervisor);
+        assert!(matches!(
+            messages.last(),
+            Some(AgentControlMessage::ExecTerminal {
+                exec_id: 520,
+                disposition: ExecDisposition::Signaled(15),
+            })
+        ));
+    }
+
+    #[test]
+    fn timeout_cancel_fatal_terminate_failure_sets_fatal_session() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor {
+            fail_next_terminate: Some(ServiceError::new(
+                ServiceErrorCode::FatalSession,
+                "injected termination uncertainty",
+            )),
+            ..FakeSupervisor::default()
+        };
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 521,
+                    argv: vec!["/bin/sleep".to_string(), "10".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: Some(5),
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+
+        let failed = service.cancel_exec(521, CancelReason::TimedOut, &mut supervisor);
+        let error = failed.expect_err("fatal termination failure must fail closed");
+        assert_eq!(error.code, ServiceErrorCode::FatalSession);
+        assert!(service.health().shutting_down);
+
+        let retry = service.create_process(
+            CreateProcessRequest {
+                exec_id: 522,
+                argv: vec!["/bin/echo".to_string(), "blocked".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            &mut supervisor,
+        );
+        assert_eq!(retry.unwrap_err().code, ServiceErrorCode::FatalSession);
     }
 
     #[test]

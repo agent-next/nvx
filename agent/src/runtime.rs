@@ -32,6 +32,9 @@ const DEFAULT_GUEST_MAPPING_ROOT: &str = "/mnt/virtiofs";
 const DEFAULT_WORKLOAD_CGROUP_PATH: &str = "/sys/fs/cgroup/nvx.workload";
 const OUTBOUND_PENDING_LIMIT: usize = 256;
 const FREEZE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Best-effort fatal-session delivery window before fail-closed stop proceeds regardless
+/// of channel backpressure or host read behavior.
+const FATAL_SESSION_DELIVERY_DEADLINE: Duration = Duration::from_millis(250);
 
 static SIGCHLD_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -60,19 +63,20 @@ pub fn run_runtime() -> Result<()> {
     let mut pending_outbound = VecDeque::new();
     let mut shutdown_requested = false;
     let mut shutdown_cleanup_started = false;
-    let mut fatal_session_reason: Option<String> = None;
+    let mut fatal_shutdown: Option<FatalSessionShutdown> = None;
 
     loop {
         let file = open_hvc1_raw_nonblocking(HVC1_DEVICE_PATH)?;
         let mut channel = agent_protocol::HvcFramedChannel::new(file);
 
         loop {
-            if let Some((exec_id, deadline)) = active_timeout
-                && Instant::now() >= deadline
-            {
-                let _ = service.cancel_exec(exec_id, CancelReason::TimedOut, &mut supervisor);
-                active_timeout = None;
-            }
+            enforce_active_timeout(
+                &mut service,
+                &mut supervisor,
+                &mut active_timeout,
+                &mut pending_outbound,
+                &mut fatal_shutdown,
+            )?;
 
             drain_outbound_to_channel(&mut channel, &mut pending_outbound)?;
             pump_supervisor_to_channel_lossless(&mut service, &mut supervisor, &mut channel)?;
@@ -84,14 +88,14 @@ pub fn run_runtime() -> Result<()> {
                 .map_err(|error| AgentError::internal(error.to_string()))?
             {}
 
-            if let Some(reason) = fatal_session_reason.as_deref()
-                && pending_outbound.is_empty()
-                && !channel.has_queued_writes()
+            if let Some(state) = fatal_shutdown.as_ref()
+                && should_stop_after_fatal_delivery(
+                    state,
+                    pending_outbound.is_empty(),
+                    channel.has_queued_writes(),
+                    Instant::now(),
+                )
             {
-                let reason = AgentError::fail_closed(format!(
-                    "fatal session protocol error requires runtime stop: {reason}"
-                ));
-                fail_closed_cleanup_and_stop(&mut service, &mut supervisor, &reason);
                 return Ok(());
             }
 
@@ -119,7 +123,7 @@ pub fn run_runtime() -> Result<()> {
                 isolation::reap_all_children();
             }
 
-            if fatal_session_reason.is_some() {
+            if fatal_shutdown.is_some() {
                 thread::sleep(LOOP_SLEEP);
                 continue;
             }
@@ -166,16 +170,24 @@ pub fn run_runtime() -> Result<()> {
                         }
                         Err(error) => return Err(error),
                     };
-                    if outbound.fatal_session && fatal_session_reason.is_none() {
-                        fatal_session_reason =
-                            outbound.messages.iter().find_map(|message| match message {
-                                AgentControlMessage::Error(detail)
-                                    if detail.code == ProtocolErrorCode::FatalSession =>
-                                {
-                                    Some(detail.message.clone())
-                                }
-                                _ => None,
-                            });
+                    if outbound.fatal_session && fatal_shutdown.is_none() {
+                        let reason = outbound.messages.iter().find_map(|message| match message {
+                            AgentControlMessage::Error(detail)
+                                if detail.code == ProtocolErrorCode::FatalSession =>
+                            {
+                                Some(detail.message.clone())
+                            }
+                            _ => None,
+                        });
+                        if let Some(reason) = reason {
+                            start_fatal_shutdown(
+                                &mut service,
+                                &mut supervisor,
+                                &mut fatal_shutdown,
+                                reason,
+                                Instant::now(),
+                            );
+                        }
                     }
                     for message in outbound.messages {
                         if matches!(message, AgentControlMessage::ShuttingDown) {
@@ -596,6 +608,71 @@ struct LaunchRuntimeConfig {
 struct HostRecordOutcome {
     messages: Vec<AgentControlMessage>,
     fatal_session: bool,
+}
+
+struct FatalSessionShutdown {
+    delivery_deadline: Instant,
+}
+
+fn start_fatal_shutdown<S: ProcessSupervisor>(
+    service: &mut MxcControlService,
+    supervisor: &mut S,
+    shutdown: &mut Option<FatalSessionShutdown>,
+    reason: String,
+    now: Instant,
+) {
+    if shutdown.is_some() {
+        return;
+    }
+    let fail_closed = AgentError::fail_closed(format!(
+        "fatal session protocol error requires runtime stop: {reason}"
+    ));
+    fail_closed_cleanup_and_stop(service, supervisor, &fail_closed);
+    let delivery_deadline = now
+        .checked_add(FATAL_SESSION_DELIVERY_DEADLINE)
+        .unwrap_or(now);
+    *shutdown = Some(FatalSessionShutdown { delivery_deadline });
+}
+
+fn should_stop_after_fatal_delivery(
+    shutdown: &FatalSessionShutdown,
+    pending_outbound_empty: bool,
+    has_queued_writes: bool,
+    now: Instant,
+) -> bool {
+    (pending_outbound_empty && !has_queued_writes) || now >= shutdown.delivery_deadline
+}
+
+fn enforce_active_timeout<S: ProcessSupervisor>(
+    service: &mut MxcControlService,
+    supervisor: &mut S,
+    active_timeout: &mut Option<(u32, Instant)>,
+    pending_outbound: &mut VecDeque<AgentControlMessage>,
+    fatal_shutdown: &mut Option<FatalSessionShutdown>,
+) -> Result<()> {
+    let Some((exec_id, deadline)) = *active_timeout else {
+        return Ok(());
+    };
+    if Instant::now() < deadline {
+        return Ok(());
+    }
+    match service.cancel_exec(exec_id, CancelReason::TimedOut, supervisor) {
+        Ok(()) => {
+            *active_timeout = None;
+            Ok(())
+        }
+        Err(error) if error.code == ServiceErrorCode::FatalSession => {
+            let detail = protocol_error_from_service(error);
+            let reason = detail.message.clone();
+            enqueue_outbound(pending_outbound, AgentControlMessage::Error(detail))?;
+            start_fatal_shutdown(service, supervisor, fatal_shutdown, reason, Instant::now());
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("NVX-AGENT-TIMEOUT-RETRY: {error}");
+            Ok(())
+        }
+    }
 }
 
 fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
@@ -1092,6 +1169,8 @@ mod tests {
         kill_calls: usize,
         cleanup_for_disconnect_calls: usize,
         fail_next_spawn: Option<ServiceError>,
+        fail_next_close_stdin: Option<ServiceError>,
+        fail_next_terminate: Option<ServiceError>,
     }
 
     impl ProcessSupervisor for RuntimeTestSupervisor {
@@ -1120,6 +1199,9 @@ mod tests {
             &mut self,
             _exec_id: u32,
         ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            if let Some(error) = self.fail_next_close_stdin.take() {
+                return Err(error);
+            }
             self.close_stdin_calls = self.close_stdin_calls.saturating_add(1);
             Ok(())
         }
@@ -1154,6 +1236,9 @@ mod tests {
             &mut self,
             _exec_id: u32,
         ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            if let Some(error) = self.fail_next_terminate.take() {
+                return Err(error);
+            }
             self.terminate_calls = self.terminate_calls.saturating_add(1);
             Ok(())
         }
@@ -1796,5 +1881,145 @@ mod tests {
             )
             .expect_err("fatal service state must block further executions");
         assert_eq!(blocked.code, ServiceErrorCode::FatalSession);
+    }
+
+    #[test]
+    fn timeout_enforcement_retries_without_clearing_active_deadline_on_recoverable_failure() {
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+        let mut supervisor = RuntimeTestSupervisor {
+            fail_next_close_stdin: Some(ServiceError {
+                code: ServiceErrorCode::Backpressure,
+                message: "injected close-stdin backpressure".to_string(),
+            }),
+            ..RuntimeTestSupervisor::default()
+        };
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 204,
+                    argv: vec!["/bin/sleep".to_string(), "10".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: Some(1),
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        let mut active_timeout = Some((204, Instant::now() - Duration::from_millis(1)));
+        let mut pending_outbound = VecDeque::new();
+        let mut fatal_shutdown = None;
+
+        enforce_active_timeout(
+            &mut service,
+            &mut supervisor,
+            &mut active_timeout,
+            &mut pending_outbound,
+            &mut fatal_shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(active_timeout.map(|(exec_id, _)| exec_id), Some(204));
+        assert!(fatal_shutdown.is_none());
+        assert!(pending_outbound.is_empty());
+        assert_eq!(service.active_exec_id(), Some(204));
+    }
+
+    #[test]
+    fn timeout_enforcement_fatal_failure_enters_bounded_fatal_shutdown_and_enqueues_error() {
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+        let mut supervisor = RuntimeTestSupervisor {
+            fail_next_terminate: Some(ServiceError {
+                code: ServiceErrorCode::FatalSession,
+                message: "injected terminate uncertainty".to_string(),
+            }),
+            ..RuntimeTestSupervisor::default()
+        };
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 205,
+                    argv: vec!["/bin/sleep".to_string(), "10".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: Some(1),
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        let mut active_timeout = Some((205, Instant::now() - Duration::from_millis(1)));
+        let mut pending_outbound = VecDeque::new();
+        let mut fatal_shutdown = None;
+
+        enforce_active_timeout(
+            &mut service,
+            &mut supervisor,
+            &mut active_timeout,
+            &mut pending_outbound,
+            &mut fatal_shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(supervisor.cleanup_for_disconnect_calls, 1);
+        assert_eq!(service.active_exec_id(), None);
+        assert!(fatal_shutdown.is_some());
+        assert!(matches!(
+            pending_outbound.front(),
+            Some(AgentControlMessage::Error(ProtocolErrorDetail {
+                code: ProtocolErrorCode::FatalSession,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn fatal_shutdown_starts_cleanup_immediately_and_stops_by_delivery_deadline_when_writer_blocked()
+     {
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+        let mut supervisor = RuntimeTestSupervisor::default();
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 206,
+                    argv: vec!["/bin/sleep".to_string(), "10".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        let mut fatal_shutdown = None;
+        let start = Instant::now();
+        start_fatal_shutdown(
+            &mut service,
+            &mut supervisor,
+            &mut fatal_shutdown,
+            "injected fatal protocol failure".to_string(),
+            start,
+        );
+        assert_eq!(
+            supervisor.cleanup_for_disconnect_calls, 1,
+            "fatal-session cleanup must begin immediately even if outbound delivery is blocked"
+        );
+        assert_eq!(service.active_exec_id(), None);
+        let state = fatal_shutdown.as_ref().expect("fatal shutdown state");
+
+        let pending_outbound_empty = false;
+        let has_queued_writes = true;
+        assert!(!should_stop_after_fatal_delivery(
+            state,
+            pending_outbound_empty,
+            has_queued_writes,
+            start,
+        ));
+        assert!(should_stop_after_fatal_delivery(
+            state,
+            pending_outbound_empty,
+            has_queued_writes,
+            start + FATAL_SESSION_DELIVERY_DEADLINE + Duration::from_millis(1),
+        ));
     }
 }

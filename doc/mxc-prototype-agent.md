@@ -40,6 +40,15 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   unavailable until reviewed.
 - Cancellation, timeout escalation, descendant termination, channel-loss cleanup,
   and graceful shutdown all execute with fail-closed behavior.
+- Fatal-session shutdown now starts fail-closed cleanup immediately, then attempts
+  typed fatal error delivery only within a bounded runtime deadline
+  (`FATAL_SESSION_DELIVERY_DEADLINE`, currently 250 ms). PID1 stops by that
+  deadline even under persistent outbound backpressure.
+- Timeout/cancel terminal disposition is now committed only after stdin close and
+  termination initiation succeed. If those actions report uncertain process-tree
+  state, the session is promoted to `FatalSession`; recoverable timeout
+  enforcement failures retain timeout state for retry instead of being silently
+  cleared.
 - Quiesce/resume now drives cgroup freezer state (`cgroup.freeze` +
   `cgroup.events:frozen`) with bounded waits and fail-closed transitions.
 - Post-spawn rollback now distinguishes successful cleanup (retryable spawn

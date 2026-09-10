@@ -1999,6 +1999,50 @@ mod tests {
     }
 
     #[test]
+    fn rollback_kill_failure_is_fatal_and_preserves_cleanup_context() {
+        let _scope = TestFailpointScope::new();
+        SET_NONBLOCKING_FAIL_CALL.with(|fail_call| fail_call.set(1));
+        ROLLBACK_CHILD_KILL_FAILPOINT.with(|flag| flag.set(true));
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let spawn_result = supervisor.spawn(&CreateProcessRequest {
+            exec_id: 709,
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 5".to_string(),
+            ],
+            cwd: Some("/".to_string()),
+            env: vec![],
+            timeout_ms: None,
+        });
+        let error = spawn_result.expect_err("rollback kill failure must fail closed");
+        assert_eq!(error.code, ServiceErrorCode::FatalSession);
+        assert!(
+            error
+                .message
+                .contains("injected failure setting descriptor nonblocking mode"),
+            "primary setup failure context must be preserved: {}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("post-spawn rollback cleanup uncertainty"),
+            "cleanup uncertainty marker must be present: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("injected kill failure"),
+            "cleanup failure context must include kill failure: {}",
+            error.message
+        );
+        assert!(
+            supervisor.active.is_none(),
+            "active process state must be cleared"
+        );
+    }
+
+    #[test]
     fn rollback_cgroup_removal_failure_is_fatal_and_preserves_cleanup_context() {
         let _scope = TestFailpointScope::new();
         let temp = tempdir().expect("tempdir");
