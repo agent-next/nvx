@@ -101,7 +101,7 @@ class SandboxLaunch:
             )
         arguments = [
             "--machine",
-            "microvm",
+            "microvm-v2",
             "--virtio-console",
             f"listen={boot_console_socket}",
             "--microvm-control-console",

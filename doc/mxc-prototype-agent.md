@@ -172,6 +172,9 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   `build/vmlinux`, and `build/initramfs-mxc-agent.cpio.gz` (unless overrides
   are supplied). Missing inputs fail with machine-readable
   `missing-prerequisite` errors.
+- Live launcher machine profile is `--machine microvm-v2` so OpenVMM owns
+  control-console enumeration and publishes `nvx_control_tty` for the fixed
+  control device; NVX does not inject a duplicate control-tty token.
 - The harness always writes a machine-readable JSON report and bounded
   diagnostics to `build/mxc-agent-harness` (or `--output-dir` override),
   including a PID/image-attested, asynchronous, one-MiB/30-second bounded
