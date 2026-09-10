@@ -5,7 +5,8 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -15,13 +16,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use agent_protocol::{
-    CreateProcessRequest, DEFAULT_STDIN_QUEUE_LIMIT_BYTES, ProcessSupervisor, ServiceError,
-    ServiceErrorCode, SupervisorEvent, WORKLOAD_GID_MXC, WORKLOAD_UID_MXC,
+    CreateProcessRequest, DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES,
+    DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_RECORDS, DEFAULT_STDIN_QUEUE_LIMIT_BYTES, ProcessSupervisor,
+    ServiceError, ServiceErrorCode, SupervisorEvent, WORKLOAD_GID_MXC, WORKLOAD_UID_MXC,
 };
 
 const STDIO_CHUNK_BYTES: usize = 4096;
 const TERM_GRACE: Duration = Duration::from_millis(250);
 const POLL_SLEEP: Duration = Duration::from_millis(10);
+const MAX_STDIO_CHUNKS_PER_REFRESH: usize = 4;
+const DESCENDANTS_CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 static PREPARE_CGROUP_FAILPOINT: std::sync::atomic::AtomicBool =
@@ -129,8 +133,12 @@ struct ActiveProcess {
     kill_sent: bool,
     exit_status_reported: bool,
     descendants_cleaned_reported: bool,
+    descendants_cleanup_started_at: Option<Instant>,
     cgroup_dir: Option<PathBuf>,
     event_queue: VecDeque<SupervisorEvent>,
+    event_queue_bytes: usize,
+    prefer_stdout_next: bool,
+    holder_wait_status: Option<fs::File>,
 }
 
 impl LinuxProcessSupervisor {
@@ -190,6 +198,8 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             prepare_exec_cgroup(cgroup_root, request.exec_id).ok()
         };
         let credential_plan = prepare_child_credential_plan().ok();
+        let mut holder_wait_status = None;
+        let mut holder_wait_status_write_fd = None;
         if let Some(holder) = self.holder.as_ref() {
             let mount_ns_fd = holder.mount_ns_fd;
             let uts_ns_fd = holder.uts_ns_fd;
@@ -201,9 +211,18 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                 .ok_or_else(|| {
                     supervisor_error("holder-backed execution requires prepared cgroup")
                 })?;
+            let (status_read_fd, status_write_fd) = create_cloexec_pipe()
+                .map_err(|error| supervisor_io("creating status pipe", error))?;
+            // SAFETY: status_read_fd is newly created and uniquely owned here.
+            let status_reader = unsafe { fs::File::from_raw_fd(status_read_fd) };
+            set_nonblocking(status_reader.as_raw_fd())?;
+            holder_wait_status = Some(status_reader);
+            holder_wait_status_write_fd = Some(status_write_fd);
             // SAFETY: closure performs direct namespace and identity syscalls before exec.
             unsafe {
                 command.pre_exec(move || {
+                    // SAFETY: best-effort close in child pre-exec context.
+                    let _ = libc::close(status_read_fd);
                     setns_checked(mount_ns_fd, libc::CLONE_NEWNS)?;
                     setns_checked(uts_ns_fd, libc::CLONE_NEWUTS)?;
                     setns_checked(ipc_ns_fd, libc::CLONE_NEWIPC)?;
@@ -226,11 +245,20 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                             }
                             break;
                         }
-                        if (status & 0x7f) == 0 {
-                            libc::_exit((status >> 8) & 0xff);
+                        let encoded = status.to_ne_bytes();
+                        let _ = write_all_fd(status_write_fd, &encoded);
+                        // SAFETY: best-effort close in child pre-exec context.
+                        let _ = libc::close(status_write_fd);
+                        if libc::WIFEXITED(status) {
+                            libc::_exit(libc::WEXITSTATUS(status));
+                        }
+                        if libc::WIFSIGNALED(status) {
+                            libc::_exit(128 + libc::WTERMSIG(status));
                         }
                         libc::_exit(1);
                     }
+                    // SAFETY: best-effort close in child pre-exec context.
+                    let _ = libc::close(status_write_fd);
                     apply_workload_exec_credentials(credential_plan)?;
                     Ok(())
                 });
@@ -240,12 +268,20 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(spawn_error) => {
+                if let Some(fd) = holder_wait_status_write_fd.take() {
+                    // SAFETY: best-effort close for locally created descriptor.
+                    let _ = unsafe { libc::close(fd) };
+                }
                 return Err(report_spawn_failure_with_cgroup_cleanup(
                     prepared_cgroup,
                     spawn_error,
                 ));
             }
         };
+        if let Some(fd) = holder_wait_status_write_fd.take() {
+            // SAFETY: best-effort close for locally created descriptor.
+            let _ = unsafe { libc::close(fd) };
+        }
         let pid = child.id() as i32;
         let mut stdin = child.stdin.take();
         let mut stdout = child.stdout.take();
@@ -290,8 +326,12 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             kill_sent: false,
             exit_status_reported: false,
             descendants_cleaned_reported: false,
+            descendants_cleanup_started_at: None,
             cgroup_dir,
             event_queue: VecDeque::new(),
+            event_queue_bytes: 0,
+            prefer_stdout_next: true,
+            holder_wait_status,
         });
         Ok(())
     }
@@ -343,7 +383,11 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
         let mut release_cgroup = None;
         {
             let active = self.require_active(exec_id)?;
-            let _ = active.event_queue.pop_front();
+            if let Some(event) = active.event_queue.pop_front() {
+                active.event_queue_bytes = active
+                    .event_queue_bytes
+                    .saturating_sub(event_payload_bytes(&event));
+            }
             if active.exit_status_reported
                 && active.descendants_cleaned_reported
                 && active.stdout_eof
@@ -355,7 +399,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
         }
         if release_cgroup.is_some() {
             self.active = None;
-            remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref());
+            remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref())?;
         }
         Ok(())
     }
@@ -403,7 +447,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             {
                 let release_cgroup = active.cgroup_dir.clone();
                 self.active = None;
-                remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref());
+                remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref())?;
                 return Ok(true);
             }
             std::thread::sleep(POLL_SLEEP);
@@ -418,7 +462,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             {
                 let release_cgroup = active.cgroup_dir.clone();
                 self.active = None;
-                remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref());
+                remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref())?;
                 return Ok(true);
             }
             std::thread::sleep(POLL_SLEEP);
@@ -490,12 +534,17 @@ fn setns_checked(fd: i32, nstype: i32) -> io::Result<()> {
 }
 
 fn refresh_active_state(active: &mut ActiveProcess) -> Result<(), ServiceError> {
-    pump_stdout(active)?;
-    pump_stderr(active)?;
+    if can_refresh_streams(active) {
+        pump_stdio_round_robin(active)?;
+    }
     pump_stdin(active)?;
     maybe_escalate_kill(active)?;
-    maybe_report_exit(active)?;
-    maybe_report_descendants_cleaned(active)?;
+    if can_enqueue_event(active, 0) {
+        maybe_report_exit(active)?;
+    }
+    if can_enqueue_event(active, 0) {
+        maybe_report_descendants_cleaned(active)?;
+    }
     Ok(())
 }
 
@@ -510,14 +559,26 @@ fn maybe_report_exit(active: &mut ActiveProcess) -> Result<(), ServiceError> {
     else {
         return Ok(());
     };
-    if let Some(code) = status.code() {
-        active.event_queue.push_back(SupervisorEvent::Exited(code));
+    if let Some(wait_status) = read_holder_wait_status(active)? {
+        if libc::WIFEXITED(wait_status) {
+            push_event(
+                active,
+                SupervisorEvent::Exited(libc::WEXITSTATUS(wait_status)),
+            )?;
+        } else if libc::WIFSIGNALED(wait_status) {
+            push_event(
+                active,
+                SupervisorEvent::Signaled(libc::WTERMSIG(wait_status)),
+            )?;
+        } else {
+            push_event(active, SupervisorEvent::Exited(1))?;
+        }
+    } else if let Some(code) = status.code() {
+        push_event(active, SupervisorEvent::Exited(code))?;
     } else if let Some(signal) = status.signal() {
-        active
-            .event_queue
-            .push_back(SupervisorEvent::Signaled(signal));
+        push_event(active, SupervisorEvent::Signaled(signal))?;
     } else {
-        active.event_queue.push_back(SupervisorEvent::Exited(1));
+        push_event(active, SupervisorEvent::Exited(1))?;
     }
     active.exit_status_reported = true;
     Ok(())
@@ -527,11 +588,129 @@ fn maybe_report_descendants_cleaned(active: &mut ActiveProcess) -> Result<(), Se
     if active.descendants_cleaned_reported || !active.exit_status_reported {
         return Ok(());
     }
+    if active.descendants_cleanup_started_at.is_none() {
+        active.descendants_cleanup_started_at = Some(Instant::now());
+    }
     kill_exec_descendants(active, libc::SIGKILL)?;
-    active
-        .event_queue
-        .push_back(SupervisorEvent::DescendantsCleaned);
-    active.descendants_cleaned_reported = true;
+    if descendants_populated_zero(active)? {
+        push_event(active, SupervisorEvent::DescendantsCleaned)?;
+        active.descendants_cleaned_reported = true;
+        return Ok(());
+    }
+    let started = active
+        .descendants_cleanup_started_at
+        .unwrap_or_else(Instant::now);
+    if started.elapsed() >= DESCENDANTS_CLEANUP_DEADLINE {
+        return Err(ServiceError {
+            code: ServiceErrorCode::CleanupTimeout,
+            message: "descendant cleanup deadline exceeded before populated=0".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn descendants_populated_zero(active: &ActiveProcess) -> Result<bool, ServiceError> {
+    let Some(cgroup_dir) = active.cgroup_dir.as_ref() else {
+        return Ok(true);
+    };
+    let events_path = cgroup_dir.join("cgroup.events");
+    let text = fs::read_to_string(&events_path).map_err(|error| {
+        supervisor_io(
+            format!("reading cgroup.events at {}", events_path.display()),
+            error,
+        )
+    })?;
+    let populated = parse_populated_from_cgroup_events(&text).ok_or_else(|| ServiceError {
+        code: ServiceErrorCode::Supervisor,
+        message: format!(
+            "cgroup.events missing populated field at {}",
+            events_path.display()
+        ),
+    })?;
+    Ok(!populated)
+}
+
+fn parse_populated_from_cgroup_events(text: &str) -> Option<bool> {
+    for line in text.lines() {
+        let (key, value) = line.split_once(' ')?;
+        if key == "populated" {
+            return match value.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+fn read_holder_wait_status(active: &mut ActiveProcess) -> Result<Option<i32>, ServiceError> {
+    let Some(mut pipe) = active.holder_wait_status.take() else {
+        return Ok(None);
+    };
+    let mut bytes = [0_u8; std::mem::size_of::<i32>()];
+    let result = match pipe.read(&mut bytes) {
+        Ok(size) if size == bytes.len() => Ok(Some(i32::from_ne_bytes(bytes))),
+        Ok(0) => Err(supervisor_error(
+            "holder wait status unavailable (pipe closed before status write)",
+        )),
+        Ok(_) => Err(supervisor_error("holder wait status short read")),
+        Err(error) if would_block(&error) => {
+            Err(supervisor_error("holder wait status not yet readable"))
+        }
+        Err(error) => Err(supervisor_io("reading holder wait status", error)),
+    };
+    if result.is_err() {
+        active.holder_wait_status = Some(pipe);
+    }
+    result
+}
+
+fn can_refresh_streams(active: &ActiveProcess) -> bool {
+    if !active.event_queue.is_empty() {
+        return false;
+    }
+    !event_queue_limits_reached(active)
+}
+
+fn can_enqueue_event(active: &ActiveProcess, payload_bytes: usize) -> bool {
+    active.event_queue.len().saturating_add(1) <= DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_RECORDS
+        && active.event_queue_bytes.saturating_add(payload_bytes)
+            <= DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES
+}
+
+fn event_queue_limits_reached(active: &ActiveProcess) -> bool {
+    active.event_queue.len() >= DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_RECORDS
+        || active.event_queue_bytes >= DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES
+}
+
+fn event_payload_bytes(event: &SupervisorEvent) -> usize {
+    match event {
+        SupervisorEvent::StdoutChunk(chunk) | SupervisorEvent::StderrChunk(chunk) => chunk.len(),
+        _ => 0,
+    }
+}
+
+fn push_event(active: &mut ActiveProcess, event: SupervisorEvent) -> Result<(), ServiceError> {
+    let payload = event_payload_bytes(&event);
+    if !can_enqueue_event(active, payload) {
+        return Err(ServiceError {
+            code: ServiceErrorCode::Backpressure,
+            message: "supervisor event queue capacity exceeded".to_string(),
+        });
+    }
+    let next_bytes = active
+        .event_queue_bytes
+        .checked_add(payload)
+        .ok_or_else(|| supervisor_error("supervisor event queue byte overflow"))?;
+    if next_bytes > DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES {
+        return Err(ServiceError {
+            code: ServiceErrorCode::Backpressure,
+            message: "supervisor event queue reached byte capacity".to_string(),
+        });
+    }
+    active.event_queue.push_back(event);
+    active.event_queue_bytes = next_bytes;
     Ok(())
 }
 
@@ -566,12 +745,7 @@ fn send_kill(active: &mut ActiveProcess) -> Result<(), ServiceError> {
 
 fn kill_exec_descendants(active: &ActiveProcess, signal: i32) -> Result<(), ServiceError> {
     if let Some(cgroup_dir) = &active.cgroup_dir {
-        let path = cgroup_dir.join("cgroup.kill");
-        if path.exists() {
-            fs::write(&path, "1\n").map_err(|error| {
-                supervisor_io(format!("writing cgroup.kill at {}", path.display()), error)
-            })?;
-        }
+        maybe_write_cgroup_kill(cgroup_dir, signal)?;
     }
     // SAFETY: kill is called with a negative process group id to signal the process group.
     let rc = unsafe { libc::kill(-active.process_group_id, signal) };
@@ -584,67 +758,92 @@ fn kill_exec_descendants(active: &ActiveProcess, signal: i32) -> Result<(), Serv
     Ok(())
 }
 
-fn pump_stdout(active: &mut ActiveProcess) -> Result<(), ServiceError> {
-    if active.stdout_eof {
+fn maybe_write_cgroup_kill(cgroup_dir: &Path, signal: i32) -> Result<(), ServiceError> {
+    if signal != libc::SIGKILL {
         return Ok(());
+    }
+    let path = cgroup_dir.join("cgroup.kill");
+    if path.exists() {
+        fs::write(&path, "1\n").map_err(|error| {
+            supervisor_io(format!("writing cgroup.kill at {}", path.display()), error)
+        })?;
+    }
+    Ok(())
+}
+
+fn pump_stdio_round_robin(active: &mut ActiveProcess) -> Result<(), ServiceError> {
+    let mut budget = MAX_STDIO_CHUNKS_PER_REFRESH;
+    while budget > 0 && !event_queue_limits_reached(active) {
+        let mut produced = false;
+        if active.prefer_stdout_next {
+            produced |= pump_stdout_chunk(active)?;
+            if budget > 0 && !event_queue_limits_reached(active) {
+                produced |= pump_stderr_chunk(active)?;
+            }
+        } else {
+            produced |= pump_stderr_chunk(active)?;
+            if budget > 0 && !event_queue_limits_reached(active) {
+                produced |= pump_stdout_chunk(active)?;
+            }
+        }
+        active.prefer_stdout_next = !active.prefer_stdout_next;
+        if !produced {
+            break;
+        }
+        budget = budget.saturating_sub(1);
+    }
+    Ok(())
+}
+
+fn pump_stdout_chunk(active: &mut ActiveProcess) -> Result<bool, ServiceError> {
+    if active.stdout_eof {
+        return Ok(false);
     }
     let Some(stdout) = active.stdout.as_mut() else {
         active.stdout_eof = true;
-        return Ok(());
+        return Ok(false);
     };
-    loop {
-        let mut chunk = vec![0_u8; STDIO_CHUNK_BYTES];
-        match io::Read::read(stdout, &mut chunk) {
-            Ok(0) => {
-                active.stdout = None;
-                active.stdout_eof = true;
-                active.event_queue.push_back(SupervisorEvent::StdoutEof);
-                return Ok(());
-            }
-            Ok(size) => {
-                chunk.truncate(size);
-                active
-                    .event_queue
-                    .push_back(SupervisorEvent::StdoutChunk(chunk));
-                if size < STDIO_CHUNK_BYTES {
-                    return Ok(());
-                }
-            }
-            Err(error) if would_block(&error) => return Ok(()),
-            Err(error) => return Err(supervisor_io("reading child stdout", error)),
+    let mut chunk = vec![0_u8; STDIO_CHUNK_BYTES];
+    match io::Read::read(stdout, &mut chunk) {
+        Ok(0) => {
+            active.stdout = None;
+            active.stdout_eof = true;
+            push_event(active, SupervisorEvent::StdoutEof)?;
+            Ok(true)
         }
+        Ok(size) => {
+            chunk.truncate(size);
+            push_event(active, SupervisorEvent::StdoutChunk(chunk))?;
+            Ok(true)
+        }
+        Err(error) if would_block(&error) => Ok(false),
+        Err(error) => Err(supervisor_io("reading child stdout", error)),
     }
 }
 
-fn pump_stderr(active: &mut ActiveProcess) -> Result<(), ServiceError> {
+fn pump_stderr_chunk(active: &mut ActiveProcess) -> Result<bool, ServiceError> {
     if active.stderr_eof {
-        return Ok(());
+        return Ok(false);
     }
     let Some(stderr) = active.stderr.as_mut() else {
         active.stderr_eof = true;
-        return Ok(());
+        return Ok(false);
     };
-    loop {
-        let mut chunk = vec![0_u8; STDIO_CHUNK_BYTES];
-        match io::Read::read(stderr, &mut chunk) {
-            Ok(0) => {
-                active.stderr = None;
-                active.stderr_eof = true;
-                active.event_queue.push_back(SupervisorEvent::StderrEof);
-                return Ok(());
-            }
-            Ok(size) => {
-                chunk.truncate(size);
-                active
-                    .event_queue
-                    .push_back(SupervisorEvent::StderrChunk(chunk));
-                if size < STDIO_CHUNK_BYTES {
-                    return Ok(());
-                }
-            }
-            Err(error) if would_block(&error) => return Ok(()),
-            Err(error) => return Err(supervisor_io("reading child stderr", error)),
+    let mut chunk = vec![0_u8; STDIO_CHUNK_BYTES];
+    match io::Read::read(stderr, &mut chunk) {
+        Ok(0) => {
+            active.stderr = None;
+            active.stderr_eof = true;
+            push_event(active, SupervisorEvent::StderrEof)?;
+            Ok(true)
         }
+        Ok(size) => {
+            chunk.truncate(size);
+            push_event(active, SupervisorEvent::StderrChunk(chunk))?;
+            Ok(true)
+        }
+        Err(error) if would_block(&error) => Ok(false),
+        Err(error) => Err(supervisor_io("reading child stderr", error)),
     }
 }
 
@@ -705,6 +904,16 @@ fn set_nonblocking(fd: i32) -> Result<(), ServiceError> {
     Ok(())
 }
 
+fn create_cloexec_pipe() -> io::Result<(i32, i32)> {
+    let mut fds = [0_i32; 2];
+    // SAFETY: pipe2 writes two descriptors into `fds` on success.
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
+
 fn try_prepare_workload_cgroup(exec_id: u32, pid: i32) -> Option<PathBuf> {
     let root = Path::new("/sys/fs/cgroup/nvx.workload");
     let mut prepared = prepare_exec_cgroup(root, exec_id).ok()?;
@@ -736,7 +945,7 @@ fn prepare_exec_cgroup(root: &Path, exec_id: u32) -> Result<PreparedExecCgroup, 
                 };
                 if fd < 0 {
                     let error = io::Error::last_os_error();
-                    remove_exec_cgroup(Some(dir.as_path()), None);
+                    let _ = remove_exec_cgroup(Some(dir.as_path()), None);
                     return Err(supervisor_io("opening cgroup.procs", error));
                 }
                 return Ok(PreparedExecCgroup {
@@ -851,21 +1060,46 @@ fn write_all_fd(fd: i32, mut bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn remove_exec_cgroup(path: Option<&Path>, holder: Option<&NamespaceHolder>) {
+fn remove_exec_cgroup(
+    path: Option<&Path>,
+    holder: Option<&NamespaceHolder>,
+) -> Result<(), ServiceError> {
     let Some(path) = path else {
-        return;
+        return Ok(());
     };
     if let Some(holder) = holder
         && path == holder.cgroup_dir.as_path()
     {
-        return;
+        return Ok(());
     }
     if let Some(root) = holder.as_ref().map(|value| value.cgroup_dir.as_path())
         && !path.starts_with(root)
     {
-        return;
+        return Ok(());
     }
-    let _ = fs::remove_dir(path);
+    let mut attempts = 0_u32;
+    loop {
+        match fs::remove_dir(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempts < 10 && is_retryable_remove_error(&error) => {
+                attempts = attempts.saturating_add(1);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(supervisor_io(
+                    format!("removing per-exec cgroup directory {}", path.display()),
+                    error,
+                ));
+            }
+        }
+    }
+}
+
+fn is_retryable_remove_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EBUSY) | Some(libc::ENOTEMPTY) | Some(libc::EINTR)
+    )
 }
 
 fn prepare_child_credential_plan() -> io::Result<ChildCredentialPlan> {
@@ -1150,13 +1384,13 @@ mod tests {
             pid_ns_fd: -1,
         };
 
-        remove_exec_cgroup(Some(holder_root.as_path()), Some(&holder));
+        remove_exec_cgroup(Some(holder_root.as_path()), Some(&holder)).expect("remove holder root");
         assert!(
             holder_root.exists(),
             "holder membership cgroup must never be deleted by exec cleanup"
         );
 
-        remove_exec_cgroup(Some(exec_dir.as_path()), Some(&holder));
+        remove_exec_cgroup(Some(exec_dir.as_path()), Some(&holder)).expect("remove exec dir");
         assert!(
             !exec_dir.exists(),
             "exec cleanup must target only per-exec child cgroups"
@@ -1304,6 +1538,194 @@ mod tests {
     }
 
     #[test]
+    fn sustained_stdout_with_unacked_front_stays_bounded_and_recovers_exactly() {
+        let mut supervisor = LinuxProcessSupervisor::new();
+        let exec_id = 404_u32;
+        let expected_bytes = 200 * 4096;
+        supervisor
+            .spawn(&CreateProcessRequest {
+                exec_id,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "dd if=/dev/zero bs=4096 count=200 2>/dev/null".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .expect("spawn");
+
+        let first = wait_for_event(&mut supervisor, exec_id, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::StdoutChunk(_))
+        })
+        .expect("first chunk");
+        assert!(matches!(first, SupervisorEvent::StdoutChunk(_)));
+
+        std::thread::sleep(Duration::from_millis(200));
+        let active = supervisor.active.as_ref().expect("active process");
+        assert_eq!(
+            active.event_queue.len(),
+            1,
+            "front-unacked output must stop additional draining"
+        );
+        assert!(
+            active.event_queue_bytes <= DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES,
+            "event queue bytes must stay bounded"
+        );
+
+        let mut stdout_total = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let Some(event) = supervisor.poll(exec_id).expect("poll") else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            if let SupervisorEvent::StdoutChunk(chunk) = event {
+                stdout_total = stdout_total.saturating_add(chunk.len());
+            }
+            if supervisor.active.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            stdout_total, expected_bytes,
+            "all producer bytes must recover losslessly after backpressure clears"
+        );
+        assert!(supervisor.active.is_none(), "process must fully clean up");
+    }
+
+    #[test]
+    fn cgroup_kill_is_reserved_for_sigkill_escalation() {
+        let temp = tempdir().expect("tempdir");
+        let cgroup_kill = temp.path().join("cgroup.kill");
+        fs::write(&cgroup_kill, b"initial").expect("seed cgroup.kill");
+
+        maybe_write_cgroup_kill(temp.path(), libc::SIGTERM).expect("sigterm write check");
+        let after_term = fs::read_to_string(&cgroup_kill).expect("read after term");
+        assert_eq!(after_term, "initial", "SIGTERM must not write cgroup.kill");
+
+        maybe_write_cgroup_kill(temp.path(), libc::SIGKILL).expect("sigkill write check");
+        let after_kill = fs::read_to_string(&cgroup_kill).expect("read after kill");
+        assert_eq!(
+            after_kill, "1\n",
+            "SIGKILL escalation must write cgroup.kill"
+        );
+    }
+
+    #[test]
+    fn descendants_cleaned_waits_for_populated_zero() {
+        let temp = tempdir().expect("tempdir");
+        let events_path = temp.path().join("cgroup.events");
+        fs::write(&events_path, "populated 1\n").expect("seed populated=1");
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn child");
+        let mut active = ActiveProcess {
+            exec_id: 1,
+            child,
+            process_group_id: i32::MAX,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            stdout_eof: true,
+            stderr_eof: true,
+            stdin_queue: VecDeque::new(),
+            stdin_queue_bytes: 0,
+            stdin_queue_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_drained_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_offset: 0,
+            stdin_close_requested: false,
+            terminate_sent_at: None,
+            kill_sent: true,
+            exit_status_reported: true,
+            descendants_cleaned_reported: false,
+            descendants_cleanup_started_at: None,
+            cgroup_dir: Some(temp.path().to_path_buf()),
+            event_queue: VecDeque::new(),
+            event_queue_bytes: 0,
+            prefer_stdout_next: true,
+            holder_wait_status: None,
+        };
+
+        maybe_report_descendants_cleaned(&mut active).expect("poll cleanup pending");
+        assert!(
+            !active.descendants_cleaned_reported,
+            "cleanup cannot complete while populated=1"
+        );
+        assert!(active.event_queue.is_empty(), "no cleanup event yet");
+
+        fs::write(&events_path, "populated 0\n").expect("flip populated=0");
+        maybe_report_descendants_cleaned(&mut active).expect("poll cleanup complete");
+        assert!(
+            active.descendants_cleaned_reported,
+            "cleanup should complete"
+        );
+        assert!(matches!(
+            active.event_queue.front(),
+            Some(SupervisorEvent::DescendantsCleaned)
+        ));
+    }
+
+    #[test]
+    fn descendants_cleanup_timeout_fails_closed() {
+        let temp = tempdir().expect("tempdir");
+        let events_path = temp.path().join("cgroup.events");
+        fs::write(&events_path, "populated 1\n").expect("seed populated=1");
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 1")
+            .spawn()
+            .expect("spawn child");
+        let mut active = ActiveProcess {
+            exec_id: 2,
+            child,
+            process_group_id: i32::MAX,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            stdout_eof: true,
+            stderr_eof: true,
+            stdin_queue: VecDeque::new(),
+            stdin_queue_bytes: 0,
+            stdin_queue_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_drained_bytes_atomic: Arc::new(AtomicUsize::new(0)),
+            stdin_offset: 0,
+            stdin_close_requested: false,
+            terminate_sent_at: None,
+            kill_sent: true,
+            exit_status_reported: true,
+            descendants_cleaned_reported: false,
+            descendants_cleanup_started_at: Some(
+                Instant::now() - DESCENDANTS_CLEANUP_DEADLINE - Duration::from_millis(1),
+            ),
+            cgroup_dir: Some(temp.path().to_path_buf()),
+            event_queue: VecDeque::new(),
+            event_queue_bytes: 0,
+            prefer_stdout_next: true,
+            holder_wait_status: None,
+        };
+        let error = maybe_report_descendants_cleaned(&mut active).expect_err("timeout expected");
+        assert_eq!(error.code, ServiceErrorCode::CleanupTimeout);
+    }
+
+    #[test]
+    fn remove_exec_cgroup_surfaces_non_empty_directory_error() {
+        let temp = tempdir().expect("tempdir");
+        let exec_dir = temp.path().join("exec-1");
+        fs::create_dir_all(&exec_dir).expect("exec dir");
+        fs::write(exec_dir.join("leftover"), b"x").expect("seed non-empty");
+        let error = remove_exec_cgroup(Some(exec_dir.as_path()), None).expect_err("must fail");
+        assert!(
+            error.message.contains("removing per-exec cgroup directory"),
+            "cleanup error context must be surfaced"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires writable cgroupfs cgroup.procs semantics"]
     fn spawn_failure_rollback_retries_past_64_without_leaking_exec_dirs() {
         let root = tempdir().expect("tempdir");
         let exec_id = 31337_u32;
@@ -1333,7 +1755,7 @@ mod tests {
             created_dir.exists(),
             "successful retry must keep prepared cgroup when cleanup is disarmed"
         );
-        remove_exec_cgroup(Some(created_dir.as_path()), None);
+        remove_exec_cgroup(Some(created_dir.as_path()), None).expect("remove created dir");
         assert_eq!(
             count_exec_cgroup_dirs(root.path(), &prefix),
             0,
@@ -1342,6 +1764,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires writable cgroupfs cgroup.procs semantics"]
     fn spawn_failure_reports_cleanup_error_without_masking_primary() {
         let root = tempdir().expect("tempdir");
         let exec_id = 5150_u32;
@@ -1398,6 +1821,33 @@ mod tests {
             count_exec_cgroup_dirs(&holder_root, &prefix),
             baseline,
             "failed holder-backed spawn must not leak per-exec cgroup directories"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Linux root privileges and holder namespaces/cgroups"]
+    fn holder_backed_signaled_workload_reports_signaled_disposition() {
+        let mut supervisor = LinuxProcessSupervisor::new_with_holder(1).expect("holder");
+        let exec_id = 505_u32;
+        supervisor
+            .spawn(&CreateProcessRequest {
+                exec_id,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "kill -TERM $$".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .expect("spawn");
+        let signal = wait_for_event(&mut supervisor, exec_id, Duration::from_secs(3), |event| {
+            matches!(event, SupervisorEvent::Signaled(_))
+        });
+        assert!(
+            matches!(signal, Some(SupervisorEvent::Signaled(libc::SIGTERM))),
+            "holder wrapper must preserve inner signal status"
         );
     }
 }

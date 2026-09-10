@@ -9,7 +9,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{
-    INNER_RECORD_MAX_BYTES, InnerRecord, InnerRecordDecodeError, OPENVMM_OUTER_RECORD_MAX_BYTES,
+    INNER_RECORD_HEADER_BYTES, INNER_RECORD_MAX_BYTES, InnerRecord, InnerRecordDecodeError,
+    OPENVMM_OUTER_RECORD_MAX_BYTES,
 };
 use crate::mapping::{
     CanonicalHostMappingRoot, ChildMapping, MappingContainmentPolicy, validate_mapping_set,
@@ -37,13 +38,18 @@ pub const HVC1_DEVICE_PATH: &str = "/dev/hvc1";
 pub const OPENVMM_OUTER_FRAME_OVERHEAD_BYTES: usize = 64;
 pub const MAX_INNER_RECORD_BYTES_FOR_OPENVMM: usize =
     OPENVMM_OUTER_RECORD_MAX_BYTES - OPENVMM_OUTER_FRAME_OVERHEAD_BYTES;
+/// Protocol-safe max binary chunk that always fits beneath the conservative OpenVMM outer-record
+/// bound after inner-record framing.
+pub const PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES: usize =
+    MAX_INNER_RECORD_BYTES_FOR_OPENVMM - INNER_RECORD_HEADER_BYTES;
 pub const DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_BYTES: usize = 256 * 1024;
 pub const DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_RECORDS: usize = 64;
-pub const DEFAULT_STDIN_QUEUE_LIMIT_BYTES: usize = 128 * 1024;
+pub const DEFAULT_STDIN_QUEUE_LIMIT_BYTES: usize = PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES;
 
 const _: [(); 1] =
     [(); (OPENVMM_OUTER_RECORD_MAX_BYTES > OPENVMM_OUTER_FRAME_OVERHEAD_BYTES) as usize];
 const _: [(); 1] = [(); (MAX_INNER_RECORD_BYTES_FOR_OPENVMM <= INNER_RECORD_MAX_BYTES) as usize];
+const _: [(); 1] = [(); (PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES > 0) as usize];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchBinding {
@@ -198,7 +204,7 @@ pub struct MxcControlService {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OperationSlice {
     Phase0Readiness,
-    FullLifecycle,
+    ExecStreamsCancel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -405,62 +411,72 @@ impl MxcControlService {
             "WaitReady".to_string(),
             "Health".to_string(),
         ];
-        let unavailable_operations = self.phase0_unavailable_operations();
-        if self.operation_slice == OperationSlice::FullLifecycle {
-            available_operations.extend(
-                unavailable_operations
-                    .iter()
-                    .map(|entry| entry.operation.clone()),
-            );
+        let unavailable_operations = self.unavailable_operations();
+        if self.operation_slice == OperationSlice::ExecStreamsCancel {
+            available_operations.extend([
+                "Exec".to_string(),
+                "Streams".to_string(),
+                "Cancel".to_string(),
+            ]);
         }
         MxcCapabilities {
             protocol_version: self.binding.protocol_version,
             image_version: self.binding.image_version.clone(),
             available_operations,
-            unavailable_operations: if self.operation_slice == OperationSlice::Phase0Readiness {
-                unavailable_operations
-            } else {
-                Vec::new()
-            },
+            unavailable_operations,
         }
     }
 
-    fn phase0_unavailable_operations(&self) -> Vec<UnavailableOperation> {
+    fn unavailable_operations(&self) -> Vec<UnavailableOperation> {
+        let mut entries = Vec::new();
+        if self.operation_slice == OperationSlice::Phase0Readiness {
+            entries.extend([
+                UnavailableOperation {
+                    operation: "Exec".to_string(),
+                    capability_flag: "exec.phase0".to_string(),
+                    reason:
+                        "phase-0 control slice exposes readiness only; exec lifecycle is disabled"
+                            .to_string(),
+                },
+                UnavailableOperation {
+                    operation: "Streams".to_string(),
+                    capability_flag: "streams.phase0".to_string(),
+                    reason: "phase-0 control slice does not expose process stream transport"
+                        .to_string(),
+                },
+                UnavailableOperation {
+                    operation: "Cancel".to_string(),
+                    capability_flag: "cancel.phase0".to_string(),
+                    reason: "phase-0 control slice does not allow execution cancellation"
+                        .to_string(),
+                },
+            ]);
+        }
         vec![
-            UnavailableOperation {
-                operation: "Exec".to_string(),
-                capability_flag: "exec.phase0".to_string(),
-                reason: "phase-0 control slice exposes readiness only; exec lifecycle is disabled"
-                    .to_string(),
-            },
-            UnavailableOperation {
-                operation: "Streams".to_string(),
-                capability_flag: "streams.phase0".to_string(),
-                reason: "phase-0 control slice does not expose process stream transport"
-                    .to_string(),
-            },
-            UnavailableOperation {
-                operation: "Cancel".to_string(),
-                capability_flag: "cancel.phase0".to_string(),
-                reason: "phase-0 control slice does not allow execution cancellation".to_string(),
-            },
             UnavailableOperation {
                 operation: "Quiesce".to_string(),
                 capability_flag: "quiesce.phase0".to_string(),
-                reason: "phase-0 control slice does not expose quiesce transitions".to_string(),
+                reason: "quiesce is intentionally unavailable until that operation is reviewed and approved"
+                    .to_string(),
             },
             UnavailableOperation {
                 operation: "Resume".to_string(),
                 capability_flag: "resume.phase0".to_string(),
-                reason: "phase-0 control slice does not expose resume transitions".to_string(),
+                reason: "resume is intentionally unavailable until that operation is reviewed and approved"
+                    .to_string(),
             },
             UnavailableOperation {
                 operation: "Shutdown".to_string(),
                 capability_flag: "shutdown.phase0".to_string(),
-                reason: "phase-0 control slice does not expose in-band shutdown control"
+                reason: "shutdown is intentionally unavailable until that operation is reviewed and approved"
                     .to_string(),
             },
         ]
+        .into_iter()
+        .fold(entries, |mut acc, item| {
+            acc.push(item);
+            acc
+        })
     }
 
     pub fn update_runtime_isolation(&mut self, isolation: IsolationStatus) {
@@ -641,7 +657,7 @@ impl MxcControlService {
     }
 
     pub fn activate_full_lifecycle(&mut self) -> Result<(), ServiceError> {
-        if self.operation_slice == OperationSlice::FullLifecycle {
+        if self.operation_slice == OperationSlice::ExecStreamsCancel {
             return Ok(());
         }
         let Some(holder_pid) = self.runtime_isolation_holder_pid else {
@@ -671,7 +687,7 @@ impl MxcControlService {
                 "configure_session must complete before full lifecycle activation",
             ));
         }
-        self.operation_slice = OperationSlice::FullLifecycle;
+        self.operation_slice = OperationSlice::ExecStreamsCancel;
         Ok(())
     }
 
@@ -981,7 +997,10 @@ impl MxcControlService {
         if self.operation_slice == OperationSlice::Phase0Readiness {
             return self.unsupported_operation(operation);
         }
-        Ok(())
+        if matches!(operation, "Exec" | "Streams" | "Cancel") {
+            return Ok(());
+        }
+        self.unsupported_operation(operation)
     }
 
     fn validate_binding(
@@ -1664,7 +1683,7 @@ fn constant_time_eq32(left: &[u8; 32], right: &[u8; 32]) -> bool {
 }
 
 fn max_stream_chunk_cap() -> usize {
-    MAX_INNER_RECORD_BYTES_FOR_OPENVMM.saturating_sub(20)
+    PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES
 }
 
 fn channel_io_error(error: io::Error) -> ServiceError {
@@ -2274,7 +2293,15 @@ mod tests {
         runtime_service.activate_full_lifecycle().unwrap();
 
         let capabilities = runtime_service.get_capabilities();
-        assert!(capabilities.unavailable_operations.is_empty());
+        let unavailable = capabilities
+            .unavailable_operations
+            .iter()
+            .map(|entry| entry.operation.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unavailable,
+            std::collections::BTreeSet::from(["Quiesce", "Resume", "Shutdown"])
+        );
         assert!(
             capabilities
                 .available_operations
@@ -2292,6 +2319,12 @@ mod tests {
                 .available_operations
                 .iter()
                 .any(|operation| operation == "Cancel")
+        );
+        assert!(
+            capabilities
+                .available_operations
+                .iter()
+                .all(|operation| operation != "Quiesce")
         );
     }
 
@@ -2415,6 +2448,23 @@ mod tests {
 
         assert_eq!(service.active_exec_id(), None);
         assert!(!service.health().configured);
+    }
+
+    #[test]
+    fn post_activation_keeps_quiesce_resume_shutdown_unavailable() {
+        let mut service = authenticated_service();
+        assert_eq!(
+            service.quiesce().unwrap_err().code,
+            ServiceErrorCode::UnsupportedOperation
+        );
+        assert_eq!(
+            service.resume().unwrap_err().code,
+            ServiceErrorCode::UnsupportedOperation
+        );
+        assert_eq!(
+            service.shutdown().unwrap_err().code,
+            ServiceErrorCode::UnsupportedOperation
+        );
     }
 
     #[test]

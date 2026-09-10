@@ -22,6 +22,9 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 - Process execution is supervised with one active exec at a time, unlimited
   sequential execs, argv/env/cwd execution without shell expansion, bounded
   stdin queueing, and non-destructive credit-aware output streaming.
+- Post-config capability advertisement now exposes `Exec`, `Streams`, and
+  `Cancel` only. `Quiesce`, `Resume`, and `Shutdown` remain explicitly
+  unavailable until reviewed.
 - Cancellation, timeout escalation, descendant termination, channel-loss cleanup,
   and graceful shutdown all execute with fail-closed behavior.
 - Quiesce/resume now drives cgroup freezer state (`cgroup.freeze` +
@@ -32,6 +35,9 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 - The service still reserves `OPENVMM_OUTER_FRAME_OVERHEAD_BYTES = 64` as a
   conservative framing budget until OpenVMM framing metadata is imported
   directly.
+- Stream payload and stdin queue bounds are pinned to one protocol-safe limit:
+  `PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES` (currently 65,452 bytes), derived from
+  the conservative OpenVMM outer-record cap after inner-record framing.
 - Security boundary: launch capability trust comes only from mxc profile boot
   configuration; host control traffic proves possession but cannot redefine the
   trusted expected value.

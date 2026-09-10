@@ -22,7 +22,9 @@ use agent_protocol::{
 use crate::config::{GuestMountRoot, SessionConfiguration as AgentSessionConfiguration};
 use crate::error::{AgentError, Result};
 use crate::isolation::{self, apply_and_verify_workload_isolation, default_isolation_plan};
-use crate::mappings::MappingResolver;
+use crate::mappings::{
+    MappingResolver, ResolvedMapping, install_resolved_mappings_in_holder_mount_namespace,
+};
 use crate::supervisor::LinuxProcessSupervisor;
 
 const LOOP_SLEEP: Duration = Duration::from_millis(10);
@@ -41,13 +43,14 @@ pub fn run_runtime() -> Result<()> {
     let build = detect_build_status();
     let network = detect_network_status();
     let isolation_result = apply_and_verify_workload_isolation(&default_isolation_plan())?;
+    let isolation_holder_pid = isolation_result.holder_pid;
     let mut service = MxcControlService::new_pid1_runtime_with_status(
         binding.clone(),
         build,
         network.clone(),
         isolation_result.status,
         WorkloadIdentityStatus::mxc_fixed(),
-        isolation_result.holder_pid,
+        isolation_holder_pid,
     );
     service.set_expected_capability(launch_config.expected_capability);
     let mut supervisor = LinuxProcessSupervisor::new_with_holder(isolation_result.holder_pid)
@@ -135,6 +138,7 @@ pub fn run_runtime() -> Result<()> {
                         &mut supervisor,
                         &mut pending_hello,
                         &mut active_timeout,
+                        isolation_holder_pid,
                         record,
                     );
                     let outbound = match outbound {
@@ -163,6 +167,7 @@ fn handle_host_record<S: ProcessSupervisor>(
     supervisor: &mut S,
     pending_hello: &mut Option<AuthenticateChannelRequest>,
     active_timeout: &mut Option<(u32, Instant)>,
+    isolation_holder_pid: libc::pid_t,
     record: agent_protocol::InnerRecord,
 ) -> Result<Vec<AgentControlMessage>> {
     if record.kind != agent_protocol::InnerRecordKind::Control {
@@ -186,6 +191,7 @@ fn handle_host_record<S: ProcessSupervisor>(
         supervisor,
         pending_hello,
         active_timeout,
+        isolation_holder_pid,
         host_message,
     ) {
         Ok(messages) => Ok(messages),
@@ -252,6 +258,7 @@ fn handle_host_message<S: ProcessSupervisor>(
     supervisor: &mut S,
     pending_hello: &mut Option<AuthenticateChannelRequest>,
     active_timeout: &mut Option<(u32, Instant)>,
+    isolation_holder_pid: libc::pid_t,
     message: HostControlMessage,
 ) -> std::result::Result<Vec<AgentControlMessage>, HostDispatchError> {
     match message {
@@ -297,7 +304,7 @@ fn handle_host_message<S: ProcessSupervisor>(
             let network = detect_network_status();
             let guest_mount_root = GuestMountRoot::parse(DEFAULT_GUEST_MAPPING_ROOT.to_string())?;
             let _ = service.authenticate_channel(authentication, now_secs(), network.clone())?;
-            verify_declared_mappings(&guest_mount_root, &mappings)?;
+            let resolved_mappings = resolve_declared_mappings(&guest_mount_root, &mappings)?;
             let configuration = session_configuration_from_host(
                 launch,
                 root,
@@ -312,6 +319,16 @@ fn handle_host_message<S: ProcessSupervisor>(
                 channel_generation: binding.channel_generation,
                 idempotent_replay: false,
                 configuration,
+            })?;
+            install_resolved_mappings_in_holder_mount_namespace(
+                isolation_holder_pid,
+                guest_mount_root.as_str(),
+                &resolved_mappings,
+            )
+            .map_err(|error| {
+                AgentError::fail_closed(format!(
+                    "mapping installation failed after configuration commit: {error}"
+                ))
             })?;
             service.activate_full_lifecycle()?;
             let _ = service.wait_ready(WaitReadyRequest {
@@ -441,15 +458,16 @@ fn ready_status(service: &MxcControlService, network: NetworkStatus) -> ReadySta
     service.ready_status(network)
 }
 
-fn verify_declared_mappings(
+fn resolve_declared_mappings(
     guest_mount_root: &GuestMountRoot,
     mappings: &[agent_protocol::ChildMapping],
-) -> Result<()> {
+) -> Result<Vec<ResolvedMapping>> {
     let resolver = MappingResolver::new(guest_mount_root.as_str(), mappings.to_vec())?;
+    let mut resolved = Vec::with_capacity(mappings.len());
     for mapping in mappings {
-        let _ = resolver.resolve_declared(&mapping.child)?;
+        resolved.push(resolver.resolve_declared(&mapping.child)?);
     }
-    Ok(())
+    Ok(resolved)
 }
 
 fn detect_network_status() -> NetworkStatus {
@@ -661,6 +679,9 @@ fn quiesce_transactional(
     service: &mut MxcControlService,
     mut set_frozen: impl FnMut(bool) -> Result<()>,
 ) -> Result<AgentControlMessage> {
+    service
+        .ensure_supported_operation("Quiesce")
+        .map_err(|error| AgentError::bad_request(error.to_string()))?;
     let initial = service.health();
     if initial.quiesced {
         return Err(AgentError::bad_request(
@@ -688,6 +709,9 @@ fn resume_transactional(
     service: &mut MxcControlService,
     mut set_frozen: impl FnMut(bool) -> Result<()>,
 ) -> Result<AgentControlMessage> {
+    service
+        .ensure_supported_operation("Resume")
+        .map_err(|error| AgentError::bad_request(error.to_string()))?;
     let initial = service.health();
     if !initial.quiesced {
         return Err(AgentError::bad_request(
@@ -1270,65 +1294,41 @@ mod tests {
     }
 
     #[test]
-    fn quiesce_freeze_failure_leaves_running_and_retry_succeeds() {
+    fn quiesce_remains_unavailable_after_runtime_activation() {
         let mut service = runtime_test_service();
         service.activate_full_lifecycle().unwrap();
 
-        let mut attempts = 0_u32;
-        let error = quiesce_transactional(&mut service, |freeze| {
-            assert!(freeze);
-            attempts += 1;
-            if attempts == 1 {
-                return Err(AgentError::freeze("injected freeze failure"));
-            }
+        let mut touched_freezer = false;
+        let error = quiesce_transactional(&mut service, |_freeze| {
+            touched_freezer = true;
             Ok(())
         })
         .unwrap_err();
-        assert_eq!(attempts, 1);
-        assert_eq!(error.code(), crate::error::ErrorCode::FreezeFailed);
-        assert!(!service.health().quiesced);
-
-        let message = quiesce_transactional(&mut service, |freeze| {
-            assert!(freeze);
-            Ok(())
-        })
-        .unwrap();
-        assert!(matches!(message, AgentControlMessage::Quiesced));
-        assert!(service.health().quiesced);
-    }
-
-    #[test]
-    fn resume_thaw_failure_leaves_quiesced_and_retry_succeeds() {
-        let mut service = runtime_test_service();
-        service.activate_full_lifecycle().unwrap();
-        quiesce_transactional(&mut service, |_| Ok(())).unwrap();
-        assert!(service.health().quiesced);
-
-        let mut attempts = 0_u32;
-        let error = resume_transactional(&mut service, |freeze| {
-            assert!(!freeze);
-            attempts += 1;
-            if attempts == 1 {
-                return Err(AgentError::freeze("injected thaw failure"));
-            }
-            Ok(())
-        })
-        .unwrap_err();
-        assert_eq!(attempts, 1);
-        assert_eq!(error.code(), crate::error::ErrorCode::FreezeFailed);
-        assert!(service.health().quiesced);
-
-        let message = resume_transactional(&mut service, |freeze| {
-            assert!(!freeze);
-            Ok(())
-        })
-        .unwrap();
-        assert!(matches!(message, AgentControlMessage::Resumed));
+        assert!(!touched_freezer);
+        assert_eq!(error.code(), crate::error::ErrorCode::BadRequest);
+        assert!(error.to_string().contains("UnsupportedOperation"));
         assert!(!service.health().quiesced);
     }
 
     #[test]
-    fn quiesce_commit_failure_preserves_fail_closed_rollback_error() {
+    fn resume_remains_unavailable_after_runtime_activation() {
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+
+        let mut touched_freezer = false;
+        let error = resume_transactional(&mut service, |_freeze| {
+            touched_freezer = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!touched_freezer);
+        assert_eq!(error.code(), crate::error::ErrorCode::BadRequest);
+        assert!(error.to_string().contains("UnsupportedOperation"));
+        assert!(!service.health().quiesced);
+    }
+
+    #[test]
+    fn quiesce_unavailable_preserves_active_execution() {
         let mut service = runtime_test_service();
         service.activate_full_lifecycle().unwrap();
         let mut supervisor = RuntimeTestSupervisor::default();
@@ -1346,75 +1346,18 @@ mod tests {
             .unwrap();
         assert_eq!(service.active_exec_id(), Some(9));
 
-        let mut transitions = Vec::new();
-        let error = quiesce_transactional(&mut service, |freeze| {
-            transitions.push(freeze);
-            if !freeze {
-                return Err(AgentError::fail_closed(
-                    "injected quiesce rollback uncertainty",
-                ));
-            }
+        let mut touched_freezer = false;
+        let error = quiesce_transactional(&mut service, |_freeze| {
+            touched_freezer = true;
             Ok(())
         })
         .unwrap_err();
 
-        assert_eq!(transitions, vec![true, false]);
-        assert!(error.requires_fail_closed_action());
-        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
-        assert_eq!(error.to_string(), "injected quiesce rollback uncertainty");
+        assert!(!touched_freezer);
+        assert_eq!(error.code(), crate::error::ErrorCode::BadRequest);
+        assert!(error.to_string().contains("UnsupportedOperation"));
         assert!(!service.health().quiesced);
         assert_eq!(service.active_exec_id(), Some(9));
-    }
-
-    #[test]
-    fn resume_commit_failure_preserves_fail_closed_rollback_error() {
-        let mut service = runtime_test_service();
-        service.activate_full_lifecycle().unwrap();
-        quiesce_transactional(&mut service, |_| Ok(())).unwrap();
-        service.shutdown().unwrap();
-        assert!(service.health().quiesced);
-
-        let mut transitions = Vec::new();
-        let error = resume_transactional(&mut service, |freeze| {
-            transitions.push(freeze);
-            if freeze {
-                return Err(AgentError::fail_closed(
-                    "injected resume rollback uncertainty",
-                ));
-            }
-            Ok(())
-        })
-        .unwrap_err();
-
-        assert_eq!(transitions, vec![false, true]);
-        assert!(error.requires_fail_closed_action());
-        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
-        assert_eq!(error.to_string(), "injected resume rollback uncertainty");
-        assert!(service.health().quiesced);
-    }
-
-    #[test]
-    fn timeout_paths_preserve_state_and_allow_retry() {
-        let mut service = runtime_test_service();
-        service.activate_full_lifecycle().unwrap();
-
-        let error = quiesce_transactional(&mut service, |_| {
-            Err(AgentError::checkpoint_timeout("injected freeze timeout"))
-        })
-        .unwrap_err();
-        assert_eq!(error.code(), crate::error::ErrorCode::CheckpointTimeout);
-        assert!(!service.health().quiesced);
-        quiesce_transactional(&mut service, |_| Ok(())).unwrap();
-        assert!(service.health().quiesced);
-
-        let error = resume_transactional(&mut service, |_| {
-            Err(AgentError::checkpoint_timeout("injected thaw timeout"))
-        })
-        .unwrap_err();
-        assert_eq!(error.code(), crate::error::ErrorCode::CheckpointTimeout);
-        assert!(service.health().quiesced);
-        resume_transactional(&mut service, |_| Ok(())).unwrap();
-        assert!(!service.health().quiesced);
     }
 
     #[derive(Default)]
@@ -1624,6 +1567,7 @@ mod tests {
                 &mut supervisor,
                 &mut pending_hello,
                 &mut active_timeout,
+                4242,
                 control_record(&operation),
             )
             .expect("dispatch");

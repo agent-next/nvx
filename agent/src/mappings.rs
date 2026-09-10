@@ -11,6 +11,8 @@ use ::std::ffi::CString;
 use ::std::mem::size_of;
 #[cfg(target_os = "linux")]
 use ::std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(target_os = "linux")]
+use ::std::path::Path;
 use ::std::path::PathBuf;
 
 use ::agent_protocol::{AccessMode, ChildMapping, RelativeChildPath, validate_mapping_set};
@@ -47,6 +49,9 @@ pub struct MappingResolver {
     #[cfg(target_os = "linux")]
     root_fd: OwnedFd,
 }
+
+#[cfg(target_os = "linux")]
+const MAPPING_ROOT_TMPFS_DATA: &str = "mode=755,nosuid,nodev";
 
 impl MappingResolver {
     pub fn new(guest_root: impl Into<PathBuf>, mappings: Vec<ChildMapping>) -> Result<Self> {
@@ -111,6 +116,292 @@ impl MappingResolver {
 #[cfg(target_os = "linux")]
 pub fn procfd_mount_source(fd: &OwnedFd) -> String {
     format!("/proc/self/fd/{}", fd.as_raw_fd())
+}
+
+#[cfg(target_os = "linux")]
+pub fn install_resolved_mappings_in_holder_mount_namespace(
+    holder_pid: libc::pid_t,
+    guest_root: &str,
+    mappings: &[ResolvedMapping],
+) -> Result<()> {
+    if holder_pid <= 1 {
+        return Err(AgentError::mount(format!(
+            "holder pid {holder_pid} is invalid for mapping installation",
+        )));
+    }
+    let mount_ns_fd = open_namespace_fd(holder_pid, "mnt")?;
+    // SAFETY: fork is used to isolate setns+mount operations from the main runtime process.
+    let child_pid = unsafe { libc::fork() };
+    if child_pid < 0 {
+        close_fd(mount_ns_fd);
+        return Err(AgentError::io(
+            "forking mapping installer helper",
+            ::std::io::Error::last_os_error(),
+        ));
+    }
+    if child_pid == 0 {
+        let exit_code = match install_resolved_mappings_in_child(mount_ns_fd, guest_root, mappings)
+        {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("NVX-MAPPING-INSTALL-ERROR: {error}");
+                1
+            }
+        };
+        // SAFETY: child must exit without unwinding parent state after fork.
+        unsafe { libc::_exit(exit_code) };
+    }
+    close_fd(mount_ns_fd);
+    wait_pid_success(child_pid, "mapping installer helper")
+}
+
+#[cfg(target_os = "linux")]
+fn install_resolved_mappings_in_child(
+    mount_ns_fd: i32,
+    guest_root: &str,
+    mappings: &[ResolvedMapping],
+) -> Result<()> {
+    setns_checked(
+        mount_ns_fd,
+        libc::CLONE_NEWNS,
+        "joining holder mount namespace",
+    )?;
+    close_fd(mount_ns_fd);
+    let guest_root_path = Path::new(guest_root);
+    ::std::fs::create_dir_all(guest_root_path).map_err(|error| {
+        AgentError::io(
+            format!("creating guest mapping root {}", guest_root_path.display()),
+            error,
+        )
+    })?;
+    mount_call(
+        "tmpfs",
+        guest_root_path,
+        "tmpfs",
+        0,
+        Some(MAPPING_ROOT_TMPFS_DATA),
+        "hiding raw mapping export with private tmpfs root",
+    )?;
+
+    for mapping in mappings {
+        let target_path = guest_root_path.join(mapping.child.as_str());
+        prepare_mapping_target(&target_path, mapping.entry_kind)?;
+        let source = procfd_mount_source(&mapping.guest_fd);
+        bind_mount_mapping_source(&source, &target_path, mapping.entry_kind)?;
+        if mapping.access == AccessMode::ReadOnly {
+            harden_read_only_recursive(&target_path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_mapping_target(target: &Path, kind: MappingEntryKind) -> Result<()> {
+    let parent = target.parent().ok_or_else(|| {
+        AgentError::mount(format!(
+            "mapping target {} has no parent directory",
+            target.display()
+        ))
+    })?;
+    ::std::fs::create_dir_all(parent).map_err(|error| {
+        AgentError::io(
+            format!("creating mapping parent directory {}", parent.display()),
+            error,
+        )
+    })?;
+    match kind {
+        MappingEntryKind::Directory => {
+            ::std::fs::create_dir_all(target).map_err(|error| {
+                AgentError::io(
+                    format!("creating mapping target directory {}", target.display()),
+                    error,
+                )
+            })?;
+        }
+        MappingEntryKind::File => {
+            if !target.exists() {
+                ::std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(target)
+                    .map_err(|error| {
+                        AgentError::io(
+                            format!("creating mapping target file {}", target.display()),
+                            error,
+                        )
+                    })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_mount_mapping_source(source: &str, target: &Path, kind: MappingEntryKind) -> Result<()> {
+    let flags = if kind == MappingEntryKind::Directory {
+        libc::MS_BIND | libc::MS_REC
+    } else {
+        libc::MS_BIND
+    };
+    mount_call(
+        source,
+        target,
+        "",
+        flags,
+        None,
+        format!(
+            "bind-mounting mapping source {source} to {}",
+            target.display()
+        ),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn harden_read_only_recursive(target: &Path) -> Result<()> {
+    let mut mount_points = collect_mount_points_under(target)?;
+    mount_points.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| right.as_os_str().len().cmp(&left.as_os_str().len()))
+    });
+    if mount_points.is_empty() {
+        mount_points.push(target.to_path_buf());
+    }
+    for mount_point in mount_points {
+        mount_call(
+            "none",
+            &mount_point,
+            "",
+            libc::MS_BIND
+                | libc::MS_REMOUNT
+                | libc::MS_RDONLY
+                | libc::MS_NOSUID
+                | libc::MS_NODEV
+                | libc::MS_NOEXEC,
+            None,
+            format!("remounting {} read-only", mount_point.display()),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn collect_mount_points_under(root: &Path) -> Result<Vec<PathBuf>> {
+    let mountinfo = ::std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| AgentError::io("reading /proc/self/mountinfo", error))?;
+    let mut points = Vec::new();
+    for line in mountinfo.lines() {
+        let pre = line.split(" - ").next().unwrap_or_default();
+        let fields: Vec<&str> = pre.split_whitespace().collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let mount_point = PathBuf::from(fields[4]);
+        if mount_point == root || mount_point.starts_with(root) {
+            points.push(mount_point);
+        }
+    }
+    Ok(points)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_call(
+    source: &str,
+    target: &Path,
+    fstype: &str,
+    flags: libc::c_ulong,
+    data: Option<&str>,
+    context: impl Into<String>,
+) -> Result<()> {
+    let c_source =
+        CString::new(source).map_err(|_| AgentError::mount("mount source contains NUL byte"))?;
+    let c_target = CString::new(target.to_string_lossy().as_ref())
+        .map_err(|_| AgentError::mount("mount target contains NUL byte"))?;
+    let c_fstype =
+        CString::new(fstype).map_err(|_| AgentError::mount("mount fstype contains NUL byte"))?;
+    let c_data = data
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| AgentError::mount("mount data contains NUL byte"))?;
+    // SAFETY: pointers point to NUL-terminated strings that outlive the syscall.
+    let rc = unsafe {
+        libc::mount(
+            c_source.as_ptr(),
+            c_target.as_ptr(),
+            if fstype.is_empty() {
+                ::std::ptr::null()
+            } else {
+                c_fstype.as_ptr()
+            },
+            flags,
+            c_data
+                .as_ref()
+                .map_or(::std::ptr::null(), |value| value.as_ptr().cast()),
+        )
+    };
+    if rc != 0 {
+        return Err(AgentError::io(context, ::std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_namespace_fd(pid: libc::pid_t, ns_name: &str) -> Result<i32> {
+    let path = CString::new(format!("/proc/{pid}/ns/{ns_name}"))
+        .map_err(|_| AgentError::mount("namespace path contains interior NUL"))?;
+    // SAFETY: path is NUL-terminated and flags are constants.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(AgentError::io(
+            format!("opening namespace /proc/{pid}/ns/{ns_name}"),
+            ::std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn setns_checked(fd: i32, nstype: i32, context: &str) -> Result<()> {
+    // SAFETY: fd references a namespace descriptor and nstype is a Linux setns flag.
+    let rc = unsafe { libc::setns(fd, nstype) };
+    if rc != 0 {
+        return Err(AgentError::io(context, ::std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_pid_success(pid: libc::pid_t, context: &str) -> Result<()> {
+    let mut status = 0_i32;
+    loop {
+        // SAFETY: waiting on known child pid with valid status pointer.
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if rc < 0 {
+            let error = ::std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(AgentError::io(format!("waiting for {context}"), error));
+        }
+        if rc != pid {
+            continue;
+        }
+        break;
+    }
+    if (status & 0x7f) != 0 || ((status >> 8) & 0xff) != 0 {
+        return Err(AgentError::mount(format!(
+            "{context} failed with wait status {status}",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn close_fd(fd: i32) {
+    // SAFETY: best-effort close of process-owned descriptor.
+    let _ = unsafe { libc::close(fd) };
 }
 
 #[cfg(target_os = "linux")]

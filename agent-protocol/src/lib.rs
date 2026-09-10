@@ -40,8 +40,8 @@ pub use crate::service::{
     HVC1_DEVICE_PATH, HealthSnapshot, HvcFramedChannel, LaunchBinding,
     MAX_INNER_RECORD_BYTES_FOR_OPENVMM, MAX_LABEL_COUNT, MAX_MAP_ENTRIES, MAX_REQUEST_BODY_BYTES,
     MAX_STRING_BYTES, MxcCapabilities, MxcControlService, OPENVMM_OUTER_FRAME_OVERHEAD_BYTES,
-    ProcessSupervisor, ReadySnapshot, ServiceError, ServiceErrorCode, SessionConfiguration,
-    SupervisorEvent, WaitReadyRequest,
+    PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES, ProcessSupervisor, ReadySnapshot, ServiceError,
+    ServiceErrorCode, SessionConfiguration, SupervisorEvent, WaitReadyRequest,
 };
 pub use crate::state::{
     ActiveExecEvent, AgentProtocolState, CHANNEL_LOSS_CLEANUP_DEADLINE_SECS, CleanupStatus,
