@@ -2,21 +2,22 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use agent_protocol::codec::{InnerRecord, InnerRecordKind};
+use agent_protocol::control_session::{
+    HostAttachStatus, HostControlSession, HostEvent, SessionError,
+};
 use agent_protocol::messages::{AgentControlMessage, HostControlMessage};
 use agent_protocol::service::{ServiceError, ServiceErrorCode};
-
-use crate::control_session::{ControlSession, ControlSessionError};
 
 const DEFAULT_MAX_INBOUND_QUEUE: usize = 256;
 
 pub struct MxcAgentClient<T: std::io::Read + std::io::Write> {
-    control: ControlSession<T>,
+    control: HostControlSession<T>,
     inbound: VecDeque<AgentControlMessage>,
     max_inbound_queue: usize,
 }
 
 impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
-    pub fn new(control: ControlSession<T>) -> Self {
+    pub fn new(control: HostControlSession<T>) -> Self {
         Self {
             control,
             inbound: VecDeque::new(),
@@ -31,8 +32,28 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         timeout: Duration,
     ) -> Result<(), String> {
         self.control
-            .send_attach(capability)
+            .send_host_attach(capability)
             .map_err(control_error)?;
+        match self.control.recv_attach_status().map_err(control_error)? {
+            HostAttachStatus::Wait => loop {
+                match self.control.recv_event_blocking().map_err(control_error)? {
+                    HostEvent::Ready => break,
+                    HostEvent::Error(code) => {
+                        return Err(format!(
+                            "control-session broker rejected host attach with error code {code}"
+                        ));
+                    }
+                    HostEvent::Wait => {}
+                    HostEvent::Data(_) => {
+                        return Err("received data before broker Ready".to_string());
+                    }
+                    HostEvent::Reset { .. } => {
+                        return Err("received reset during host attach handshake".to_string());
+                    }
+                }
+            },
+            HostAttachStatus::Ready => {}
+        }
         self.send_host_control(hello)?;
         let response = self.recv_agent_control(timeout)?;
         if matches!(response, AgentControlMessage::Ready { .. }) {
@@ -53,22 +74,42 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
     }
 
     pub fn recv_agent_control(&mut self, timeout: Duration) -> Result<AgentControlMessage, String> {
+        let _ = timeout;
         if let Some(message) = self.inbound.pop_front() {
             return Ok(message);
         }
-        let frame = self.control.read_frame(timeout).map_err(control_error)?;
-        let record = InnerRecord::decode(&frame.payload).map_err(|error| {
-            format!("failed to decode inner record from control payload: {error:?}")
-        })?;
-        if record.kind != InnerRecordKind::Control {
-            return Err(format!(
-                "expected control inner record from agent, got {:?}",
-                record.kind
-            ));
+        loop {
+            match self.control.recv_event_blocking().map_err(control_error)? {
+                HostEvent::Data(payload) => {
+                    let record = InnerRecord::decode(&payload).map_err(|error| {
+                        format!("failed to decode inner record from control payload: {error:?}")
+                    })?;
+                    if record.kind != InnerRecordKind::Control {
+                        return Err(format!(
+                            "expected control inner record from agent, got {:?}",
+                            record.kind
+                        ));
+                    }
+                    let message: AgentControlMessage = serde_json::from_slice(&record.payload)
+                        .map_err(|error| {
+                            format!("failed to decode agent control message: {error}")
+                        })?;
+                    return Ok(message);
+                }
+                HostEvent::Error(code) => {
+                    return Err(format!(
+                        "control-session broker sent Error with code {code}"
+                    ));
+                }
+                HostEvent::Reset { .. } => {
+                    return Err(
+                        "control-session reset observed while waiting for agent control message"
+                            .to_string(),
+                    );
+                }
+                HostEvent::Wait | HostEvent::Ready => {}
+            }
         }
-        let message: AgentControlMessage = serde_json::from_slice(&record.payload)
-            .map_err(|error| format!("failed to decode agent control message: {error}"))?;
-        Ok(message)
     }
 
     pub fn queue_agent_message_for_test(
@@ -90,14 +131,14 @@ pub fn missing_ready_error() -> ServiceError {
     }
 }
 
-fn control_error(error: ControlSessionError) -> String {
+fn control_error(error: SessionError) -> String {
     format!("control-session transport error: {error}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_session::{CONTROL_PROTOCOL_MAGIC, CONTROL_PROTOCOL_VERSION};
+    use crate::control_session::{HostControlSession, Record, RecordType, encode};
     use agent_protocol::messages::{LaunchIdentity, ReadyStatus, SERVICE_IDENTITY};
     use std::io::{Cursor, Read, Write};
 
@@ -134,8 +175,7 @@ mod tests {
 
     #[test]
     fn inbound_queue_is_bounded() {
-        let io = Cursor::new(Vec::new());
-        let session = ControlSession::new(io, 1, [0; 16]);
+        let session = HostControlSession::new(Cursor::new(Vec::new()));
         let mut client = MxcAgentClient::new(session);
         for _ in 0..DEFAULT_MAX_INBOUND_QUEUE {
             client
@@ -192,17 +232,9 @@ mod tests {
         };
         let inner = InnerRecord::control(&ready).expect("encode control");
         let inner = inner.encode().expect("encode bytes");
-        let mut outer = Vec::new();
-        outer.extend_from_slice(&CONTROL_PROTOCOL_MAGIC.to_be_bytes());
-        outer.extend_from_slice(&CONTROL_PROTOCOL_VERSION.to_be_bytes());
-        outer.extend_from_slice(&(5_u16).to_be_bytes()); // Data
-        outer.extend_from_slice(&0_u64.to_be_bytes());
-        outer.extend_from_slice(&1_u64.to_be_bytes());
-        outer.extend_from_slice(&[0_u8; 16]);
-        outer.extend_from_slice(&(inner.len() as u32).to_be_bytes());
-        outer.extend_from_slice(&inner);
-
-        let session = ControlSession::new(MockDuplex::with_read_bytes(outer), 1, [0; 16]);
+        let outer = encode(&Record::session(RecordType::Data, [0xA5; 16], 3, 0, inner))
+            .expect("encode outer");
+        let session = HostControlSession::new(MockDuplex::with_read_bytes(outer));
         let mut client = MxcAgentClient::new(session);
         let decoded = client
             .recv_agent_control(Duration::from_secs(1))

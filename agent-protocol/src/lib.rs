@@ -8,6 +8,7 @@
 //! It provides an explicit adapter boundary for future integration.
 
 pub mod codec;
+pub mod control_session;
 pub mod e2e_profile;
 pub mod mapping;
 pub mod messages;
@@ -19,6 +20,12 @@ pub use crate::codec::{
     EncodedRecordTooLargeError, INNER_RECORD_HEADER_BYTES, INNER_RECORD_MAX_BYTES, InnerRecord,
     InnerRecordDecodeError, InnerRecordEncodeError, InnerRecordKind, MAX_STREAM_CHUNK_BYTES,
     OPENVMM_OUTER_RECORD_MAX_BYTES,
+};
+pub use crate::control_session::{
+    CONTROL_HEADER_BYTES, CONTROL_MAX_DATA_BYTES, CONTROL_PROTOCOL_MAGIC, CONTROL_PROTOCOL_VERSION,
+    GuestControlSession, GuestEvent, HostAttachStatus, HostControlSession, HostEvent,
+    ParseProgress, Parser, ParserSnapshot, ProtocolError as ControlProtocolError, Record,
+    RecordType, SessionError, decode_exact, encode,
 };
 pub use crate::mapping::{
     AccessMode, CanonicalHostMappingRoot, ChildMapping, MappingContainmentPolicy, MappingError,

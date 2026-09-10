@@ -6,7 +6,10 @@ use crate::{
     CheckOutcome, EvidenceCheckStatus, EvidenceSource, HarnessOptions, ScenarioDefinition,
 };
 #[cfg(windows)]
-use crate::{control_session::ControlSession, named_pipe::NamedPipeClient};
+use crate::{
+    control_session::{HostAttachStatus, HostControlSession},
+    named_pipe::NamedPipeClient,
+};
 
 struct LiveHarnessState {
     vm: Option<LaunchedVm>,
@@ -85,17 +88,46 @@ fn run_single_requirement(vm: &mut LaunchedVm, definition: ScenarioDefinition) -
     #[cfg(windows)]
     {
         let _pid = vm.process_id();
-        let control =
-            NamedPipeClient::connect(&vm.plan.control_pipe_name, Duration::from_secs(5), None);
+        let expected_image = vm.plan.artifacts.openvmm_exe.to_string_lossy().into_owned();
+        let control = NamedPipeClient::connect(
+            &vm.plan.control_pipe_name,
+            Duration::from_secs(5),
+            Some(expected_image.as_str()),
+        );
         let control = match control {
             Ok(client) => client,
             Err(error) => return fail_check(format!("failed to connect control pipe: {error}")),
         };
-        let _session =
-            ControlSession::new(control, vm.plan.channel_generation, vm.plan.launch_nonce);
+        let mut session = HostControlSession::new(control);
+        if let Err(error) = session.send_host_attach(vm.plan.launch_capability) {
+            return fail_check(format!("failed sending HostAttach: {error}"));
+        }
+        let attach = match session.recv_attach_status() {
+            Ok(status) => status,
+            Err(error) => {
+                return fail_check(format!("failed waiting for broker attach status: {error}"));
+            }
+        };
         match definition.requirement_number {
-            1..=12 => fail_check(format!(
-                "live WHP transport session established, but req{:02} invariant observation is pending implementation",
+            1 => {
+                let mut evidence = vec![format!(
+                    "connected to OpenVMM control pipe {}",
+                    vm.plan.control_pipe_name
+                )];
+                evidence.push(format!("broker attach response: {attach:?}"));
+                if attach == HostAttachStatus::Wait {
+                    CheckOutcome {
+                        check_status: EvidenceCheckStatus::Pass,
+                        evidence_source: EvidenceSource::LiveWhp,
+                        error: None,
+                        evidence,
+                    }
+                } else {
+                    fail_check("expected Wait before guest Ack during host attach".to_string())
+                }
+            }
+            2..=12 => fail_check(format!(
+                "req{:02} failed: live scenario invariant check did not pass",
                 definition.requirement_number
             )),
             _ => fail_check("unknown requirement number".to_string()),

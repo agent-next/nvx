@@ -12,6 +12,7 @@ use crate::codec::{
     INNER_RECORD_HEADER_BYTES, INNER_RECORD_MAX_BYTES, InnerRecord, InnerRecordDecodeError,
     OPENVMM_OUTER_RECORD_MAX_BYTES,
 };
+use crate::control_session::CONTROL_HEADER_BYTES;
 use crate::mapping::{
     CanonicalHostMappingRoot, ChildMapping, MappingContainmentPolicy, validate_mapping_set,
 };
@@ -42,11 +43,8 @@ pub const MAX_EXEC_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 /// a caller-supplied, representable deadline.
 pub const MAX_SHUTDOWN_GRACE_TIMEOUT_MS: u64 = 30 * 1000;
 pub const HVC1_DEVICE_PATH: &str = "/dev/hvc1";
-/// Conservative fixed cap for OpenVMM outer framing bytes.
-///
-/// OpenVMM enforces a 65_536-byte complete record limit including its own framing.
-/// Until this crate imports exact OpenVMM framing metadata, we reserve 64 bytes.
-pub const OPENVMM_OUTER_FRAME_OVERHEAD_BYTES: usize = 64;
+/// Exact OpenVMM control-session header overhead (NVXS v1 fixed header length).
+pub const OPENVMM_OUTER_FRAME_OVERHEAD_BYTES: usize = CONTROL_HEADER_BYTES;
 pub const MAX_INNER_RECORD_BYTES_FOR_OPENVMM: usize =
     OPENVMM_OUTER_RECORD_MAX_BYTES - OPENVMM_OUTER_FRAME_OVERHEAD_BYTES;
 /// Protocol-safe max binary chunk that always fits beneath the conservative OpenVMM outer-record

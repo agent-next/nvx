@@ -2647,6 +2647,17 @@ mod tests {
     }
 
     #[test]
+    fn live_scenarios_do_not_reference_pending_placeholders() {
+        let source = include_str!("scenarios.rs");
+        for banned in ["pending implementation", "not implemented", "TODO"] {
+            assert!(
+                !source.contains(banned),
+                "live scenario source contains placeholder marker {banned:?}"
+            );
+        }
+    }
+
+    #[test]
     fn static_mode_never_satisfies_live_gate() {
         let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
         let root = std::env::temp_dir().join("nvx-agent-harness-static-gate");

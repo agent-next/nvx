@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::io::Read;
+use std::io::Write;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{FromRawFd, RawFd};
@@ -18,13 +19,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_protocol::{
     AccessMode, AgentControlMessage, AuthenticateChannelRequest, BuildStatus, CancelReason,
-    ChannelReadResult, ConfigureSessionRequest, CreateProcessRequest, DnsStatus, HVC1_DEVICE_PATH,
-    HostControlMessage, LaunchBinding, LaunchIdentity, MAX_SHUTDOWN_GRACE_TIMEOUT_MS,
-    MappingContainmentPolicy, MxcControlService, NetworkFailureCode, NetworkFailureStatus,
-    NetworkInterfaceStatus, NetworkLinkState, NetworkMode, NetworkSetupState, NetworkStatus,
-    OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, PROTOCOL_VERSION, ProcessSupervisor, ProtocolErrorCode,
-    ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, ServiceError, ServiceErrorCode,
-    SessionConfiguration, WaitReadyRequest, WorkloadIdentityStatus,
+    ChannelReadResult, ConfigureSessionRequest, CreateProcessRequest, DnsStatus,
+    GuestControlSession, GuestEvent, HVC1_DEVICE_PATH, HostControlMessage, LaunchBinding,
+    LaunchIdentity, MAX_SHUTDOWN_GRACE_TIMEOUT_MS, MappingContainmentPolicy, MxcControlService,
+    NetworkFailureCode, NetworkFailureStatus, NetworkInterfaceStatus, NetworkLinkState,
+    NetworkMode, NetworkSetupState, NetworkStatus, OPENVMM_OUTER_FRAME_OVERHEAD_BYTES,
+    PROTOCOL_VERSION, ProcessSupervisor, ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus,
+    SERVICE_IDENTITY, ServiceError, ServiceErrorCode, SessionConfiguration, WaitReadyRequest,
+    WorkloadIdentityStatus,
 };
 
 use crate::config::{GuestMountRoot, SessionConfiguration as AgentSessionConfiguration};
@@ -84,7 +86,8 @@ pub fn run_runtime() -> Result<()> {
 
     loop {
         let file = open_hvc1_raw_nonblocking(HVC1_DEVICE_PATH)?;
-        let mut channel = agent_protocol::HvcFramedChannel::new(file);
+        let control_transport = GuestControlTransport::connect(file)?;
+        let mut channel = agent_protocol::HvcFramedChannel::new(control_transport);
 
         loop {
             enforce_active_timeout(
@@ -1896,6 +1899,95 @@ fn open_hvc1_raw_nonblocking(path: &str) -> Result<File> {
             format!("opening {path}"),
             io::Error::last_os_error(),
         ));
+    }
+
+    struct GuestControlTransport {
+        session: GuestControlSession<File>,
+        read_buffer: VecDeque<u8>,
+        eof_after_reset: bool,
+    }
+
+    impl GuestControlTransport {
+        fn connect(file: File) -> Result<Self> {
+            let mut session = GuestControlSession::new(file);
+            session.attach().map_err(|error| {
+                AgentError::internal(format!("control-session attach failed: {error}"))
+            })?;
+            Ok(Self {
+                session,
+                read_buffer: VecDeque::new(),
+                eof_after_reset: false,
+            })
+        }
+
+        fn fill_read_buffer(&mut self) -> io::Result<()> {
+            if self.eof_after_reset {
+                return Ok(());
+            }
+            match self.session.try_recv_event() {
+                Ok(Some(GuestEvent::Data(payload))) => {
+                    self.read_buffer.extend(payload);
+                    Ok(())
+                }
+                Ok(Some(GuestEvent::Reset { .. })) => {
+                    self.eof_after_reset = true;
+                    Ok(())
+                }
+                Ok(None) => Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "control-session idle",
+                )),
+                Err(error) => Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    error.to_string(),
+                )),
+            }
+        }
+    }
+
+    impl Read for GuestControlTransport {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.eof_after_reset {
+                return Ok(0);
+            }
+            if self.read_buffer.is_empty() {
+                self.fill_read_buffer()?;
+                if self.eof_after_reset {
+                    return Ok(0);
+                }
+            }
+            let mut read = 0usize;
+            while read < buf.len() {
+                let Some(byte) = self.read_buffer.pop_front() else {
+                    break;
+                };
+                buf[read] = byte;
+                read += 1;
+            }
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "control-session idle",
+                ));
+            }
+            Ok(read)
+        }
+    }
+
+    impl Write for GuestControlTransport {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.session
+                .send_data(buf.to_vec())
+                .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
     configure_fd_raw_nonblocking(fd)?;
     // SAFETY: fd is newly opened and transferred to File ownership.

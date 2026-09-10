@@ -5,8 +5,11 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 
 ## What is live now
 
-- PID1 opens `/dev/hvc1` read/write, switches the device to raw mode, and
-  exchanges encoded protocol frames through `HvcFramedChannel`.
+- PID1 opens `/dev/hvc1` read/write, switches the device to raw mode, and now
+  speaks the frozen OpenVMM outer control-session wire contract (`NVXS` magic,
+  version 1, fixed 44-byte little-endian header, record types 1..8). The guest
+  control leg sends `GuestAttach`, waits for `Reset`, acknowledges exactly
+  after `Reset`, then carries inner MXC records through outer `Data`.
 - Launch authentication now validates a trusted 32-byte capability loaded once
   from an out-of-band boot configuration key (`nvx.launch_capability` /
   `nvx_launch_capability`) with strict single-key parsing and exact 64-hex
@@ -108,9 +111,8 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 
 ## Scope notes
 
-- The service still reserves `OPENVMM_OUTER_FRAME_OVERHEAD_BYTES = 64` as a
-  conservative framing budget until OpenVMM framing metadata is imported
-  directly.
+- OpenVMM outer-frame accounting now uses the exact frozen header size
+  (`OPENVMM_OUTER_FRAME_OVERHEAD_BYTES = 44`) instead of a guessed reserve.
 - Stream payload and stdin queue bounds are pinned to one protocol-safe limit:
   `PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES` (currently 65,452 bytes), derived from
   the conservative OpenVMM outer-record cap after inner-record framing.

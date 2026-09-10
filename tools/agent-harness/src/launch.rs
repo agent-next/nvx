@@ -4,6 +4,14 @@ use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
+#[cfg(windows)]
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR};
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::WriteFile;
+#[cfg(windows)]
+use windows::Win32::System::Pipes::CreatePipe;
 
 const DEFAULT_INITRAMFS: &str = "initramfs-mxc-agent.cpio.gz";
 
@@ -180,6 +188,8 @@ pub fn launch_whp_vm(plan: LaunchPlan) -> Result<LaunchedVm, String> {
         "nvx.launch_capability={capability_hex} nvx.channel_generation={}",
         plan.channel_generation
     );
+    #[cfg(windows)]
+    let auth_pipe = create_inherited_auth_pipe()?;
     let args = vec![
         "--single-process".to_string(),
         "--machine".to_string(),
@@ -196,6 +206,10 @@ pub fn launch_whp_vm(plan: LaunchPlan) -> Result<LaunchedVm, String> {
         format!("listen={}", plan.boot_pipe_name),
         "--microvm-control-console".to_string(),
         format!("listen={}", plan.control_pipe_name),
+        #[cfg(windows)]
+        "--microvm-control-auth-handle".to_string(),
+        #[cfg(windows)]
+        format!("{}", auth_pipe.read.0 as usize),
         "--cmdline".to_string(),
         cmdline,
     ];
@@ -212,12 +226,64 @@ pub fn launch_whp_vm(plan: LaunchPlan) -> Result<LaunchedVm, String> {
                 plan.artifacts.openvmm_exe.display()
             )
         })?;
+    #[cfg(windows)]
+    {
+        write_auth_capability_and_close(&auth_pipe, &plan.launch_capability)?;
+    }
 
     Ok(LaunchedVm { plan, child })
 }
 
 pub fn startupinfoex_handle_allowlist(capability_read_handle: usize) -> Vec<usize> {
     vec![capability_read_handle]
+}
+
+#[cfg(windows)]
+struct InheritedAuthPipe {
+    read: HANDLE,
+    write: HANDLE,
+}
+
+#[cfg(windows)]
+fn create_inherited_auth_pipe() -> Result<InheritedAuthPipe, String> {
+    let mut read = HANDLE::default();
+    let mut write = HANDLE::default();
+    let security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut::<SECURITY_DESCRIPTOR>() as *mut _,
+        bInheritHandle: true.into(),
+    };
+    // SAFETY: read/write pointers and SECURITY_ATTRIBUTES are valid for CreatePipe.
+    let ok = unsafe { CreatePipe(&mut read, &mut write, Some(&security), 0) };
+    if ok.is_err() {
+        return Err("CreatePipe for OpenVMM auth handle failed".to_string());
+    }
+    Ok(InheritedAuthPipe { read, write })
+}
+
+#[cfg(windows)]
+fn write_auth_capability_and_close(
+    pipe: &InheritedAuthPipe,
+    capability: &[u8; 32],
+) -> Result<(), String> {
+    let mut bytes_written = 0_u32;
+    // SAFETY: handle and fixed-size byte slice are valid for WriteFile.
+    let write_result = unsafe {
+        WriteFile(
+            pipe.write,
+            Some(capability.as_slice()),
+            Some(&mut bytes_written),
+            None,
+        )
+    };
+    // SAFETY: close parent-owned handles after launch authentication payload write.
+    let _ = unsafe { CloseHandle(pipe.write) };
+    // SAFETY: parent no longer needs the inherited read handle.
+    let _ = unsafe { CloseHandle(pipe.read) };
+    if write_result.is_err() || bytes_written != capability.len() as u32 {
+        return Err("failed to write complete OpenVMM control capability".to_string());
+    }
+    Ok(())
 }
 
 fn os_arg(path: &Path) -> String {
