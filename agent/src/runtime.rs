@@ -332,32 +332,25 @@ fn handle_host_message(
                 },
             )])
         }
-        HostControlMessage::Quiesce => {
-            let message = service
-                .quiesce()
-                .map_err(|error| AgentError::bad_request(error.to_string()))?;
+        HostControlMessage::Quiesce => Ok(vec![quiesce_transactional(service, |freeze| {
             // SAFETY: sync has no memory-safety preconditions.
             unsafe { libc::sync() };
             set_workload_frozen(
                 Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
-                true,
+                freeze,
                 FREEZE_WAIT_TIMEOUT,
             )?;
             // SAFETY: sync has no memory-safety preconditions.
             unsafe { libc::sync() };
-            Ok(vec![message])
-        }
-        HostControlMessage::Resume => {
-            let message = service
-                .resume()
-                .map_err(|error| AgentError::bad_request(error.to_string()))?;
+            Ok(())
+        })?]),
+        HostControlMessage::Resume => Ok(vec![resume_transactional(service, |freeze| {
             set_workload_frozen(
                 Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
-                false,
+                freeze,
                 FREEZE_WAIT_TIMEOUT,
-            )?;
-            Ok(vec![message])
-        }
+            )
+        })?]),
         HostControlMessage::Shutdown { .. } => {
             Ok(vec![service.shutdown().map_err(|error| {
                 AgentError::bad_request(error.to_string())
@@ -617,6 +610,54 @@ fn pump_supervisor_to_channel_lossless<T: io::Read + io::Write>(
     {
         agent_protocol::service::PumpSupervisorResult::Drained
         | agent_protocol::service::PumpSupervisorResult::WouldBlock => Ok(()),
+    }
+}
+
+fn quiesce_transactional(
+    service: &mut MxcControlService,
+    mut set_frozen: impl FnMut(bool) -> Result<()>,
+) -> Result<AgentControlMessage> {
+    let initial = service.health();
+    if initial.quiesced {
+        return Err(AgentError::bad_request(
+            "invalid lifecycle transition: quiesce",
+        ));
+    }
+    set_frozen(true)?;
+    match service.quiesce() {
+        Ok(message) => Ok(message),
+        Err(error) => {
+            if let Err(rollback_error) = set_frozen(false) {
+                return Err(AgentError::quiesce(format!(
+                    "quiesce lifecycle commit failed after freezing ({error}); rollback thaw failed: {rollback_error}"
+                )));
+            }
+            Err(AgentError::bad_request(error.to_string()))
+        }
+    }
+}
+
+fn resume_transactional(
+    service: &mut MxcControlService,
+    mut set_frozen: impl FnMut(bool) -> Result<()>,
+) -> Result<AgentControlMessage> {
+    let initial = service.health();
+    if !initial.quiesced {
+        return Err(AgentError::bad_request(
+            "invalid lifecycle transition: resume",
+        ));
+    }
+    set_frozen(false)?;
+    match service.resume() {
+        Ok(message) => Ok(message),
+        Err(error) => {
+            if let Err(rollback_error) = set_frozen(true) {
+                return Err(AgentError::quiesce(format!(
+                    "resume lifecycle commit failed after thawing ({error}); rollback freeze failed: {rollback_error}"
+                )));
+            }
+            Err(AgentError::bad_request(error.to_string()))
+        }
     }
 }
 
@@ -1077,5 +1118,87 @@ mod tests {
             }
         ));
         assert_eq!(supervisor.acked_events, 2);
+    }
+
+    #[test]
+    fn quiesce_freeze_failure_leaves_running_and_retry_succeeds() {
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+
+        let mut attempts = 0_u32;
+        let error = quiesce_transactional(&mut service, |freeze| {
+            assert!(freeze);
+            attempts += 1;
+            if attempts == 1 {
+                return Err(AgentError::freeze("injected freeze failure"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(error.code(), crate::error::ErrorCode::FreezeFailed);
+        assert!(!service.health().quiesced);
+
+        let message = quiesce_transactional(&mut service, |freeze| {
+            assert!(freeze);
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(message, AgentControlMessage::Quiesced));
+        assert!(service.health().quiesced);
+    }
+
+    #[test]
+    fn resume_thaw_failure_leaves_quiesced_and_retry_succeeds() {
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+        quiesce_transactional(&mut service, |_| Ok(())).unwrap();
+        assert!(service.health().quiesced);
+
+        let mut attempts = 0_u32;
+        let error = resume_transactional(&mut service, |freeze| {
+            assert!(!freeze);
+            attempts += 1;
+            if attempts == 1 {
+                return Err(AgentError::freeze("injected thaw failure"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(error.code(), crate::error::ErrorCode::FreezeFailed);
+        assert!(service.health().quiesced);
+
+        let message = resume_transactional(&mut service, |freeze| {
+            assert!(!freeze);
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(message, AgentControlMessage::Resumed));
+        assert!(!service.health().quiesced);
+    }
+
+    #[test]
+    fn timeout_paths_preserve_state_and_allow_retry() {
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+
+        let error = quiesce_transactional(&mut service, |_| {
+            Err(AgentError::checkpoint_timeout("injected freeze timeout"))
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), crate::error::ErrorCode::CheckpointTimeout);
+        assert!(!service.health().quiesced);
+        quiesce_transactional(&mut service, |_| Ok(())).unwrap();
+        assert!(service.health().quiesced);
+
+        let error = resume_transactional(&mut service, |_| {
+            Err(AgentError::checkpoint_timeout("injected thaw timeout"))
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), crate::error::ErrorCode::CheckpointTimeout);
+        assert!(service.health().quiesced);
+        resume_transactional(&mut service, |_| Ok(())).unwrap();
+        assert!(!service.health().quiesced);
     }
 }
