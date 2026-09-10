@@ -47,3 +47,13 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   configuration; host control traffic proves possession but cannot redefine the
   trusted expected value.
 - `legacy` and `broker-ttrpc` paths remain out of scope for this profile.
+
+## Deterministic WHP harness command
+
+- Canonical host harness command:
+  `python scripts\nvx.py test-mxc-agent --backend whp`
+- Optional deterministic in-process mode for CI/unit coverage (not a live WHP
+  proof): `--static-only`
+- The harness always writes a machine-readable JSON report and bounded
+  diagnostics to `build/mxc-agent-harness` (or `--output-dir` override), halts
+  on the first failing invariant, and keeps the output directory on failures.

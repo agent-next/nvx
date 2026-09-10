@@ -221,6 +221,23 @@ def command_test_openvmm(args: argparse.Namespace) -> None:
     run_openvmm_tests(args.backend)
 
 
+def command_test_mxc_agent(args: argparse.Namespace) -> None:
+    command: list[str | os.PathLike[str]] = [
+        "cargo",
+        "run",
+        "-p",
+        "agent-harness",
+        "--",
+        "--backend",
+        args.backend,
+        "--output-dir",
+        args.output_dir,
+    ]
+    if args.static_only:
+        command.append("--static-only")
+    _run(command, cwd=REPO_ROOT)
+
+
 def command_build(args: argparse.Namespace) -> None:
     command_build_guest(args)
     command_build_openvmm(args)
@@ -558,6 +575,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
     )
     openvmm_tests.set_defaults(handler=command_test_openvmm)
+
+    mxc_agent_tests = subparsers.add_parser(
+        "test-mxc-agent",
+        help="run the deterministic MXC agent host harness",
+    )
+    mxc_agent_tests.add_argument(
+        "--backend",
+        choices=("whp",),
+        required=True,
+    )
+    mxc_agent_tests.add_argument(
+        "--static-only",
+        action="store_true",
+        help="run deterministic in-process checks without claiming live WHP proof",
+    )
+    mxc_agent_tests.add_argument(
+        "--output-dir",
+        type=Path,
+        default=BUILD_DIR / "mxc-agent-harness",
+    )
+    mxc_agent_tests.set_defaults(handler=command_test_mxc_agent)
 
     microvm_tests = subparsers.add_parser(
         "test-microvm",

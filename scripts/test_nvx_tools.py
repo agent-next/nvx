@@ -555,6 +555,44 @@ class CliTests(unittest.TestCase):
         self.assertEqual(openvmm_tests.backend, "mshv")
         self.assertIs(openvmm_tests.handler, nvx.command_test_openvmm)
 
+        mxc_agent_tests = nvx.parse_args(["test-mxc-agent", "--backend", "whp"])
+        self.assertEqual(mxc_agent_tests.backend, "whp")
+        self.assertEqual(mxc_agent_tests.output_dir, common.BUILD_DIR / "mxc-agent-harness")
+        self.assertFalse(mxc_agent_tests.static_only)
+        self.assertIs(mxc_agent_tests.handler, nvx.command_test_mxc_agent)
+
+    def test_test_mxc_agent_builds_canonical_command(self):
+        args = nvx.parse_args(
+            [
+                "test-mxc-agent",
+                "--backend",
+                "whp",
+                "--static-only",
+                "--output-dir",
+                "artifacts/mxc-harness",
+            ]
+        )
+
+        with patch.object(nvx, "_run") as run:
+            nvx.command_test_mxc_agent(args)
+
+        command = [str(value) for value in run.call_args.args[0]]
+        self.assertEqual(
+            command,
+            [
+                "cargo",
+                "run",
+                "-p",
+                "agent-harness",
+                "--",
+                "--backend",
+                "whp",
+                "--output-dir",
+                str(Path("artifacts/mxc-harness")),
+                "--static-only",
+            ],
+        )
+
     def test_sandbox_command_parses_typed_launch_contract(self):
         args = nvx.parse_args(
             [
