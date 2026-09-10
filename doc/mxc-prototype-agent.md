@@ -22,6 +22,11 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 - Process execution is supervised with one active exec at a time, unlimited
   sequential execs, argv/env/cwd execution without shell expansion, bounded
   stdin queueing, and non-destructive credit-aware output streaming.
+- `tools/agent-harness` scenarios 3–6 now exercise the production
+  `MxcControlService` + `LinuxProcessSupervisor` path with real subprocesses on
+  Linux/WSL (sequential exec + typed busy, binary stdout/stderr separation,
+  backpressure/credits, and terminal-order invariants). On non-Linux hosts
+  these scenarios report `Blocked` rather than synthetic pass results.
 - Post-config capability advertisement now exposes `Exec`, `Streams`, and
   `Cancel` only. `Quiesce`, `Resume`, and `Shutdown` remain explicitly
   unavailable until reviewed.

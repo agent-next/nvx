@@ -5,6 +5,15 @@ edition = "2024"
 license = "MIT"
 description = "NVX guest init agent: assembles the sandbox filesystem and serves the host control channel as PID 1."
 
+[lib]
+name = "nvx_agent"
+path = "src/lib.rs"
+test = false
+
+[features]
+default = []
+harness-supervisor = []
+
 [[bin]]
 name = "nvx-agent"
 path = "src/main.rs"

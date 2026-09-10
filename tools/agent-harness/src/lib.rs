@@ -1,23 +1,35 @@
 use ::std::collections::BTreeMap;
-use ::std::collections::VecDeque;
 use ::std::process::ExitCode;
+#[cfg(target_os = "linux")]
+use ::std::thread;
+#[cfg(target_os = "linux")]
+use ::std::time::{Duration, Instant};
 
 use ::agent_protocol::mapping::{
     AccessMode, CanonicalHostMappingRoot, ChildMapping, MappingContainmentPolicy,
     RelativeChildPath, SymlinkContainmentPolicy,
 };
-use ::agent_protocol::messages::{
-    FlowCreditRequest, LaunchIdentity, NetworkMode, NetworkStatus, SERVICE_IDENTITY, StreamName,
-};
+#[cfg(target_os = "linux")]
+use ::agent_protocol::messages::{AgentControlMessage, ExecDisposition};
+#[cfg(target_os = "linux")]
+use ::agent_protocol::messages::{FlowCreditRequest, StreamName};
+use ::agent_protocol::messages::{LaunchIdentity, NetworkMode, NetworkStatus, SERVICE_IDENTITY};
 use ::agent_protocol::mxc_extension::{
     AciAdapterStatus, MODELED_REQUIREMENTS, MxcRequirement, UnsupportedAciAdapter,
 };
+#[cfg(target_os = "linux")]
+use ::agent_protocol::service::ProcessSupervisor;
 use ::agent_protocol::service::{
-    AuthenticateChannelRequest, CancelReason, ConfigureSessionRequest, CreateProcessRequest,
-    FilesystemStatus, LaunchBinding, MxcControlService, ProcessSupervisor, ServiceError,
-    ServiceErrorCode, SessionConfiguration, SupervisorEvent, WaitReadyRequest,
+    AuthenticateChannelRequest, ConfigureSessionRequest, FilesystemStatus, LaunchBinding,
+    MxcControlService, ServiceErrorCode, SessionConfiguration, WaitReadyRequest,
+};
+#[cfg(target_os = "linux")]
+use ::agent_protocol::service::{
+    CancelReason, CreateProcessRequest, ServiceError, SupervisorEvent,
 };
 use ::agent_protocol::state::PROTOCOL_VERSION;
+#[cfg(target_os = "linux")]
+use ::nvx_agent::LinuxProcessSupervisor;
 use ::serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -272,81 +284,7 @@ fn run_health_probe() -> RequirementResult {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct HarnessSupervisor {
-    active_exec_id: Option<u32>,
-    events: VecDeque<SupervisorEvent>,
-    stdin_queue: Vec<Vec<u8>>,
-    stdin_pending_bytes: usize,
-    stdin_drained_bytes: usize,
-    stdin_closed: bool,
-    terminate_calls: usize,
-}
-
-impl ProcessSupervisor for HarnessSupervisor {
-    fn spawn(&mut self, request: &CreateProcessRequest) -> Result<(), ServiceError> {
-        self.active_exec_id = Some(request.exec_id);
-        Ok(())
-    }
-
-    fn queue_stdin(&mut self, _exec_id: u32, chunk: Vec<u8>) -> Result<(), ServiceError> {
-        self.stdin_pending_bytes = self.stdin_pending_bytes.saturating_add(chunk.len());
-        self.stdin_queue.push(chunk);
-        Ok(())
-    }
-
-    fn close_stdin(&mut self, _exec_id: u32) -> Result<(), ServiceError> {
-        if self.stdin_pending_bytes != 0 {
-            return Err(ServiceError {
-                code: ServiceErrorCode::Backpressure,
-                message: "stdin queue is not drained".to_string(),
-            });
-        }
-        self.stdin_closed = true;
-        Ok(())
-    }
-
-    fn take_stdin_drain_bytes(&mut self, _exec_id: u32) -> Result<usize, ServiceError> {
-        let drained = self.stdin_drained_bytes;
-        self.stdin_drained_bytes = 0;
-        Ok(drained)
-    }
-
-    fn peek_event(&mut self, _exec_id: u32) -> Result<Option<SupervisorEvent>, ServiceError> {
-        Ok(self.events.front().cloned())
-    }
-
-    fn ack_event(&mut self, _exec_id: u32) -> Result<(), ServiceError> {
-        self.events.pop_front();
-        Ok(())
-    }
-
-    fn terminate(&mut self, _exec_id: u32) -> Result<(), ServiceError> {
-        self.terminate_calls = self.terminate_calls.saturating_add(1);
-        Ok(())
-    }
-
-    fn kill(&mut self, _exec_id: u32) -> Result<(), ServiceError> {
-        Ok(())
-    }
-
-    fn poll(&mut self, exec_id: u32) -> Result<Option<SupervisorEvent>, ServiceError> {
-        let event = self.peek_event(exec_id)?;
-        if event.is_some() {
-            self.ack_event(exec_id)?;
-        }
-        Ok(event)
-    }
-
-    fn cleanup_for_disconnect(
-        &mut self,
-        _exec_id: u32,
-        _deadline: ::std::time::Duration,
-    ) -> Result<bool, ServiceError> {
-        Ok(true)
-    }
-}
-
+#[cfg(target_os = "linux")]
 fn activated_service() -> MxcControlService {
     let mut service = MxcControlService::new_pid1_runtime(launch_binding(), 4242);
     authenticate(&mut service);
@@ -357,54 +295,196 @@ fn activated_service() -> MxcControlService {
     service
 }
 
-fn drain_messages(
+#[cfg(target_os = "linux")]
+struct ExecObservation {
+    messages: Vec<AgentControlMessage>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    terminals: Vec<(usize, ExecDisposition)>,
+    stdout_eof: Option<usize>,
+    stderr_eof: Option<usize>,
+    descendants_cleaned: Option<usize>,
+    max_chunk_bytes: usize,
+}
+
+#[cfg(not(target_os = "linux"))]
+fn blocked_requirement(requirement: MxcRequirement, reason: &str) -> RequirementResult {
+    RequirementResult {
+        name: requirement.name().to_string(),
+        requirement,
+        status: RequirementStatus::Blocked,
+        reason: reason.to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_until_exec_finishes(
     service: &mut MxcControlService,
-    supervisor: &mut HarnessSupervisor,
-) -> Vec<agent_protocol::AgentControlMessage> {
-    let mut out = Vec::new();
-    for _ in 0..128 {
-        let batch = service.pump_supervisor(supervisor).expect("pump");
-        out.extend(batch);
-        if supervisor.events.is_empty() && service.active_exec_id().is_none() {
-            break;
+    supervisor: &mut LinuxProcessSupervisor,
+    timeout: Duration,
+) -> Result<ExecObservation, String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "timeout overflow".to_string())?;
+    let mut observation = ExecObservation {
+        messages: Vec::new(),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        terminals: Vec::new(),
+        stdout_eof: None,
+        stderr_eof: None,
+        descendants_cleaned: None,
+        max_chunk_bytes: 0,
+    };
+
+    while Instant::now() < deadline {
+        let batch = service
+            .pump_supervisor(supervisor)
+            .map_err(|error| format!("pumping supervisor failed: {error}"))?;
+        if !batch.is_empty() {
+            for message in batch {
+                let index = observation.messages.len();
+                match &message {
+                    AgentControlMessage::StdoutChunk(record) => {
+                        observation.max_chunk_bytes =
+                            observation.max_chunk_bytes.max(record.chunk.len());
+                        observation.stdout.extend_from_slice(&record.chunk);
+                    }
+                    AgentControlMessage::StderrChunk(record) => {
+                        observation.max_chunk_bytes =
+                            observation.max_chunk_bytes.max(record.chunk.len());
+                        observation.stderr.extend_from_slice(&record.chunk);
+                    }
+                    AgentControlMessage::StdoutEof(_) => observation.stdout_eof = Some(index),
+                    AgentControlMessage::StderrEof(_) => observation.stderr_eof = Some(index),
+                    AgentControlMessage::DescendantsCleaned { .. } => {
+                        observation.descendants_cleaned = Some(index)
+                    }
+                    AgentControlMessage::ExecTerminal { disposition, .. } => {
+                        observation.terminals.push((index, *disposition))
+                    }
+                    _ => {}
+                }
+                observation.messages.push(message);
+            }
         }
+        if service.active_exec_id().is_none() {
+            return Ok(observation);
+        }
+        thread::sleep(Duration::from_millis(10));
     }
-    out
+
+    if let Some(exec_id) = service.active_exec_id() {
+        let _ = service.cancel_exec(exec_id, CancelReason::Cancelled, supervisor);
+        let _ = supervisor.cleanup_for_disconnect(exec_id, Duration::from_secs(1));
+    }
+    Err("execution did not reach terminal state before timeout".to_string())
 }
 
-fn drain_one_stdin_chunk(supervisor: &mut HarnessSupervisor) {
-    if let Some(chunk) = supervisor.stdin_queue.first() {
-        let size = chunk.len();
-        supervisor.stdin_queue.remove(0);
-        supervisor.stdin_pending_bytes = supervisor.stdin_pending_bytes.saturating_sub(size);
-        supervisor.stdin_drained_bytes = supervisor.stdin_drained_bytes.saturating_add(size);
-    }
+#[cfg(target_os = "linux")]
+fn spawn_exec(
+    service: &mut MxcControlService,
+    supervisor: &mut LinuxProcessSupervisor,
+    exec_id: u32,
+    argv: Vec<String>,
+    timeout_ms: Option<u64>,
+) -> Result<(), String> {
+    service
+        .create_process(
+            CreateProcessRequest {
+                exec_id,
+                argv,
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms,
+            },
+            supervisor,
+        )
+        .map_err(|error| format!("create_process failed for exec {exec_id}: {error}"))
 }
 
+#[cfg(target_os = "linux")]
+fn grant_output_credits(
+    service: &mut MxcControlService,
+    exec_id: u32,
+    credits: u32,
+) -> Result<(), String> {
+    service
+        .grant_flow_credits(FlowCreditRequest {
+            exec_id,
+            stream: StreamName::Stdout,
+            credits,
+        })
+        .map_err(|error| format!("stdout credits failed for exec {exec_id}: {error}"))?;
+    service
+        .grant_flow_credits(FlowCreditRequest {
+            exec_id,
+            stream: StreamName::Stderr,
+            credits,
+        })
+        .map_err(|error| format!("stderr credits failed for exec {exec_id}: {error}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_after_eof_and_cleanup(observation: &ExecObservation) -> bool {
+    if observation.terminals.len() != 1 {
+        return false;
+    }
+    let terminal_index = observation.terminals[0].0;
+    observation
+        .stdout_eof
+        .is_some_and(|index| index < terminal_index)
+        && observation
+            .stderr_eof
+            .is_some_and(|index| index < terminal_index)
+        && observation
+            .descendants_cleaned
+            .is_some_and(|index| index < terminal_index)
+}
+
+#[cfg(target_os = "linux")]
 fn run_exec_sequencing() -> RequirementResult {
     let mut service = activated_service();
-    let mut supervisor = HarnessSupervisor::default();
-    let mut sequential_ok = true;
+    let mut supervisor = LinuxProcessSupervisor::new();
+    let mut outcomes = Vec::new();
     let mut saw_busy_rejection = false;
 
-    for exec_id in [300_u32, 301_u32, 302_u32] {
-        service
-            .create_process(
-                CreateProcessRequest {
-                    exec_id,
-                    argv: vec!["/bin/echo".to_string(), format!("exec-{exec_id}")],
-                    cwd: Some("/".to_string()),
-                    env: vec![],
-                    timeout_ms: None,
-                },
-                &mut supervisor,
-            )
-            .expect("create process");
+    for (exec_id, exit_code) in [(300_u32, 10), (301_u32, 11), (302_u32, 12)] {
+        let argv = if exec_id == 300 {
+            vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                format!("sleep 0.2; exit {exit_code}"),
+            ]
+        } else {
+            vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                format!("exit {exit_code}"),
+            ]
+        };
+        if let Err(error) = spawn_exec(&mut service, &mut supervisor, exec_id, argv, None) {
+            return RequirementResult {
+                name: MxcRequirement::ExecuteCommand.name().to_string(),
+                requirement: MxcRequirement::ExecuteCommand,
+                status: RequirementStatus::Fail,
+                reason: error,
+            };
+        }
+        if let Err(error) = grant_output_credits(&mut service, exec_id, 8) {
+            return RequirementResult {
+                name: MxcRequirement::ExecuteCommand.name().to_string(),
+                requirement: MxcRequirement::ExecuteCommand,
+                status: RequirementStatus::Fail,
+                reason: error,
+            };
+        }
         if exec_id == 300 {
             let busy = service.create_process(
                 CreateProcessRequest {
                     exec_id: 399,
-                    argv: vec!["/bin/echo".to_string(), "busy".to_string()],
+                    argv: vec!["/bin/true".to_string()],
                     cwd: Some("/".to_string()),
                     env: vec![],
                     timeout_ms: None,
@@ -414,32 +494,41 @@ fn run_exec_sequencing() -> RequirementResult {
             saw_busy_rejection = matches!(
                 busy,
                 Err(ServiceError {
-                    code: ServiceErrorCode::LifecycleError,
+                    code: ServiceErrorCode::WorkloadBusy,
                     ..
                 })
             );
         }
-        supervisor.events.push_back(SupervisorEvent::StdoutEof);
-        supervisor.events.push_back(SupervisorEvent::StderrEof);
-        supervisor
-            .events
-            .push_back(SupervisorEvent::DescendantsCleaned);
-        supervisor.events.push_back(SupervisorEvent::Exited(0));
-        let terminal_count = drain_messages(&mut service, &mut supervisor)
-            .into_iter()
-            .filter(|message| {
-                matches!(
-                    message,
-                    agent_protocol::AgentControlMessage::ExecTerminal { .. }
-                )
-            })
-            .count();
-        if terminal_count != 1 {
-            sequential_ok = false;
-        }
+        let observation = match collect_until_exec_finishes(
+            &mut service,
+            &mut supervisor,
+            Duration::from_secs(5),
+        ) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return RequirementResult {
+                    name: MxcRequirement::ExecuteCommand.name().to_string(),
+                    requirement: MxcRequirement::ExecuteCommand,
+                    status: RequirementStatus::Fail,
+                    reason: error,
+                };
+            }
+        };
+        outcomes.push(
+            observation
+                .terminals
+                .first()
+                .map(|(_, disposition)| *disposition),
+        );
     }
 
-    let passed = sequential_ok && saw_busy_rejection;
+    let passed = saw_busy_rejection
+        && outcomes
+            == vec![
+                Some(ExecDisposition::ExitCode(10)),
+                Some(ExecDisposition::ExitCode(11)),
+                Some(ExecDisposition::ExitCode(12)),
+            ];
     RequirementResult {
         name: MxcRequirement::ExecuteCommand.name().to_string(),
         requirement: MxcRequirement::ExecuteCommand,
@@ -449,71 +538,61 @@ fn run_exec_sequencing() -> RequirementResult {
             RequirementStatus::Fail
         },
         reason: if passed {
-            "One active exec is enforced; concurrent create is rejected while allowing unlimited sequential unique execs.".to_string()
+            "Three real subprocesses ran sequentially in one supervisor/session and an overlapping create received typed WorkloadBusy.".to_string()
         } else {
-            "Exec sequencing/busy rejection contract failed.".to_string()
+            "Sequential execution outcomes or typed busy rejection did not match contract."
+                .to_string()
         },
     }
 }
 
+#[cfg(target_os = "linux")]
 fn run_binary_stream_separation() -> RequirementResult {
     let mut service = activated_service();
-    let mut supervisor = HarnessSupervisor::default();
-    service
-        .create_process(
-            CreateProcessRequest {
-                exec_id: 401,
-                argv: vec!["/bin/cat".to_string()],
-                cwd: Some("/".to_string()),
-                env: vec![],
-                timeout_ms: None,
-            },
-            &mut supervisor,
-        )
-        .expect("create process");
-    service
-        .grant_flow_credits(FlowCreditRequest {
-            exec_id: 401,
-            stream: StreamName::Stdout,
-            credits: 2,
-        })
-        .expect("stdout credit");
-    service
-        .grant_flow_credits(FlowCreditRequest {
-            exec_id: 401,
-            stream: StreamName::Stderr,
-            credits: 2,
-        })
-        .expect("stderr credit");
-    let stdout = vec![0, 1, 2, 0, 3, 255];
-    let stderr = vec![7, 0, 8, 9, 0, 10];
-    supervisor
-        .events
-        .push_back(SupervisorEvent::StdoutChunk(stdout.clone()));
-    supervisor
-        .events
-        .push_back(SupervisorEvent::StderrChunk(stderr.clone()));
-    supervisor.events.push_back(SupervisorEvent::StdoutEof);
-    supervisor.events.push_back(SupervisorEvent::StderrEof);
-    supervisor
-        .events
-        .push_back(SupervisorEvent::DescendantsCleaned);
-    supervisor.events.push_back(SupervisorEvent::Exited(0));
-
-    let mut saw_stdout = false;
-    let mut saw_stderr = false;
-    for message in drain_messages(&mut service, &mut supervisor) {
-        match message {
-            agent_protocol::AgentControlMessage::StdoutChunk(record) => {
-                saw_stdout = record.chunk == stdout;
-            }
-            agent_protocol::AgentControlMessage::StderrChunk(record) => {
-                saw_stderr = record.chunk == stderr;
-            }
-            _ => {}
-        }
+    let mut supervisor = LinuxProcessSupervisor::new();
+    let exec_id = 401_u32;
+    if let Err(error) = spawn_exec(
+        &mut service,
+        &mut supervisor,
+        exec_id,
+        vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "printf 'A\\000B\\377C'; printf 'X\\000Y\\376Z' 1>&2".to_string(),
+        ],
+        None,
+    ) {
+        return RequirementResult {
+            name: MxcRequirement::InteractiveShell.name().to_string(),
+            requirement: MxcRequirement::InteractiveShell,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
     }
-    let passed = saw_stdout && saw_stderr;
+    if let Err(error) = grant_output_credits(&mut service, exec_id, 8) {
+        return RequirementResult {
+            name: MxcRequirement::InteractiveShell.name().to_string(),
+            requirement: MxcRequirement::InteractiveShell,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
+
+    let observation =
+        match collect_until_exec_finishes(&mut service, &mut supervisor, Duration::from_secs(5)) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return RequirementResult {
+                    name: MxcRequirement::InteractiveShell.name().to_string(),
+                    requirement: MxcRequirement::InteractiveShell,
+                    status: RequirementStatus::Fail,
+                    reason: error,
+                };
+            }
+        };
+    let expected_stdout = vec![b'A', 0, b'B', 255, b'C'];
+    let expected_stderr = vec![b'X', 0, b'Y', 254, b'Z'];
+    let passed = observation.stdout == expected_stdout && observation.stderr == expected_stderr;
     RequirementResult {
         name: MxcRequirement::InteractiveShell.name().to_string(),
         requirement: MxcRequirement::InteractiveShell,
@@ -523,43 +602,155 @@ fn run_binary_stream_separation() -> RequirementResult {
             RequirementStatus::Fail
         },
         reason: if passed {
-            "Binary-safe stdout/stderr remain distinct and preserve arbitrary bytes including NUL."
-                .to_string()
+            "Real subprocess output preserved exact stdout/stderr separation including arbitrary bytes and NUL.".to_string()
         } else {
-            "Stdout/stderr separation or binary preservation failed.".to_string()
+            "Real stdout/stderr bytes diverged from expected binary-safe separation.".to_string()
         },
     }
 }
 
+#[cfg(target_os = "linux")]
 fn run_backpressure_contract() -> RequirementResult {
     let mut service = activated_service();
-    let mut supervisor = HarnessSupervisor::default();
+    let mut supervisor = LinuxProcessSupervisor::new();
     let exec_id = 501_u32;
-    service
-        .create_process(
-            CreateProcessRequest {
-                exec_id,
-                argv: vec!["/bin/cat".to_string()],
-                cwd: Some("/".to_string()),
-                env: vec![],
-                timeout_ms: None,
-            },
-            &mut supervisor,
-        )
-        .expect("create process");
-    service
-        .grant_flow_credits(FlowCreditRequest {
-            exec_id,
-            stream: StreamName::Stdin,
-            credits: 4,
-        })
-        .expect("stdin credits");
-    let max = agent_protocol::PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES;
+    if let Err(error) = spawn_exec(
+        &mut service,
+        &mut supervisor,
+        exec_id,
+        vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "i=0; while [ $i -lt 20000 ]; do printf '0123456789abcdef0123456789abcdef'; i=$((i+1)); done".to_string(),
+        ],
+        None,
+    ) {
+        return RequirementResult {
+            name: MxcRequirement::StreamLogs.name().to_string(),
+            requirement: MxcRequirement::StreamLogs,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
+    if let Err(error) = service.grant_flow_credits(FlowCreditRequest {
+        exec_id,
+        stream: StreamName::Stderr,
+        credits: 64,
+    }) {
+        return RequirementResult {
+            name: MxcRequirement::StreamLogs.name().to_string(),
+            requirement: MxcRequirement::StreamLogs,
+            status: RequirementStatus::Fail,
+            reason: format!("stderr credits failed for high-output scenario: {error}"),
+        };
+    }
+    let mut max_chunk_bytes = 0usize;
+    let pressure_deadline = Instant::now() + Duration::from_secs(3);
+    let mut credit_backpressured = false;
+    while Instant::now() < pressure_deadline {
+        match service.pump_supervisor(&mut supervisor) {
+            Ok(messages) => {
+                for message in messages {
+                    match message {
+                        AgentControlMessage::StdoutChunk(record) => {
+                            max_chunk_bytes = max_chunk_bytes.max(record.chunk.len());
+                        }
+                        AgentControlMessage::StderrChunk(record) => {
+                            max_chunk_bytes = max_chunk_bytes.max(record.chunk.len());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(ServiceError {
+                code: ServiceErrorCode::LifecycleError,
+                message,
+            }) if message.contains("FlowControlCreditExhausted") => {
+                if let Some(active_exec_id) = service.active_exec_id() {
+                    match supervisor.peek_event(active_exec_id) {
+                        Ok(Some(SupervisorEvent::StdoutChunk(chunk)))
+                        | Ok(Some(SupervisorEvent::StderrChunk(chunk))) => {
+                            max_chunk_bytes = max_chunk_bytes.max(chunk.len());
+                        }
+                        _ => {}
+                    }
+                }
+                credit_backpressured = true;
+                break;
+            }
+            Err(error) => {
+                return RequirementResult {
+                    name: MxcRequirement::StreamLogs.name().to_string(),
+                    requirement: MxcRequirement::StreamLogs,
+                    status: RequirementStatus::Fail,
+                    reason: format!("high-output pump failed: {error}"),
+                };
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let health_responsive_during_credit_pressure = service.health().configured;
+    if let Some(active_exec_id) = service.active_exec_id() {
+        let _ = service.cancel_exec(active_exec_id, CancelReason::Cancelled, &mut supervisor);
+        let cleanup_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < cleanup_deadline {
+            match service.pump_supervisor(&mut supervisor) {
+                Ok(_) => {
+                    if service.active_exec_id().is_none() {
+                        break;
+                    }
+                }
+                Err(error) if error.code == ServiceErrorCode::Supervisor => break,
+                Err(_) => break,
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let mut service = activated_service();
+    let mut supervisor = LinuxProcessSupervisor::new();
+    let stdin_exec_id = 502_u32;
+    if let Err(error) = spawn_exec(
+        &mut service,
+        &mut supervisor,
+        stdin_exec_id,
+        vec!["/bin/cat".to_string()],
+        None,
+    ) {
+        return RequirementResult {
+            name: MxcRequirement::StreamLogs.name().to_string(),
+            requirement: MxcRequirement::StreamLogs,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
+    if let Err(error) = grant_output_credits(&mut service, stdin_exec_id, 4_096) {
+        return RequirementResult {
+            name: MxcRequirement::StreamLogs.name().to_string(),
+            requirement: MxcRequirement::StreamLogs,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
+    if let Err(error) = service.grant_flow_credits(FlowCreditRequest {
+        exec_id: stdin_exec_id,
+        stream: StreamName::Stdin,
+        credits: 8,
+    }) {
+        return RequirementResult {
+            name: MxcRequirement::StreamLogs.name().to_string(),
+            requirement: MxcRequirement::StreamLogs,
+            status: RequirementStatus::Fail,
+            reason: format!("stdin credits failed: {error}"),
+        };
+    }
+
+    let protocol_safe_cap = agent_protocol::PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES;
     let oversized = service.stdin_chunk(
         agent_protocol::StdinChunkRecord {
-            exec_id,
+            exec_id: stdin_exec_id,
             sequence: 0,
-            chunk: vec![1_u8; max + 1],
+            chunk: vec![1_u8; protocol_safe_cap + 1],
         },
         &mut supervisor,
     );
@@ -570,19 +761,24 @@ fn run_backpressure_contract() -> RequirementResult {
             ..
         })
     );
-    service
-        .stdin_chunk(
-            agent_protocol::StdinChunkRecord {
-                exec_id,
-                sequence: 0,
-                chunk: vec![2_u8; max],
-            },
-            &mut supervisor,
-        )
-        .expect("fill queue with one safe chunk");
+    if let Err(error) = service.stdin_chunk(
+        agent_protocol::StdinChunkRecord {
+            exec_id: stdin_exec_id,
+            sequence: 0,
+            chunk: vec![2_u8; protocol_safe_cap],
+        },
+        &mut supervisor,
+    ) {
+        return RequirementResult {
+            name: MxcRequirement::StreamLogs.name().to_string(),
+            requirement: MxcRequirement::StreamLogs,
+            status: RequirementStatus::Fail,
+            reason: format!("max-sized stdin chunk failed: {error}"),
+        };
+    }
     let saturated = service.stdin_chunk(
         agent_protocol::StdinChunkRecord {
-            exec_id,
+            exec_id: stdin_exec_id,
             sequence: 1,
             chunk: vec![3_u8; 1],
         },
@@ -595,19 +791,105 @@ fn run_backpressure_contract() -> RequirementResult {
             ..
         })
     );
-    let health_responsive = service.health().configured;
-    drain_one_stdin_chunk(&mut supervisor);
-    service
-        .stdin_chunk(
+    let health_responsive_during_stdin_pressure = service.health().configured;
+
+    let mut second_chunk_accepted = false;
+    let second_chunk_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < second_chunk_deadline {
+        match service.stdin_chunk(
             agent_protocol::StdinChunkRecord {
-                exec_id,
+                exec_id: stdin_exec_id,
                 sequence: 1,
                 chunk: vec![3_u8; 1],
             },
             &mut supervisor,
-        )
-        .expect("retry after drain");
-    let passed = oversized_rejected && queue_saturated && health_responsive;
+        ) {
+            Ok(()) => {
+                second_chunk_accepted = true;
+                break;
+            }
+            Err(ServiceError {
+                code: ServiceErrorCode::Backpressure,
+                ..
+            }) => {
+                let _ = service.pump_supervisor(&mut supervisor);
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return RequirementResult {
+                    name: MxcRequirement::StreamLogs.name().to_string(),
+                    requirement: MxcRequirement::StreamLogs,
+                    status: RequirementStatus::Fail,
+                    reason: format!("stdin retry failed: {error}"),
+                };
+            }
+        }
+    }
+    if !second_chunk_accepted {
+        return RequirementResult {
+            name: MxcRequirement::StreamLogs.name().to_string(),
+            requirement: MxcRequirement::StreamLogs,
+            status: RequirementStatus::Fail,
+            reason: "stdin queue did not drain before bounded retry deadline".to_string(),
+        };
+    }
+
+    let mut eof_sent = false;
+    for _ in 0..100 {
+        match service.stdin_eof(
+            agent_protocol::StdinEofRecord {
+                exec_id: stdin_exec_id,
+                sequence: 2,
+            },
+            &mut supervisor,
+        ) {
+            Ok(()) => {
+                eof_sent = true;
+                break;
+            }
+            Err(ServiceError {
+                code: ServiceErrorCode::Backpressure,
+                ..
+            }) => {
+                let _ = service.pump_supervisor(&mut supervisor);
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return RequirementResult {
+                    name: MxcRequirement::StreamLogs.name().to_string(),
+                    requirement: MxcRequirement::StreamLogs,
+                    status: RequirementStatus::Fail,
+                    reason: format!("stdin eof after retry failed: {error}"),
+                };
+            }
+        }
+    }
+    if !eof_sent {
+        return RequirementResult {
+            name: MxcRequirement::StreamLogs.name().to_string(),
+            requirement: MxcRequirement::StreamLogs,
+            status: RequirementStatus::Fail,
+            reason: "stdin eof remained backpressured past bounded retry window".to_string(),
+        };
+    }
+    if let Err(error) =
+        collect_until_exec_finishes(&mut service, &mut supervisor, Duration::from_secs(8))
+    {
+        return RequirementResult {
+            name: MxcRequirement::StreamLogs.name().to_string(),
+            requirement: MxcRequirement::StreamLogs,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
+
+    let passed = credit_backpressured
+        && oversized_rejected
+        && queue_saturated
+        && second_chunk_accepted
+        && max_chunk_bytes <= protocol_safe_cap
+        && health_responsive_during_credit_pressure
+        && health_responsive_during_stdin_pressure;
     RequirementResult {
         name: MxcRequirement::StreamLogs.name().to_string(),
         requirement: MxcRequirement::StreamLogs,
@@ -617,84 +899,235 @@ fn run_backpressure_contract() -> RequirementResult {
             RequirementStatus::Fail
         },
         reason: if passed {
-            "Chunk and queue bounds enforce deterministic backpressure with oversized input rejected before enqueue while control health remains responsive.".to_string()
+            "Real high-output execution hit flow-credit backpressure, max stream chunk stayed protocol-safe, max-sized stdin queueing enforced the protocol-safe cap, and Health remained responsive while backpressured.".to_string()
         } else {
-            "Backpressure/oversized-chunk contract failed.".to_string()
+            format!(
+                "Backpressure contract failed (credit_backpressured={credit_backpressured}, oversized_rejected={oversized_rejected}, queue_saturated={queue_saturated}, second_chunk_accepted={second_chunk_accepted}, max_chunk_bytes={max_chunk_bytes}, protocol_safe_cap={protocol_safe_cap}, health_credit={health_responsive_during_credit_pressure}, health_stdin={health_responsive_during_stdin_pressure})."
+            )
         },
     }
 }
 
+#[cfg(target_os = "linux")]
 fn run_terminal_semantics() -> RequirementResult {
     let mut service = activated_service();
-    let mut supervisor = HarnessSupervisor::default();
-    let exec_id = 601_u32;
+    let mut supervisor = LinuxProcessSupervisor::new();
+
+    let stdin_exec_id = 601_u32;
+    if let Err(error) = spawn_exec(
+        &mut service,
+        &mut supervisor,
+        stdin_exec_id,
+        vec!["/bin/cat".to_string()],
+        None,
+    ) {
+        return RequirementResult {
+            name: MxcRequirement::Signal.name().to_string(),
+            requirement: MxcRequirement::Signal,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
+    if let Err(error) = grant_output_credits(&mut service, stdin_exec_id, 16) {
+        return RequirementResult {
+            name: MxcRequirement::Signal.name().to_string(),
+            requirement: MxcRequirement::Signal,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
     service
-        .create_process(
-            CreateProcessRequest {
-                exec_id,
-                argv: vec!["/bin/sleep".to_string(), "10".to_string()],
-                cwd: Some("/".to_string()),
-                env: vec![],
-                timeout_ms: Some(100),
+        .grant_flow_credits(FlowCreditRequest {
+            exec_id: stdin_exec_id,
+            stream: StreamName::Stdin,
+            credits: 2,
+        })
+        .expect("stdin credits");
+    let stdin_payload = vec![b'i', b'n', 0, b'p', b'u', b't', b'\n'];
+    if let Err(error) = service.stdin_chunk(
+        agent_protocol::StdinChunkRecord {
+            exec_id: stdin_exec_id,
+            sequence: 0,
+            chunk: stdin_payload.clone(),
+        },
+        &mut supervisor,
+    ) {
+        return RequirementResult {
+            name: MxcRequirement::Signal.name().to_string(),
+            requirement: MxcRequirement::Signal,
+            status: RequirementStatus::Fail,
+            reason: format!("stdin chunk failed: {error}"),
+        };
+    }
+    let mut eof_sent = false;
+    for _ in 0..100 {
+        match service.stdin_eof(
+            agent_protocol::StdinEofRecord {
+                exec_id: stdin_exec_id,
+                sequence: 1,
             },
             &mut supervisor,
-        )
-        .expect("create process");
-    service
-        .cancel_exec(exec_id, CancelReason::TimedOut, &mut supervisor)
-        .expect("cancel timed out");
-    let terminated = supervisor.terminate_calls == 1;
-    service
-        .grant_flow_credits(FlowCreditRequest {
-            exec_id,
-            stream: StreamName::Stdout,
-            credits: 1,
-        })
-        .expect("stdout credit");
-    service
-        .grant_flow_credits(FlowCreditRequest {
-            exec_id,
-            stream: StreamName::Stderr,
-            credits: 1,
-        })
-        .expect("stderr credit");
-    supervisor.events.push_back(SupervisorEvent::StdoutEof);
-    supervisor.events.push_back(SupervisorEvent::StderrEof);
-    supervisor
-        .events
-        .push_back(SupervisorEvent::DescendantsCleaned);
-    supervisor.events.push_back(SupervisorEvent::Signaled(9));
-    let messages = drain_messages(&mut service, &mut supervisor);
-    let terminal_indices: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| {
-            matches!(
-                message,
-                agent_protocol::AgentControlMessage::ExecTerminal { .. }
-            )
-            .then_some(index)
-        })
-        .collect();
-    let descendants_index = messages
-        .iter()
-        .position(|message| {
-            matches!(
-                message,
-                agent_protocol::AgentControlMessage::DescendantsCleaned { .. }
-            )
-        })
-        .unwrap_or(usize::MAX);
-    let passed = terminated
-        && terminal_indices.len() == 1
-        && descendants_index < terminal_indices[0]
-        && matches!(
-            messages[terminal_indices[0]],
-            agent_protocol::AgentControlMessage::ExecTerminal {
-                disposition: agent_protocol::ExecDisposition::TimedOut,
-                ..
+        ) {
+            Ok(()) => {
+                eof_sent = true;
+                break;
             }
-        );
+            Err(ServiceError {
+                code: ServiceErrorCode::Backpressure,
+                ..
+            }) => {
+                let _ = service.pump_supervisor(&mut supervisor);
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return RequirementResult {
+                    name: MxcRequirement::Signal.name().to_string(),
+                    requirement: MxcRequirement::Signal,
+                    status: RequirementStatus::Fail,
+                    reason: format!("stdin eof failed: {error}"),
+                };
+            }
+        }
+    }
+    if !eof_sent {
+        return RequirementResult {
+            name: MxcRequirement::Signal.name().to_string(),
+            requirement: MxcRequirement::Signal,
+            status: RequirementStatus::Fail,
+            reason: "stdin eof remained backpressured past bounded retry window".to_string(),
+        };
+    }
+    let normal =
+        match collect_until_exec_finishes(&mut service, &mut supervisor, Duration::from_secs(5)) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return RequirementResult {
+                    name: MxcRequirement::Signal.name().to_string(),
+                    requirement: MxcRequirement::Signal,
+                    status: RequirementStatus::Fail,
+                    reason: error,
+                };
+            }
+        };
+
+    let cancel_exec_id = 602_u32;
+    if let Err(error) = spawn_exec(
+        &mut service,
+        &mut supervisor,
+        cancel_exec_id,
+        vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "trap '' TERM; while :; do sleep 1; done".to_string(),
+        ],
+        None,
+    ) {
+        return RequirementResult {
+            name: MxcRequirement::Signal.name().to_string(),
+            requirement: MxcRequirement::Signal,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
+    if let Err(error) = grant_output_credits(&mut service, cancel_exec_id, 8) {
+        return RequirementResult {
+            name: MxcRequirement::Signal.name().to_string(),
+            requirement: MxcRequirement::Signal,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
+    if let Err(error) =
+        service.cancel_exec(cancel_exec_id, CancelReason::Cancelled, &mut supervisor)
+    {
+        return RequirementResult {
+            name: MxcRequirement::Signal.name().to_string(),
+            requirement: MxcRequirement::Signal,
+            status: RequirementStatus::Fail,
+            reason: format!("cancel failed: {error}"),
+        };
+    }
+    let cancelled =
+        match collect_until_exec_finishes(&mut service, &mut supervisor, Duration::from_secs(8)) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return RequirementResult {
+                    name: MxcRequirement::Signal.name().to_string(),
+                    requirement: MxcRequirement::Signal,
+                    status: RequirementStatus::Fail,
+                    reason: error,
+                };
+            }
+        };
+
+    let timeout_exec_id = 603_u32;
+    if let Err(error) = spawn_exec(
+        &mut service,
+        &mut supervisor,
+        timeout_exec_id,
+        vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "trap '' TERM; while :; do sleep 1; done".to_string(),
+        ],
+        Some(150),
+    ) {
+        return RequirementResult {
+            name: MxcRequirement::Signal.name().to_string(),
+            requirement: MxcRequirement::Signal,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
+    if let Err(error) = grant_output_credits(&mut service, timeout_exec_id, 8) {
+        return RequirementResult {
+            name: MxcRequirement::Signal.name().to_string(),
+            requirement: MxcRequirement::Signal,
+            status: RequirementStatus::Fail,
+            reason: error,
+        };
+    }
+    thread::sleep(Duration::from_millis(200));
+    if let Err(error) =
+        service.cancel_exec(timeout_exec_id, CancelReason::TimedOut, &mut supervisor)
+    {
+        return RequirementResult {
+            name: MxcRequirement::Signal.name().to_string(),
+            requirement: MxcRequirement::Signal,
+            status: RequirementStatus::Fail,
+            reason: format!("timeout cancel failed: {error}"),
+        };
+    }
+    let timed_out =
+        match collect_until_exec_finishes(&mut service, &mut supervisor, Duration::from_secs(8)) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return RequirementResult {
+                    name: MxcRequirement::Signal.name().to_string(),
+                    requirement: MxcRequirement::Signal,
+                    status: RequirementStatus::Fail,
+                    reason: error,
+                };
+            }
+        };
+
+    let normal_ok = normal.stdout == stdin_payload
+        && normal
+            .terminals
+            .first()
+            .is_some_and(|(_, disposition)| *disposition == ExecDisposition::ExitCode(0))
+        && terminal_after_eof_and_cleanup(&normal);
+    let cancelled_ok = cancelled
+        .terminals
+        .first()
+        .is_some_and(|(_, disposition)| *disposition == ExecDisposition::Cancelled)
+        && terminal_after_eof_and_cleanup(&cancelled);
+    let timeout_ok = timed_out
+        .terminals
+        .first()
+        .is_some_and(|(_, disposition)| *disposition == ExecDisposition::TimedOut)
+        && terminal_after_eof_and_cleanup(&timed_out);
+    let passed = normal_ok && cancelled_ok && timeout_ok;
     RequirementResult {
         name: MxcRequirement::Signal.name().to_string(),
         requirement: MxcRequirement::Signal,
@@ -704,11 +1137,43 @@ fn run_terminal_semantics() -> RequirementResult {
             RequirementStatus::Fail
         },
         reason: if passed {
-            "EOF/cancel/timeout sequencing emits exactly one terminal event only after stream EOF and descendant cleanup.".to_string()
+            "Real executions proved stdin EOF/normal exit, cancelled and timed-out termination, and exactly one terminal event emitted only after stdout/stderr EOF plus descendant cleanup.".to_string()
         } else {
-            "Terminal ordering/uniqueness or timeout disposition contract failed.".to_string()
+            "Terminal ordering/disposition invariants were not satisfied for one or more real executions.".to_string()
         },
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_exec_sequencing() -> RequirementResult {
+    blocked_requirement(
+        MxcRequirement::ExecuteCommand,
+        "Scenario requires Linux runtime/supervisor process execution path and is blocked on non-Linux hosts.",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_binary_stream_separation() -> RequirementResult {
+    blocked_requirement(
+        MxcRequirement::InteractiveShell,
+        "Scenario requires Linux runtime/supervisor process execution path and is blocked on non-Linux hosts.",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_backpressure_contract() -> RequirementResult {
+    blocked_requirement(
+        MxcRequirement::StreamLogs,
+        "Scenario requires Linux runtime/supervisor process execution path and is blocked on non-Linux hosts.",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_terminal_semantics() -> RequirementResult {
+    blocked_requirement(
+        MxcRequirement::Signal,
+        "Scenario requires Linux runtime/supervisor process execution path and is blocked on non-Linux hosts.",
+    )
 }
 
 fn run_identity_verification() -> RequirementResult {
@@ -899,28 +1364,59 @@ mod tests {
             .iter()
             .find(|result| result.requirement == MxcRequirement::ExecuteCommand)
             .unwrap();
-        assert_eq!(exec.status, RequirementStatus::Pass);
+        if cfg!(target_os = "linux") {
+            assert_eq!(exec.status, RequirementStatus::Pass, "{}", exec.reason);
+        } else {
+            assert_eq!(exec.status, RequirementStatus::Blocked);
+        }
 
         let streams = report
             .requirements
             .iter()
             .find(|result| result.requirement == MxcRequirement::InteractiveShell)
             .unwrap();
-        assert_eq!(streams.status, RequirementStatus::Pass);
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                streams.status,
+                RequirementStatus::Pass,
+                "{}",
+                streams.reason
+            );
+        } else {
+            assert_eq!(streams.status, RequirementStatus::Blocked);
+        }
 
         let backpressure = report
             .requirements
             .iter()
             .find(|result| result.requirement == MxcRequirement::StreamLogs)
             .unwrap();
-        assert_eq!(backpressure.status, RequirementStatus::Pass);
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                backpressure.status,
+                RequirementStatus::Pass,
+                "{}",
+                backpressure.reason
+            );
+        } else {
+            assert_eq!(backpressure.status, RequirementStatus::Blocked);
+        }
 
         let terminal = report
             .requirements
             .iter()
             .find(|result| result.requirement == MxcRequirement::Signal)
             .unwrap();
-        assert_eq!(terminal.status, RequirementStatus::Pass);
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                terminal.status,
+                RequirementStatus::Pass,
+                "{}",
+                terminal.reason
+            );
+        } else {
+            assert_eq!(terminal.status, RequirementStatus::Blocked);
+        }
 
         let uid_gid = report
             .requirements

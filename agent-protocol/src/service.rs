@@ -154,6 +154,7 @@ pub enum ServiceErrorCode {
     CleanupTimeout,
     UnsupportedOperation,
     AuthenticationFailed,
+    WorkloadBusy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,7 +182,11 @@ impl std::error::Error for ServiceError {}
 
 impl From<StateError> for ServiceError {
     fn from(value: StateError) -> Self {
-        Self::new(ServiceErrorCode::LifecycleError, value.to_string())
+        let code = match value {
+            StateError::ActiveExecExists { .. } => ServiceErrorCode::WorkloadBusy,
+            _ => ServiceErrorCode::LifecycleError,
+        };
+        Self::new(code, value.to_string())
     }
 }
 
@@ -937,10 +942,13 @@ impl MxcControlService {
         };
         let exec_id = current.exec_id;
         let mut out = Vec::new();
-        while let Some(event) = supervisor.peek_event(exec_id)? {
+        loop {
             if self.active_exec.is_none() {
                 break;
             }
+            let Some(event) = supervisor.peek_event(exec_id)? else {
+                break;
+            };
             apply_supervisor_event(self, exec_id, event, &mut out)?;
             supervisor.ack_event(exec_id)?;
         }
@@ -956,10 +964,13 @@ impl MxcControlService {
             return Ok(PumpSupervisorResult::Drained);
         };
         let exec_id = current.exec_id;
-        while let Some(event) = supervisor.peek_event(exec_id)? {
+        loop {
             if self.active_exec.is_none() {
                 break;
             }
+            let Some(event) = supervisor.peek_event(exec_id)? else {
+                break;
+            };
             let protocol_snapshot = self.protocol_state.clone();
             let active_snapshot = self.active_exec.clone();
             let mut messages = Vec::new();
@@ -1198,6 +1209,13 @@ fn apply_supervisor_event(
             }
         }
         SupervisorEvent::Exited(exit_code) => {
+            if service
+                .active_exec
+                .as_ref()
+                .is_some_and(|exec| exec.cancelled || exec.timed_out)
+            {
+                return Ok(());
+            }
             let disposition = if service
                 .active_exec
                 .as_ref()
@@ -1225,6 +1243,13 @@ fn apply_supervisor_event(
             }
         }
         SupervisorEvent::Signaled(signal) => {
+            if service
+                .active_exec
+                .as_ref()
+                .is_some_and(|exec| exec.cancelled || exec.timed_out)
+            {
+                return Ok(());
+            }
             let disposition = if service
                 .active_exec
                 .as_ref()
@@ -2493,7 +2518,7 @@ mod tests {
             },
             &mut supervisor,
         );
-        assert_eq!(second.unwrap_err().code, ServiceErrorCode::LifecycleError);
+        assert_eq!(second.unwrap_err().code, ServiceErrorCode::WorkloadBusy);
 
         supervisor.events.push_back(SupervisorEvent::StdoutEof);
         supervisor.events.push_back(SupervisorEvent::StderrEof);
