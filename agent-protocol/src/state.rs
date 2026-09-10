@@ -482,6 +482,15 @@ impl AgentProtocolState {
         }
     }
 
+    pub(crate) fn is_completed_exec_id(&self, exec_id: u32) -> bool {
+        self.launch.as_ref().is_some_and(|launch| {
+            launch.used_exec_ids.contains(&exec_id)
+                && launch
+                    .active_exec
+                    .is_none_or(|active| active.exec_id != exec_id)
+        })
+    }
+
     pub fn quiesce(&mut self) -> Result<AgentControlMessage, StateError> {
         let launch_state = self.launch_mut()?;
         match launch_state.lifecycle {

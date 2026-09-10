@@ -820,6 +820,9 @@ impl MxcControlService {
 
     pub fn grant_flow_credits(&mut self, request: FlowCreditRequest) -> Result<(), ServiceError> {
         self.require_supported_operation("Streams")?;
+        if self.protocol_state.is_completed_exec_id(request.exec_id) {
+            return Ok(());
+        }
         self.protocol_state.apply_exec_event(
             request.exec_id,
             ActiveExecEvent::AddFlowCredits {
@@ -839,7 +842,7 @@ impl MxcControlService {
         let active = self.active_exec.as_mut().ok_or_else(|| {
             ServiceError::new(
                 ServiceErrorCode::LifecycleError,
-                "no active exec for stdin chunk",
+                format!("no active exec for stdin chunk exec id {}", record.exec_id),
             )
         })?;
         if active.exec_id != record.exec_id {
@@ -1530,6 +1533,18 @@ impl<T: Read + Write> HvcFramedChannel<T> {
             current_write_offset: 0,
             write_credits: u32::MAX,
         }
+    }
+
+    pub fn io_mut(&mut self) -> &mut T {
+        &mut self.io
+    }
+
+    pub fn reset_framing(&mut self) {
+        self.read_buffer.clear();
+        self.queued_frames.clear();
+        self.write_queue_bytes = 0;
+        self.current_write_offset = 0;
+        self.write_credits = u32::MAX;
     }
 
     pub fn grant_write_credits(&mut self, credits: u32) {
@@ -2891,6 +2906,24 @@ mod tests {
             messages.last(),
             Some(AgentControlMessage::ExecTerminal { exec_id: 41, .. })
         ));
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 41,
+                stream: StreamName::Stdout,
+                credits: 1,
+            })
+            .expect("in-flight flow credit for completed exec is idempotent");
+        assert_eq!(
+            service
+                .grant_flow_credits(FlowCreditRequest {
+                    exec_id: 999,
+                    stream: StreamName::Stdout,
+                    credits: 1,
+                })
+                .unwrap_err()
+                .code,
+            ServiceErrorCode::LifecycleError
+        );
         let reused = service.create_process(
             CreateProcessRequest {
                 exec_id: 41,

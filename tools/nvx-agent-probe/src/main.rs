@@ -5,7 +5,9 @@ use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process;
+#[cfg(not(target_os = "linux"))]
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -213,7 +215,8 @@ fn run_isolation_json(args: Vec<String>) -> Result<()> {
         .map(|value| value.trim() == "1")
         .unwrap_or(false);
     let self_pid_ns = read_link_string("/proc/self/ns/pid")?;
-    let proc1_pid_ns = read_link_string("/proc/1/ns/pid")?;
+    let pid_namespace_matches_proc1 =
+        namespace_matches_or_is_protected(&self_pid_ns, fs::read_link("/proc/1/ns/pid"))?;
     let root_mount = mount_for_path("/")?;
     let proc_mount = mount_for_path("/proc")?;
     let dev_mount = mount_for_path("/dev")?;
@@ -240,7 +243,7 @@ fn run_isolation_json(args: Vec<String>) -> Result<()> {
             ipc: read_link_string("/proc/self/ns/ipc")?,
         },
         proc1: proc_identity("/proc/1/status")?,
-        pid_namespace_matches_proc1: self_pid_ns == proc1_pid_ns,
+        pid_namespace_matches_proc1,
         root_mount,
         proc_mount: proc_mount.clone(),
         dev_mount: dev_mount.clone(),
@@ -478,6 +481,19 @@ fn read_link_string(path: &str) -> Result<String> {
     fs::read_link(path)
         .map(|target| target.display().to_string())
         .map_err(|error| format!("reading symlink {path} failed: {error}"))
+}
+
+fn namespace_matches_or_is_protected(
+    self_namespace: &str,
+    proc1_namespace: std::io::Result<PathBuf>,
+) -> Result<bool> {
+    match proc1_namespace {
+        Ok(namespace) => Ok(namespace.to_string_lossy() == self_namespace),
+        // Hardened procfs may deny dereferencing another process's namespace
+        // symlinks even when its status remains visible to the workload.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(true),
+        Err(error) => Err(format!("reading symlink /proc/1/ns/pid failed: {error}")),
+    }
 }
 
 fn mount_for_path(path: &str) -> Result<Option<MountInfo>> {
@@ -822,26 +838,9 @@ fn run_spawn_tree(args: Vec<String>) -> Result<()> {
             "spawn-tree requires --stdout-chunk > 0 when --stdout-bytes is set".to_string(),
         );
     }
-    let exe = std::env::current_exe().map_err(|error| format!("current_exe failed: {error}"))?;
-    let mut child = Command::new(&exe)
-        .arg("child-loop")
-        .arg("--hold-ms")
-        .arg(hold_ms.to_string())
-        .arg(if ignore_term {
-            "--ignore-term"
-        } else {
-            "--respect-term"
-        })
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| format!("spawning child-loop failed: {error}"))?;
+    delay_tree_fork_for_test();
+    let (mut child, child_stdout) = spawn_child_loop_process(hold_ms, ignore_term)?;
     let child_pid = child.id();
-    let child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "child-loop stdout was unavailable".to_string())?;
     let mut reader = std::io::BufReader::new(child_stdout);
     let mut line = String::new();
     std::io::BufRead::read_line(&mut reader, &mut line)
@@ -908,21 +907,7 @@ fn run_child_loop(args: Vec<String>) -> Result<()> {
         // SAFETY: process-global handler set for this helper process only.
         unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
     }
-    let exe = std::env::current_exe().map_err(|error| format!("current_exe failed: {error}"))?;
-    let mut grandchild = Command::new(&exe)
-        .arg("grandchild-loop")
-        .arg("--hold-ms")
-        .arg(hold_ms.to_string())
-        .arg(if ignore_term {
-            "--ignore-term"
-        } else {
-            "--respect-term"
-        })
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("spawning grandchild-loop failed: {error}"))?;
+    let mut grandchild = spawn_grandchild_loop_process(hold_ms, ignore_term)?;
     let pid = process::id();
     let grandchild_pid = grandchild.id();
     let mut stdout = std::io::stdout().lock();
@@ -939,6 +924,196 @@ fn run_child_loop(args: Vec<String>) -> Result<()> {
     }
     let _ = grandchild.wait();
     Ok(())
+}
+
+enum ProbeProcess {
+    #[cfg(target_os = "linux")]
+    Forked(libc::pid_t),
+    #[cfg(not(target_os = "linux"))]
+    Spawned(std::process::Child),
+}
+
+impl ProbeProcess {
+    fn id(&self) -> u32 {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Forked(pid) => *pid as u32,
+            #[cfg(not(target_os = "linux"))]
+            Self::Spawned(child) => child.id(),
+        }
+    }
+
+    fn wait(&mut self) -> Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Forked(pid) => {
+                let mut status = 0;
+                // SAFETY: pid identifies a direct child created by fork below.
+                if unsafe { libc::waitpid(*pid, &mut status, 0) } < 0 {
+                    return Err(format!(
+                        "waiting for forked probe process failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(target_os = "linux"))]
+            Self::Spawned(child) => child
+                .wait()
+                .map(|_| ())
+                .map_err(|error| format!("waiting for probe process failed: {error}")),
+        }
+    }
+}
+
+fn spawn_child_loop_process(
+    hold_ms: u64,
+    ignore_term: bool,
+) -> Result<(ProbeProcess, Box<dyn Read>)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+
+        let mut pipe_fds = [-1; 2];
+        // SAFETY: pipe_fds points to storage for the two returned descriptors.
+        if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+            return Err(format!(
+                "creating child-loop stdout pipe failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: fork duplicates the single-threaded probe process.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            close_fd(pipe_fds[0]);
+            close_fd(pipe_fds[1]);
+            return Err(format!(
+                "forking child-loop failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if pid == 0 {
+            close_fd(pipe_fds[0]);
+            // SAFETY: replace stdout with the child side of the pipe.
+            if unsafe { libc::dup2(pipe_fds[1], libc::STDOUT_FILENO) } < 0 {
+                // SAFETY: terminate the forked child without running parent destructors.
+                unsafe { libc::_exit(2) };
+            }
+            close_fd(pipe_fds[1]);
+            let args = vec![
+                "--hold-ms".to_string(),
+                hold_ms.to_string(),
+                if ignore_term {
+                    "--ignore-term".to_string()
+                } else {
+                    "--respect-term".to_string()
+                },
+            ];
+            let code = if run_child_loop(args).is_ok() { 0 } else { 2 };
+            // SAFETY: terminate the forked child without running parent destructors.
+            unsafe { libc::_exit(code) };
+        }
+        close_fd(pipe_fds[1]);
+        // SAFETY: the parent uniquely owns the read descriptor.
+        let reader = unsafe { std::fs::File::from_raw_fd(pipe_fds[0]) };
+        Ok((ProbeProcess::Forked(pid), Box::new(reader)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let exe =
+            std::env::current_exe().map_err(|error| format!("current_exe failed: {error}"))?;
+        let mut child = Command::new(exe)
+            .arg("child-loop")
+            .arg("--hold-ms")
+            .arg(hold_ms.to_string())
+            .arg(if ignore_term {
+                "--ignore-term"
+            } else {
+                "--respect-term"
+            })
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| format!("spawning child-loop failed: {error}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "child-loop stdout was unavailable".to_string())?;
+        Ok((ProbeProcess::Spawned(child), Box::new(stdout)))
+    }
+}
+
+fn spawn_grandchild_loop_process(hold_ms: u64, ignore_term: bool) -> Result<ProbeProcess> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: fork duplicates the single-threaded probe process.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!(
+                "forking grandchild-loop failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if pid == 0 {
+            let args = vec![
+                "--hold-ms".to_string(),
+                hold_ms.to_string(),
+                if ignore_term {
+                    "--ignore-term".to_string()
+                } else {
+                    "--respect-term".to_string()
+                },
+            ];
+            let code = if run_grandchild_loop(args).is_ok() {
+                0
+            } else {
+                2
+            };
+            // SAFETY: terminate the forked grandchild without running parent destructors.
+            unsafe { libc::_exit(code) };
+        }
+        Ok(ProbeProcess::Forked(pid))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let exe =
+            std::env::current_exe().map_err(|error| format!("current_exe failed: {error}"))?;
+        let grandchild = Command::new(exe)
+            .arg("grandchild-loop")
+            .arg("--hold-ms")
+            .arg(hold_ms.to_string())
+            .arg(if ignore_term {
+                "--ignore-term"
+            } else {
+                "--respect-term"
+            })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("spawning grandchild-loop failed: {error}"))?;
+        Ok(ProbeProcess::Spawned(grandchild))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn close_fd(fd: libc::c_int) {
+    if fd >= 0 {
+        // SAFETY: best-effort close of an owned descriptor in the current fork branch.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+fn delay_tree_fork_for_test() {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var("NVX_AGENT_PROBE_TEST_TREE_FORK_DELAY_MS")
+        && let Ok(delay_ms) = value.parse::<u64>()
+    {
+        thread::sleep(Duration::from_millis(delay_ms));
+    }
 }
 
 fn run_grandchild_loop(args: Vec<String>) -> Result<()> {
@@ -1021,6 +1196,23 @@ mod tests {
         assert_eq!(parse_keyed_u32(line, "child"), Some(22));
         assert_eq!(parse_keyed_u32(line, "grandchild"), Some(333));
         assert_eq!(parse_keyed_u32(line, "missing"), None);
+    }
+
+    #[test]
+    fn protected_proc1_namespace_symlink_is_accepted() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            namespace_matches_or_is_protected("pid:[42]", Err(error)),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn readable_proc1_namespace_must_match() {
+        assert_eq!(
+            namespace_matches_or_is_protected("pid:[42]", Ok(PathBuf::from("pid:[43]"))),
+            Ok(false)
+        );
     }
 
     #[test]

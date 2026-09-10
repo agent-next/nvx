@@ -127,30 +127,18 @@ pub fn install_resolved_mappings_in_holder_mount_namespace(
         )));
     }
     let mount_ns_fd = open_namespace_fd(holder_pid, "mnt")?;
-    let pid_ns_fd = match open_namespace_fd(holder_pid, "pid") {
-        Ok(fd) => fd,
-        Err(error) => {
-            close_fd(mount_ns_fd);
-            return Err(error);
-        }
-    };
     // SAFETY: fork is used to isolate setns+mount operations from the main runtime process.
     let child_pid = unsafe { libc::fork() };
     if child_pid < 0 {
         close_fd(mount_ns_fd);
-        close_fd(pid_ns_fd);
         return Err(AgentError::io(
             "forking mapping installer helper",
             ::std::io::Error::last_os_error(),
         ));
     }
     if child_pid == 0 {
-        let exit_code = match install_resolved_mappings_in_child(
-            mount_ns_fd,
-            pid_ns_fd,
-            guest_root,
-            mappings,
-        ) {
+        let exit_code = match install_resolved_mappings_in_child(mount_ns_fd, guest_root, mappings)
+        {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("NVX-MAPPING-INSTALL-ERROR: {error}");
@@ -161,14 +149,12 @@ pub fn install_resolved_mappings_in_holder_mount_namespace(
         unsafe { libc::_exit(exit_code) };
     }
     close_fd(mount_ns_fd);
-    close_fd(pid_ns_fd);
     wait_pid_success(child_pid, "mapping installer helper")
 }
 
 #[cfg(target_os = "linux")]
 fn install_resolved_mappings_in_child(
     mount_ns_fd: i32,
-    pid_ns_fd: i32,
     guest_root: &str,
     mappings: &[ResolvedMapping],
 ) -> Result<()> {
@@ -188,43 +174,6 @@ fn install_resolved_mappings_in_child(
         "joining holder mount namespace",
     )?;
     close_fd(mount_ns_fd);
-    setns_checked(
-        pid_ns_fd,
-        libc::CLONE_NEWPID,
-        "joining holder pid namespace for mountinfo-aware hardening",
-    )?;
-    close_fd(pid_ns_fd);
-    // CLONE_NEWPID setns applies only to subsequently forked children.
-    // Spawn one worker in the holder PID namespace so /proc/self/* paths
-    // (including mountinfo reads during read-only hardening) resolve correctly.
-    let worker_pid = unsafe { libc::fork() };
-    if worker_pid < 0 {
-        return Err(AgentError::io(
-            "forking mapping installer worker",
-            ::std::io::Error::last_os_error(),
-        ));
-    }
-    if worker_pid == 0 {
-        let exit_code =
-            match install_resolved_mappings_worker(guest_root, mappings, detached_mounts) {
-                Ok(()) => 0,
-                Err(error) => {
-                    eprintln!("NVX-MAPPING-INSTALL-ERROR: {error}");
-                    1
-                }
-            };
-        // SAFETY: child must exit without unwinding parent state after fork.
-        unsafe { libc::_exit(exit_code) };
-    }
-    wait_pid_success(worker_pid, "mapping installer worker")
-}
-
-#[cfg(target_os = "linux")]
-fn install_resolved_mappings_worker(
-    guest_root: &str,
-    mappings: &[ResolvedMapping],
-    detached_mounts: Vec<OwnedFd>,
-) -> Result<()> {
     let guest_root_path = Path::new(guest_root);
     ::std::fs::create_dir_all(guest_root_path).map_err(|error| {
         AgentError::io(
@@ -232,6 +181,10 @@ fn install_resolved_mappings_worker(
             error,
         )
     })?;
+    unmount_detached(
+        guest_root_path,
+        "detaching raw mapping export from holder mount namespace",
+    )?;
     mount_call(
         "tmpfs",
         guest_root_path,
@@ -246,6 +199,19 @@ fn install_resolved_mappings_worker(
         prepare_mapping_target(&target_path, mapping.entry_kind)?;
         let target_fd = open_mapping_target(&target_path, mapping.entry_kind)?;
         attach_detached_mount(&detached_mount, &target_fd, &target_path)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unmount_detached(target: &Path, context: impl Into<String>) -> Result<()> {
+    let c_target = CString::new(target.to_string_lossy().as_ref())
+        .map_err(|_| AgentError::mount("unmount target contains NUL byte"))?;
+    // SAFETY: target is a valid NUL-terminated path; lazy detachment removes the
+    // raw export from the namespace while detached mapping clones remain valid.
+    let rc = unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) };
+    if rc != 0 {
+        return Err(AgentError::io(context, ::std::io::Error::last_os_error()));
     }
     Ok(())
 }
@@ -1265,6 +1231,7 @@ mod tests {
         let source_file = source_dir.join("payload.txt");
         let guest_root = temp.path().join("guest-mapping-root");
         ::std::fs::create_dir_all(&source_dir).expect("source dir");
+        ::std::fs::create_dir_all(&guest_root).expect("guest root");
         ::std::fs::write(&source_file, b"payload").expect("source payload");
 
         let resolver = MappingResolver::new(
@@ -1343,6 +1310,21 @@ mod tests {
                     )
                 };
             }
+            if let (Ok(source), Ok(target)) = (
+                CString::new(declared_root.to_string_lossy().as_bytes()),
+                CString::new(guest_root.to_string_lossy().as_bytes()),
+            ) {
+                // SAFETY: mount paths remain valid for the duration of the syscall.
+                let _ = unsafe {
+                    libc::mount(
+                        source.as_ptr(),
+                        target.as_ptr(),
+                        ::std::ptr::null(),
+                        libc::MS_BIND | libc::MS_REC,
+                        ::std::ptr::null(),
+                    )
+                };
+            }
             loop {
                 // SAFETY: pause waits for a signal in helper process.
                 unsafe { libc::pause() };
@@ -1373,6 +1355,18 @@ mod tests {
         assert_eq!(
             ::std::fs::read_to_string(&guest_file).expect("guest file"),
             "payload"
+        );
+        let holder_mountinfo = ::std::fs::read_to_string(format!("/proc/{holder_pid}/mountinfo"))
+            .expect("holder mountinfo");
+        let guest_root_mounts =
+            collect_mount_points_under_from_mountinfo(&guest_root, &holder_mountinfo)
+                .expect("parse holder mountinfo")
+                .into_iter()
+                .filter(|entry| entry.mount_point == guest_root)
+                .count();
+        assert_eq!(
+            guest_root_mounts, 1,
+            "raw export remained stacked beneath the private mapping root"
         );
     }
 

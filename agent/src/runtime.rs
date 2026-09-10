@@ -147,13 +147,14 @@ pub fn run_runtime() -> Result<()> {
             if let Some(state) = graceful_shutdown.as_mut()
                 && !state.cleanup_started
             {
-                service
-                    .begin_disconnect_cleanup_with_deadline(
-                        now_secs(),
-                        &mut supervisor,
-                        state.absolute_deadline,
-                    )
-                    .map_err(|error| AgentError::fail_closed(error.to_string()))?;
+                if let Err(error) = service.begin_disconnect_cleanup_with_deadline(
+                    now_secs(),
+                    &mut supervisor,
+                    state.absolute_deadline,
+                ) {
+                    eprintln!("NVX-AGENT-FAIL-CLOSED-SHUTDOWN: {error}");
+                    return Ok(());
+                }
                 state.cleanup_started = true;
             }
 
@@ -231,6 +232,10 @@ pub fn run_runtime() -> Result<()> {
                     active_timeout = None;
                     graceful_shutdown = None;
                     writable_mapping_paths.clear();
+                    if channel.io_mut().resume_after_reset() {
+                        channel.reset_framing();
+                        continue;
+                    }
                     break;
                 }
                 ChannelReadResult::Record(record) => {
@@ -2245,6 +2250,16 @@ impl GuestControlTransport {
                 error.to_string(),
             )),
         }
+    }
+
+    fn resume_after_reset(&mut self) -> bool {
+        if !self.eof_after_reset {
+            return false;
+        }
+        self.eof_after_reset = false;
+        self.read_buffer.clear();
+        self.write_buffer.clear();
+        true
     }
 }
 

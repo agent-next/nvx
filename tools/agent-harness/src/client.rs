@@ -166,13 +166,33 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
 
     pub fn send_host_control(&mut self, message: HostControlMessage) -> Result<u64, ClientError> {
         self.ensure_valid()?;
+        let message_type = Self::host_control_message_type(&message);
         let record = InnerRecord::control(&message).map_err(|error| {
             ClientError::Protocol(format!("failed to encode host control record: {error:?}"))
         })?;
         let encoded = record.encode().map_err(|error| {
             ClientError::Protocol(format!("failed to encode inner record bytes: {error:?}"))
         })?;
-        self.control.send_data(encoded).map_err(ClientError::from)
+        let sequence = self.control.send_data(encoded).map_err(ClientError::from)?;
+        let operation_id = host_control_operation_id(&message);
+        eprintln!("NVX-HARNESS-CONTROL-TX sequence={sequence} type={message_type}{operation_id}");
+        Ok(sequence)
+    }
+
+    fn host_control_message_type(message: &HostControlMessage) -> &'static str {
+        match message {
+            HostControlMessage::HostHello { .. } => "HostHello",
+            HostControlMessage::Configure { .. } => "Configure",
+            HostControlMessage::CreateProcess { .. } => "CreateProcess",
+            HostControlMessage::CancelExecution { .. } => "CancelExecution",
+            HostControlMessage::FlowCredits(_) => "FlowCredits",
+            HostControlMessage::StdinChunk(_) => "StdinChunk",
+            HostControlMessage::StdinEof(_) => "StdinEof",
+            HostControlMessage::Health => "Health",
+            HostControlMessage::Quiesce => "Quiesce",
+            HostControlMessage::Resume => "Resume",
+            HostControlMessage::Shutdown { .. } => "Shutdown",
+        }
     }
 
     pub fn send_raw_control_payload(&mut self, payload: &[u8]) -> Result<u64, ClientError> {
@@ -518,6 +538,10 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         match event {
             HostEvent::Data(payload) => {
                 let message = decode_control_message(&payload)?;
+                eprintln!(
+                    "NVX-HARNESS-CONTROL-RX type={}",
+                    message_type_name(&message)
+                );
                 self.push_inbound(message)
             }
             HostEvent::Error(code) => Err(ClientError::Protocol(format!(
@@ -626,6 +650,38 @@ fn message_type_name(message: &AgentControlMessage) -> &'static str {
         AgentControlMessage::StreamDrained { .. } => "StreamDrained",
         AgentControlMessage::DescendantsCleaned { .. } => "DescendantsCleaned",
         AgentControlMessage::ExecTerminal { .. } => "ExecTerminal",
+    }
+}
+
+fn host_control_operation_id(message: &HostControlMessage) -> String {
+    match message {
+        HostControlMessage::Configure { launch, .. } => {
+            format!(" launch_generation={}", launch.generation)
+        }
+        HostControlMessage::CreateProcess { exec_id, .. }
+        | HostControlMessage::CancelExecution { exec_id } => format!(" exec_id={exec_id}"),
+        HostControlMessage::FlowCredits(request) => {
+            format!(" exec_id={} stream={:?}", request.exec_id, request.stream)
+        }
+        HostControlMessage::StdinChunk(record) => {
+            format!(
+                " exec_id={} stream_sequence={}",
+                record.exec_id, record.sequence
+            )
+        }
+        HostControlMessage::StdinEof(record) => {
+            format!(
+                " exec_id={} stream_sequence={}",
+                record.exec_id, record.sequence
+            )
+        }
+        HostControlMessage::HostHello { launch, .. } => {
+            format!(" launch_generation={}", launch.generation)
+        }
+        HostControlMessage::Health
+        | HostControlMessage::Quiesce
+        | HostControlMessage::Resume
+        | HostControlMessage::Shutdown { .. } => String::new(),
     }
 }
 

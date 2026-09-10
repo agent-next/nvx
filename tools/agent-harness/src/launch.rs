@@ -249,10 +249,21 @@ pub fn discover_artifacts(
     }
 
     Ok(LaunchArtifacts {
-        openvmm_exe,
-        kernel,
-        mxc_initramfs,
-        common_root,
+        openvmm_exe: absolute_artifact_path("openvmm_exe", &openvmm_exe)?,
+        kernel: absolute_artifact_path("kernel", &kernel)?,
+        mxc_initramfs: absolute_artifact_path("mxc_initramfs", &mxc_initramfs)?,
+        common_root: absolute_artifact_path("common_root", &common_root)?,
+    })
+}
+
+fn absolute_artifact_path(
+    field: &'static str,
+    path: &Path,
+) -> Result<PathBuf, MissingPrerequisite> {
+    std::path::absolute(path).map_err(|error| MissingPrerequisite {
+        field,
+        path: path.to_path_buf(),
+        reason: format!("failed to make path absolute: {error}"),
     })
 }
 
@@ -941,6 +952,9 @@ pub fn kill_child_process_tree(child: &mut Child) -> Result<(), String> {
 
 #[cfg(windows)]
 fn close_job_handle_and_kill(vm: &mut LaunchedVm) -> Result<(), String> {
+    if let Some(capture) = vm.boot_console_capture.as_ref() {
+        capture.stop.store(true, Ordering::Release);
+    }
     let teardown_result = terminate_openvmm_process_tree(vm);
     let capture_result = match vm.boot_console_capture.as_mut() {
         Some(capture) => capture.stop_and_join(),
@@ -1255,6 +1269,39 @@ mod tests {
         assert!(result.is_err());
         let error = result.expect_err("missing openvmm expected");
         assert!(!error.field.is_empty());
+    }
+
+    #[test]
+    fn artifact_discovery_normalizes_relative_overrides_to_absolute_paths() {
+        let relative_root =
+            PathBuf::from("target").join(format!("launch-relative-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&relative_root);
+        std::fs::create_dir_all(&relative_root).expect("create relative root");
+        let openvmm = relative_root.join(if cfg!(windows) {
+            "openvmm.exe"
+        } else {
+            "openvmm"
+        });
+        let kernel = relative_root.join("vmlinux");
+        let initramfs = relative_root.join(DEFAULT_INITRAMFS);
+        std::fs::write(&openvmm, b"openvmm").expect("openvmm");
+        std::fs::write(&kernel, b"kernel").expect("kernel");
+        std::fs::write(&initramfs, b"initramfs").expect("initramfs");
+        let overrides = LaunchOverrides {
+            openvmm_exe: Some(openvmm),
+            kernel: Some(kernel),
+            mxc_initramfs: Some(initramfs),
+            common_root: Some(relative_root.join("common")),
+        };
+
+        let artifacts =
+            discover_artifacts(&relative_root.join("output"), &overrides).expect("artifacts");
+
+        assert!(artifacts.openvmm_exe.is_absolute());
+        assert!(artifacts.kernel.is_absolute());
+        assert!(artifacts.mxc_initramfs.is_absolute());
+        assert!(artifacts.common_root.is_absolute());
+        std::fs::remove_dir_all(relative_root).expect("cleanup");
     }
 
     #[test]

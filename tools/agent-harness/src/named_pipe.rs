@@ -131,18 +131,23 @@ impl NamedPipeClient {
                 client.verify_expected_server(expected_server_pid, expected_server_image)?;
                 return Ok(client);
             }
+            let connect_error = std::io::Error::last_os_error();
             let remaining = deadline_at.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(NamedPipeError {
-                    message: format!("timed out connecting to named pipe {path}"),
+                    message: format!(
+                        "timed out connecting to named pipe {path}: last CreateFileW error: {connect_error}"
+                    ),
                 });
             }
-            let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+            let wait_ms = remaining.as_millis().min(25) as u32;
             // SAFETY: stable path pointer and bounded timeout value.
             let waited = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), wait_ms) };
             if !waited.as_bool() && Instant::now() >= deadline_at {
                 return Err(NamedPipeError {
-                    message: format!("named-pipe wait deadline reached for {path}"),
+                    message: format!(
+                        "named-pipe wait deadline reached for {path}: last CreateFileW error: {connect_error}"
+                    ),
                 });
             }
         }
