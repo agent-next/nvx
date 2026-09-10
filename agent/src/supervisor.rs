@@ -774,23 +774,33 @@ fn maybe_write_cgroup_kill(cgroup_dir: &Path, signal: i32) -> Result<(), Service
 fn pump_stdio_round_robin(active: &mut ActiveProcess) -> Result<(), ServiceError> {
     let mut budget = MAX_STDIO_CHUNKS_PER_REFRESH;
     while budget > 0 && !event_queue_limits_reached(active) {
-        let mut produced = false;
+        let mut produced = 0_usize;
         if active.prefer_stdout_next {
-            produced |= pump_stdout_chunk(active)?;
-            if budget > 0 && !event_queue_limits_reached(active) {
-                produced |= pump_stderr_chunk(active)?;
+            if pump_stdout_chunk(active)? {
+                produced = produced.saturating_add(1);
+            }
+            if budget > produced
+                && !event_queue_limits_reached(active)
+                && pump_stderr_chunk(active)?
+            {
+                produced = produced.saturating_add(1);
             }
         } else {
-            produced |= pump_stderr_chunk(active)?;
-            if budget > 0 && !event_queue_limits_reached(active) {
-                produced |= pump_stdout_chunk(active)?;
+            if pump_stderr_chunk(active)? {
+                produced = produced.saturating_add(1);
+            }
+            if budget > produced
+                && !event_queue_limits_reached(active)
+                && pump_stdout_chunk(active)?
+            {
+                produced = produced.saturating_add(1);
             }
         }
         active.prefer_stdout_next = !active.prefer_stdout_next;
-        if !produced {
+        if produced == 0 {
             break;
         }
-        budget = budget.saturating_sub(1);
+        budget = budget.saturating_sub(produced);
     }
     Ok(())
 }
