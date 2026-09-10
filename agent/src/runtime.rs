@@ -117,17 +117,15 @@ pub fn run_runtime() -> Result<()> {
                 shutdown_delivery_deadline = Instant::now().checked_add(SHUTDOWN_DELIVERY_DEADLINE);
             }
 
-            if shutdown_requested
-                && service.active_exec_id().is_none()
-                && pending_outbound.is_empty()
-                && !channel.has_queued_writes()
-            {
-                return Ok(());
-            }
-            if shutdown_requested
-                && shutdown_cleanup_started
-                && shutdown_delivery_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-            {
+            if should_complete_shutdown(
+                shutdown_requested,
+                shutdown_cleanup_started,
+                service.active_exec_id(),
+                pending_outbound.is_empty(),
+                channel.has_queued_writes(),
+                shutdown_delivery_deadline,
+                Instant::now(),
+            ) {
                 return Ok(());
             }
 
@@ -573,6 +571,20 @@ fn detect_network_status() -> NetworkStatus {
     }
 }
 
+#[cfg(feature = "harness-supervisor")]
+#[allow(dead_code)]
+pub fn harness_detect_network_status_with_probe(
+    interfaces_present: bool,
+    timeout: Duration,
+    probe: impl FnMut() -> std::result::Result<NetworkStatus, NetworkFailureStatus>,
+    sleep: impl FnMut(Duration),
+) -> NetworkStatus {
+    if !interfaces_present {
+        return no_nic_network_status();
+    }
+    detect_portable_network_status_with_probe(timeout, probe, sleep)
+}
+
 fn no_nic_network_status() -> NetworkStatus {
     NetworkStatus {
         mode: NetworkMode::NoNic,
@@ -619,6 +631,18 @@ fn collect_portable_network_status() -> std::result::Result<NetworkStatus, Netwo
         detail: "portable-network mode requires one non-loopback interface".to_string(),
     })?;
     let interface = collect_interface_status(primary)?;
+    collect_portable_network_status_with_sources(
+        interface,
+        || parse_default_route_gateway_ipv4(primary),
+        parse_dns_status,
+    )
+}
+
+fn collect_portable_network_status_with_sources(
+    interface: NetworkInterfaceStatus,
+    mut route_probe: impl FnMut() -> std::result::Result<Option<Ipv4Addr>, NetworkFailureStatus>,
+    mut dns_probe: impl FnMut() -> std::result::Result<DnsStatus, NetworkFailureStatus>,
+) -> std::result::Result<NetworkStatus, NetworkFailureStatus> {
     if !matches!(interface.link_state, NetworkLinkState::Up) {
         return Err(NetworkFailureStatus {
             code: NetworkFailureCode::InterfaceMissing,
@@ -631,12 +655,11 @@ fn collect_portable_network_status() -> std::result::Result<NetworkStatus, Netwo
             detail: format!("interface {} has no assigned addresses", interface.name),
         });
     }
-    let gateway =
-        parse_default_route_gateway_ipv4(&interface.name)?.ok_or(NetworkFailureStatus {
-            code: NetworkFailureCode::RouteMissing,
-            detail: format!("interface {} has no IPv4 default route", interface.name),
-        })?;
-    let dns = parse_dns_status()?;
+    let gateway = route_probe()?.ok_or(NetworkFailureStatus {
+        code: NetworkFailureCode::RouteMissing,
+        detail: format!("interface {} has no IPv4 default route", interface.name),
+    })?;
+    let dns = dns_probe()?;
     if !dns.ready {
         return Err(NetworkFailureStatus {
             code: NetworkFailureCode::DnsMissing,
@@ -654,6 +677,21 @@ fn collect_portable_network_status() -> std::result::Result<NetworkStatus, Netwo
         dns,
         failure: None,
     })
+}
+
+#[cfg(feature = "harness-supervisor")]
+#[allow(dead_code)]
+pub fn harness_collect_portable_network_status(
+    interface: NetworkInterfaceStatus,
+    route_table_text: &str,
+    resolv_conf_text: &str,
+) -> std::result::Result<NetworkStatus, NetworkFailureStatus> {
+    let name = interface.name.clone();
+    collect_portable_network_status_with_sources(
+        interface,
+        || parse_default_route_gateway_ipv4_from_text(&name, route_table_text),
+        || parse_dns_status_from_text(resolv_conf_text),
+    )
 }
 
 fn failed_portable_network_status(failure: NetworkFailureStatus) -> NetworkStatus {
@@ -1000,6 +1038,39 @@ fn should_stop_after_fatal_delivery(
     (pending_outbound_empty && !has_queued_writes) || now >= shutdown.delivery_deadline
 }
 
+fn should_complete_shutdown(
+    shutdown_requested: bool,
+    shutdown_cleanup_started: bool,
+    active_exec_id: Option<u32>,
+    pending_outbound_empty: bool,
+    has_queued_writes: bool,
+    shutdown_delivery_deadline: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !shutdown_requested {
+        return false;
+    }
+    if active_exec_id.is_none() && pending_outbound_empty && !has_queued_writes {
+        return true;
+    }
+    shutdown_cleanup_started && shutdown_delivery_deadline.is_some_and(|deadline| now >= deadline)
+}
+
+#[cfg(feature = "harness-supervisor")]
+#[allow(dead_code)]
+pub fn harness_should_complete_shutdown_when_writer_blocked(
+    active_exec_id: Option<u32>,
+    deadline_elapsed: bool,
+) -> bool {
+    let now = Instant::now();
+    let deadline = if deadline_elapsed {
+        Some(now.checked_sub(Duration::from_millis(1)).unwrap_or(now))
+    } else {
+        now.checked_add(Duration::from_secs(1))
+    };
+    should_complete_shutdown(true, true, active_exec_id, false, true, deadline, now)
+}
+
 fn enforce_active_timeout<S: ProcessSupervisor>(
     service: &mut MxcControlService,
     supervisor: &mut S,
@@ -1190,6 +1261,7 @@ fn quiesce_transactional(
             "invalid lifecycle transition: quiesce",
         ));
     }
+
     if initial.active_exec_id.is_some() {
         return Err(AgentError::bad_request(
             "quiesce rejected while an execution is active; retry after workload completion",
@@ -1225,6 +1297,7 @@ fn resume_transactional(
             "invalid lifecycle transition: resume",
         ));
     }
+
     set_frozen(false)?;
     match service.resume() {
         Ok(message) => Ok(message),
@@ -1240,6 +1313,37 @@ fn resume_transactional(
             Err(AgentError::bad_request(error.to_string()))
         }
     }
+}
+
+#[cfg(feature = "harness-supervisor")]
+#[allow(dead_code)]
+pub fn harness_quiesce_transactional(
+    service: &mut MxcControlService,
+    cgroup_dir: &Path,
+) -> std::result::Result<(), String> {
+    quiesce_transactional(service, |freeze| {
+        // SAFETY: sync has no memory-safety preconditions.
+        unsafe { libc::sync() };
+        set_workload_frozen(cgroup_dir, freeze, FREEZE_WAIT_TIMEOUT)?;
+        // SAFETY: sync has no memory-safety preconditions.
+        unsafe { libc::sync() };
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "harness-supervisor")]
+#[allow(dead_code)]
+pub fn harness_resume_transactional(
+    service: &mut MxcControlService,
+    cgroup_dir: &Path,
+) -> std::result::Result<(), String> {
+    resume_transactional(service, |freeze| {
+        set_workload_frozen(cgroup_dir, freeze, FREEZE_WAIT_TIMEOUT)
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 fn set_workload_frozen(cgroup_dir: &Path, freeze: bool, timeout: Duration) -> Result<()> {

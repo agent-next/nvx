@@ -33,9 +33,13 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   `LinuxProcessSupervisor` path with real subprocesses on Linux/WSL
   (`local-linux-runtime` evidence: sequential exec + typed busy, binary
   stdout/stderr separation, backpressure/credits, terminal-order invariants,
-  typed network status semantics, health/quiesce/resume/shutdown transitions,
-  and channel-loss cleanup/new-generation enforcement). This remains
-  non-conformance (`NotLive`) until observed on live WHP.
+  runtime network-readiness/health paths (including deterministic no-NIC,
+  portable-ready, malformed, and timeout probes), production
+  quiesce/resume/shutdown lifecycle transactions with bounded blocked-writer
+  shutdown semantics, and channel-loss cleanup/new-generation enforcement).
+  If the production runtime prerequisites are unavailable on the local host,
+  req10/req11 are reported as `Blocked` instead of passing. Any local runtime
+  pass remains non-conformance (`NotLive`) until observed on live WHP.
 - Post-config capability advertisement now exposes `Exec`, `Streams`, `Cancel`,
   `Quiesce`, `Resume`, and `Shutdown` after full lifecycle activation.
 - Cancellation, timeout escalation, descendant termination, channel-loss cleanup,

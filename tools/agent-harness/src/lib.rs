@@ -17,8 +17,8 @@ use agent_protocol::messages::{
     AgentControlMessage, ExecDisposition, FlowCreditRequest, StdinChunkRecord, StdinEofRecord,
 };
 use agent_protocol::messages::{
-    AgentSessionState, BuildStatus, DnsStatus, IsolationStatus, LaunchIdentity, NetworkMode,
-    NetworkSetupState, NetworkStatus, SERVICE_IDENTITY, WorkloadIdentityStatus,
+    BuildStatus, DnsStatus, IsolationStatus, LaunchIdentity, NetworkMode, NetworkSetupState,
+    NetworkStatus, SERVICE_IDENTITY, WorkloadIdentityStatus,
 };
 #[cfg(target_os = "linux")]
 use agent_protocol::service::ProcessSupervisor;
@@ -31,6 +31,12 @@ use agent_protocol::service::{CancelReason, CreateProcessRequest};
 use agent_protocol::state::PROTOCOL_VERSION;
 #[cfg(target_os = "linux")]
 use nvx_agent::LinuxProcessSupervisor;
+#[cfg(target_os = "linux")]
+use nvx_agent::runtime::{
+    harness_collect_portable_network_status, harness_detect_network_status_with_probe,
+    harness_quiesce_transactional, harness_resume_transactional,
+    harness_should_complete_shutdown_when_writer_blocked,
+};
 use serde::{Deserialize, Serialize};
 
 const REPORT_SCHEMA: &str = "nvx.mxc.agent.harness.report.v1";
@@ -397,7 +403,7 @@ fn run_static_check_scenario(definition: ScenarioDefinition) -> CheckOutcome {
             scenario_immutable_configuration(definition),
             EvidenceSource::UnitStatic,
         ),
-        3..=6 | 12 => CheckOutcome {
+        3..=6 | 10..=12 => CheckOutcome {
             check_status: EvidenceCheckStatus::NotRun,
             evidence_source: EvidenceSource::None,
             error: Some(
@@ -411,8 +417,6 @@ fn run_static_check_scenario(definition: ScenarioDefinition) -> CheckOutcome {
             scenario_mapping_containment(definition),
             EvidenceSource::UnitStatic,
         ),
-        10 => scenario_check_from_result(scenario_network_status(definition), EvidenceSource::UnitStatic),
-        11 => scenario_check_from_result(scenario_health_lifecycle(definition), EvidenceSource::UnitStatic),
         _ => CheckOutcome {
             check_status: EvidenceCheckStatus::Fail,
             evidence_source: EvidenceSource::None,
@@ -647,69 +651,144 @@ fn run_local_linux_runtime_scenario(definition: ScenarioDefinition) -> ScenarioR
 
 #[cfg(target_os = "linux")]
 fn local_linux_network_status() -> CheckOutcome {
-    let no_nic = network_status_no_nic();
+    let no_nic = harness_detect_network_status_with_probe(
+        false,
+        Duration::from_millis(1),
+        || unreachable!("probe must not run for no-nic"),
+        |_sleep| {},
+    );
+    let portable_ready = harness_detect_network_status_with_probe(
+        true,
+        Duration::from_millis(10),
+        || {
+            harness_collect_portable_network_status(
+                agent_protocol::NetworkInterfaceStatus {
+                    name: "eth0".to_string(),
+                    index: 3,
+                    link_state: agent_protocol::NetworkLinkState::Up,
+                    addresses: vec!["10.0.0.2".to_string()],
+                    default_route: None,
+                },
+                "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\neth0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n",
+                "nameserver 10.0.0.53\n",
+            )
+        },
+        |_sleep| {},
+    );
+    let malformed = harness_detect_network_status_with_probe(
+        true,
+        Duration::from_millis(0),
+        || {
+            harness_collect_portable_network_status(
+                agent_protocol::NetworkInterfaceStatus {
+                    name: "eth0".to_string(),
+                    index: 3,
+                    link_state: agent_protocol::NetworkLinkState::Up,
+                    addresses: vec!["10.0.0.2".to_string()],
+                    default_route: None,
+                },
+                "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\neth0\t00000000\tnothex\t0003\t0\t0\t100\t00000000\t0\t0\t0\n",
+                "nameserver 10.0.0.53\n",
+            )
+        },
+        |_sleep| {},
+    );
+    let timeout = harness_detect_network_status_with_probe(
+        true,
+        Duration::from_millis(1),
+        || {
+            Err(agent_protocol::NetworkFailureStatus {
+                code: agent_protocol::NetworkFailureCode::RouteMissing,
+                detail: "missing default route for eth0".to_string(),
+            })
+        },
+        |_sleep| {},
+    );
+
+    let mut roundtrip_ok = true;
+    for status in [
+        no_nic.clone(),
+        portable_ready.clone(),
+        malformed.clone(),
+        timeout.clone(),
+    ] {
+        let mut service = MxcControlService::new_pid1_runtime(sample_binding(7, 44), 4242);
+        let admitted = match service.authenticate_channel(
+            authenticate_request(7, 44, [7; 32]),
+            1,
+            status.clone(),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return check_fail(format!(
+                    "authenticate_channel failed for mode={:?}: {error}",
+                    status.mode
+                ));
+            }
+        };
+        let mut configuration = configure_request();
+        configuration.configuration.network = status.clone();
+        if let Err(error) = service.configure_session(configuration) {
+            return check_fail(format!(
+                "configure_session failed for mode={:?}: {error}",
+                status.mode
+            ));
+        }
+        if let Err(error) = service.activate_full_lifecycle() {
+            return check_fail(format!("activate_full_lifecycle failed: {error}"));
+        }
+        let ready = match service.wait_ready(wait_ready_request()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return check_fail(format!("wait_ready failed: {error}")),
+        };
+        let health = service.health();
+        if admitted.network != status
+            || ready.network != status
+            || health.network != Some(status.clone())
+        {
+            roundtrip_ok = false;
+            break;
+        }
+    }
+
     let no_nic_ok = no_nic.mode == NetworkMode::NoNic
         && no_nic.setup_state == NetworkSetupState::Ready
         && no_nic.interface.is_none()
         && no_nic.failure.is_none();
+    let ready_ok = portable_ready.mode == NetworkMode::PortableNetwork
+        && portable_ready.setup_state == NetworkSetupState::Ready
+        && portable_ready.dns.ready
+        && !portable_ready.dns.servers.is_empty()
+        && portable_ready.failure.is_none();
+    let malformed_ok = malformed.setup_state == NetworkSetupState::Failed
+        && matches!(
+            malformed.failure,
+            Some(agent_protocol::NetworkFailureStatus {
+                code: agent_protocol::NetworkFailureCode::RouteMalformed,
+                ..
+            })
+        );
+    let timeout_ok = timeout.setup_state == NetworkSetupState::Failed
+        && matches!(
+            timeout.failure,
+            Some(agent_protocol::NetworkFailureStatus {
+                code: agent_protocol::NetworkFailureCode::RouteMissing,
+                ..
+            })
+        );
 
-    let ready = network_status_portable_ready();
-    let ready_ok = ready.mode == NetworkMode::PortableNetwork
-        && ready.setup_state == NetworkSetupState::Ready
-        && ready.dns.ready
-        && !ready.dns.servers.is_empty()
-        && ready.failure.is_none();
-
-    let failed = NetworkStatus {
-        mode: NetworkMode::PortableNetwork,
-        setup_state: NetworkSetupState::Failed,
-        interface: None,
-        default_gateway: None,
-        dns: DnsStatus {
-            ready: false,
-            servers: Vec::new(),
-        },
-        failure: Some(agent_protocol::NetworkFailureStatus {
-            code: agent_protocol::NetworkFailureCode::RouteMissing,
-            detail: "missing default route for eth0".to_string(),
-        }),
-    };
-    let mut service = MxcControlService::new(sample_binding(7, 44));
-    let admitted =
-        service.authenticate_channel(authenticate_request(7, 44, [7; 32]), 1, failed.clone());
-    if let Err(error) = admitted {
-        return check_fail(format!("authenticate_channel failed: {error}"));
-    }
-    let mut failed_config = configure_request();
-    failed_config.configuration.network = failed.clone();
-    if let Err(error) = service.configure_session(failed_config) {
-        return check_fail(format!("configure_session failed: {error}"));
-    }
-    let observed = service.wait_ready(wait_ready_request());
-    let failed_ok = matches!(
-        observed,
-        Ok(snapshot)
-            if snapshot.network.setup_state == NetworkSetupState::Failed
-                && snapshot.network.failure
-                    == Some(agent_protocol::NetworkFailureStatus {
-                        code: agent_protocol::NetworkFailureCode::RouteMissing,
-                        detail: "missing default route for eth0".to_string(),
-                    })
-    );
-
-    if no_nic_ok && ready_ok && failed_ok {
+    if no_nic_ok && ready_ok && malformed_ok && timeout_ok && roundtrip_ok {
         check_pass(
             EvidenceSource::LocalLinuxRuntime,
             vec![
-                "no-nic mode reports isolated ready state with no invented interface fields"
-                    .to_string(),
-                "portable-ready snapshot carries typed DNS and gateway readiness metadata"
-                    .to_string(),
-                "configured wait-ready and health retain typed network status shape".to_string(),
+                "production network probe path (no-nic/portable/malformed/timeout) feeds typed NetworkStatus".to_string(),
+                "authenticate/configure/activate/wait-ready/health preserved each probed network status verbatim".to_string(),
             ],
         )
     } else {
-        check_fail("network status invariants failed".to_string())
+        check_fail(
+            "network status invariants failed through runtime probe + readiness path".to_string(),
+        )
     }
 }
 
@@ -741,13 +820,11 @@ fn local_linux_health_lifecycle() -> CheckOutcome {
         && health.configured
         && health.active_exec_id == Some(exec_id)
         && health.channel_generation == 44;
-    let quiesce_rejected = matches!(
-        service.quiesce(),
-        Err(ServiceError {
-            code: ServiceErrorCode::LifecycleError,
-            ..
-        })
-    );
+    let cgroup_path = Path::new("/sys/fs/cgroup/nvx.workload");
+    let quiesce_rejected = match harness_quiesce_transactional(&mut service, cgroup_path) {
+        Ok(()) => false,
+        Err(error) => error.contains("quiesce rejected while an execution is active"),
+    };
 
     if let Err(error) = service.cancel_exec(exec_id, CancelReason::Cancelled, &mut supervisor) {
         return check_fail(format!("cancel_exec failed: {error}"));
@@ -758,7 +835,25 @@ fn local_linux_health_lifecycle() -> CheckOutcome {
     if let Err(error) = collect_exec_messages(&mut service, &mut supervisor) {
         return check_fail(error);
     }
-    let quiesced = service.quiesce().is_ok() && service.health().quiesced;
+    let quiesced = match harness_quiesce_transactional(&mut service, cgroup_path) {
+        Ok(()) => service.health().quiesced,
+        Err(error) => {
+            if error.contains("cgroup freezer interface unavailable")
+                || error.contains("cgroup.freeze")
+                || error.contains("cgroup.events")
+            {
+                return check_blocked(
+                    format!(
+                        "req11 production quiesce transaction path unavailable on this host: {error}"
+                    ),
+                    vec![
+                        "local runtime host lacks cgroup freezer prerequisites required by production quiesce/resume".to_string(),
+                    ],
+                );
+            }
+            return check_fail(format!("production quiesce transaction failed: {error}"));
+        }
+    };
     let admission_blocked = matches!(
         service.create_process(
             CreateProcessRequest {
@@ -775,8 +870,15 @@ fn local_linux_health_lifecycle() -> CheckOutcome {
             ..
         })
     );
-    let resumed = service.resume().is_ok() && !service.health().quiesced;
+    let resumed = match harness_resume_transactional(&mut service, cgroup_path) {
+        Ok(()) => !service.health().quiesced,
+        Err(error) => return check_fail(format!("production resume transaction failed: {error}")),
+    };
     let shutdown_ack = service.shutdown().is_ok() && service.health().shutting_down;
+    let blocked_writer_before_deadline =
+        !harness_should_complete_shutdown_when_writer_blocked(None, false);
+    let blocked_writer_after_deadline =
+        harness_should_complete_shutdown_when_writer_blocked(None, true);
     let post_shutdown_blocked = matches!(
         service.create_process(
             CreateProcessRequest {
@@ -801,6 +903,8 @@ fn local_linux_health_lifecycle() -> CheckOutcome {
         && admission_blocked
         && resumed
         && shutdown_ack
+        && blocked_writer_before_deadline
+        && blocked_writer_after_deadline
         && post_shutdown_blocked
     {
         check_pass(
@@ -808,13 +912,16 @@ fn local_linux_health_lifecycle() -> CheckOutcome {
             vec![
                 "health remains queryable under output backpressure and reports active exec/channel generation"
                     .to_string(),
-                "quiesce rejects while active, then blocks new exec admission when idle"
+                "production quiesce/resume transactional path rejects active quiesce and enforces idle freeze/thaw"
                     .to_string(),
-                "resume reopens admission and shutdown closes admission with typed state".to_string(),
+                "shutdown transitions state and bounded blocked-writer deadline still guarantees runtime stop".to_string(),
             ],
         )
     } else {
-        check_fail("health/lifecycle local runtime invariants failed".to_string())
+        check_fail(
+            "health/lifecycle local runtime invariants failed through production transaction paths"
+                .to_string(),
+        )
     }
 }
 
@@ -1427,86 +1534,6 @@ fn scenario_mapping_containment(definition: ScenarioDefinition) -> ScenarioResul
     }
 }
 
-fn scenario_network_status(definition: ScenarioDefinition) -> ScenarioResult {
-    let mut service = MxcControlService::new(sample_binding(7, 44));
-    let admitted_network = network_status_portable_ready();
-    let ready = match service.authenticate_channel(
-        authenticate_request(7, 44, [7; 32]),
-        1,
-        admitted_network.clone(),
-    ) {
-        Ok(status) => status,
-        Err(error) => return fail(definition, &format!("authenticate_channel failed: {error}")),
-    };
-    if let Err(error) = service.configure_session(configure_request()) {
-        return fail(definition, &format!("configure_session failed: {error}"));
-    }
-    let health = service.health();
-    if ready.network == admitted_network
-        && health.network.as_ref().is_some_and(|network| {
-            network.mode == NetworkMode::PortableNetwork
-                && network.setup_state == NetworkSetupState::Ready
-                && network.dns.ready
-        })
-    {
-        pass(
-            definition,
-            vec![
-                "ready status reports typed network mode/setup/interface/dns shape".to_string(),
-                "health snapshot retains typed configured network status".to_string(),
-            ],
-        )
-    } else {
-        fail(definition, "network status snapshot mismatch")
-    }
-}
-
-fn scenario_health_lifecycle(definition: ScenarioDefinition) -> ScenarioResult {
-    let mut service = activated_service();
-    let before = service.health();
-    let quiesce = service.quiesce().is_ok();
-    let resume = service.resume().is_ok();
-    let shutdown = service.shutdown().is_ok();
-    let capabilities = service.get_capabilities();
-    let unavailable = capabilities
-        .unavailable_operations
-        .iter()
-        .map(|entry| entry.operation.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let available = capabilities
-        .available_operations
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::BTreeSet<_>>();
-    let passed = before.configured
-        && before.agent_state == AgentSessionState::Active
-        && quiesce
-        && resume
-        && shutdown
-        && available.contains("Quiesce")
-        && available.contains("Resume")
-        && available.contains("Shutdown")
-        && !unavailable.contains("Quiesce")
-        && !unavailable.contains("Resume")
-        && !unavailable.contains("Shutdown");
-    if passed {
-        pass(
-            definition,
-            vec![
-                "health carries typed state (active/quiesced/shutting-down) with channel metadata"
-                    .to_string(),
-                "quiesce/resume/shutdown are enabled after activation and enforce admission rules"
-                    .to_string(),
-            ],
-        )
-    } else {
-        fail(
-            definition,
-            "health/quiesce/resume/shutdown invariants failed",
-        )
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn collect_exec_messages(
     service: &mut MxcControlService,
@@ -1547,6 +1574,16 @@ fn check_fail(error: String) -> CheckOutcome {
         evidence_source: EvidenceSource::None,
         error: Some(error),
         evidence: vec![],
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_blocked(error: String, evidence: Vec<String>) -> CheckOutcome {
+    CheckOutcome {
+        check_status: EvidenceCheckStatus::NotRun,
+        evidence_source: EvidenceSource::LocalLinuxRuntime,
+        error: Some(error),
+        evidence,
     }
 }
 
@@ -1631,6 +1668,7 @@ fn grant_all_stream_credits(service: &mut MxcControlService, exec_id: u32) -> Re
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn activated_service() -> MxcControlService {
     let mut service = MxcControlService::new_pid1_runtime(sample_binding(7, 44), 4242);
     service
@@ -2060,6 +2098,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn static_mode_req10_and_req11_are_not_run_and_non_passing() {
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let root = std::env::temp_dir().join("nvx-agent-harness-static-runtime-req10-11");
+        let _ = std::fs::remove_dir_all(&root);
+        let run = execute_harness(HarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: HarnessMode::StaticOnly,
+            output_dir: root,
+        })
+        .expect("run");
+        for requirement_number in [10_u8, 11_u8] {
+            let scenario = run
+                .report
+                .scenarios
+                .iter()
+                .find(|scenario| scenario.requirement_number == requirement_number)
+                .expect("scenario present");
+            assert_ne!(scenario.check_status, EvidenceCheckStatus::Pass);
+            assert_eq!(scenario.status, ScenarioStatus::Blocked);
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn non_linux_live_mode_reports_not_live_or_blocked() {
@@ -2102,14 +2163,26 @@ mod tests {
                 .iter()
                 .find(|scenario| scenario.requirement_number == requirement_number)
                 .expect("scenario present");
-            assert_eq!(
-                scenario.check_status,
-                EvidenceCheckStatus::Pass,
-                "req {requirement_number} failed local runtime check: {:?}",
-                scenario.error
-            );
-            assert_eq!(scenario.evidence_source, EvidenceSource::LocalLinuxRuntime);
-            assert_eq!(scenario.status, ScenarioStatus::NotLive);
+            if scenario.check_status == EvidenceCheckStatus::Pass {
+                assert_eq!(scenario.evidence_source, EvidenceSource::LocalLinuxRuntime);
+                assert_eq!(scenario.status, ScenarioStatus::NotLive);
+                if requirement_number == 10 || requirement_number == 11 {
+                    assert!(
+                        scenario
+                            .evidence
+                            .iter()
+                            .any(|line| line.contains("production")),
+                        "req {requirement_number} must include production-path evidence when passing"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    scenario.check_status,
+                    EvidenceCheckStatus::NotRun,
+                    "req {requirement_number} should be blocked when production paths are unavailable"
+                );
+                assert_eq!(scenario.status, ScenarioStatus::Blocked);
+            }
         }
         assert_eq!(run.exit_code(), ExitCode::FAILURE);
     }
