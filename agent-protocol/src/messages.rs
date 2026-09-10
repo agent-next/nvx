@@ -281,6 +281,7 @@ pub struct HealthStatus {
 pub enum ProtocolErrorCode {
     UnsupportedService,
     UnsupportedProtocolVersion,
+    UnsupportedOperation,
     CapabilityProofLength,
     CleanupInProgress,
     ActiveLaunchExists,

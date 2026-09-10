@@ -15,8 +15,8 @@ use agent_protocol::{
     ConfigureSessionRequest, CreateProcessRequest, HVC1_DEVICE_PATH, HostControlMessage,
     LaunchBinding, LaunchIdentity, MappingContainmentPolicy, MxcControlService, NetworkMode,
     NetworkStatus, OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, PROTOCOL_VERSION, ProcessSupervisor,
-    ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, ServiceErrorCode,
-    SessionConfiguration, WaitReadyRequest, WorkloadIdentityStatus,
+    ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, ServiceError,
+    ServiceErrorCode, SessionConfiguration, WaitReadyRequest, WorkloadIdentityStatus,
 };
 
 use crate::config::{GuestMountRoot, SessionConfiguration as AgentSessionConfiguration};
@@ -149,10 +149,10 @@ pub fn run_runtime() -> Result<()> {
     }
 }
 
-fn handle_host_record(
+fn handle_host_record<S: ProcessSupervisor>(
     binding: &LaunchBinding,
     service: &mut MxcControlService,
-    supervisor: &mut LinuxProcessSupervisor,
+    supervisor: &mut S,
     pending_hello: &mut Option<AuthenticateChannelRequest>,
     active_timeout: &mut Option<(u32, Instant)>,
     record: agent_protocol::InnerRecord,
@@ -181,21 +181,57 @@ fn handle_host_record(
         host_message,
     ) {
         Ok(messages) => Ok(messages),
-        Err(error) => Ok(vec![AgentControlMessage::Error(ProtocolErrorDetail {
-            code: ProtocolErrorCode::InvalidLifecycleTransition,
-            message: error.to_string(),
-        })]),
+        Err(HostDispatchError::Service(error)) => Ok(vec![AgentControlMessage::Error(
+            protocol_error_from_service(error),
+        )]),
+        Err(HostDispatchError::Agent(error)) => {
+            Ok(vec![AgentControlMessage::Error(ProtocolErrorDetail {
+                code: ProtocolErrorCode::InvalidLifecycleTransition,
+                message: error.to_string(),
+            })])
+        }
     }
 }
 
-fn handle_host_message(
+enum HostDispatchError {
+    Service(ServiceError),
+    Agent(AgentError),
+}
+
+impl From<ServiceError> for HostDispatchError {
+    fn from(value: ServiceError) -> Self {
+        Self::Service(value)
+    }
+}
+
+impl From<AgentError> for HostDispatchError {
+    fn from(value: AgentError) -> Self {
+        Self::Agent(value)
+    }
+}
+
+fn protocol_error_from_service(error: ServiceError) -> ProtocolErrorDetail {
+    let code = match error.code {
+        ServiceErrorCode::UnsupportedProtocolVersion => {
+            ProtocolErrorCode::UnsupportedProtocolVersion
+        }
+        ServiceErrorCode::UnsupportedOperation => ProtocolErrorCode::UnsupportedOperation,
+        _ => ProtocolErrorCode::InvalidLifecycleTransition,
+    };
+    ProtocolErrorDetail {
+        code,
+        message: error.to_string(),
+    }
+}
+
+fn handle_host_message<S: ProcessSupervisor>(
     binding: &LaunchBinding,
     service: &mut MxcControlService,
-    supervisor: &mut LinuxProcessSupervisor,
+    supervisor: &mut S,
     pending_hello: &mut Option<AuthenticateChannelRequest>,
     active_timeout: &mut Option<(u32, Instant)>,
     message: HostControlMessage,
-) -> Result<Vec<AgentControlMessage>> {
+) -> std::result::Result<Vec<AgentControlMessage>, HostDispatchError> {
     match message {
         HostControlMessage::HostHello {
             service: remote_service,
@@ -238,9 +274,7 @@ fn handle_host_message(
             };
             let network = detect_network_status();
             let guest_mount_root = GuestMountRoot::parse(DEFAULT_GUEST_MAPPING_ROOT.to_string())?;
-            let _ = service
-                .authenticate_channel(authentication, now_secs(), network.clone())
-                .map_err(|error| AgentError::bad_request(error.to_string()))?;
+            let _ = service.authenticate_channel(authentication, now_secs(), network.clone())?;
             verify_declared_mappings(&guest_mount_root, &mappings)?;
             let configuration = session_configuration_from_host(
                 launch,
@@ -249,19 +283,15 @@ fn handle_host_message(
                 containment,
                 network.clone(),
             )?;
-            service
-                .configure_session(ConfigureSessionRequest {
-                    protocol_version: binding.protocol_version,
-                    image_version: binding.image_version.clone(),
-                    launch,
-                    channel_generation: binding.channel_generation,
-                    idempotent_replay: false,
-                    configuration,
-                })
-                .map_err(|error| AgentError::bad_request(error.to_string()))?;
-            service
-                .activate_full_lifecycle()
-                .map_err(|error| AgentError::bad_request(error.to_string()))?;
+            service.configure_session(ConfigureSessionRequest {
+                protocol_version: binding.protocol_version,
+                image_version: binding.image_version.clone(),
+                launch,
+                channel_generation: binding.channel_generation,
+                idempotent_replay: false,
+                configuration,
+            })?;
+            service.activate_full_lifecycle()?;
             let _ = service.wait_ready(WaitReadyRequest {
                 protocol_version: binding.protocol_version,
                 image_version: binding.image_version.clone(),
@@ -280,18 +310,16 @@ fn handle_host_message(
             env,
             timeout_ms,
         } => {
-            service
-                .create_process(
-                    CreateProcessRequest {
-                        exec_id,
-                        argv,
-                        cwd,
-                        env,
-                        timeout_ms,
-                    },
-                    supervisor,
-                )
-                .map_err(|error| AgentError::exec(error.to_string()))?;
+            service.create_process(
+                CreateProcessRequest {
+                    exec_id,
+                    argv,
+                    cwd,
+                    env,
+                    timeout_ms,
+                },
+                supervisor,
+            )?;
             if let Some(timeout) = timeout_ms
                 && let Some(deadline) = Instant::now().checked_add(Duration::from_millis(timeout))
             {
@@ -300,27 +328,19 @@ fn handle_host_message(
             Ok(Vec::new())
         }
         HostControlMessage::CancelExecution { exec_id } => {
-            service
-                .cancel_exec(exec_id, CancelReason::Cancelled, supervisor)
-                .map_err(|error| AgentError::exec(error.to_string()))?;
+            service.cancel_exec(exec_id, CancelReason::Cancelled, supervisor)?;
             Ok(Vec::new())
         }
         HostControlMessage::FlowCredits(request) => {
-            service
-                .grant_flow_credits(request)
-                .map_err(|error| AgentError::bad_request(error.to_string()))?;
+            service.grant_flow_credits(request)?;
             Ok(Vec::new())
         }
         HostControlMessage::StdinChunk(record) => {
-            service
-                .stdin_chunk(record, supervisor)
-                .map_err(|error| AgentError::exec(error.to_string()))?;
+            service.stdin_chunk(record, supervisor)?;
             Ok(Vec::new())
         }
         HostControlMessage::StdinEof(record) => {
-            service
-                .stdin_eof(record, supervisor)
-                .map_err(|error| AgentError::exec(error.to_string()))?;
+            service.stdin_eof(record, supervisor)?;
             Ok(Vec::new())
         }
         HostControlMessage::Health => {
@@ -332,30 +352,32 @@ fn handle_host_message(
                 },
             )])
         }
-        HostControlMessage::Quiesce => Ok(vec![quiesce_transactional(service, |freeze| {
-            // SAFETY: sync has no memory-safety preconditions.
-            unsafe { libc::sync() };
-            set_workload_frozen(
-                Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
-                freeze,
-                FREEZE_WAIT_TIMEOUT,
-            )?;
-            // SAFETY: sync has no memory-safety preconditions.
-            unsafe { libc::sync() };
-            Ok(())
-        })?]),
-        HostControlMessage::Resume => Ok(vec![resume_transactional(service, |freeze| {
-            set_workload_frozen(
-                Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
-                freeze,
-                FREEZE_WAIT_TIMEOUT,
-            )
-        })?]),
-        HostControlMessage::Shutdown { .. } => {
-            Ok(vec![service.shutdown().map_err(|error| {
-                AgentError::bad_request(error.to_string())
+        HostControlMessage::Quiesce => {
+            service.ensure_supported_operation("Quiesce")?;
+            Ok(vec![quiesce_transactional(service, |freeze| {
+                // SAFETY: sync has no memory-safety preconditions.
+                unsafe { libc::sync() };
+                set_workload_frozen(
+                    Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
+                    freeze,
+                    FREEZE_WAIT_TIMEOUT,
+                )?;
+                // SAFETY: sync has no memory-safety preconditions.
+                unsafe { libc::sync() };
+                Ok(())
             })?])
         }
+        HostControlMessage::Resume => {
+            service.ensure_supported_operation("Resume")?;
+            Ok(vec![resume_transactional(service, |freeze| {
+                set_workload_frozen(
+                    Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
+                    freeze,
+                    FREEZE_WAIT_TIMEOUT,
+                )
+            })?])
+        }
+        HostControlMessage::Shutdown { .. } => Ok(vec![service.shutdown()?]),
     }
 }
 
@@ -807,9 +829,10 @@ mod tests {
     use super::*;
     use agent_protocol::{
         AccessMode, AuthenticateChannelRequest, CanonicalHostMappingRoot, ConfigureSessionRequest,
-        CreateProcessRequest, FlowCreditRequest, HealthStatus, LaunchBinding, LaunchIdentity,
-        MappingContainmentPolicy, NetworkMode, NetworkStatus, ProcessSupervisor, SERVICE_IDENTITY,
-        SessionConfiguration, StreamName, SupervisorEvent, SymlinkContainmentPolicy,
+        CreateProcessRequest, FlowCreditRequest, HealthStatus, HostControlMessage, InnerRecord,
+        LaunchBinding, LaunchIdentity, MappingContainmentPolicy, NetworkMode, NetworkStatus,
+        ProcessSupervisor, ProtocolErrorCode, SERVICE_IDENTITY, SessionConfiguration, StreamName,
+        SupervisorEvent, SymlinkContainmentPolicy,
     };
     use std::cell::RefCell;
     use std::io::{self, Cursor, Read, Write};
@@ -857,11 +880,17 @@ mod tests {
         assert_eq!(OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, 64);
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
     struct RuntimeTestSupervisor {
         exec_id: Option<u32>,
         events: VecDeque<SupervisorEvent>,
         acked_events: usize,
+        spawn_calls: usize,
+        queue_stdin_calls: usize,
+        close_stdin_calls: usize,
+        terminate_calls: usize,
+        kill_calls: usize,
+        cleanup_for_disconnect_calls: usize,
     }
 
     impl ProcessSupervisor for RuntimeTestSupervisor {
@@ -870,6 +899,7 @@ mod tests {
             request: &CreateProcessRequest,
         ) -> std::result::Result<(), agent_protocol::ServiceError> {
             self.exec_id = Some(request.exec_id);
+            self.spawn_calls = self.spawn_calls.saturating_add(1);
             Ok(())
         }
 
@@ -878,6 +908,7 @@ mod tests {
             _exec_id: u32,
             _chunk: Vec<u8>,
         ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            self.queue_stdin_calls = self.queue_stdin_calls.saturating_add(1);
             Ok(())
         }
 
@@ -885,6 +916,7 @@ mod tests {
             &mut self,
             _exec_id: u32,
         ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            self.close_stdin_calls = self.close_stdin_calls.saturating_add(1);
             Ok(())
         }
 
@@ -918,10 +950,12 @@ mod tests {
             &mut self,
             _exec_id: u32,
         ) -> std::result::Result<(), agent_protocol::ServiceError> {
+            self.terminate_calls = self.terminate_calls.saturating_add(1);
             Ok(())
         }
 
         fn kill(&mut self, _exec_id: u32) -> std::result::Result<(), agent_protocol::ServiceError> {
+            self.kill_calls = self.kill_calls.saturating_add(1);
             Ok(())
         }
 
@@ -941,6 +975,7 @@ mod tests {
             _exec_id: u32,
             _deadline: Duration,
         ) -> std::result::Result<bool, agent_protocol::ServiceError> {
+            self.cleanup_for_disconnect_calls = self.cleanup_for_disconnect_calls.saturating_add(1);
             Ok(true)
         }
     }
@@ -1040,9 +1075,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_supervisor_pump_waits_for_full_256_queue_and_replays_once_losslessly() {
+    fn runtime_supervisor_pump_waits_for_full_record_limit_and_replays_once_losslessly() {
         let mut service = runtime_test_service();
         let mut supervisor = RuntimeTestSupervisor::default();
+        service.activate_full_lifecycle().unwrap();
         service
             .create_process(
                 CreateProcessRequest {
@@ -1055,7 +1091,6 @@ mod tests {
                 &mut supervisor,
             )
             .unwrap();
-        service.activate_full_lifecycle().unwrap();
         service
             .grant_flow_credits(FlowCreditRequest {
                 exec_id: 65,
@@ -1075,7 +1110,7 @@ mod tests {
             quiesced: false,
             launch_admitted: true,
         });
-        for _ in 0..256 {
+        for _ in 0..agent_protocol::DEFAULT_CHANNEL_WRITE_QUEUE_LIMIT_RECORDS {
             channel.queue_control_message(&filler).unwrap();
         }
         assert_eq!(
@@ -1200,5 +1235,89 @@ mod tests {
         assert!(service.health().quiesced);
         resume_transactional(&mut service, |_| Ok(())).unwrap();
         assert!(!service.health().quiesced);
+    }
+
+    fn runtime_test_binding() -> LaunchBinding {
+        LaunchBinding {
+            protocol_version: PROTOCOL_VERSION,
+            image_version: "img-v1".to_string(),
+            launch: LaunchIdentity {
+                generation: 7,
+                nonce: [7; 16],
+            },
+            channel_generation: 17,
+        }
+    }
+
+    fn control_record(message: &HostControlMessage) -> agent_protocol::InnerRecord {
+        InnerRecord::control(message).expect("control record")
+    }
+
+    #[test]
+    fn phase0_handle_host_record_rejects_unavailable_operations_without_side_effects() {
+        let binding = runtime_test_binding();
+        let mut service = runtime_test_service();
+        let mut supervisor = RuntimeTestSupervisor::default();
+        let mut pending_hello = None;
+        let mut active_timeout = None;
+
+        let baseline_health = service.health();
+        let baseline_active_exec = service.active_exec_id();
+        let baseline_supervisor = supervisor.clone();
+
+        let operations = [
+            HostControlMessage::CreateProcess {
+                exec_id: 41,
+                argv: vec!["/bin/echo".to_string(), "ok".to_string()],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            },
+            HostControlMessage::FlowCredits(FlowCreditRequest {
+                exec_id: 41,
+                stream: StreamName::Stdout,
+                credits: 1,
+            }),
+            HostControlMessage::StdinChunk(agent_protocol::StdinChunkRecord {
+                exec_id: 41,
+                sequence: 0,
+                chunk: b"input".to_vec(),
+            }),
+            HostControlMessage::StdinEof(agent_protocol::StdinEofRecord {
+                exec_id: 41,
+                sequence: 1,
+            }),
+            HostControlMessage::CancelExecution { exec_id: 41 },
+            HostControlMessage::Quiesce,
+            HostControlMessage::Resume,
+            HostControlMessage::Shutdown {
+                grace_timeout_ms: 100,
+            },
+        ];
+
+        for operation in operations {
+            let outbound = handle_host_record(
+                &binding,
+                &mut service,
+                &mut supervisor,
+                &mut pending_hello,
+                &mut active_timeout,
+                control_record(&operation),
+            )
+            .expect("dispatch");
+            assert_eq!(outbound.len(), 1);
+            assert!(matches!(
+                &outbound[0],
+                AgentControlMessage::Error(ProtocolErrorDetail {
+                    code: ProtocolErrorCode::UnsupportedOperation,
+                    ..
+                })
+            ));
+            assert_eq!(service.health(), baseline_health);
+            assert_eq!(service.active_exec_id(), baseline_active_exec);
+            assert!(pending_hello.is_none());
+            assert!(active_timeout.is_none());
+            assert_eq!(supervisor, baseline_supervisor);
+        }
     }
 }

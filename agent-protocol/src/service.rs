@@ -450,12 +450,6 @@ impl MxcControlService {
                 reason: "phase-0 control slice does not expose quiesce transitions".to_string(),
             },
             UnavailableOperation {
-                operation: "DisconnectCleanup".to_string(),
-                capability_flag: "disconnect_cleanup.phase0".to_string(),
-                reason: "phase-0 control slice does not expose disconnect cleanup control"
-                    .to_string(),
-            },
-            UnavailableOperation {
                 operation: "Resume".to_string(),
                 capability_flag: "resume.phase0".to_string(),
                 reason: "phase-0 control slice does not expose resume transitions".to_string(),
@@ -686,6 +680,10 @@ impl MxcControlService {
             ServiceErrorCode::UnsupportedOperation,
             format!("{operation} is outside the current operational slice"),
         ))
+    }
+
+    pub fn ensure_supported_operation(&self, operation: &str) -> Result<(), ServiceError> {
+        self.require_supported_operation(operation)
     }
 
     pub fn create_process(
@@ -1785,13 +1783,7 @@ mod tests {
         assert_eq!(
             unavailable,
             std::collections::BTreeSet::from([
-                "Exec",
-                "Streams",
-                "Cancel",
-                "Quiesce",
-                "DisconnectCleanup",
-                "Resume",
-                "Shutdown",
+                "Exec", "Streams", "Cancel", "Quiesce", "Resume", "Shutdown",
             ])
         );
 
@@ -1867,9 +1859,6 @@ mod tests {
             service.quiesce().unwrap_err(),
             service.resume().unwrap_err(),
             service.shutdown().unwrap_err(),
-            service
-                .unsupported_operation("DisconnectCleanup")
-                .unwrap_err(),
         ];
 
         for error in errors {

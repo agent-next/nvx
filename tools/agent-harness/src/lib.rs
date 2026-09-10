@@ -154,12 +154,29 @@ fn run_launch_bound_readiness() -> RequirementResult {
     let first = service.wait_ready(wait_ready_request());
     let second = service.wait_ready(wait_ready_request());
     let health = service.health();
+    let unavailable_operations = capabilities
+        .unavailable_operations
+        .iter()
+        .map(|entry| entry.operation.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
     let passed = wrong_nonce_rejected
         && capabilities.protocol_version == PROTOCOL_VERSION
+        && capabilities.available_operations
+            == vec![
+                "GetCapabilities".to_string(),
+                "AuthenticateChannel".to_string(),
+                "ConfigureSession".to_string(),
+                "WaitReady".to_string(),
+                "Health".to_string(),
+            ]
+        && unavailable_operations
+            == std::collections::BTreeSet::from([
+                "Exec", "Streams", "Cancel", "Quiesce", "Resume", "Shutdown",
+            ])
         && capabilities
-            .available_operations
+            .unavailable_operations
             .iter()
-            .any(|operation| operation == "GetCapabilities")
+            .all(|entry| !entry.capability_flag.is_empty() && !entry.reason.is_empty())
         && first.is_ok()
         && second.is_ok()
         && first == second
@@ -177,9 +194,10 @@ fn run_launch_bound_readiness() -> RequirementResult {
             RequirementStatus::Fail
         },
         reason: if passed {
-            "WaitReady is launch-bound to nonce/version/channel generation and remains level-triggered with filesystem+network readiness.".to_string()
+            "WaitReady is launch-bound to nonce/version/channel generation and GetCapabilities truthfully reports the phase-0 operational slice.".to_string()
         } else {
-            "WaitReady launch binding or level-trigger behavior failed.".to_string()
+            "WaitReady launch binding, level-trigger behavior, or capability truthfulness failed."
+                .to_string()
         },
     }
 }
