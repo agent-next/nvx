@@ -515,6 +515,12 @@ impl AgentProtocolState {
         Ok(())
     }
 
+    pub fn complete_channel_loss_cleanup(&mut self) {
+        if let CleanupStatus::InProgress { generation, .. } = self.cleanup_status {
+            self.cleanup_status = CleanupStatus::Completed { generation };
+        }
+    }
+
     fn cleanup_generation(&self) -> u64 {
         match self.cleanup_status {
             CleanupStatus::InProgress { generation, .. }
@@ -1153,6 +1159,17 @@ mod tests {
             state.cleanup_status(),
             CleanupStatus::Completed { generation: 6 }
         );
+    }
+
+    #[test]
+    fn cleanup_can_be_completed_early_after_disconnect_cleanup_finishes() {
+        let mut state = AgentProtocolState::new();
+        state.admit_launch(admission_input(9, 1)).expect("launch");
+        state.begin_channel_loss_cleanup(10).expect("cleanup start");
+        state.complete_channel_loss_cleanup();
+        state
+            .admit_launch(admission_input(10, 11))
+            .expect("new generation after explicit cleanup completion");
     }
 
     #[test]

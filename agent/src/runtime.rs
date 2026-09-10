@@ -1,108 +1,154 @@
 // Copyright(c) The microvm authors.
 // Licensed under the MIT License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_protocol::{
     AgentControlMessage, AuthenticateChannelRequest, BuildStatus, CancelReason, ChannelReadResult,
     ConfigureSessionRequest, CreateProcessRequest, HVC1_DEVICE_PATH, HostControlMessage,
-    IsolationStatus, LaunchBinding, LaunchIdentity, MappingContainmentPolicy, MxcControlService,
-    NetworkMode, NetworkStatus, OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, PROTOCOL_VERSION,
-    ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, SessionConfiguration,
-    WaitReadyRequest, WorkloadIdentityStatus,
+    LaunchBinding, LaunchIdentity, MappingContainmentPolicy, MxcControlService, NetworkMode,
+    NetworkStatus, OPENVMM_OUTER_FRAME_OVERHEAD_BYTES, PROTOCOL_VERSION, ProcessSupervisor,
+    ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, ServiceErrorCode,
+    SessionConfiguration, WaitReadyRequest, WorkloadIdentityStatus,
 };
 
 use crate::config::{GuestMountRoot, SessionConfiguration as AgentSessionConfiguration};
 use crate::error::{AgentError, Result};
-use crate::isolation::{apply_and_verify_workload_isolation, default_isolation_plan};
+use crate::isolation::{self, apply_and_verify_workload_isolation, default_isolation_plan};
 use crate::mappings::MappingResolver;
 use crate::supervisor::LinuxProcessSupervisor;
 
 const LOOP_SLEEP: Duration = Duration::from_millis(10);
 const DEFAULT_GUEST_MAPPING_ROOT: &str = "/mnt/virtiofs";
+const DEFAULT_WORKLOAD_CGROUP_PATH: &str = "/sys/fs/cgroup/nvx.workload";
+const OUTBOUND_PENDING_LIMIT: usize = 256;
+const FREEZE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+static SIGCHLD_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub fn run_runtime() -> Result<()> {
     assert_conservative_openvmm_overhead()?;
-    let binding = read_launch_binding()?;
+    install_sigchld_wakeup_handler()?;
+    let launch_config = read_launch_binding()?;
+    let binding = launch_config.binding;
     let build = detect_build_status();
     let network = detect_network_status();
-    let isolation = optimistic_isolation_status();
+    let isolation_result = apply_and_verify_workload_isolation(&default_isolation_plan())?;
     let mut service = MxcControlService::new_with_status(
         binding.clone(),
         build,
         network.clone(),
-        isolation,
+        isolation_result.status,
         WorkloadIdentityStatus::mxc_fixed(),
     );
-    let file = open_hvc1_raw_nonblocking(HVC1_DEVICE_PATH)?;
-    let mut channel = agent_protocol::HvcFramedChannel::new(file);
-    let mut supervisor = LinuxProcessSupervisor::new();
+    service.set_expected_capability(launch_config.expected_capability);
+    let mut supervisor = LinuxProcessSupervisor::new_with_holder(isolation_result.holder_pid)
+        .map_err(|error| AgentError::internal(error.to_string()))?;
     let mut pending_hello: Option<AuthenticateChannelRequest> = None;
     let mut active_timeout: Option<(u32, Instant)> = None;
+    let mut pending_outbound = VecDeque::new();
+    let mut shutdown_requested = false;
+    let mut shutdown_cleanup_started = false;
 
     loop {
-        if let Some((exec_id, deadline)) = active_timeout
-            && Instant::now() >= deadline
-        {
-            let _ = service.cancel_exec(exec_id, CancelReason::TimedOut, &mut supervisor);
-            active_timeout = None;
-        }
+        let file = open_hvc1_raw_nonblocking(HVC1_DEVICE_PATH)?;
+        let mut channel = agent_protocol::HvcFramedChannel::new(file);
 
-        for message in service
-            .pump_supervisor(&mut supervisor)
-            .map_err(|error| AgentError::internal(error.to_string()))?
-        {
-            if matches!(message, AgentControlMessage::ExecTerminal { .. }) {
+        loop {
+            if let Some((exec_id, deadline)) = active_timeout
+                && Instant::now() >= deadline
+            {
+                let _ = service.cancel_exec(exec_id, CancelReason::TimedOut, &mut supervisor);
                 active_timeout = None;
             }
-            queue_agent_message(&mut channel, &message)?;
-        }
-        while channel
-            .flush_once()
-            .map_err(|error| AgentError::internal(error.to_string()))?
-        {}
 
-        match channel
-            .try_read_next_inner_record()
-            .map_err(|error| AgentError::internal(error.to_string()))?
-        {
-            ChannelReadResult::WouldBlock => {
-                thread::sleep(LOOP_SLEEP);
-                continue;
-            }
-            ChannelReadResult::Closed => {
-                let cleanup = service.begin_disconnect_cleanup(now_secs(), &mut supervisor);
-                if let Err(error) = cleanup {
-                    return Err(AgentError::internal(format!(
-                        "channel-loss cleanup failed closed: {error}"
-                    )));
+            if pending_outbound.is_empty() && !channel.is_write_saturated() {
+                for message in service
+                    .pump_supervisor(&mut supervisor)
+                    .map_err(|error| AgentError::internal(error.to_string()))?
+                {
+                    if matches!(message, AgentControlMessage::ExecTerminal { .. }) {
+                        active_timeout = None;
+                    }
+                    enqueue_outbound(&mut pending_outbound, message)?;
                 }
+            }
+
+            drain_outbound_to_channel(&mut channel, &mut pending_outbound)?;
+            while channel
+                .flush_once()
+                .map_err(|error| AgentError::internal(error.to_string()))?
+            {}
+
+            if shutdown_requested && !shutdown_cleanup_started {
+                if let Some(exec_id) = service.active_exec_id() {
+                    supervisor
+                        .close_stdin(exec_id)
+                        .map_err(|error| AgentError::internal(error.to_string()))?;
+                    supervisor
+                        .terminate(exec_id)
+                        .map_err(|error| AgentError::internal(error.to_string()))?;
+                }
+                shutdown_cleanup_started = true;
+            }
+
+            if shutdown_requested
+                && service.active_exec_id().is_none()
+                && pending_outbound.is_empty()
+                && !channel.has_queued_writes()
+            {
                 return Ok(());
             }
-            ChannelReadResult::Record(record) => {
-                let outbound = handle_host_record(
-                    &binding,
-                    &mut service,
-                    &mut supervisor,
-                    &mut pending_hello,
-                    &mut active_timeout,
-                    record,
-                )?;
-                for message in outbound {
-                    let shutting_down = matches!(message, AgentControlMessage::ShuttingDown);
-                    queue_agent_message(&mut channel, &message)?;
-                    while channel
-                        .flush_once()
-                        .map_err(|error| AgentError::internal(error.to_string()))?
-                    {
+
+            if service.active_exec_id().is_none() {
+                isolation::reap_all_children();
+            }
+
+            match channel
+                .try_read_next_inner_record()
+                .map_err(|error| AgentError::internal(error.to_string()))?
+            {
+                ChannelReadResult::WouldBlock => {
+                    if !SIGCHLD_PENDING.swap(false, Ordering::SeqCst) {
+                        thread::sleep(LOOP_SLEEP);
                     }
-                    if shutting_down {
-                        return Ok(());
+                    continue;
+                }
+                ChannelReadResult::Closed => {
+                    if service.launch_admitted() {
+                        service
+                            .begin_disconnect_cleanup(now_secs(), &mut supervisor)
+                            .map_err(|error| AgentError::internal(error.to_string()))?;
+                    }
+                    isolation::reap_all_children();
+                    pending_hello = None;
+                    pending_outbound.clear();
+                    active_timeout = None;
+                    shutdown_requested = false;
+                    shutdown_cleanup_started = false;
+                    break;
+                }
+                ChannelReadResult::Record(record) => {
+                    let outbound = handle_host_record(
+                        &binding,
+                        &mut service,
+                        &mut supervisor,
+                        &mut pending_hello,
+                        &mut active_timeout,
+                        record,
+                    )?;
+                    for message in outbound {
+                        if matches!(message, AgentControlMessage::ShuttingDown) {
+                            shutdown_requested = true;
+                        }
+                        enqueue_outbound(&mut pending_outbound, message)?;
                     }
                 }
             }
@@ -199,13 +245,9 @@ fn handle_host_message(
             };
             let network = detect_network_status();
             let guest_mount_root = GuestMountRoot::parse(DEFAULT_GUEST_MAPPING_ROOT.to_string())?;
-            let isolation_result = apply_and_verify_workload_isolation(&default_isolation_plan())?;
-            let _ = isolation_result.holder_pid;
-            service.update_runtime_isolation(isolation_result.status.clone());
             let _ = service
                 .authenticate_channel(authentication, now_secs(), network.clone())
                 .map_err(|error| AgentError::bad_request(error.to_string()))?;
-
             verify_declared_mappings(&guest_mount_root, &mappings)?;
             let configuration = session_configuration_from_host(
                 launch,
@@ -230,11 +272,10 @@ fn handle_host_message(
                 launch,
                 channel_generation: binding.channel_generation,
             });
-            let ready = AgentControlMessage::Ready {
+            Ok(vec![AgentControlMessage::Ready {
                 launch,
                 status: ready_status(service, network),
-            };
-            Ok(vec![ready])
+            }])
         }
         HostControlMessage::CreateProcess {
             exec_id,
@@ -296,14 +337,30 @@ fn handle_host_message(
             )])
         }
         HostControlMessage::Quiesce => {
-            Ok(vec![service.quiesce().map_err(|error| {
-                AgentError::bad_request(error.to_string())
-            })?])
+            let message = service
+                .quiesce()
+                .map_err(|error| AgentError::bad_request(error.to_string()))?;
+            // SAFETY: sync has no memory-safety preconditions.
+            unsafe { libc::sync() };
+            set_workload_frozen(
+                Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
+                true,
+                FREEZE_WAIT_TIMEOUT,
+            )?;
+            // SAFETY: sync has no memory-safety preconditions.
+            unsafe { libc::sync() };
+            Ok(vec![message])
         }
         HostControlMessage::Resume => {
-            Ok(vec![service.resume().map_err(|error| {
-                AgentError::bad_request(error.to_string())
-            })?])
+            let message = service
+                .resume()
+                .map_err(|error| AgentError::bad_request(error.to_string()))?;
+            set_workload_frozen(
+                Path::new(DEFAULT_WORKLOAD_CGROUP_PATH),
+                false,
+                FREEZE_WAIT_TIMEOUT,
+            )?;
+            Ok(vec![message])
         }
         HostControlMessage::Shutdown { .. } => {
             Ok(vec![service.shutdown().map_err(|error| {
@@ -360,15 +417,6 @@ fn verify_declared_mappings(
         let _ = resolver.resolve_declared(&mapping.child)?;
     }
     Ok(())
-}
-
-fn queue_agent_message<T: io::Read + io::Write>(
-    channel: &mut agent_protocol::HvcFramedChannel<T>,
-    message: &AgentControlMessage,
-) -> Result<()> {
-    channel
-        .queue_control_message(message)
-        .map_err(|error| AgentError::internal(error.to_string()))
 }
 
 fn detect_network_status() -> NetworkStatus {
@@ -432,79 +480,98 @@ fn assert_conservative_openvmm_overhead() -> Result<()> {
     Ok(())
 }
 
-fn read_launch_binding() -> Result<LaunchBinding> {
+struct LaunchRuntimeConfig {
+    binding: LaunchBinding,
+    expected_capability: [u8; 32],
+}
+
+fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
     let cmdline = std::fs::read_to_string("/proc/cmdline")
         .map_err(|error| AgentError::io("reading /proc/cmdline", error))?;
-    let generation = parse_u64_arg(
-        &cmdline,
-        &["nvx.launch_generation", "nvx_launch_generation"],
-    )?;
-    let channel_generation = parse_u64_arg(
+    let channel_generation = parse_required_u64_arg(
         &cmdline,
         &["nvx.channel_generation", "nvx_channel_generation"],
     )?;
-    let nonce = parse_nonce_arg(&cmdline, &["nvx.launch_nonce", "nvx_launch_nonce"])?;
-    Ok(LaunchBinding {
-        protocol_version: PROTOCOL_VERSION,
-        image_version: env!("CARGO_PKG_VERSION").to_string(),
-        launch: LaunchIdentity { generation, nonce },
-        channel_generation,
+    let expected_capability = parse_required_hex_32_arg(
+        &cmdline,
+        &["nvx.launch_capability", "nvx_launch_capability"],
+    )?;
+    Ok(LaunchRuntimeConfig {
+        binding: LaunchBinding {
+            protocol_version: PROTOCOL_VERSION,
+            image_version: env!("CARGO_PKG_VERSION").to_string(),
+            launch: LaunchIdentity {
+                generation: 0,
+                nonce: [0_u8; 16],
+            },
+            channel_generation,
+        },
+        expected_capability,
     })
 }
 
-fn parse_u64_arg(cmdline: &str, keys: &[&str]) -> Result<u64> {
-    for key in keys {
-        if let Some(value) = extract_cmdline_value(cmdline, key) {
-            return value.parse::<u64>().map_err(|error| {
-                AgentError::config(format!("invalid {key} value {value:?}: {error}"))
-            });
-        }
-    }
-    Err(AgentError::config(format!(
-        "missing required kernel argument; expected one of: {}",
-        keys.join(", ")
-    )))
+fn parse_required_u64_arg(cmdline: &str, keys: &[&str]) -> Result<u64> {
+    let (key, value) = extract_unique_cmdline_value(cmdline, keys)?;
+    value
+        .parse::<u64>()
+        .map_err(|error| AgentError::config(format!("invalid {key} value: {error}")))
 }
 
-fn parse_nonce_arg(cmdline: &str, keys: &[&str]) -> Result<[u8; 16]> {
-    for key in keys {
-        if let Some(value) = extract_cmdline_value(cmdline, key) {
-            return parse_nonce_hex(&value).map_err(|error| {
-                AgentError::config(format!("invalid {key} value {value:?}: {error}"))
-            });
-        }
-    }
-    Err(AgentError::config(format!(
-        "missing required kernel nonce argument; expected one of: {}",
-        keys.join(", ")
-    )))
+fn parse_required_hex_32_arg(cmdline: &str, keys: &[&str]) -> Result<[u8; 32]> {
+    let (key, value) = extract_unique_cmdline_value(cmdline, keys)?;
+    parse_hex_32(&value)
+        .map_err(|error| AgentError::config(format!("invalid {key} value: {error}")))
 }
 
-fn extract_cmdline_value(cmdline: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}=");
+fn extract_unique_cmdline_value(cmdline: &str, keys: &[&str]) -> Result<(String, String)> {
+    let mut found: Option<(String, String)> = None;
     for token in cmdline.split_whitespace() {
-        if let Some(value) = token.strip_prefix(&prefix) {
-            return Some(value.to_string());
+        for key in keys {
+            if token == *key {
+                return Err(AgentError::config(format!(
+                    "kernel argument {key} must use key=value form",
+                )));
+            }
+            let prefix = format!("{key}=");
+            if let Some(value) = token.strip_prefix(&prefix) {
+                if value.is_empty() {
+                    return Err(AgentError::config(format!(
+                        "kernel argument {key} must not be empty",
+                    )));
+                }
+                if found.is_some() {
+                    return Err(AgentError::config(format!(
+                        "duplicate kernel argument for {}",
+                        keys.join(", ")
+                    )));
+                }
+                found = Some(((*key).to_string(), value.to_string()));
+            }
         }
     }
-    None
+    found.ok_or_else(|| {
+        AgentError::config(format!(
+            "missing required kernel argument; expected one of: {}",
+            keys.join(", ")
+        ))
+    })
 }
 
-fn parse_nonce_hex(value: &str) -> Result<[u8; 16]> {
-    if value.len() != 32 {
+fn parse_hex_32(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 {
         return Err(AgentError::config(
-            "nonce must be exactly 32 hex characters",
+            "capability must be exactly 64 hex characters",
         ));
     }
-    let mut nonce = [0_u8; 16];
-    for (index, slot) in nonce.iter_mut().enumerate() {
+    let mut capability = [0_u8; 32];
+    for (index, slot) in capability.iter_mut().enumerate() {
         let start = index * 2;
         let end = start + 2;
         let byte = u8::from_str_radix(&value[start..end], 16)
-            .map_err(|error| AgentError::config(format!("invalid nonce hex: {error}")))?;
+            .map_err(|error| AgentError::config(format!("invalid capability hex: {error}")))?;
         *slot = byte;
     }
-    Ok(nonce)
+    Ok(capability)
 }
 
 fn now_secs() -> u64 {
@@ -514,22 +581,115 @@ fn now_secs() -> u64 {
     }
 }
 
-fn optimistic_isolation_status() -> IsolationStatus {
-    IsolationStatus {
-        pid_namespace: true,
-        mount_namespace: true,
-        uts_namespace: true,
-        ipc_namespace: true,
-        private_proc: true,
-        private_dev: true,
-        private_devpts: true,
-        private_shm: true,
-        read_only_sys: true,
-        capabilities_dropped: true,
-        no_new_privs: true,
-        cgroup_separation: true,
-        orphan_reaping: true,
+fn enqueue_outbound(
+    queue: &mut VecDeque<AgentControlMessage>,
+    message: AgentControlMessage,
+) -> Result<()> {
+    if queue.len() >= OUTBOUND_PENDING_LIMIT {
+        return Err(AgentError::internal(
+            "outbound pending queue exceeded bounded capacity",
+        ));
     }
+    queue.push_back(message);
+    Ok(())
+}
+
+fn drain_outbound_to_channel<T: io::Read + io::Write>(
+    channel: &mut agent_protocol::HvcFramedChannel<T>,
+    queue: &mut VecDeque<AgentControlMessage>,
+) -> Result<()> {
+    while let Some(front) = queue.front() {
+        match channel.queue_control_message(front) {
+            Ok(()) => {
+                queue.pop_front();
+            }
+            Err(error) if error.code == ServiceErrorCode::Backpressure => return Ok(()),
+            Err(error) => return Err(AgentError::internal(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+fn set_workload_frozen(cgroup_dir: &Path, freeze: bool, timeout: Duration) -> Result<()> {
+    let freeze_path = cgroup_dir.join("cgroup.freeze");
+    let events_path = cgroup_dir.join("cgroup.events");
+    if !freeze_path.exists() || !events_path.exists() {
+        return Err(AgentError::freeze(format!(
+            "cgroup freezer interface unavailable at {}",
+            cgroup_dir.display()
+        )));
+    }
+    std::fs::write(&freeze_path, if freeze { "1\n" } else { "0\n" })
+        .map_err(|error| AgentError::io(format!("writing {}", freeze_path.display()), error))?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| AgentError::freeze("freeze deadline overflow"))?;
+    loop {
+        let events = std::fs::read_to_string(&events_path)
+            .map_err(|error| AgentError::io(format!("reading {}", events_path.display()), error))?;
+        if parse_cgroup_frozen_flag(&events)? == freeze {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(AgentError::checkpoint_timeout(format!(
+                "timed out waiting for cgroup.freeze={} in {}",
+                if freeze { 1 } else { 0 },
+                cgroup_dir.display()
+            )));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn parse_cgroup_frozen_flag(events: &str) -> Result<bool> {
+    for line in events.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(key) = fields.next() else {
+            continue;
+        };
+        if key != "frozen" {
+            continue;
+        }
+        let Some(value) = fields.next() else {
+            return Err(AgentError::freeze(
+                "cgroup.events frozen entry missing value",
+            ));
+        };
+        return match value {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => Err(AgentError::freeze(
+                "cgroup.events frozen value must be 0 or 1",
+            )),
+        };
+    }
+    Err(AgentError::freeze(
+        "cgroup.events missing required frozen entry",
+    ))
+}
+
+fn install_sigchld_wakeup_handler() -> Result<()> {
+    unsafe extern "C" fn sigchld_handler(_signal: i32) {
+        SIGCHLD_PENDING.store(true, Ordering::SeqCst);
+    }
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_flags = libc::SA_RESTART;
+    action.sa_sigaction = sigchld_handler as *const () as usize;
+    // SAFETY: action.sa_mask points to valid mutable memory.
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+        return Err(AgentError::io(
+            "sigemptyset(SIGCHLD handler)",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: sigaction is called with initialized pointers and SIGCHLD.
+    if unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) } != 0 {
+        return Err(AgentError::io(
+            "sigaction(SIGCHLD)",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
 }
 
 fn open_hvc1_raw_nonblocking(path: &str) -> Result<File> {
@@ -596,30 +756,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nonce_parser_accepts_exact_32_hex_characters() {
-        let nonce = parse_nonce_hex("00112233445566778899aabbccddeeff").unwrap();
-        assert_eq!(nonce[0], 0x00);
-        assert_eq!(nonce[15], 0xff);
+    fn capability_parser_accepts_exact_64_hex_characters() {
+        let capability =
+            parse_hex_32("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+                .unwrap();
+        assert_eq!(capability[0], 0x00);
+        assert_eq!(capability[31], 0xff);
     }
 
     #[test]
-    fn nonce_parser_rejects_invalid_length_and_digits() {
-        assert!(parse_nonce_hex("0011").is_err());
-        assert!(parse_nonce_hex("gg112233445566778899aabbccddeeff").is_err());
+    fn capability_parser_rejects_invalid_length_and_digits() {
+        assert!(parse_hex_32("0011").is_err());
+        assert!(
+            parse_hex_32("gg112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+                .is_err()
+        );
     }
 
     #[test]
-    fn cmdline_value_extraction_reads_kernel_tokens() {
-        let cmdline =
-            "quiet nvx.launch_generation=7 nvx_launch_nonce=00112233445566778899aabbccddeeff";
-        assert_eq!(
-            extract_cmdline_value(cmdline, "nvx.launch_generation").as_deref(),
-            Some("7")
+    fn cmdline_unique_extraction_rejects_duplicates() {
+        let cmdline = "quiet nvx.channel_generation=7 nvx_channel_generation=8 nvx.launch_capability=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let duplicate = extract_unique_cmdline_value(
+            cmdline,
+            &["nvx.channel_generation", "nvx_channel_generation"],
         );
-        assert_eq!(
-            extract_cmdline_value(cmdline, "nvx_launch_nonce").as_deref(),
-            Some("00112233445566778899aabbccddeeff")
-        );
+        assert!(duplicate.is_err());
+    }
+
+    #[test]
+    fn cgroup_frozen_parser_accepts_and_rejects_expected_shapes() {
+        assert!(parse_cgroup_frozen_flag("populated 1\nfrozen 1\n").unwrap());
+        assert!(!parse_cgroup_frozen_flag("frozen 0\n").unwrap());
+        assert!(parse_cgroup_frozen_flag("frozen maybe\n").is_err());
+        assert!(parse_cgroup_frozen_flag("populated 1\n").is_err());
     }
 
     #[test]

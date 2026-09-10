@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use agent_protocol::{
     CreateProcessRequest, DEFAULT_STDIN_QUEUE_LIMIT_BYTES, ProcessSupervisor, ServiceError,
-    ServiceErrorCode, SupervisorEvent,
+    ServiceErrorCode, SupervisorEvent, WORKLOAD_GID_MXC, WORKLOAD_UID_MXC,
 };
 
 const STDIO_CHUNK_BYTES: usize = 4096;
@@ -22,6 +23,16 @@ const POLL_SLEEP: Duration = Duration::from_millis(10);
 
 pub struct LinuxProcessSupervisor {
     active: Option<ActiveProcess>,
+    holder: Option<NamespaceHolder>,
+}
+
+struct NamespaceHolder {
+    cgroup_dir: PathBuf,
+    cgroup_procs_path: CString,
+    mount_ns_fd: i32,
+    uts_ns_fd: i32,
+    ipc_ns_fd: i32,
+    pid_ns_fd: i32,
 }
 
 struct ActiveProcess {
@@ -46,7 +57,17 @@ struct ActiveProcess {
 
 impl LinuxProcessSupervisor {
     pub fn new() -> Self {
-        Self { active: None }
+        Self {
+            active: None,
+            holder: None,
+        }
+    }
+
+    pub fn new_with_holder(holder_pid: libc::pid_t) -> Result<Self, ServiceError> {
+        Ok(Self {
+            active: None,
+            holder: Some(NamespaceHolder::from_pid(holder_pid)?),
+        })
     }
 }
 
@@ -79,6 +100,52 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.process_group(0);
+        if let Some(holder) = self.holder.as_ref() {
+            let mount_ns_fd = holder.mount_ns_fd;
+            let uts_ns_fd = holder.uts_ns_fd;
+            let ipc_ns_fd = holder.ipc_ns_fd;
+            let pid_ns_fd = holder.pid_ns_fd;
+            let cgroup_procs_path = holder.cgroup_procs_path.clone();
+            // SAFETY: closure performs direct namespace and identity syscalls before exec.
+            unsafe {
+                command.pre_exec(move || {
+                    setns_checked(mount_ns_fd, libc::CLONE_NEWNS)?;
+                    setns_checked(uts_ns_fd, libc::CLONE_NEWUTS)?;
+                    setns_checked(ipc_ns_fd, libc::CLONE_NEWIPC)?;
+                    setns_checked(pid_ns_fd, libc::CLONE_NEWPID)?;
+                    move_self_to_cgroup(&cgroup_procs_path)?;
+                    let workload_pid = libc::fork();
+                    if workload_pid < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if workload_pid > 0 {
+                        let mut status = 0_i32;
+                        loop {
+                            let rc = libc::waitpid(workload_pid, &mut status, 0);
+                            if rc < 0 {
+                                let error = io::Error::last_os_error();
+                                if error.raw_os_error() == Some(libc::EINTR) {
+                                    continue;
+                                }
+                                libc::_exit(1);
+                            }
+                            break;
+                        }
+                        if (status & 0x7f) == 0 {
+                            libc::_exit((status >> 8) & 0xff);
+                        }
+                        libc::_exit(1);
+                    }
+                    if libc::setgid(WORKLOAD_GID_MXC) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::setuid(WORKLOAD_UID_MXC) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
 
         let mut child = command
             .spawn()
@@ -97,7 +164,11 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             set_nonblocking(stderr_ref.as_raw_fd())?;
         }
 
-        let cgroup_dir = try_prepare_workload_cgroup(request.exec_id, pid);
+        let cgroup_dir = self
+            .holder
+            .as_ref()
+            .map(|holder| holder.cgroup_dir.clone())
+            .or_else(|| try_prepare_workload_cgroup(request.exec_id, pid));
         self.active = Some(ActiveProcess {
             exec_id: request.exec_id,
             child,
@@ -218,6 +289,90 @@ impl LinuxProcessSupervisor {
         }
         Ok(active)
     }
+}
+
+impl NamespaceHolder {
+    fn from_pid(holder_pid: libc::pid_t) -> Result<Self, ServiceError> {
+        let cgroup_dir = PathBuf::from("/sys/fs/cgroup/nvx.workload");
+        let cgroup_procs_path = CString::new(format!("{}/cgroup.procs", cgroup_dir.display()))
+            .map_err(|_| supervisor_error("holder cgroup path contains interior NUL"))?;
+        Ok(Self {
+            cgroup_dir,
+            cgroup_procs_path,
+            mount_ns_fd: open_namespace_fd(holder_pid, "mnt")?,
+            uts_ns_fd: open_namespace_fd(holder_pid, "uts")?,
+            ipc_ns_fd: open_namespace_fd(holder_pid, "ipc")?,
+            pid_ns_fd: open_namespace_fd(holder_pid, "pid")?,
+        })
+    }
+}
+
+impl Drop for NamespaceHolder {
+    fn drop(&mut self) {
+        // SAFETY: best-effort close for process-owned descriptors.
+        let _ = unsafe { libc::close(self.mount_ns_fd) };
+        // SAFETY: best-effort close for process-owned descriptors.
+        let _ = unsafe { libc::close(self.uts_ns_fd) };
+        // SAFETY: best-effort close for process-owned descriptors.
+        let _ = unsafe { libc::close(self.ipc_ns_fd) };
+        // SAFETY: best-effort close for process-owned descriptors.
+        let _ = unsafe { libc::close(self.pid_ns_fd) };
+    }
+}
+
+fn open_namespace_fd(pid: libc::pid_t, ns_name: &str) -> Result<i32, ServiceError> {
+    let path = CString::new(format!("/proc/{pid}/ns/{ns_name}"))
+        .map_err(|_| supervisor_error("namespace path contains interior NUL"))?;
+    // SAFETY: path is NUL-terminated and flags are constants.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(supervisor_io(
+            format!("opening holder namespace /proc/{pid}/ns/{ns_name}"),
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(fd)
+}
+
+fn setns_checked(fd: i32, nstype: i32) -> io::Result<()> {
+    // SAFETY: fd references a namespace descriptor opened by open_namespace_fd.
+    let rc = unsafe { libc::setns(fd, nstype) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn move_self_to_cgroup(cgroup_procs_path: &CString) -> io::Result<()> {
+    // SAFETY: path pointer is NUL-terminated and flags are constants.
+    let fd = unsafe { libc::open(cgroup_procs_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut pid_digits = [0_u8; 21];
+    let mut len = 0usize;
+    let mut value = unsafe { libc::getpid() } as u32;
+    loop {
+        pid_digits[len] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let mut payload = [0_u8; 22];
+    for index in 0..len {
+        payload[index] = pid_digits[len - index - 1];
+    }
+    payload[len] = b'\n';
+    // SAFETY: payload pointer valid for len+1 bytes.
+    let rc = unsafe { libc::write(fd, payload.as_ptr().cast(), len + 1) };
+    // SAFETY: best-effort close for opened descriptor.
+    let _ = unsafe { libc::close(fd) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn refresh_active_state(active: &mut ActiveProcess) -> Result<(), ServiceError> {
@@ -531,5 +686,30 @@ mod tests {
             matches!(event, SupervisorEvent::DescendantsCleaned)
         });
         assert!(cleaned.is_some(), "expected descendant cleanup event");
+    }
+
+    #[test]
+    fn holder_spawn_abstraction_rejects_invalid_holder_pid() {
+        let result = LinuxProcessSupervisor::new_with_holder(-1);
+        assert!(result.is_err(), "invalid holder pid must fail closed");
+    }
+
+    #[test]
+    #[ignore = "requires Linux root privileges and namespace/cgroup write access"]
+    fn holder_namespace_execution_matches_holder_namespace_ids() {
+        let mut supervisor = LinuxProcessSupervisor::new_with_holder(1).expect("holder");
+        supervisor
+            .spawn(&CreateProcessRequest {
+                exec_id: 9,
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "readlink /proc/self/ns/mnt; readlink /proc/self/ns/pid; readlink /proc/self/ns/uts; readlink /proc/self/ns/ipc".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .expect("spawn");
     }
 }

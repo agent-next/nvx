@@ -140,6 +140,7 @@ pub enum ServiceErrorCode {
     Supervisor,
     CleanupTimeout,
     UnsupportedOperation,
+    AuthenticationFailed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +174,7 @@ impl From<StateError> for ServiceError {
 
 pub struct MxcControlService {
     binding: LaunchBinding,
+    expected_capability: [u8; 32],
     configured: Option<SessionConfiguration>,
     protocol_state: AgentProtocolState,
     build_status: BuildStatus,
@@ -304,6 +306,7 @@ impl MxcControlService {
         workload_identity: WorkloadIdentityStatus,
     ) -> Self {
         Self {
+            expected_capability: fallback_expected_capability(binding.launch),
             binding,
             configured: None,
             protocol_state: AgentProtocolState::new(),
@@ -342,6 +345,10 @@ impl MxcControlService {
         self.isolation_status = isolation;
     }
 
+    pub fn set_expected_capability(&mut self, capability: [u8; 32]) {
+        self.expected_capability = capability;
+    }
+
     pub fn ready_status(&self, network: NetworkStatus) -> ReadyStatus {
         ReadyStatus {
             service: SERVICE_IDENTITY.to_string(),
@@ -374,16 +381,10 @@ impl MxcControlService {
                 ),
             ));
         }
-        if request.launch != self.binding.launch {
+        if !constant_time_eq32(&request.capability_proof, &self.expected_capability) {
             return Err(ServiceError::new(
-                ServiceErrorCode::LaunchGenerationMismatch,
-                "launch identity mismatch for authenticated channel",
-            ));
-        }
-        if request.channel_generation != self.binding.channel_generation {
-            return Err(ServiceError::new(
-                ServiceErrorCode::ChannelGenerationMismatch,
-                "channel generation mismatch for authenticated channel",
+                ServiceErrorCode::AuthenticationFailed,
+                "capability proof did not match trusted launch capability",
             ));
         }
         let ready =
@@ -411,6 +412,8 @@ impl MxcControlService {
                 "launch admission did not return Ready",
             ));
         };
+        self.binding.launch = request.launch;
+        self.binding.channel_generation = request.channel_generation;
         self.authenticated = true;
         Ok(status)
     }
@@ -505,6 +508,14 @@ impl MxcControlService {
                 .as_ref()
                 .map(|config| config.network.clone()),
         }
+    }
+
+    pub fn active_exec_id(&self) -> Option<u32> {
+        self.active_exec.as_ref().map(|exec| exec.exec_id)
+    }
+
+    pub fn launch_admitted(&self) -> bool {
+        self.protocol_state.health().launch_admitted
     }
 
     pub fn unsupported_operation(&self, operation: &str) -> Result<(), ServiceError> {
@@ -698,6 +709,7 @@ impl MxcControlService {
             }
             self.active_exec = None;
         }
+        self.protocol_state.complete_channel_loss_cleanup();
         self.authenticated = false;
         self.configured = None;
         Ok(())
@@ -973,6 +985,16 @@ impl<T: Read + Write> HvcFramedChannel<T> {
         self.write_credits = self.write_credits.saturating_add(credits);
     }
 
+    pub fn is_write_saturated(&self) -> bool {
+        self.write_credits == 0
+            || self.queued_frames.len() >= self.write_queue_limit_records
+            || self.write_queue_bytes >= self.write_queue_limit_bytes
+    }
+
+    pub fn has_queued_writes(&self) -> bool {
+        !self.queued_frames.is_empty()
+    }
+
     pub fn queue_inner_record(&mut self, record: &InnerRecord) -> Result<(), ServiceError> {
         let encoded = record.encode().map_err(|error| {
             ServiceError::new(
@@ -1141,6 +1163,13 @@ impl<T: Read + Write> HvcFramedChannel<T> {
     }
 }
 
+fn fallback_expected_capability(launch: LaunchIdentity) -> [u8; 32] {
+    let mut capability = [0_u8; 32];
+    capability[..16].copy_from_slice(&launch.nonce);
+    capability[16..].copy_from_slice(&launch.nonce);
+    capability
+}
+
 fn validate_configuration_bounds(configuration: &SessionConfiguration) -> Result<(), ServiceError> {
     let encoded_len = serde_json::to_vec(configuration)
         .map_err(|error| {
@@ -1258,6 +1287,14 @@ fn validate_string(value: &str, context: &str) -> Result<(), ServiceError> {
     Ok(())
 }
 
+fn constant_time_eq32(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut diff = 0_u8;
+    for index in 0..32 {
+        diff |= left[index] ^ right[index];
+    }
+    diff == 0
+}
+
 fn max_stream_chunk_cap() -> usize {
     MAX_INNER_RECORD_BYTES_FOR_OPENVMM.saturating_sub(20)
 }
@@ -1341,7 +1378,7 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     launch: launch(7),
                     channel_generation: 17,
-                    capability_proof: [8; 32],
+                    capability_proof: [7; 32],
                 },
                 1,
                 NetworkStatus {
@@ -1371,6 +1408,28 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.filesystem.rootfs_ready);
         assert_eq!(first.network.mode, NetworkMode::PortableNetwork);
+    }
+
+    #[test]
+    fn authentication_rejects_wrong_capability_same_length() {
+        let mut service = MxcControlService::new(sample_binding());
+        let error = service
+            .authenticate_channel(
+                AuthenticateChannelRequest {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    launch: launch(7),
+                    channel_generation: 17,
+                    capability_proof: [4; 32],
+                },
+                1,
+                NetworkStatus {
+                    mode: NetworkMode::NoNic,
+                    detail: None,
+                },
+            )
+            .expect_err("must reject wrong capability");
+        assert_eq!(error.code, ServiceErrorCode::AuthenticationFailed);
     }
 
     #[test]
@@ -1621,7 +1680,7 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     launch: launch(7),
                     channel_generation: 17,
-                    capability_proof: [9; 32],
+                    capability_proof: [7; 32],
                 },
                 1,
                 NetworkStatus {
@@ -1984,6 +2043,61 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_requires_strictly_newer_generation() {
+        let mut service = MxcControlService::new(sample_binding());
+        service
+            .authenticate_channel(
+                AuthenticateChannelRequest {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    launch: launch(7),
+                    channel_generation: 17,
+                    capability_proof: [7; 32],
+                },
+                1,
+                NetworkStatus {
+                    mode: NetworkMode::NoNic,
+                    detail: None,
+                },
+            )
+            .unwrap();
+        let mut supervisor = FakeSupervisor::default();
+        service
+            .begin_disconnect_cleanup(2, &mut supervisor)
+            .unwrap();
+        let same = service.authenticate_channel(
+            AuthenticateChannelRequest {
+                service: SERVICE_IDENTITY.to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                launch: launch(7),
+                channel_generation: 17,
+                capability_proof: [7; 32],
+            },
+            40,
+            NetworkStatus {
+                mode: NetworkMode::NoNic,
+                detail: None,
+            },
+        );
+        assert_eq!(same.unwrap_err().code, ServiceErrorCode::LifecycleError);
+        let newer = service.authenticate_channel(
+            AuthenticateChannelRequest {
+                service: SERVICE_IDENTITY.to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                launch: launch(8),
+                channel_generation: 17,
+                capability_proof: [7; 32],
+            },
+            40,
+            NetworkStatus {
+                mode: NetworkMode::NoNic,
+                detail: None,
+            },
+        );
+        assert!(newer.is_ok());
+    }
+
+    #[test]
     fn framed_channel_writes_and_reads_with_partial_io() {
         #[derive(Clone, Default)]
         struct PartialIo {
@@ -2057,5 +2171,29 @@ mod tests {
         channel.queue_inner_record(&record).unwrap();
         let second = channel.queue_inner_record(&record);
         assert_eq!(second.unwrap_err().code, ServiceErrorCode::Backpressure);
+    }
+
+    #[test]
+    fn framed_channel_credit_saturation_recovers_without_data_loss() {
+        let io = Cursor::new(Vec::<u8>::new());
+        let mut channel = HvcFramedChannel::new(io);
+        channel.write_credits = 1;
+        let first = InnerRecord::control(&HealthStatus {
+            quiesced: false,
+            launch_admitted: true,
+        })
+        .unwrap();
+        let second = InnerRecord::control(&HealthStatus {
+            quiesced: true,
+            launch_admitted: false,
+        })
+        .unwrap();
+        channel.queue_inner_record(&first).unwrap();
+        let saturated = channel.queue_inner_record(&second);
+        assert_eq!(saturated.unwrap_err().code, ServiceErrorCode::Backpressure);
+        channel.grant_write_credits(1);
+        channel.queue_inner_record(&second).unwrap();
+        assert_eq!(channel.queued_frames.len(), 2);
+        assert!(channel.has_queued_writes());
     }
 }
