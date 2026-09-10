@@ -2165,6 +2165,7 @@ fn read_artifact_checked(
     let relative = PathBuf::from(relative_path);
     let checked = rel_artifact_path(&relative)?;
     let requested_full_path = output_dir.join(&checked);
+    reject_symlink_or_reparse_metadata(output_dir, output_dir)?;
     let trusted_output_dir = output_dir.canonicalize().map_err(|error| {
         format!(
             "failed to canonicalize trusted output directory {}: {error}",
@@ -2525,10 +2526,14 @@ fn validate_attestation_artifacts(run: &HarnessRun) -> bool {
     {
         return false;
     }
-    let manifest_bytes = match fs::read(&run.attestation_manifest_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
+    let (manifest_path, manifest_bytes) =
+        match read_artifact_checked(output_dir, "attestation-manifest.json") {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+    if manifest_path != run.attestation_manifest_path {
+        return false;
+    }
     let manifest: AttestationManifest = match serde_json::from_slice(&manifest_bytes) {
         Ok(value) => value,
         Err(_) => return false,
@@ -3129,6 +3134,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn canonical_gate_rejects_unix_manifest_symlink_replacement_with_valid_bytes() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+        let run = forged_passing_run();
+        assert!(is_passing_report(&run));
+        let output_dir = run.report_path.parent().expect("output dir");
+
+        let outside_manifest = output_dir.join("outside-attestation-manifest.json");
+        let manifest_bytes = std::fs::read(&run.attestation_manifest_path).expect("read manifest");
+        std::fs::write(&outside_manifest, &manifest_bytes).expect("write outside manifest");
+        std::fs::remove_file(&run.attestation_manifest_path).expect("remove manifest");
+        symlink(&outside_manifest, &run.attestation_manifest_path).expect("symlink manifest");
+
+        assert!(
+            !is_passing_report(&run),
+            "manifest symlink replacement with valid bytes must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn artifact_reader_rejects_unix_final_symlink_and_component_symlink() {
         use std::os::unix::fs::symlink;
 
@@ -3161,6 +3188,83 @@ mod tests {
             .expect_err("component symlink traversal must be rejected");
         assert!(error.contains("symlink"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_gate_rejects_windows_manifest_reparse_and_junction_replacements() {
+        use std::os::windows::fs::symlink_file;
+        use std::process::Command;
+
+        let _guard = HARNESS_TEST_LOCK.lock().expect("lock");
+
+        let symlink_run = forged_passing_run();
+        assert!(is_passing_report(&symlink_run));
+        let symlink_output_dir = symlink_run.report_path.parent().expect("output dir");
+        let outside_manifest = symlink_output_dir.join("outside-attestation-manifest.json");
+        let manifest_bytes =
+            std::fs::read(&symlink_run.attestation_manifest_path).expect("read manifest");
+        std::fs::write(&outside_manifest, &manifest_bytes).expect("write outside manifest");
+        std::fs::remove_file(&symlink_run.attestation_manifest_path).expect("remove manifest");
+        if symlink_file(&outside_manifest, &symlink_run.attestation_manifest_path).is_err() {
+            eprintln!("skipping manifest symlink reparse check: no privilege to create symlink");
+        } else {
+            assert!(
+                !is_passing_report(&symlink_run),
+                "manifest file reparse replacement with valid bytes must be rejected"
+            );
+        }
+
+        let junction_run = forged_passing_run();
+        assert!(is_passing_report(&junction_run));
+        let output_dir = junction_run
+            .report_path
+            .parent()
+            .expect("output dir")
+            .to_path_buf();
+        let backup_dir = output_dir.with_extension(format!("original-{}", unix_ms_now()));
+        let replacement_dir = std::env::temp_dir().join(format!(
+            "nvx-agent-harness-manifest-replacement-{}-{}",
+            std::process::id(),
+            unix_ms_now()
+        ));
+        let report_bytes = std::fs::read(&junction_run.report_path).expect("read report");
+        let diagnostics_bytes =
+            std::fs::read(&junction_run.diagnostics_path).expect("read diagnostics");
+        let manifest_bytes =
+            std::fs::read(&junction_run.attestation_manifest_path).expect("read manifest");
+        std::fs::create_dir_all(&replacement_dir).expect("create replacement dir");
+        std::fs::write(replacement_dir.join("report.json"), report_bytes).expect("write report");
+        std::fs::write(replacement_dir.join("diagnostics.log"), diagnostics_bytes)
+            .expect("write diagnostics");
+        std::fs::write(
+            replacement_dir.join("attestation-manifest.json"),
+            manifest_bytes,
+        )
+        .expect("write manifest");
+        std::fs::rename(&output_dir, &backup_dir).expect("rename original output dir");
+        let junction_status = Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &output_dir.to_string_lossy(),
+                &replacement_dir.to_string_lossy(),
+            ])
+            .status()
+            .expect("create output junction");
+        assert!(
+            junction_status.success(),
+            "failed to create replacement junction for canonical gate test"
+        );
+        assert!(
+            !is_passing_report(&junction_run),
+            "manifest replacement via output-directory junction with valid bytes must be rejected"
+        );
+        let _ = std::fs::remove_dir(&output_dir);
+        let _ = std::fs::rename(&backup_dir, &output_dir);
+        let _ = std::fs::remove_dir_all(&output_dir);
+        let _ = std::fs::remove_dir_all(&replacement_dir);
     }
 
     #[cfg(windows)]
