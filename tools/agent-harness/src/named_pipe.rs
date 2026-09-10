@@ -39,18 +39,37 @@ impl core::fmt::Display for NamedPipeError {
 
 impl std::error::Error for NamedPipeError {}
 
+const PIPE_PREFIX_CLI: &str = "//./pipe/";
+const PIPE_PREFIX_WIN32: &str = "\\\\.\\pipe\\";
+
 pub fn validate_local_pipe_path(path: &str) -> Result<(), NamedPipeError> {
-    if !path.starts_with(r"\\.\pipe\") {
-        return Err(NamedPipeError {
-            message: format!("pipe path must start with \\\\.\\pipe\\, got {path:?}"),
-        });
-    }
+    normalize_local_pipe_path(path).map(|_| ())
+}
+
+fn normalize_local_pipe_path(path: &str) -> Result<String, NamedPipeError> {
     if path.len() > 240 {
         return Err(NamedPipeError {
             message: "pipe path exceeds conservative bound".to_string(),
         });
     }
-    Ok(())
+    let slash_normalized = path.replace('\\', "/");
+    let Some(suffix) = slash_normalized.strip_prefix(PIPE_PREFIX_CLI) else {
+        return Err(NamedPipeError {
+            message: format!(
+                "pipe path must use local //./pipe/<name> (or equivalent \\\\.\\pipe\\<name>) form, got {path:?}"
+            ),
+        });
+    };
+    if suffix.is_empty() {
+        return Err(NamedPipeError {
+            message: "pipe path must include a pipe name".to_string(),
+        });
+    }
+    Ok(format!(
+        "{}{}",
+        PIPE_PREFIX_WIN32,
+        suffix.replace('/', "\\")
+    ))
 }
 
 #[cfg(windows)]
@@ -68,9 +87,9 @@ impl NamedPipeClient {
         expected_server_pid: Option<u32>,
         expected_server_image: Option<&str>,
     ) -> Result<Self, NamedPipeError> {
-        validate_local_pipe_path(path)?;
+        let win32_path = normalize_local_pipe_path(path)?;
         let deadline_at = Instant::now() + deadline;
-        let wide = wide_null(path);
+        let wide = wide_null(&win32_path);
         loop {
             // SAFETY: Win32 call with stable UTF-16 buffer.
             let handle = unsafe {
@@ -310,18 +329,35 @@ mod tests {
     fn rejects_non_local_pipe_paths() {
         assert!(validate_local_pipe_path("tcp://127.0.0.1:9999").is_err());
         assert!(validate_local_pipe_path(r"\\?\C:\temp\pipe").is_err());
+        assert!(validate_local_pipe_path("//server/pipe/control").is_err());
     }
 
     #[test]
     fn accepts_local_pipe_paths() {
         assert!(validate_local_pipe_path(r"\\.\pipe\nvx-control-test").is_ok());
+        assert!(validate_local_pipe_path("//./pipe/openvmm-microvm-control-test").is_ok());
+    }
+
+    #[test]
+    fn normalize_local_pipe_path_preserves_pipe_identity() {
+        let cli = normalize_local_pipe_path("//./pipe/openvmm-microvm-control-test")
+            .expect("cli spelling should normalize");
+        assert_eq!(cli, r"\\.\pipe\openvmm-microvm-control-test");
+        let win32 = normalize_local_pipe_path(r"\\.\pipe\openvmm-microvm-control-test")
+            .expect("win32 spelling should normalize");
+        assert_eq!(win32, r"\\.\pipe\openvmm-microvm-control-test");
+    }
+
+    #[test]
+    fn normalize_local_pipe_path_rejects_missing_pipe_name() {
+        assert!(normalize_local_pipe_path("//./pipe/").is_err());
     }
 
     #[cfg(not(windows))]
     #[test]
     fn non_windows_connect_reports_platform_requirement() {
         let result = NamedPipeClient::connect(
-            r"\\.\pipe\nvx-control-test",
+            "//./pipe/openvmm-microvm-control-test",
             Duration::from_millis(5),
             None,
             None,

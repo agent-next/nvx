@@ -38,6 +38,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{PCWSTR, PWSTR};
 
 const DEFAULT_INITRAMFS: &str = "initramfs-mxc-agent.cpio.gz";
+const OPENVMM_MICROVM_PIPE_PREFIX: &str = "//./pipe/openvmm-microvm-";
 #[cfg(windows)]
 const TEARDOWN_WAIT_MS: u32 = 5_000;
 
@@ -246,16 +247,51 @@ pub fn build_launch_plan(output_dir: &Path, artifacts: LaunchArtifacts) -> Launc
     let owner = std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "owner".to_string());
-    let run_id = format!("{}-{}-{}", owner, std::process::id(), stamp);
+    let owner = sanitize_pipe_name_component(&owner);
+    let mut uniqueness = [0_u8; 8];
+    rand::rng().fill(&mut uniqueness);
+    let run_id = format!(
+        "{owner}-{}-{stamp:x}-{:016x}",
+        std::process::id(),
+        u64::from_le_bytes(uniqueness)
+    );
 
     LaunchPlan {
         artifacts,
-        control_pipe_name: format!(r"\\.\pipe\nvx-mxc-control-{run_id}"),
-        boot_pipe_name: format!(r"\\.\pipe\nvx-mxc-boot-{run_id}"),
+        control_pipe_name: format!("{OPENVMM_MICROVM_PIPE_PREFIX}control-{run_id}"),
+        boot_pipe_name: format!("{OPENVMM_MICROVM_PIPE_PREFIX}boot-{run_id}"),
         launch_capability,
         channel_generation: 1,
         launch_nonce,
         process_log_path: output_dir.join("openvmm-process.log"),
+    }
+}
+
+fn sanitize_pipe_name_component(input: &str) -> String {
+    let mut sanitized = String::with_capacity(input.len());
+    let mut previous_dash = false;
+    for byte in input.bytes() {
+        let mapped = match byte {
+            b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' => byte as char,
+            b'A'..=b'Z' => (byte as char).to_ascii_lowercase(),
+            b'-' => '-',
+            _ => '-',
+        };
+        if mapped == '-' {
+            if previous_dash {
+                continue;
+            }
+            previous_dash = true;
+        } else {
+            previous_dash = false;
+        }
+        sanitized.push(mapped);
+    }
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        "owner".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -1016,8 +1052,21 @@ mod tests {
         };
         let plan = build_launch_plan(&root, artifacts);
         assert_eq!(plan.launch_capability.len(), 32);
-        assert!(plan.control_pipe_name.starts_with(r"\\.\pipe\"));
-        assert!(plan.boot_pipe_name.starts_with(r"\\.\pipe\"));
+        assert!(
+            plan.control_pipe_name
+                .starts_with(OPENVMM_MICROVM_PIPE_PREFIX)
+        );
+        assert!(plan.boot_pipe_name.starts_with(OPENVMM_MICROVM_PIPE_PREFIX));
+        assert_ne!(plan.control_pipe_name, plan.boot_pipe_name);
+        assert!(plan.control_pipe_name.contains("-control-"));
+        assert!(plan.boot_pipe_name.contains("-boot-"));
+    }
+
+    #[test]
+    fn sanitize_pipe_name_component_emits_openvmm_safe_charset() {
+        let safe = sanitize_pipe_name_component("Moda Nish/DEV@123");
+        assert_eq!(safe, "moda-nish-dev-123");
+        assert_eq!(sanitize_pipe_name_component("$$$"), "owner");
     }
 
     #[test]
