@@ -717,7 +717,7 @@ fn move_pid_to_exec_cgroup(cgroup_procs_path: &CString, pid: i32) -> io::Result<
     write_result
 }
 
-fn encode_pid_line<'a>(pid: i32, scratch: &'a mut [u8; 32]) -> io::Result<&'a [u8]> {
+fn encode_pid_line(pid: i32, scratch: &mut [u8; 32]) -> io::Result<&[u8]> {
     if pid < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
