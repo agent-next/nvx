@@ -89,6 +89,10 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         }
     }
 
+    pub fn control_session_mut(&mut self) -> &mut HostControlSession<T> {
+        &mut self.control
+    }
+
     pub fn authenticate_launch(
         &mut self,
         capability: [u8; 32],

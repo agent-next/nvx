@@ -57,6 +57,13 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   bounded queue cleanup.
   Any local runtime
   pass remains non-conformance (`NotLive`) until observed on live WHP.
+- Live WHP scenario execution now implements req10/req11/req12 directly instead
+  of hardcoded harness failures: req10 validates runtime-emitted
+  `WaitReady`/`Health` network status by observed launch mode, req11 runs
+  health/quiesce/resume on the shared session plus a dedicated shutdown
+  validation VM (tracked auxiliary launch lifecycle), and req12 validates
+  control-channel loss cleanup + strictly newer-generation reconnect with
+  stale-ID rejection before admitting new execution.
 - Post-config capability advertisement now exposes `Exec`, `Streams`, `Cancel`,
   `Quiesce`, `Resume`, and `Shutdown` after full lifecycle activation.
 - Cancellation, timeout escalation, descendant termination, channel-loss cleanup,

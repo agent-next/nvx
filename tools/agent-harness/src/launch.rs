@@ -2,7 +2,9 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(not(windows))]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
 #[cfg(windows)]
@@ -133,6 +135,34 @@ impl LaunchedVm {
         }
         #[cfg(not(windows))]
         self.child.id()
+    }
+
+    pub fn wait_for_exit_with_timeout(&mut self, timeout: Duration) -> Result<bool, String> {
+        #[cfg(windows)]
+        {
+            let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+            wait_for_process_exit(HANDLE(self.process_handle.as_raw_handle()), timeout_ms)
+        }
+        #[cfg(not(windows))]
+        {
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now);
+            loop {
+                if self
+                    .child
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 }
 
@@ -1214,5 +1244,20 @@ mod tests {
         let result = launch_failpoint::run_with(Some(Failpoint::TeardownExitTimeout), || vm.kill());
         assert!(result.is_err());
         let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_exit_wait_respects_deadline_and_observes_real_exit() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping -n 4 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn child");
+        let process = HANDLE(child.as_raw_handle());
+        let timed_out = wait_for_process_exit(process, 1).expect("short wait");
+        assert!(!timed_out);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(wait_for_process_exit(process, TEARDOWN_WAIT_MS).expect("post-kill wait"));
     }
 }

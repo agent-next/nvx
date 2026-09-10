@@ -1,6 +1,8 @@
 #[cfg(windows)]
 use std::fs;
 #[cfg(windows)]
+use std::net::IpAddr;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -12,7 +14,10 @@ use crate::{
     ScenarioDefinition,
 };
 #[cfg(windows)]
-use crate::{control_session::HostControlSession, named_pipe::NamedPipeClient};
+use crate::{
+    control_session::{HostAttachStatus, HostControlSession, HostEvent},
+    named_pipe::NamedPipeClient,
+};
 #[cfg(windows)]
 use agent_protocol::mapping::{
     AccessMode, CanonicalHostMappingRoot, ChildMapping, MappingContainmentPolicy,
@@ -21,9 +26,10 @@ use agent_protocol::mapping::{
 #[cfg(windows)]
 use agent_protocol::messages::{
     AgentControlMessage, CapabilityProofMaterial, ExecDisposition, FlowCreditRequest,
-    HostControlMessage, LaunchIdentity, NetworkSetupState, ProtocolErrorCode, ProtocolErrorDetail,
-    ReadyStatus, SERVICE_IDENTITY, StdinChunkRecord, StdinEofRecord, StreamName,
-    TerminationOutcome, WORKLOAD_GID_MXC, WORKLOAD_GROUP_MXC, WORKLOAD_UID_MXC, WORKLOAD_USER_MXC,
+    HostControlMessage, LaunchIdentity, NetworkMode, NetworkSetupState, NetworkStatus,
+    ProtocolErrorCode, ProtocolErrorDetail, ReadyStatus, SERVICE_IDENTITY, StdinChunkRecord,
+    StdinEofRecord, StreamName, TerminationOutcome, WORKLOAD_GID_MXC, WORKLOAD_GROUP_MXC,
+    WORKLOAD_UID_MXC, WORKLOAD_USER_MXC,
 };
 #[cfg(windows)]
 use agent_protocol::{PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES, PROTOCOL_VERSION};
@@ -53,6 +59,10 @@ const RO_SEED_FILE: &str = "known.bin";
 const UNDECLARED_CHILD: &str = "undeclared-sibling";
 #[cfg(windows)]
 const REPARSE_ESCAPE_LINK: &str = "escape-link";
+#[cfg(windows)]
+const SHUTDOWN_VALIDATION_GRACE_MS: u64 = 1200;
+#[cfg(windows)]
+const SHUTDOWN_VALIDATION_EXIT_BOUND: Duration = Duration::from_secs(8);
 
 struct LiveHarnessState {
     run_key: Option<String>,
@@ -74,6 +84,8 @@ struct LiveWhpSession {
     containment: MappingContainmentPolicy,
     req9_mappings: Vec<ChildMapping>,
     req9_fixtures: Req9Fixtures,
+    auxiliary_launches_started: u32,
+    auxiliary_launches_torn_down: u32,
     baseline_ready: ReadyStatus,
     baseline_health: agent_protocol::messages::HealthStatus,
 }
@@ -309,15 +321,16 @@ where
         return fail_check(combined);
     }
 
-    if outcome.check_status == EvidenceCheckStatus::Pass && is_last_canonical_scenario(definition) {
-        if let Err(error) = teardown(guard) {
-            let combined = format!(
-                "req{:02} pass evidence collected but final teardown failed: {error}",
-                definition.requirement_number
-            );
-            guard.first_failure = Some((definition.requirement_number, combined.clone()));
-            return fail_check(combined);
-        }
+    if outcome.check_status == EvidenceCheckStatus::Pass
+        && is_last_canonical_scenario(definition)
+        && let Err(error) = teardown(guard)
+    {
+        let combined = format!(
+            "req{:02} pass evidence collected but final teardown failed: {error}",
+            definition.requirement_number
+        );
+        guard.first_failure = Some((definition.requirement_number, combined.clone()));
+        return fail_check(combined);
     }
 
     outcome
@@ -337,10 +350,9 @@ fn run_requirement_check(
         7 => run_req7_fixed_mxc_identity(guard),
         8 => run_req8_full_isolation_verification(guard),
         9 => run_req9_mapping_containment(guard),
-        10..=12 => fail_check(format!(
-            "req{:02} failed: live scenario invariant check did not pass",
-            definition.requirement_number
-        )),
+        10 => run_req10_network_status(guard),
+        11 => run_req11_health_quiesce_resume_shutdown(guard),
+        12 => run_req12_channel_loss_generation(guard),
         _ => fail_check("unknown requirement number".to_string()),
     }
 }
@@ -569,6 +581,8 @@ fn ensure_live_initialized(
             containment,
             req9_mappings,
             req9_fixtures,
+            auxiliary_launches_started: 0,
+            auxiliary_launches_torn_down: 0,
             baseline_ready: ready_status,
             baseline_health: health_status,
         });
@@ -1398,7 +1412,10 @@ fn run_req9_mapping_containment(state: &mut LiveHarnessState) -> CheckOutcome {
             || detail.code == ProtocolErrorCode::MappingConflict
     })
     .unwrap_or(false);
-    let validation_checks = match run_req9_validation_session(session) {
+    session.auxiliary_launches_started = session.auxiliary_launches_started.saturating_add(1);
+    let validation_result = run_req9_validation_session(session);
+    session.auxiliary_launches_torn_down = session.auxiliary_launches_torn_down.saturating_add(1);
+    let validation_checks = match validation_result {
         Ok(value) => value,
         Err(error) => return fail_check(error),
     };
@@ -1423,12 +1440,365 @@ fn run_req9_mapping_containment(state: &mut LiveHarnessState) -> CheckOutcome {
             "ro mapping preserved seed bytes and rejected write plus metadata mutation attempts"
                 .to_string(),
             "undeclared sibling/raw export remained hidden; traversal/symlink-over-escape/overlap and post-config mutation checks were rejected".to_string(),
+            format!(
+                "auxiliary validation launches tracked: started={}, torn_down={}",
+                session.auxiliary_launches_started, session.auxiliary_launches_torn_down
+            ),
         ])
     } else {
         fail_check(format!(
             "mapping containment checks failed (rw_output_path={})",
             report.rw_output_path
         ))
+    }
+}
+
+#[cfg(windows)]
+fn run_req10_network_status(state: &mut LiveHarnessState) -> CheckOutcome {
+    let Some(session) = state.session.as_mut() else {
+        return fail_check("live session unavailable".to_string());
+    };
+    let ready = match session.client.wait_ready(LIVE_TIMEOUT) {
+        Ok(AgentControlMessage::Ready { launch, status }) => {
+            if launch != session.launch {
+                return fail_check(format!(
+                    "req10 wait_ready launch changed unexpectedly: expected {:?}, got {:?}",
+                    session.launch, launch
+                ));
+            }
+            status
+        }
+        Ok(other) => {
+            return fail_check(format!(
+                "req10 wait_ready returned unexpected message: {other:?}"
+            ));
+        }
+        Err(error) => return fail_check(format!("req10 wait_ready failed: {error}")),
+    };
+    let health = match session.client.request_health(LIVE_TIMEOUT) {
+        Ok(AgentControlMessage::Health(status)) => status,
+        Ok(other) => {
+            return fail_check(format!(
+                "req10 health returned unexpected message: {other:?}"
+            ));
+        }
+        Err(error) => return fail_check(format!("req10 health request failed: {error}")),
+    };
+    let Some(health_network) = health.network.clone() else {
+        return fail_check("req10 health omitted network status".to_string());
+    };
+    if ready.network != health_network {
+        return fail_check(format!(
+            "req10 network mismatch between wait_ready and health (ready={:?}, health={:?})",
+            ready.network, health_network
+        ));
+    }
+    let mode_evidence = match validate_live_network_status(&ready.network) {
+        Ok(line) => line,
+        Err(error) => return fail_check(format!("req10 network validation failed: {error}")),
+    };
+    pass_check(vec![
+        "validated req10 using runtime-emitted WaitReady/Health NetworkStatus (no host-constructed status)".to_string(),
+        mode_evidence,
+        "live req10 attestation reflects only the observed launch mode; malformed/missing portable-network fixtures are not attested unless directly observed in live launch".to_string(),
+    ])
+}
+
+#[cfg(windows)]
+fn run_req11_health_quiesce_resume_shutdown(state: &mut LiveHarnessState) -> CheckOutcome {
+    let Some(session) = state.session.as_mut() else {
+        return fail_check("live session unavailable".to_string());
+    };
+    let exec_id = 1_101_u32;
+    if let Err(error) = start_probe_exec(
+        session,
+        exec_id,
+        &[
+            "flood", "--stream", "stdout", "--bytes", "131072", "--chunk", "4096",
+        ],
+        None,
+    ) {
+        return fail_check(error);
+    }
+    if let Err(error) = grant_stream(session, exec_id, StreamName::Stderr, 1) {
+        return fail_check(error);
+    }
+    let health_started = Instant::now();
+    let health = match session
+        .client
+        .request_health_observing_inbound(LIVE_TIMEOUT, |message| match message {
+            AgentControlMessage::StdoutChunk(record) if record.exec_id == exec_id => {
+                Err(ClientError::Protocol(format!(
+                    "req11 observed stdout for exec {exec_id} before credits were granted"
+                )))
+            }
+            _ => Ok(()),
+        }) {
+        Ok(AgentControlMessage::Health(status)) => status,
+        Ok(AgentControlMessage::Error(detail)) => {
+            return fail_check(format!(
+                "req11 health request returned protocol error {:?}: {}",
+                detail.code, detail.message
+            ));
+        }
+        Ok(other) => {
+            return fail_check(format!(
+                "req11 health returned unexpected message: {other:?}"
+            ));
+        }
+        Err(error) => return fail_check(format!("req11 health request failed: {error}")),
+    };
+    let health_elapsed = health_started.elapsed();
+    let health_ok = health.launch_admitted
+        && health.filesystem.is_some()
+        && health.network.is_some()
+        && health.active_exec_id == Some(exec_id)
+        && health.channel_generation == session.vm.plan.channel_generation;
+    let active_quiesce_rejected = match session.client.request_quiesce(LIVE_TIMEOUT) {
+        Ok(AgentControlMessage::Error(detail)) => {
+            detail.code == ProtocolErrorCode::InvalidLifecycleTransition
+                || detail.code == ProtocolErrorCode::ActiveExecExists
+                || detail.message.contains("active")
+        }
+        Ok(_) => false,
+        Err(_) => false,
+    };
+    if let Err(error) = session.client.send_cancel_execution(exec_id) {
+        return fail_check(format!("req11 cancel active exec failed: {error}"));
+    }
+    let cancelled = match collect_exec_until_terminal(
+        session,
+        exec_id,
+        Duration::from_secs(12),
+        true,
+        ExecCollectionLimits::tree_probe(Duration::from_secs(12)),
+    ) {
+        Ok(obs) => {
+            obs.disposition == Some(ExecDisposition::Cancelled)
+                || obs.disposition == Some(ExecDisposition::ExitCode(0))
+        }
+        Err(error) => return fail_check(error),
+    };
+    let idle_quiesce_ok = matches!(
+        session.client.request_quiesce(LIVE_TIMEOUT),
+        Ok(AgentControlMessage::Quiesced)
+    );
+    if !idle_quiesce_ok {
+        return fail_check("req11 idle quiesce did not succeed".to_string());
+    }
+    let quiesced_exec_attempt =
+        start_probe_exec(session, 1_102, &["seq", "--token", "blocked"], None)
+            .and_then(|_| expect_protocol_error(session, LIVE_TIMEOUT));
+    let quiesced_exec_rejected = matches!(
+        quiesced_exec_attempt,
+        Ok(ProtocolErrorDetail {
+            code: ProtocolErrorCode::LaunchQuiesced | ProtocolErrorCode::InvalidLifecycleTransition,
+            ..
+        })
+    );
+    let resumed = matches!(
+        session.client.request_resume(LIVE_TIMEOUT),
+        Ok(AgentControlMessage::Resumed)
+    );
+    if !resumed {
+        return fail_check("req11 resume did not succeed".to_string());
+    }
+    let post_resume_exec_ok = matches!(run_simple_probe_exec(session, 1_103, &["seq", "--token", "resume-ok", "--exit", "0"]), Ok((ExecDisposition::ExitCode(0), ref out, _)) if out == b"seq:resume-ok\n");
+
+    let shutdown_validation = match run_req11_shutdown_validation_session(session) {
+        Ok(value) => value,
+        Err(error) => return fail_check(error),
+    };
+    if health_ok
+        && health_elapsed <= LIVE_TIMEOUT
+        && active_quiesce_rejected
+        && cancelled
+        && quiesced_exec_rejected
+        && post_resume_exec_ok
+        && shutdown_validation
+    {
+        pass_check(vec![
+            format!(
+                "health remained responsive under output/backpressure activity (elapsed {:?}) and reported active exec {} with channel_generation={}",
+                health_elapsed, exec_id, session.vm.plan.channel_generation
+            ),
+            "active quiesce was rejected; once idle, quiesce succeeded, blocked new exec admission, then resume restored execution".to_string(),
+            format!(
+                "dedicated shutdown-validation VM enforced grace={}ms and exited within {:?} even with a blocked writer",
+                SHUTDOWN_VALIDATION_GRACE_MS, SHUTDOWN_VALIDATION_EXIT_BOUND
+            ),
+            format!(
+                "auxiliary validation launches tracked: started={}, torn_down={}",
+                session.auxiliary_launches_started, session.auxiliary_launches_torn_down
+            ),
+        ])
+    } else {
+        fail_check("req11 health/quiesce/resume/shutdown invariants failed".to_string())
+    }
+}
+
+#[cfg(windows)]
+fn run_req12_channel_loss_generation(state: &mut LiveHarnessState) -> CheckOutcome {
+    let Some(session) = state.session.as_mut() else {
+        return fail_check("live session unavailable".to_string());
+    };
+    let old_launch = session.launch;
+    let exec_id = 1_201_u32;
+    if let Err(error) = start_probe_exec(
+        session,
+        exec_id,
+        &["spawn-tree", "--hold-ms", "30000"],
+        None,
+    ) {
+        return fail_check(error);
+    }
+    if let Err(error) = grant_stream(session, exec_id, StreamName::Stdout, 1) {
+        return fail_check(error);
+    }
+    if let Err(error) = grant_stream(session, exec_id, StreamName::Stderr, 1) {
+        return fail_check(error);
+    }
+    let mut output = Vec::new();
+    let mut observed_messages = 0_usize;
+    let pid_deadline = Instant::now() + Duration::from_secs(8);
+    let tree_pids = loop {
+        if Instant::now() >= pid_deadline {
+            return fail_check("req12 timed out waiting for child+grandchild PID line".to_string());
+        }
+        let message = match session
+            .client
+            .recv_agent_control(Duration::from_millis(250))
+        {
+            Ok(value) => value,
+            Err(ClientError::Timeout(_)) => continue,
+            Err(error) => {
+                return fail_check(format!("req12 waiting for tree line failed: {error}"));
+            }
+        };
+        match message {
+            AgentControlMessage::StdoutChunk(record) if record.exec_id == exec_id => {
+                observed_messages = observed_messages.saturating_add(1);
+                if let Err(error) = enforce_tree_pid_capture_limit(
+                    session,
+                    exec_id,
+                    observed_messages,
+                    output.len(),
+                    record.chunk.len(),
+                ) {
+                    return fail_check(error);
+                }
+                output.extend_from_slice(&record.chunk);
+                let _ = grant_stream(session, exec_id, StreamName::Stdout, 1);
+                if let Some(pids) = parse_tree_pids(&output) {
+                    break pids;
+                }
+            }
+            AgentControlMessage::StderrChunk(record) if record.exec_id == exec_id => {
+                observed_messages = observed_messages.saturating_add(1);
+                if let Err(error) = enforce_tree_pid_capture_limit(
+                    session,
+                    exec_id,
+                    observed_messages,
+                    output.len(),
+                    0,
+                ) {
+                    return fail_check(error);
+                }
+                let _ = grant_stream(session, exec_id, StreamName::Stderr, 1);
+            }
+            _ => {}
+        }
+    };
+    let reconnect_launch = LaunchIdentity {
+        generation: old_launch.generation.saturating_add(1),
+        nonce: next_launch_nonce(old_launch.nonce),
+    };
+    let reconnect = match reconnect_after_control_drop(session, reconnect_launch) {
+        Ok(value) => value,
+        Err(error) => return fail_check(error),
+    };
+    let tree_gone = match run_pid_check(session, 1_202, tree_pids.child, tree_pids.grandchild) {
+        Ok(value) => value,
+        Err(error) => return fail_check(error),
+    };
+    if !tree_gone {
+        return fail_check(
+            "req12 reconnect admitted work before old child tree was gone".to_string(),
+        );
+    }
+    let stale_launch_rejected = expect_error_after_send(
+        session,
+        HostControlMessage::Configure {
+            launch: old_launch,
+            root: session.root.clone(),
+            mappings: session.req9_mappings.clone(),
+            containment: session.containment,
+        },
+        LIVE_TIMEOUT,
+    )
+    .map(|detail| {
+        detail.code == ProtocolErrorCode::LaunchGenerationConflict
+            || detail.code == ProtocolErrorCode::LaunchGenerationNotNewer
+            || detail.code == ProtocolErrorCode::InvalidLifecycleTransition
+    })
+    .unwrap_or(false);
+    let stale_flow_rejected = match session.client.send_flow_credits(FlowCreditRequest {
+        exec_id,
+        stream: StreamName::Stdout,
+        credits: 1,
+    }) {
+        Ok(_) => match expect_protocol_error(session, LIVE_TIMEOUT) {
+            Ok(detail) => is_stale_identifier_rejection(&detail),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    let stale_stdin_rejected = match session.client.send_stdin_chunk(StdinChunkRecord {
+        exec_id,
+        sequence: 0,
+        chunk: vec![1, 2, 3],
+    }) {
+        Ok(_) => match expect_protocol_error(session, LIVE_TIMEOUT) {
+            Ok(detail) => is_stale_identifier_rejection(&detail),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    let reused_exec_rejected =
+        match start_probe_exec(session, exec_id, &["seq", "--token", "stale"], None) {
+            Ok(()) => match expect_protocol_error(session, LIVE_TIMEOUT) {
+                Ok(detail) => is_stale_identifier_rejection(&detail),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+    let new_exec_ok = matches!(
+        run_simple_probe_exec(session, 1_203, &["seq", "--token", "fresh", "--exit", "0"]),
+        Ok((ExecDisposition::ExitCode(0), ref out, _)) if out == b"seq:fresh\n"
+    );
+    let generation_advanced = reconnect.new_launch.generation > old_launch.generation;
+    if generation_advanced
+        && reconnect.ready_observed
+        && tree_gone
+        && stale_launch_rejected
+        && stale_flow_rejected
+        && stale_stdin_rejected
+        && reused_exec_rejected
+        && new_exec_ok
+    {
+        pass_check(vec![
+            format!(
+                "dropped authenticated control pipe during active child+grandchild exec (child={}, grandchild={}) and reattached to same OpenVMM broker",
+                tree_pids.child, tree_pids.grandchild
+            ),
+            format!(
+                "reconnect handled broker attach flow (wait_seen={}, reset_seen={}), admitted strictly newer launch generation {}",
+                reconnect.wait_observed, reconnect.reset_observed, reconnect.new_launch.generation
+            ),
+            "old tree was confirmed gone before new work admission; stale launch/stream/stdin/reused-exec identifiers were rejected; new unique exec succeeded exactly once".to_string(),
+        ])
+    } else {
+        fail_check("req12 channel-loss/reconnect generation invariants failed".to_string())
     }
 }
 
@@ -1611,6 +1981,393 @@ fn run_req9_validation_session(shared: &LiveWhpSession) -> Result<bool, String> 
         (Ok(_), Err(teardown_error)) => Err(teardown_error),
         (Err(check_error), Err(teardown_error)) => Err(format!("{check_error}; {teardown_error}")),
     }
+}
+
+#[cfg(windows)]
+struct ReconnectObservation {
+    new_launch: LaunchIdentity,
+    wait_observed: bool,
+    ready_observed: bool,
+    reset_observed: bool,
+}
+
+#[cfg(windows)]
+fn reconnect_after_control_drop(
+    session: &mut LiveWhpSession,
+    new_launch: LaunchIdentity,
+) -> Result<ReconnectObservation, String> {
+    let pipe_path = session.vm.plan.control_pipe_name.clone();
+    let expected_image = session
+        .vm
+        .plan
+        .artifacts
+        .openvmm_exe
+        .to_string_lossy()
+        .into_owned();
+    let reconnect_pipe = NamedPipeClient::connect(
+        &pipe_path,
+        Duration::from_secs(5),
+        Some(session.vm.process_id()),
+        Some(expected_image.as_str()),
+    )
+    .map_err(|error| format!("req12 reconnect control-pipe connect failed: {error}"))?;
+    let replacement_client = MxcAgentClient::new(HostControlSession::new(reconnect_pipe));
+    let old_client = std::mem::replace(&mut session.client, replacement_client);
+    drop(old_client);
+
+    let attach_deadline = Instant::now() + Duration::from_secs(5);
+    let mut wait_observed = false;
+    let mut reset_observed = false;
+    {
+        let raw = session.client.control_session_mut();
+        raw.send_host_attach(session.vm.plan.launch_capability)
+            .map_err(|error| format!("req12 reconnect host-attach send failed: {error}"))?;
+        match raw
+            .recv_attach_status_until(attach_deadline)
+            .map_err(|error| format!("req12 reconnect attach status failed: {error}"))?
+        {
+            HostAttachStatus::Ready => {}
+            HostAttachStatus::Wait => {
+                wait_observed = true;
+                loop {
+                    match raw
+                        .recv_event_until(attach_deadline)
+                        .map_err(|error| format!("req12 reconnect attach event failed: {error}"))?
+                    {
+                        HostEvent::Ready => break,
+                        HostEvent::Wait => {
+                            wait_observed = true;
+                        }
+                        HostEvent::Reset { .. } => {
+                            reset_observed = true;
+                        }
+                        HostEvent::Error(code) => {
+                            return Err(format!(
+                                "req12 reconnect attach failed with broker error code {code}"
+                            ));
+                        }
+                        HostEvent::Data(_) => {
+                            return Err(
+                                "req12 reconnect received data before broker Ready during attach"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+            HostAttachStatus::Error(code) => {
+                return Err(format!(
+                    "req12 reconnect broker rejected host attach with code {code}"
+                ));
+            }
+        }
+    }
+    session
+        .client
+        .send_host_hello(HostControlMessage::HostHello {
+            service: SERVICE_IDENTITY.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            launch: new_launch,
+            capability_proof: launch_capability_proof(new_launch.nonce)?,
+        })
+        .map_err(|error| format!("req12 reconnect HostHello send failed: {error}"))?;
+    if let Some(message) = session
+        .client
+        .poll_agent_control(Duration::from_millis(10))
+        .map_err(|error| format!("req12 reconnect HostHello poll failed: {error}"))?
+        && matches!(message, AgentControlMessage::Error(_))
+    {
+        return Err(format!(
+            "req12 reconnect HostHello unexpectedly failed: {message:?}"
+        ));
+    }
+    session
+        .client
+        .send_configure(HostControlMessage::Configure {
+            launch: new_launch,
+            root: session.root.clone(),
+            mappings: session.req9_mappings.clone(),
+            containment: session.containment,
+        })
+        .map_err(|error| format!("req12 reconnect configure send failed: {error}"))?;
+    let ready_observed = matches!(
+        session
+            .client
+            .wait_ready(LIVE_TIMEOUT)
+            .map_err(|error| format!("req12 reconnect wait_ready failed: {error}"))?,
+        AgentControlMessage::Ready { launch, .. } if launch == new_launch
+    );
+    session.launch = new_launch;
+    Ok(ReconnectObservation {
+        new_launch,
+        wait_observed,
+        ready_observed,
+        reset_observed,
+    })
+}
+
+#[cfg(windows)]
+fn run_req11_shutdown_validation_session(session: &mut LiveWhpSession) -> Result<bool, String> {
+    session.auxiliary_launches_started = session.auxiliary_launches_started.saturating_add(1);
+    let validation_dir = session
+        .req9_fixtures
+        .run_dir
+        .join("req11-shutdown-validation");
+    fs::create_dir_all(&validation_dir).map_err(|error| {
+        format!(
+            "creating req11 shutdown validation directory {} failed: {error}",
+            validation_dir.display()
+        )
+    })?;
+    let mut vm = launch_whp_vm(build_launch_plan(
+        &validation_dir,
+        session.vm.plan.artifacts.clone(),
+    ))?;
+    let checks = (|| -> Result<bool, String> {
+        let pid = vm.process_id();
+        let expected_image = vm.plan.artifacts.openvmm_exe.to_string_lossy().into_owned();
+        let control = NamedPipeClient::connect(
+            &vm.plan.control_pipe_name,
+            Duration::from_secs(5),
+            Some(pid),
+            Some(expected_image.as_str()),
+        )
+        .map_err(|error| format!("req11 shutdown validation pipe connect failed: {error}"))?;
+        let mut client = MxcAgentClient::new(HostControlSession::new(control));
+        client
+            .authenticate_launch(
+                vm.plan.launch_capability,
+                HostControlMessage::HostHello {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    launch: LaunchIdentity {
+                        generation: vm.plan.channel_generation.saturating_add(1),
+                        nonce: vm.plan.launch_nonce,
+                    },
+                    capability_proof: launch_capability_proof(vm.plan.launch_nonce)?,
+                },
+                LIVE_TIMEOUT,
+            )
+            .map_err(|error| format!("req11 shutdown validation launch auth failed: {error}"))?;
+        let root = CanonicalHostMappingRoot::parse(ROOT_CANONICAL_HOST.to_string())
+            .map_err(|error| format!("req11 shutdown validation root parse failed: {error}"))?;
+        client
+            .send_configure(HostControlMessage::Configure {
+                launch: LaunchIdentity {
+                    generation: vm.plan.channel_generation.saturating_add(1),
+                    nonce: vm.plan.launch_nonce,
+                },
+                root,
+                mappings: req9_legitimate_mappings()?,
+                containment: MappingContainmentPolicy {
+                    symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                    reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                },
+            })
+            .map_err(|error| format!("req11 shutdown validation configure failed: {error}"))?;
+        match client
+            .wait_ready(LIVE_TIMEOUT)
+            .map_err(|error| format!("req11 shutdown validation wait_ready failed: {error}"))?
+        {
+            AgentControlMessage::Ready { .. } => {}
+            other => {
+                return Err(format!(
+                    "req11 shutdown validation expected Ready, got {other:?}"
+                ));
+            }
+        }
+        client
+            .send_create_process(HostControlMessage::CreateProcess {
+                exec_id: 11_901,
+                argv: vec![
+                    PROBE_PATH.to_string(),
+                    "flood".to_string(),
+                    "--stream".to_string(),
+                    "stdout".to_string(),
+                    "--bytes".to_string(),
+                    "524288".to_string(),
+                    "--chunk".to_string(),
+                    "4096".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            })
+            .map_err(|error| format!("req11 shutdown validation create failed: {error}"))?;
+        client
+            .send_flow_credits(FlowCreditRequest {
+                exec_id: 11_901,
+                stream: StreamName::Stderr,
+                credits: 1,
+            })
+            .map_err(|error| format!("req11 shutdown validation stderr credit failed: {error}"))?;
+        let active = matches!(
+            client
+                .request_health(LIVE_TIMEOUT)
+                .map_err(|error| format!("req11 shutdown validation health failed: {error}"))?,
+            AgentControlMessage::Health(status) if status.active_exec_id == Some(11_901)
+        );
+        let shutdown_ack = matches!(
+            client
+                .request_shutdown(SHUTDOWN_VALIDATION_GRACE_MS, LIVE_TIMEOUT)
+                .map_err(|error| format!(
+                    "req11 shutdown validation shutdown request failed: {error}"
+                ))?,
+            AgentControlMessage::ShuttingDown
+        );
+        let post_ack_exec_rejected =
+            match client.send_create_process(HostControlMessage::CreateProcess {
+                exec_id: 11_902,
+                argv: vec![
+                    PROBE_PATH.to_string(),
+                    "seq".to_string(),
+                    "--token".to_string(),
+                    "blocked".to_string(),
+                ],
+                cwd: Some("/".to_string()),
+                env: vec![],
+                timeout_ms: None,
+            }) {
+                Ok(_) => expect_protocol_error_in(&mut client, LIVE_TIMEOUT).is_ok(),
+                Err(_) => true,
+            };
+        let shutdown_start = Instant::now();
+        let exited = vm.wait_for_exit_with_timeout(SHUTDOWN_VALIDATION_EXIT_BOUND)?;
+        let exited_elapsed = shutdown_start.elapsed();
+        Ok(active
+            && shutdown_ack
+            && post_ack_exec_rejected
+            && exited
+            && exited_elapsed <= SHUTDOWN_VALIDATION_EXIT_BOUND)
+    })();
+    let teardown = vm
+        .kill()
+        .map_err(|error| format!("req11 shutdown validation teardown failed: {error}"));
+    session.auxiliary_launches_torn_down = session.auxiliary_launches_torn_down.saturating_add(1);
+    match (checks, teardown) {
+        (Ok(true), Ok(())) => Ok(true),
+        (Ok(false), Ok(())) => Ok(false),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(teardown_error)) => Err(teardown_error),
+        (Err(check_error), Err(teardown_error)) => Err(format!("{check_error}; {teardown_error}")),
+    }
+}
+
+#[cfg(windows)]
+fn validate_live_network_status(status: &NetworkStatus) -> Result<String, String> {
+    match status.mode {
+        NetworkMode::NoNic => {
+            if status.setup_state != NetworkSetupState::Ready {
+                return Err(format!(
+                    "NoNic setup_state must be Ready, got {:?}",
+                    status.setup_state
+                ));
+            }
+            if status.interface.is_some() {
+                return Err("NoNic must not report interface details".to_string());
+            }
+            if status.default_gateway.is_some() {
+                return Err("NoNic must not report default gateway".to_string());
+            }
+            if !status.dns.ready || !status.dns.servers.is_empty() {
+                return Err("NoNic must report DNS ready=true with no DNS servers".to_string());
+            }
+            if status.failure.is_some() {
+                return Err("NoNic must not report network failure".to_string());
+            }
+            Ok("launch mode NoNic: isolated-ready status with no interface/gateway/DNS-server/failure fields".to_string())
+        }
+        NetworkMode::PortableNetwork => {
+            if status.setup_state != NetworkSetupState::Ready {
+                return Err(format!(
+                    "PortableNetwork setup_state must be Ready, got {:?}",
+                    status.setup_state
+                ));
+            }
+            if status.failure.is_some() {
+                return Err("PortableNetwork must not report network failure".to_string());
+            }
+            let interface = status
+                .interface
+                .as_ref()
+                .ok_or_else(|| "PortableNetwork must report interface".to_string())?;
+            if interface.link_state != agent_protocol::NetworkLinkState::Up {
+                return Err(format!(
+                    "PortableNetwork interface link_state must be Up, got {:?}",
+                    interface.link_state
+                ));
+            }
+            if interface.addresses.is_empty() || interface.addresses.len() > 8 {
+                return Err(format!(
+                    "PortableNetwork addresses count must be 1..=8, got {}",
+                    interface.addresses.len()
+                ));
+            }
+            for address in &interface.addresses {
+                address.parse::<IpAddr>().map_err(|error| {
+                    format!("PortableNetwork address {address:?} is invalid: {error}")
+                })?;
+            }
+            let gateway = status
+                .default_gateway
+                .as_ref()
+                .ok_or_else(|| "PortableNetwork must report default gateway".to_string())?;
+            gateway
+                .parse::<IpAddr>()
+                .map_err(|error| format!("PortableNetwork default gateway is invalid: {error}"))?;
+            if interface.default_route.as_ref() != Some(gateway) {
+                return Err(format!(
+                    "PortableNetwork interface.default_route {:?} must match default_gateway {:?}",
+                    interface.default_route, gateway
+                ));
+            }
+            if !status.dns.ready {
+                return Err("PortableNetwork must report DNS ready=true".to_string());
+            }
+            if status.dns.servers.is_empty() || status.dns.servers.len() > 8 {
+                return Err(format!(
+                    "PortableNetwork DNS server count must be 1..=8, got {}",
+                    status.dns.servers.len()
+                ));
+            }
+            for server in &status.dns.servers {
+                server.parse::<IpAddr>().map_err(|error| {
+                    format!("PortableNetwork DNS server {server:?} is invalid: {error}")
+                })?;
+            }
+            Ok(format!(
+                "launch mode PortableNetwork: interface={} link-up addresses={} gateway={} dns_servers={}",
+                interface.name,
+                interface.addresses.len(),
+                gateway,
+                status.dns.servers.len()
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn launch_capability_proof(nonce: [u8; 16]) -> Result<CapabilityProofMaterial, String> {
+    let mut capability_proof = [0_u8; 32];
+    capability_proof[..16].copy_from_slice(&nonce);
+    capability_proof[16..].copy_from_slice(&nonce);
+    CapabilityProofMaterial::try_from(capability_proof.to_vec())
+        .map_err(|error| format!("building launch capability proof failed: {error}"))
+}
+
+#[cfg(windows)]
+fn is_stale_identifier_rejection(detail: &ProtocolErrorDetail) -> bool {
+    detail.code == ProtocolErrorCode::UnknownExecId
+        || detail.code == ProtocolErrorCode::ExecIdReusedInGeneration
+        || detail.code == ProtocolErrorCode::InvalidLifecycleTransition
+}
+
+#[cfg(windows)]
+fn next_launch_nonce(current: [u8; 16]) -> [u8; 16] {
+    let mut next = current;
+    next[0] ^= 0xA5;
+    next[15] ^= 0x5A;
+    next
 }
 
 #[cfg(windows)]
@@ -2641,5 +3398,94 @@ mod tests {
 
         assert_eq!(launch_count.get(), 1);
         assert_eq!(teardown_count.get(), 1);
+    }
+
+    #[test]
+    fn req10_network_validation_enforces_mode_specific_invariants() {
+        let no_nic = NetworkStatus {
+            mode: NetworkMode::NoNic,
+            setup_state: NetworkSetupState::Ready,
+            interface: None,
+            default_gateway: None,
+            dns: agent_protocol::DnsStatus {
+                ready: true,
+                servers: vec![],
+            },
+            failure: None,
+        };
+        let portable = NetworkStatus {
+            mode: NetworkMode::PortableNetwork,
+            setup_state: NetworkSetupState::Ready,
+            interface: Some(agent_protocol::NetworkInterfaceStatus {
+                name: "eth0".to_string(),
+                index: 3,
+                link_state: agent_protocol::NetworkLinkState::Up,
+                addresses: vec!["10.0.0.2".to_string(), "2001:db8::2".to_string()],
+                default_route: Some("10.0.0.1".to_string()),
+            }),
+            default_gateway: Some("10.0.0.1".to_string()),
+            dns: agent_protocol::DnsStatus {
+                ready: true,
+                servers: vec!["10.0.0.53".to_string()],
+            },
+            failure: None,
+        };
+        let malformed_portable = NetworkStatus {
+            dns: agent_protocol::DnsStatus {
+                ready: true,
+                servers: vec!["not-an-ip".to_string()],
+            },
+            ..portable.clone()
+        };
+        assert!(validate_live_network_status(&no_nic).is_ok());
+        assert!(validate_live_network_status(&portable).is_ok());
+        assert!(validate_live_network_status(&malformed_portable).is_err());
+    }
+
+    #[test]
+    fn req12_stale_identifier_rejection_classifier_accepts_only_expected_codes() {
+        let stale_unknown = ProtocolErrorDetail {
+            code: ProtocolErrorCode::UnknownExecId,
+            message: "unknown exec".to_string(),
+        };
+        let stale_reused = ProtocolErrorDetail {
+            code: ProtocolErrorCode::ExecIdReusedInGeneration,
+            message: "reused".to_string(),
+        };
+        let stale_lifecycle = ProtocolErrorDetail {
+            code: ProtocolErrorCode::InvalidLifecycleTransition,
+            message: "invalid".to_string(),
+        };
+        let non_stale = ProtocolErrorDetail {
+            code: ProtocolErrorCode::FlowControlCreditOverflow,
+            message: "overflow".to_string(),
+        };
+        assert!(is_stale_identifier_rejection(&stale_unknown));
+        assert!(is_stale_identifier_rejection(&stale_reused));
+        assert!(is_stale_identifier_rejection(&stale_lifecycle));
+        assert!(!is_stale_identifier_rejection(&non_stale));
+    }
+
+    #[test]
+    fn req12_next_launch_nonce_changes_deterministically() {
+        let nonce = [7_u8; 16];
+        let next = next_launch_nonce(nonce);
+        assert_ne!(next, nonce);
+        assert_eq!(next[0], nonce[0] ^ 0xA5);
+        assert_eq!(next[15], nonce[15] ^ 0x5A);
+        assert_eq!(next[1..15], nonce[1..15]);
+    }
+
+    #[test]
+    fn source_no_longer_contains_hardcoded_req10_to_req12_failure_arm() {
+        let source = include_str!("scenarios.rs");
+        let banned = ["live scenario invariant", " check did not pass"].concat();
+        assert!(
+            !source.contains(&banned),
+            "req10-req12 hardcoded live failure message must be removed"
+        );
+        assert!(source.contains("10 => run_req10_network_status"));
+        assert!(source.contains("11 => run_req11_health_quiesce_resume_shutdown"));
+        assert!(source.contains("12 => run_req12_channel_loss_generation"));
     }
 }
