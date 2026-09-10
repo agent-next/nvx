@@ -1,11 +1,21 @@
 use std::fs::OpenOptions;
+#[cfg(windows)]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
+#[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::thread::JoinHandle;
 #[cfg(not(windows))]
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use crate::named_pipe::NamedPipeClient;
 use rand::Rng;
 #[cfg(windows)]
 use std::ffi::c_void;
@@ -41,6 +51,14 @@ const DEFAULT_INITRAMFS: &str = "initramfs-mxc-agent.cpio.gz";
 const OPENVMM_MICROVM_PIPE_PREFIX: &str = "//./pipe/openvmm-microvm-";
 #[cfg(windows)]
 const TEARDOWN_WAIT_MS: u32 = 5_000;
+#[cfg(windows)]
+const BOOT_CONSOLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const BOOT_CONSOLE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const BOOT_CONSOLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+#[cfg(windows)]
+const BOOT_CONSOLE_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct LaunchOverrides {
@@ -74,6 +92,7 @@ pub struct LaunchPlan {
     pub channel_generation: u64,
     pub launch_nonce: [u8; 16],
     pub process_log_path: PathBuf,
+    pub boot_console_log_path: PathBuf,
 }
 
 pub struct LaunchedVm {
@@ -86,6 +105,8 @@ pub struct LaunchedVm {
     job_handle: Option<OwnedHandle>,
     #[cfg(windows)]
     pid: u32,
+    #[cfg(windows)]
+    boot_console_capture: Option<BootConsoleCapture>,
 }
 
 impl Drop for LaunchedVm {
@@ -264,6 +285,7 @@ pub fn build_launch_plan(output_dir: &Path, artifacts: LaunchArtifacts) -> Launc
         channel_generation: 1,
         launch_nonce,
         process_log_path: output_dir.join("openvmm-process.log"),
+        boot_console_log_path: output_dir.join("boot-console.log"),
     }
 }
 
@@ -626,16 +648,192 @@ fn launch_whp_vm_windows(plan: LaunchPlan, mut args: Vec<String>) -> Result<Laun
     failpoint(Failpoint::CapabilityWrite)?;
     write_auth_capability_and_close(failure_guard.auth_pipe_mut()?, &plan.launch_capability)?;
 
-    failpoint(Failpoint::ResumeThread)?;
-    resume_thread(failure_guard.thread.as_ref().expect("thread present"))?;
-    let (process_handle, job_handle, pid) = failure_guard.take_success()?;
+    let pid =
+        unsafe { windows::Win32::System::Threading::GetProcessId(failure_guard.process_handle()?) };
+    if pid == 0 {
+        return Err("launched OpenVMM process has no valid process id".to_string());
+    }
+    let mut boot_console_capture = BootConsoleCapture::start(
+        &plan.boot_pipe_name,
+        &plan.boot_console_log_path,
+        pid,
+        &plan.artifacts.openvmm_exe,
+    )?;
+    if let Err(error) = failpoint(Failpoint::ResumeThread)
+        .and_then(|()| resume_thread(failure_guard.thread.as_ref().expect("thread present")))
+    {
+        let capture_error = boot_console_capture.stop_and_join().err();
+        return Err(match capture_error {
+            Some(capture_error) => format!("{error}; {capture_error}"),
+            None => error,
+        });
+    }
+    let (process_handle, job_handle, pid) = match failure_guard.take_success() {
+        Ok(success) => success,
+        Err(error) => {
+            let capture_error = boot_console_capture.stop_and_join().err();
+            return Err(match capture_error {
+                Some(capture_error) => format!("{error}; {capture_error}"),
+                None => error,
+            });
+        }
+    };
 
     Ok(LaunchedVm {
         plan,
         process_handle,
         job_handle: Some(job_handle),
         pid,
+        boot_console_capture: Some(boot_console_capture),
     })
+}
+
+#[cfg(windows)]
+struct BootConsoleCapture {
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<Result<(), String>>>,
+}
+
+#[cfg(windows)]
+impl BootConsoleCapture {
+    fn start(
+        pipe_name: &str,
+        artifact_path: &Path,
+        expected_pid: u32,
+        expected_image: &Path,
+    ) -> Result<Self, String> {
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(artifact_path)
+            .map_err(|error| {
+                format!(
+                    "failed to create boot-console artifact {}: {error}",
+                    artifact_path.display()
+                )
+            })?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let pipe_name = pipe_name.to_string();
+        let artifact_path = artifact_path.to_path_buf();
+        let expected_image = expected_image.to_string_lossy().into_owned();
+        let worker = std::thread::Builder::new()
+            .name("nvx-boot-console-capture".to_string())
+            .spawn(move || {
+                capture_boot_console(
+                    &pipe_name,
+                    &artifact_path,
+                    expected_pid,
+                    &expected_image,
+                    &worker_stop,
+                )
+            })
+            .map_err(|error| format!("failed to start boot-console capture worker: {error}"))?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    fn stop_and_join(&mut self) -> Result<(), String> {
+        self.stop.store(true, Ordering::Release);
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| "boot-console capture worker panicked".to_string())?
+    }
+}
+
+#[cfg(windows)]
+fn capture_boot_console(
+    pipe_name: &str,
+    artifact_path: &Path,
+    expected_pid: u32,
+    expected_image: &str,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let mut artifact = OpenOptions::new()
+        .append(true)
+        .open(artifact_path)
+        .map_err(|error| {
+            format!(
+                "failed to open boot-console artifact {}: {error}",
+                artifact_path.display()
+            )
+        })?;
+    let mut pipe = match NamedPipeClient::connect(
+        pipe_name,
+        BOOT_CONSOLE_CONNECT_TIMEOUT,
+        Some(expected_pid),
+        Some(expected_image),
+    ) {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            let message = format!("[boot-console capture failed: {error}]\n");
+            artifact
+                .write_all(&message.as_bytes()[..message.len().min(BOOT_CONSOLE_MAX_BYTES)])
+                .map_err(|write_error| {
+                    format!(
+                        "boot-console connection failed ({error}); failed writing diagnostic artifact: {write_error}"
+                    )
+                })?;
+            return Err(format!("failed to connect boot-console pipe: {error}"));
+        }
+    };
+    let header = format!(
+        "[boot-console connected pid={expected_pid} image={expected_image:?} max_bytes={BOOT_CONSOLE_MAX_BYTES} timeout_ms={}]\n",
+        BOOT_CONSOLE_CAPTURE_TIMEOUT.as_millis()
+    );
+    let header_bytes = &header.as_bytes()[..header.len().min(BOOT_CONSOLE_MAX_BYTES)];
+    artifact
+        .write_all(header_bytes)
+        .map_err(|error| format!("failed writing boot-console capture header: {error}"))?;
+    drain_boot_console(
+        &mut pipe,
+        &mut artifact,
+        stop,
+        started,
+        BOOT_CONSOLE_CAPTURE_TIMEOUT,
+        BOOT_CONSOLE_MAX_BYTES - header_bytes.len(),
+    )
+}
+
+#[cfg(windows)]
+fn drain_boot_console(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    stop: &AtomicBool,
+    started: std::time::Instant,
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let mut captured = 0_usize;
+    let mut buffer = [0_u8; 4096];
+    while !stop.load(Ordering::Acquire) && started.elapsed() < timeout && captured < max_bytes {
+        let remaining = max_bytes - captured;
+        let read_len = buffer.len().min(remaining);
+        match reader.read(&mut buffer[..read_len]) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                writer
+                    .write_all(&buffer[..bytes_read])
+                    .map_err(|error| format!("failed writing boot-console artifact: {error}"))?;
+                captured += bytes_read;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(BOOT_CONSOLE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(format!("failed reading boot-console pipe: {error}")),
+        }
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("failed flushing boot-console artifact: {error}"))
 }
 
 #[cfg(windows)]
@@ -743,6 +941,25 @@ pub fn kill_child_process_tree(child: &mut Child) -> Result<(), String> {
 
 #[cfg(windows)]
 fn close_job_handle_and_kill(vm: &mut LaunchedVm) -> Result<(), String> {
+    let teardown_result = terminate_openvmm_process_tree(vm);
+    let capture_result = match vm.boot_console_capture.as_mut() {
+        Some(capture) => capture.stop_and_join(),
+        None => Ok(()),
+    };
+    vm.boot_console_capture = None;
+
+    match (teardown_result, capture_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(teardown_error), Ok(())) => Err(teardown_error),
+        (Ok(()), Err(capture_error)) => Err(capture_error),
+        (Err(teardown_error), Err(capture_error)) => {
+            Err(format!("{teardown_error}; {capture_error}"))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminate_openvmm_process_tree(vm: &mut LaunchedVm) -> Result<(), String> {
     let process = HANDLE(vm.process_handle.as_raw_handle());
     let mut uncertainty = None::<String>;
 
@@ -1060,6 +1277,7 @@ mod tests {
         assert_ne!(plan.control_pipe_name, plan.boot_pipe_name);
         assert!(plan.control_pipe_name.contains("-control-"));
         assert!(plan.boot_pipe_name.contains("-boot-"));
+        assert_eq!(plan.boot_console_log_path, root.join("boot-console.log"));
     }
 
     #[test]
@@ -1096,6 +1314,60 @@ mod tests {
     fn startupinfoex_allowlist_contains_only_capability_read_handle() {
         let handles = startupinfoex_handle_allowlist(77, &[]);
         assert_eq!(handles, vec![77]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn boot_console_drain_enforces_byte_bound() {
+        let payload = vec![0x5a; BOOT_CONSOLE_MAX_BYTES + 4096];
+        let mut reader = std::io::Cursor::new(payload);
+        let mut writer = Vec::new();
+        drain_boot_console(
+            &mut reader,
+            &mut writer,
+            &AtomicBool::new(false),
+            std::time::Instant::now(),
+            Duration::from_secs(1),
+            BOOT_CONSOLE_MAX_BYTES,
+        )
+        .expect("bounded capture");
+        assert_eq!(writer.len(), BOOT_CONSOLE_MAX_BYTES);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn boot_console_drain_honors_teardown_stop() {
+        let mut reader = std::io::Cursor::new(b"must not be captured".to_vec());
+        let mut writer = Vec::new();
+        drain_boot_console(
+            &mut reader,
+            &mut writer,
+            &AtomicBool::new(true),
+            std::time::Instant::now(),
+            Duration::from_secs(1),
+            BOOT_CONSOLE_MAX_BYTES,
+        )
+        .expect("stopped capture");
+        assert!(writer.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn boot_console_capture_joins_worker_on_teardown() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            Ok(())
+        });
+        let mut capture = BootConsoleCapture {
+            stop,
+            worker: Some(worker),
+        };
+        capture.stop_and_join().expect("join capture worker");
+        assert!(capture.worker.is_none());
     }
 
     #[cfg(windows)]
@@ -1256,6 +1528,7 @@ mod tests {
             process_handle,
             job_handle: Some(job_handle),
             pid: child.id(),
+            boot_console_capture: None,
         };
         let result = launch_failpoint::run_with(Some(Failpoint::TeardownCloseHandle), || vm.kill());
         assert!(result.is_err());
@@ -1289,6 +1562,7 @@ mod tests {
             process_handle,
             job_handle: Some(job_handle),
             pid: child.id(),
+            boot_console_capture: None,
         };
         let result = launch_failpoint::run_with(Some(Failpoint::TeardownExitTimeout), || vm.kill());
         assert!(result.is_err());

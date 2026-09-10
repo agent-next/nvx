@@ -134,7 +134,7 @@ impl NamedPipeClient {
             let remaining = deadline_at.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(NamedPipeError {
-                    message: format!("timed out connecting to control pipe {path}"),
+                    message: format!("timed out connecting to named pipe {path}"),
                 });
             }
             let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
@@ -142,7 +142,7 @@ impl NamedPipeClient {
             let waited = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), wait_ms) };
             if !waited.as_bool() && Instant::now() >= deadline_at {
                 return Err(NamedPipeError {
-                    message: format!("control pipe wait deadline reached for {path}"),
+                    message: format!("named-pipe wait deadline reached for {path}"),
                 });
             }
         }
