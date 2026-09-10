@@ -225,6 +225,7 @@ pub fn build_launch_plan(output_dir: &Path, artifacts: LaunchArtifacts) -> Launc
 
 pub fn launch_whp_vm(plan: LaunchPlan) -> Result<LaunchedVm, String> {
     let cmdline = format!("nvx.channel_generation={}", plan.channel_generation);
+    let mount = mount_argument_for_common_root(&plan.artifacts.common_root)?;
     let args = vec![
         "--single-process".to_string(),
         "--machine".to_string(),
@@ -237,6 +238,8 @@ pub fn launch_whp_vm(plan: LaunchPlan) -> Result<LaunchedVm, String> {
         os_arg(&plan.artifacts.kernel),
         "--initrd".to_string(),
         os_arg(&plan.artifacts.mxc_initramfs),
+        "--mount".to_string(),
+        mount,
         "--virtio-console".to_string(),
         format!("listen={}", plan.boot_pipe_name),
         "--microvm-control-console".to_string(),
@@ -278,6 +281,17 @@ pub fn launch_whp_vm(plan: LaunchPlan) -> Result<LaunchedVm, String> {
             })?;
         Ok(LaunchedVm { plan, child })
     }
+}
+
+fn mount_argument_for_common_root(common_root: &Path) -> Result<String, String> {
+    let host_path = os_arg(common_root);
+    if host_path.contains(',') {
+        return Err(format!(
+            "common-root path cannot contain commas for --mount: {}",
+            common_root.display()
+        ));
+    }
+    Ok(format!("/mnt/virtiofs,{host_path},rw"))
 }
 
 pub fn startupinfoex_handle_allowlist(
@@ -863,6 +877,29 @@ mod tests {
         assert_eq!(plan.launch_capability.len(), 32);
         assert!(plan.control_pipe_name.starts_with(r"\\.\pipe\"));
         assert!(plan.boot_pipe_name.starts_with(r"\\.\pipe\"));
+    }
+
+    #[test]
+    fn mount_argument_uses_microvm_tagged_root() {
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\tmp\common-root")
+        } else {
+            PathBuf::from("/tmp/common-root")
+        };
+        let mount = mount_argument_for_common_root(&root).expect("mount");
+        assert!(mount.starts_with("/mnt/virtiofs,"));
+        assert!(mount.ends_with(",rw"));
+    }
+
+    #[test]
+    fn mount_argument_rejects_comma_in_host_path() {
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\tmp\comma,path")
+        } else {
+            PathBuf::from("/tmp/comma,path")
+        };
+        let error = mount_argument_for_common_root(&root).expect_err("comma path must fail");
+        assert!(error.contains("cannot contain commas"));
     }
 
     #[test]

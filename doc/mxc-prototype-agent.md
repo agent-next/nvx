@@ -40,6 +40,12 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   `LinuxProcessSupervisor` path with real subprocesses on Linux/WSL
   (`local-linux-runtime` evidence: sequential exec + typed busy, binary
   stdout/stderr separation, backpressure/credits, terminal-order invariants,
+  and live req07 fixed-identity probes (real/effective/saved uid/gid + groups),
+  req08 namespace/isolation probes (namespace IDs, `/proc`/mount isolation, zero
+  capabilities, `no_new_privs`, FD inventory, host-pid invisibility, and orphan
+  cleanup), and req09 mapping containment probes (rw/ro behavior, undeclared/
+  raw-export invisibility, recursive ro flags, traversal/symlink/overlap
+  rejection, and post-config mutation rejection),
   runtime network-readiness/health paths (including deterministic no-NIC,
   portable-ready, malformed, and timeout probes), production
   quiesce/resume/shutdown lifecycle transactions with bounded blocked-writer

@@ -154,6 +154,23 @@ impl<T: std::io::Read + std::io::Write> MxcAgentClient<T> {
         self.control.send_data(encoded).map_err(ClientError::from)
     }
 
+    pub fn send_raw_control_payload(&mut self, payload: &[u8]) -> Result<u64, ClientError> {
+        self.ensure_valid()?;
+        let record = InnerRecord {
+            exec_id: 0,
+            kind: InnerRecordKind::Control,
+            end_of_stream: false,
+            sequence: 0,
+            payload: payload.to_vec(),
+        };
+        let encoded = record.encode().map_err(|error| {
+            ClientError::Protocol(format!(
+                "failed to encode raw inner record bytes: {error:?}"
+            ))
+        })?;
+        self.control.send_data(encoded).map_err(ClientError::from)
+    }
+
     pub fn recv_agent_control(
         &mut self,
         timeout: Duration,
