@@ -322,9 +322,13 @@ impl SetupStepExecutor for SyscallSetupExecutor {
             SetupStep::MoveToWorkloadCgroup => move_pid_to_cgroup(1, &context.plan.cgroup.workload),
             SetupStep::MakeRootPrivate => make_root_private(),
             SetupStep::MountPrivateProc => mount_call("proc", "/proc", "proc", 0, None),
-            SetupStep::MountPrivateDev => {
-                mount_call("tmpfs", "/dev", "tmpfs", 0, Some("mode=755,nosuid,nodev"))
-            }
+            SetupStep::MountPrivateDev => mount_call(
+                "tmpfs",
+                "/dev",
+                "tmpfs",
+                libc::MS_NOSUID | libc::MS_NODEV,
+                Some("mode=755"),
+            ),
             SetupStep::CreatePrivateDevLayout => ensure_minimal_private_dev_layout(),
             SetupStep::MountPrivateDevpts => mount_call(
                 "devpts",
@@ -337,13 +341,11 @@ impl SetupStepExecutor for SyscallSetupExecutor {
                 "tmpfs",
                 "/dev/shm",
                 "tmpfs",
-                0,
-                Some("mode=1777,nosuid,nodev"),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                Some("mode=1777"),
             ),
             SetupStep::BindPrivatePtmx => ensure_ptmx_binding(),
-            SetupStep::MountReadOnlySys => {
-                mount_call("sysfs", "/sys", "sysfs", libc::MS_RDONLY, None)
-            }
+            SetupStep::MountReadOnlySys => ensure_read_only_sysfs_mount(),
             SetupStep::DropBoundingAndAmbientCaps => drop_bounding_and_ambient_capabilities(),
             SetupStep::SwitchToMxcIdentity => switch_to_mxc_identity(),
             SetupStep::ClearRemainingCaps => clear_remaining_capabilities(),
@@ -508,7 +510,8 @@ fn stage_one_child(
     close_fd(child_report_read);
     let probe = match apply_workload_controls(plan, &parent_namespace, &parent_cgroup) {
         Ok(probe) => probe,
-        Err(_) => {
+        Err(error) => {
+            eprintln!("NVX-AGENT-ISOLATION-SETUP-ERROR: {error}");
             let _ = write_all_fd(child_report_write, &[HOLDER_REPORT_ERROR, 0, 0, 0]);
             close_fd(child_report_write);
             close_fd(report_fd);
@@ -738,6 +741,29 @@ fn ensure_ptmx_binding() -> Result<()> {
         return Err(AgentError::io(
             "creating /dev/ptmx -> pts/ptmx symlink in private /dev",
             ::std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_read_only_sysfs_mount() -> Result<()> {
+    let mountinfo_before = read_to_string(
+        "/proc/self/mountinfo",
+        "reading mountinfo before read-only /sys setup",
+    )?;
+    if mountinfo_has_mount(&mountinfo_before, "/sys", "sysfs", false) {
+        mount_call("none", "/sys", "", libc::MS_REMOUNT | libc::MS_RDONLY, None)?;
+    } else {
+        mount_call("sysfs", "/sys", "sysfs", libc::MS_RDONLY, None)?;
+    }
+    let mountinfo_after = read_to_string(
+        "/proc/self/mountinfo",
+        "reading mountinfo after read-only /sys setup",
+    )?;
+    if !mountinfo_has_mount(&mountinfo_after, "/sys", "sysfs", true) {
+        return Err(AgentError::isolation(
+            "read-only sysfs is required at /sys after isolation mount setup",
         ));
     }
     Ok(())

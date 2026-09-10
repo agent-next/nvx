@@ -38,8 +38,8 @@ pub fn private_mount_specs() -> Vec<MountSpec> {
             source: "tmpfs",
             target: "/dev",
             fstype: "tmpfs",
-            flags: 0,
-            data: Some("mode=755,nosuid"),
+            flags: libc::MS_NOSUID | libc::MS_NODEV,
+            data: Some("mode=755"),
         },
         MountSpec {
             source: "devpts",
@@ -52,8 +52,8 @@ pub fn private_mount_specs() -> Vec<MountSpec> {
             source: "tmpfs",
             target: "/dev/shm",
             fstype: "tmpfs",
-            flags: 0,
-            data: Some("mode=1777,nosuid,nodev"),
+            flags: libc::MS_NOSUID | libc::MS_NODEV,
+            data: Some("mode=1777"),
         },
         MountSpec {
             source: "sysfs",
@@ -146,5 +146,21 @@ mod tests {
             .find(|spec| spec.target == "/sys")
             .expect("sys mount");
         assert_ne!(sys.flags & READ_ONLY_FLAG, 0);
+    }
+
+    #[test]
+    fn tmpfs_mounts_use_kernel_flags_for_nosuid_and_nodev() {
+        let specs = private_mount_specs();
+        for target in ["/dev", "/dev/shm"] {
+            let mount = specs
+                .iter()
+                .find(|spec| spec.target == target)
+                .expect("tmpfs mount");
+            assert_ne!(mount.flags & libc::MS_NOSUID, 0);
+            assert_ne!(mount.flags & libc::MS_NODEV, 0);
+            let data = mount.data.expect("tmpfs mount data");
+            assert!(!data.contains("nosuid"));
+            assert!(!data.contains("nodev"));
+        }
     }
 }

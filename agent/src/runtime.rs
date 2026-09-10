@@ -43,10 +43,17 @@ const DEFAULT_WORKLOAD_CGROUP_PATH: &str = "/sys/fs/cgroup/nvx.workload";
 const BOOT_DIAGNOSTIC_TTY: &str = "hvc1";
 const PROC_MOUNT_TARGET: &str = "/proc";
 const PROC_CMDLINE_PATH: &str = "/proc/cmdline";
+const SYS_MOUNT_TARGET: &str = "/sys";
+const SYS_KERNEL_PATH: &str = "/sys/kernel";
+const CGROUP2_MOUNT_TARGET: &str = "/sys/fs/cgroup";
+const CGROUP2_CONTROLLERS_PATH: &str = "/sys/fs/cgroup/cgroup.controllers";
+const DEV_MOUNT_TARGET: &str = "/dev";
 const OUTBOUND_PENDING_LIMIT: usize = 256;
 const FREEZE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const NETWORK_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const NETWORK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CONTROL_TTY_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_TTY_OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_NETWORK_METADATA_ITEMS: usize = 8;
 const MAX_NETWORK_METADATA_STRING_BYTES: usize = 128;
 const MAX_PROC_TEXT_BYTES: usize = 64 * 1024;
@@ -63,7 +70,11 @@ static SYNC_HELPER_UNREAPABLE_AFTER_KILL: AtomicBool = AtomicBool::new(false);
 pub fn run_runtime() -> Result<()> {
     assert_conservative_openvmm_overhead()?;
     install_sigchld_wakeup_handler()?;
+    ensure_required_pseudofs_for_pid1_startup()?;
     let launch_config = read_launch_binding()?;
+    ensure_control_tty_device_available(&launch_config.control_tty_device_path)?;
+    let control_tty_seed =
+        open_control_tty_raw_nonblocking(&launch_config.control_tty_device_path)?;
     let binding = launch_config.binding;
     let build = detect_build_status();
     let network = detect_network_status();
@@ -87,7 +98,9 @@ pub fn run_runtime() -> Result<()> {
     let mut writable_mapping_paths: Vec<String> = Vec::new();
 
     loop {
-        let file = open_control_tty_raw_nonblocking(&launch_config.control_tty_device_path)?;
+        let file = control_tty_seed
+            .try_clone()
+            .map_err(|error| AgentError::io("cloning pre-opened control tty handle", error))?;
         let control_transport =
             GuestControlTransport::connect(file, CONTROL_SESSION_ATTACH_TIMEOUT)?;
         let mut channel = agent_protocol::HvcFramedChannel::new(control_transport);
@@ -1487,7 +1500,6 @@ fn enforce_active_timeout<S: ProcessSupervisor>(
 }
 
 fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
-    ensure_procfs_for_pid1_startup()?;
     let cmdline = std::fs::read_to_string(PROC_CMDLINE_PATH)
         .map_err(|error| AgentError::io("reading /proc/cmdline", error))?;
     let channel_generation = parse_required_u64_arg(
@@ -1509,60 +1521,179 @@ fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
     })
 }
 
-fn ensure_procfs_for_pid1_startup() -> Result<()> {
-    ensure_procfs_for_pid1_startup_with_ops(
-        || Path::new(PROC_CMDLINE_PATH).exists(),
+#[derive(Clone, Copy)]
+struct PseudoFsRequirement {
+    name: &'static str,
+    source: &'static str,
+    mount_point: &'static str,
+    fs_type: &'static str,
+    required_path: &'static str,
+}
+
+const REQUIRED_STARTUP_PSEUDO_FILESYSTEMS: [PseudoFsRequirement; 3] = [
+    PseudoFsRequirement {
+        name: "procfs",
+        source: "proc",
+        mount_point: PROC_MOUNT_TARGET,
+        fs_type: "proc",
+        required_path: PROC_CMDLINE_PATH,
+    },
+    PseudoFsRequirement {
+        name: "sysfs",
+        source: "sysfs",
+        mount_point: SYS_MOUNT_TARGET,
+        fs_type: "sysfs",
+        required_path: SYS_KERNEL_PATH,
+    },
+    PseudoFsRequirement {
+        name: "cgroup v2",
+        source: "cgroup2",
+        mount_point: CGROUP2_MOUNT_TARGET,
+        fs_type: "cgroup2",
+        required_path: CGROUP2_CONTROLLERS_PATH,
+    },
+];
+
+fn ensure_required_pseudofs_for_pid1_startup() -> Result<()> {
+    ensure_required_pseudofs_for_pid1_startup_with_ops(
         || {
-            std::fs::create_dir_all(PROC_MOUNT_TARGET)
-                .map_err(|error| AgentError::io("creating /proc mountpoint", error))
+            std::fs::read_to_string("/proc/self/mountinfo")
+                .map_err(|error| AgentError::io("reading /proc/self/mountinfo", error))
         },
-        mount_procfs_on_proc,
+        |mount_point| {
+            std::fs::create_dir_all(mount_point).map_err(|error| {
+                AgentError::io(format!("creating {mount_point} mountpoint"), error)
+            })
+        },
+        mount_startup_pseudofs,
+        |path| Path::new(path).exists(),
     )
 }
 
-fn ensure_procfs_for_pid1_startup_with_ops(
-    cmdline_exists: impl FnMut() -> bool,
-    ensure_proc_mountpoint: impl FnMut() -> Result<()>,
-    mount_procfs: impl FnMut() -> Result<()>,
+fn ensure_required_pseudofs_for_pid1_startup_with_ops(
+    mut read_mountinfo: impl FnMut() -> Result<String>,
+    mut ensure_mountpoint: impl FnMut(&str) -> Result<()>,
+    mut mount_filesystem: impl FnMut(PseudoFsRequirement) -> Result<()>,
+    mut required_path_exists: impl FnMut(&str) -> bool,
 ) -> Result<()> {
-    ensure_procfs_mounted_with_ops(cmdline_exists, ensure_proc_mountpoint, mount_procfs).map_err(
-        |error| {
+    for requirement in REQUIRED_STARTUP_PSEUDO_FILESYSTEMS {
+        ensure_pseudofs_mounted_with_ops(
+            requirement,
+            &mut read_mountinfo,
+            &mut ensure_mountpoint,
+            &mut mount_filesystem,
+            &mut required_path_exists,
+        )
+        .map_err(|error| {
             if error.requires_fail_closed_action() {
                 error
             } else {
                 AgentError::fail_closed(format!(
-                    "PID 1 startup requires mounted procfs before reading /proc/cmdline: {error}",
+                    "PID 1 startup requires {} mounted at {} ({}) before launch binding/service initialization: {error}",
+                    requirement.name, requirement.mount_point, requirement.fs_type,
                 ))
             }
-        },
+        })?;
+    }
+    Ok(())
+}
+
+fn ensure_pseudofs_mounted_with_ops(
+    requirement: PseudoFsRequirement,
+    mut read_mountinfo: impl FnMut() -> Result<String>,
+    mut ensure_mountpoint: impl FnMut(&str) -> Result<()>,
+    mut mount_filesystem: impl FnMut(PseudoFsRequirement) -> Result<()>,
+    mut required_path_exists: impl FnMut(&str) -> bool,
+) -> Result<()> {
+    match read_mountinfo() {
+        Ok(mountinfo_before) => {
+            if let Some(actual_fstype) =
+                mount_fstype_for_mountpoint(&mountinfo_before, requirement.mount_point)
+            {
+                return validate_existing_pseudofs_mount(
+                    requirement,
+                    actual_fstype,
+                    required_path_exists,
+                );
+            }
+        }
+        Err(error) => {
+            let proc_mountinfo_unavailable = requirement.mount_point == PROC_MOUNT_TARGET
+                && !required_path_exists(requirement.required_path);
+            if !proc_mountinfo_unavailable {
+                return Err(error);
+            }
+        }
+    }
+
+    ensure_mountpoint(requirement.mount_point)?;
+    mount_filesystem(requirement)?;
+
+    let mountinfo_after = read_mountinfo()?;
+    let Some(actual_fstype) =
+        mount_fstype_for_mountpoint(&mountinfo_after, requirement.mount_point)
+    else {
+        return Err(AgentError::fail_closed(format!(
+            "{} mount on {} did not appear in /proc/self/mountinfo after mount operation",
+            requirement.name, requirement.mount_point
+        )));
+    };
+    validate_existing_pseudofs_mount(requirement, actual_fstype, required_path_exists)
+}
+
+fn validate_existing_pseudofs_mount(
+    requirement: PseudoFsRequirement,
+    actual_fstype: String,
+    mut required_path_exists: impl FnMut(&str) -> bool,
+) -> Result<()> {
+    if actual_fstype != requirement.fs_type {
+        return Err(AgentError::fail_closed(format!(
+            "{} at {} must be {} but is mounted as {}",
+            requirement.name, requirement.mount_point, requirement.fs_type, actual_fstype
+        )));
+    }
+    if required_path_exists(requirement.required_path) {
+        return Ok(());
+    }
+    Err(AgentError::fail_closed(format!(
+        "{} is mounted on {} but required path {} is unavailable",
+        requirement.name, requirement.mount_point, requirement.required_path
+    )))
+}
+
+fn mount_fstype_for_mountpoint(mountinfo: &str, mount_point: &str) -> Option<String> {
+    mountinfo.lines().find_map(|line| {
+        let mut parts = line.split(" - ");
+        let pre = parts.next()?;
+        let post = parts.next()?;
+        let pre_fields: Vec<&str> = pre.split_whitespace().collect();
+        if pre_fields.len() < 5 || pre_fields[4] != mount_point {
+            return None;
+        }
+        let post_fields: Vec<&str> = post.split_whitespace().collect();
+        let fs_type = post_fields.first()?;
+        Some((*fs_type).to_string())
+    })
+}
+
+fn mount_startup_pseudofs(requirement: PseudoFsRequirement) -> Result<()> {
+    mount_filesystem(
+        requirement.source,
+        requirement.mount_point,
+        requirement.fs_type,
     )
 }
 
-fn ensure_procfs_mounted_with_ops(
-    mut cmdline_exists: impl FnMut() -> bool,
-    mut ensure_proc_mountpoint: impl FnMut() -> Result<()>,
-    mut mount_procfs: impl FnMut() -> Result<()>,
-) -> Result<()> {
-    if cmdline_exists() {
-        return Ok(());
-    }
-    ensure_proc_mountpoint()?;
-    mount_procfs()?;
-    if cmdline_exists() {
-        return Ok(());
-    }
-    Err(AgentError::fail_closed(
-        "procfs mount completed but /proc/cmdline is still unavailable",
-    ))
-}
-
-fn mount_procfs_on_proc() -> Result<()> {
-    let source = std::ffi::CString::new("proc")
-        .map_err(|_| AgentError::mount("proc source contains NUL"))?;
-    let target = std::ffi::CString::new(PROC_MOUNT_TARGET)
-        .map_err(|_| AgentError::mount("proc target contains NUL"))?;
-    let fstype = std::ffi::CString::new("proc")
-        .map_err(|_| AgentError::mount("proc fstype contains NUL"))?;
+fn mount_filesystem(source: &str, target: &str, fstype: &str) -> Result<()> {
+    let source_label = source.to_string();
+    let target_label = target.to_string();
+    let fstype_label = fstype.to_string();
+    let source = std::ffi::CString::new(source)
+        .map_err(|_| AgentError::mount("mount source contains NUL"))?;
+    let target = std::ffi::CString::new(target)
+        .map_err(|_| AgentError::mount("mount target contains NUL"))?;
+    let fstype = std::ffi::CString::new(fstype)
+        .map_err(|_| AgentError::mount("mount fstype contains NUL"))?;
     // SAFETY: mount is called with constant C strings and null data.
     let rc = unsafe {
         libc::mount(
@@ -1580,7 +1711,41 @@ fn mount_procfs_on_proc() -> Result<()> {
     if error.raw_os_error() == Some(libc::EBUSY) {
         return Ok(());
     }
-    Err(AgentError::io("mounting procfs on /proc", error))
+    Err(AgentError::io(
+        format!("mounting {source_label} on {target_label} as {fstype_label}"),
+        error,
+    ))
+}
+
+fn ensure_control_tty_device_available(control_tty_path: &str) -> Result<()> {
+    ensure_control_tty_device_available_with_ops(
+        control_tty_path,
+        |path| Path::new(path).exists(),
+        || {
+            std::fs::create_dir_all(DEV_MOUNT_TARGET)
+                .map_err(|error| AgentError::io("creating /dev mountpoint", error))
+        },
+        || mount_filesystem("devtmpfs", DEV_MOUNT_TARGET, "devtmpfs"),
+    )
+}
+
+fn ensure_control_tty_device_available_with_ops(
+    control_tty_path: &str,
+    mut path_exists: impl FnMut(&str) -> bool,
+    mut ensure_dev_mountpoint: impl FnMut() -> Result<()>,
+    mut mount_devtmpfs: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    if path_exists(control_tty_path) {
+        return Ok(());
+    }
+    ensure_dev_mountpoint()?;
+    mount_devtmpfs()?;
+    if path_exists(control_tty_path) {
+        return Ok(());
+    }
+    Err(AgentError::fail_closed(format!(
+        "required control tty {control_tty_path} is unavailable after ensuring /dev devtmpfs",
+    )))
 }
 
 fn parse_required_u64_arg(cmdline: &str, keys: &[&str]) -> Result<u64> {
@@ -2067,22 +2232,33 @@ impl Write for GuestControlTransport {
 fn open_control_tty_raw_nonblocking(path: &str) -> Result<File> {
     let c_path = std::ffi::CString::new(path)
         .map_err(|_| AgentError::config("hvc path contains interior NUL"))?;
-    // SAFETY: open called with a valid NUL-terminated path and constant flags.
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY,
-        )
-    };
-    if fd < 0 {
-        return Err(AgentError::io(
-            format!("opening {path}"),
-            io::Error::last_os_error(),
-        ));
+    let deadline = Instant::now()
+        .checked_add(CONTROL_TTY_OPEN_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    loop {
+        // SAFETY: open called with a valid NUL-terminated path and constant flags.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY,
+            )
+        };
+        if fd >= 0 {
+            configure_fd_raw_nonblocking(fd)?;
+            // SAFETY: fd is newly opened and transferred to File ownership.
+            return Ok(unsafe { File::from_raw_fd(fd as RawFd) });
+        }
+        let error = io::Error::last_os_error();
+        let transient_missing_tty = matches!(
+            error.raw_os_error(),
+            Some(libc::ENOENT) | Some(libc::ENODEV)
+        );
+        if transient_missing_tty && Instant::now() < deadline {
+            thread::sleep(CONTROL_TTY_OPEN_RETRY_INTERVAL);
+            continue;
+        }
+        return Err(AgentError::io(format!("opening {path}"), error));
     }
-    configure_fd_raw_nonblocking(fd)?;
-    // SAFETY: fd is newly opened and transferred to File ownership.
-    Ok(unsafe { File::from_raw_fd(fd as RawFd) })
 }
 
 fn configure_fd_raw_nonblocking(fd: i32) -> Result<()> {
@@ -2167,11 +2343,203 @@ mod tests {
     }
 
     #[test]
-    fn procfs_startup_guard_is_idempotent_when_cmdline_already_present() {
+    fn startup_pseudofs_guard_is_idempotent_when_everything_is_already_valid() {
+        let mountinfo = "1 1 0:1 / /proc rw - proc proc rw\n2 1 0:2 / /sys rw - sysfs sysfs rw\n3 2 0:3 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n".to_string();
         let mut mkdir_calls = 0_u32;
         let mut mount_calls = 0_u32;
-        ensure_procfs_mounted_with_ops(
-            || true,
+        ensure_required_pseudofs_for_pid1_startup_with_ops(
+            || Ok(mountinfo.clone()),
+            |_| {
+                mkdir_calls = mkdir_calls.saturating_add(1);
+                Ok(())
+            },
+            |_| {
+                mount_calls = mount_calls.saturating_add(1);
+                Ok(())
+            },
+            |_| true,
+        )
+        .expect("already-mounted and verified pseudo-filesystems should pass");
+        assert_eq!(mkdir_calls, 0);
+        assert_eq!(mount_calls, 0);
+    }
+
+    #[test]
+    fn startup_pseudofs_guard_mounts_missing_proc_sys_and_cgroup2() {
+        let mounted = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
+        let mounted_for_read = Rc::clone(&mounted);
+        let mounted_for_mount = Rc::clone(&mounted);
+        let mounted_for_required = Rc::clone(&mounted);
+        let mount_calls = Rc::new(RefCell::new(Vec::<String>::new()));
+        let mount_calls_for_mount = Rc::clone(&mount_calls);
+
+        ensure_required_pseudofs_for_pid1_startup_with_ops(
+            move || {
+                let entries = mounted_for_read.borrow();
+                let mut mountinfo = String::new();
+                for (mount_point, fs_type) in entries.iter() {
+                    mountinfo.push_str(&format!(
+                        "10 9 0:40 / {mount_point} rw - {fs_type} {fs_type} rw\n"
+                    ));
+                }
+                Ok(mountinfo)
+            },
+            |_| Ok(()),
+            move |requirement| {
+                mount_calls_for_mount
+                    .borrow_mut()
+                    .push(requirement.mount_point.to_string());
+                mounted_for_mount.borrow_mut().push((
+                    requirement.mount_point.to_string(),
+                    requirement.fs_type.to_string(),
+                ));
+                Ok(())
+            },
+            move |path| {
+                let entries = mounted_for_required.borrow();
+                match path {
+                    PROC_CMDLINE_PATH => entries
+                        .iter()
+                        .any(|(mount_point, fs_type)| mount_point == "/proc" && fs_type == "proc"),
+                    SYS_KERNEL_PATH => entries
+                        .iter()
+                        .any(|(mount_point, fs_type)| mount_point == "/sys" && fs_type == "sysfs"),
+                    CGROUP2_CONTROLLERS_PATH => entries.iter().any(|(mount_point, fs_type)| {
+                        mount_point == "/sys/fs/cgroup" && fs_type == "cgroup2"
+                    }),
+                    _ => false,
+                }
+            },
+        )
+        .expect("guard should mount all required pseudo-filesystems");
+
+        assert_eq!(
+            mount_calls.borrow().clone(),
+            vec![
+                "/proc".to_string(),
+                "/sys".to_string(),
+                "/sys/fs/cgroup".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_pseudofs_guard_handles_proc_mountinfo_missing_before_proc_mount() {
+        let mounted = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
+        let mounted_for_read = Rc::clone(&mounted);
+        let mounted_for_mount = Rc::clone(&mounted);
+        let mounted_for_required = Rc::clone(&mounted);
+
+        ensure_required_pseudofs_for_pid1_startup_with_ops(
+            move || {
+                let entries = mounted_for_read.borrow();
+                if !entries
+                    .iter()
+                    .any(|(mount_point, _)| mount_point == PROC_MOUNT_TARGET)
+                {
+                    return Err(AgentError::io(
+                        "reading /proc/self/mountinfo",
+                        io::Error::from_raw_os_error(libc::ENOENT),
+                    ));
+                }
+                let mut mountinfo = String::new();
+                for (mount_point, fs_type) in entries.iter() {
+                    mountinfo.push_str(&format!(
+                        "10 9 0:40 / {mount_point} rw - {fs_type} {fs_type} rw\n"
+                    ));
+                }
+                Ok(mountinfo)
+            },
+            |_| Ok(()),
+            move |requirement| {
+                mounted_for_mount.borrow_mut().push((
+                    requirement.mount_point.to_string(),
+                    requirement.fs_type.to_string(),
+                ));
+                Ok(())
+            },
+            move |path| {
+                let entries = mounted_for_required.borrow();
+                match path {
+                    PROC_CMDLINE_PATH => entries
+                        .iter()
+                        .any(|(mount_point, fs_type)| mount_point == "/proc" && fs_type == "proc"),
+                    SYS_KERNEL_PATH => entries
+                        .iter()
+                        .any(|(mount_point, fs_type)| mount_point == "/sys" && fs_type == "sysfs"),
+                    CGROUP2_CONTROLLERS_PATH => entries.iter().any(|(mount_point, fs_type)| {
+                        mount_point == "/sys/fs/cgroup" && fs_type == "cgroup2"
+                    }),
+                    _ => false,
+                }
+            },
+        )
+        .expect("startup guard should mount proc before reading mountinfo, then continue");
+    }
+
+    #[test]
+    fn startup_pseudofs_guard_fails_closed_on_wrong_existing_filesystem_type() {
+        let mountinfo = "1 1 0:1 / /proc rw - proc proc rw\n2 1 0:2 / /sys rw - tmpfs tmpfs rw\n3 2 0:3 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n".to_string();
+        let mut mount_calls = 0_u32;
+        let error = ensure_required_pseudofs_for_pid1_startup_with_ops(
+            || Ok(mountinfo.clone()),
+            |_| Ok(()),
+            |_| {
+                mount_calls = mount_calls.saturating_add(1);
+                Ok(())
+            },
+            |_| true,
+        )
+        .expect_err("wrong existing sysfs type must fail closed");
+        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
+        assert!(error.to_string().contains("/sys"));
+        assert!(error.to_string().contains("must be sysfs"));
+        assert_eq!(mount_calls, 0);
+    }
+
+    #[test]
+    fn startup_pseudofs_guard_fails_closed_when_required_marker_is_missing() {
+        let mountinfo = "1 1 0:1 / /proc rw - proc proc rw\n2 1 0:2 / /sys rw - sysfs sysfs rw\n3 2 0:3 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n".to_string();
+        let error = ensure_required_pseudofs_for_pid1_startup_with_ops(
+            || Ok(mountinfo.clone()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |path| path != CGROUP2_CONTROLLERS_PATH,
+        )
+        .expect_err("missing cgroup.controllers must fail closed");
+        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
+        assert!(error.to_string().contains(CGROUP2_CONTROLLERS_PATH));
+    }
+
+    #[test]
+    fn startup_pseudofs_guard_wraps_mount_errors_as_fail_closed_for_pid1_path() {
+        let error = ensure_required_pseudofs_for_pid1_startup_with_ops(
+            || Ok(String::new()),
+            |_| Ok(()),
+            |_| {
+                Err(AgentError::io(
+                    "mounting proc on /proc as proc",
+                    io::Error::from_raw_os_error(libc::EPERM),
+                ))
+            },
+            |_| false,
+        )
+        .expect_err("pid1 pseudo-fs guard must fail closed on mount failure");
+        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
+        assert!(
+            error
+                .to_string()
+                .contains("launch binding/service initialization")
+        );
+    }
+
+    #[test]
+    fn control_tty_guard_is_idempotent_when_device_is_already_present() {
+        let mut mkdir_calls = 0_u32;
+        let mut mount_calls = 0_u32;
+        ensure_control_tty_device_available_with_ops(
+            "/dev/hvc2",
+            |_| true,
             || {
                 mkdir_calls = mkdir_calls.saturating_add(1);
                 Ok(())
@@ -2181,17 +2549,18 @@ mod tests {
                 Ok(())
             },
         )
-        .expect("existing procfs should not trigger setup");
+        .expect("existing control tty should not require /dev setup");
         assert_eq!(mkdir_calls, 0);
         assert_eq!(mount_calls, 0);
     }
 
     #[test]
-    fn procfs_startup_guard_mounts_once_when_cmdline_initially_missing() {
-        let mut mount_calls = 0_u32;
+    fn control_tty_guard_mounts_devtmpfs_when_device_is_initially_missing() {
         let mut exists_checks = 0_u32;
-        ensure_procfs_mounted_with_ops(
-            || {
+        let mut mount_calls = 0_u32;
+        ensure_control_tty_device_available_with_ops(
+            "/dev/hvc2",
+            |_| {
                 exists_checks = exists_checks.saturating_add(1);
                 exists_checks > 1
             },
@@ -2201,55 +2570,22 @@ mod tests {
                 Ok(())
             },
         )
-        .expect("guard should mount procfs and proceed");
+        .expect("guard should mount /dev and then observe tty");
         assert_eq!(mount_calls, 1);
         assert_eq!(exists_checks, 2);
     }
 
     #[test]
-    fn procfs_startup_guard_fails_closed_when_cmdline_stays_missing() {
-        let error = ensure_procfs_mounted_with_ops(|| false, || Ok(()), || Ok(()))
-            .expect_err("missing cmdline after mount must fail closed");
-        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
-        assert!(
-            error
-                .to_string()
-                .contains("/proc/cmdline is still unavailable"),
-            "expected explicit procfs fail-closed reason"
-        );
-    }
-
-    #[test]
-    fn procfs_startup_guard_propagates_mount_failure() {
-        let error = ensure_procfs_mounted_with_ops(
-            || false,
+    fn control_tty_guard_fails_closed_when_device_stays_missing() {
+        let error = ensure_control_tty_device_available_with_ops(
+            "/dev/hvc2",
+            |_| false,
             || Ok(()),
-            || {
-                Err(AgentError::io(
-                    "mounting procfs on /proc",
-                    io::Error::from_raw_os_error(libc::EPERM),
-                ))
-            },
-        )
-        .expect_err("mount failure must be surfaced");
-        assert_eq!(error.code(), crate::error::ErrorCode::Internal);
-    }
-
-    #[test]
-    fn procfs_startup_guard_wraps_non_fail_closed_errors_for_pid1_path() {
-        let error = ensure_procfs_for_pid1_startup_with_ops(
-            || false,
-            || {
-                Err(AgentError::io(
-                    "creating /proc mountpoint",
-                    io::Error::from_raw_os_error(libc::EROFS),
-                ))
-            },
             || Ok(()),
         )
-        .expect_err("pid1 guard must fail closed on procfs setup failure");
+        .expect_err("missing control tty after devtmpfs mount must fail closed");
         assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
-        assert!(error.to_string().contains("requires mounted procfs"));
+        assert!(error.to_string().contains("/dev/hvc2"));
     }
 
     #[test]
