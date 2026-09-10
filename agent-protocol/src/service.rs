@@ -95,7 +95,14 @@ pub struct MxcCapabilities {
     pub protocol_version: u32,
     pub image_version: String,
     pub available_operations: Vec<String>,
-    pub unavailable_operations: Vec<String>,
+    pub unavailable_operations: Vec<UnavailableOperation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnavailableOperation {
+    pub operation: String,
+    pub capability_flag: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -326,18 +333,54 @@ impl MxcControlService {
             image_version: self.binding.image_version.clone(),
             available_operations: vec![
                 "GetCapabilities".to_string(),
+                "AuthenticateChannel".to_string(),
                 "ConfigureSession".to_string(),
                 "WaitReady".to_string(),
                 "Health".to_string(),
-                "Exec".to_string(),
-                "Streams".to_string(),
-                "Cancel".to_string(),
-                "Quiesce".to_string(),
-                "DisconnectCleanup".to_string(),
-                "Resume".to_string(),
-                "Shutdown".to_string(),
             ],
-            unavailable_operations: vec![],
+            unavailable_operations: vec![
+                UnavailableOperation {
+                    operation: "Exec".to_string(),
+                    capability_flag: "exec.phase0".to_string(),
+                    reason:
+                        "phase-0 control slice exposes readiness only; exec lifecycle is disabled"
+                            .to_string(),
+                },
+                UnavailableOperation {
+                    operation: "Streams".to_string(),
+                    capability_flag: "streams.phase0".to_string(),
+                    reason: "phase-0 control slice does not expose process stream transport"
+                        .to_string(),
+                },
+                UnavailableOperation {
+                    operation: "Cancel".to_string(),
+                    capability_flag: "cancel.phase0".to_string(),
+                    reason: "phase-0 control slice does not allow execution cancellation"
+                        .to_string(),
+                },
+                UnavailableOperation {
+                    operation: "Quiesce".to_string(),
+                    capability_flag: "quiesce.phase0".to_string(),
+                    reason: "phase-0 control slice does not expose quiesce transitions".to_string(),
+                },
+                UnavailableOperation {
+                    operation: "DisconnectCleanup".to_string(),
+                    capability_flag: "disconnect_cleanup.phase0".to_string(),
+                    reason: "phase-0 control slice does not expose disconnect cleanup control"
+                        .to_string(),
+                },
+                UnavailableOperation {
+                    operation: "Resume".to_string(),
+                    capability_flag: "resume.phase0".to_string(),
+                    reason: "phase-0 control slice does not expose resume transitions".to_string(),
+                },
+                UnavailableOperation {
+                    operation: "Shutdown".to_string(),
+                    capability_flag: "shutdown.phase0".to_string(),
+                    reason: "phase-0 control slice does not expose in-band shutdown control"
+                        .to_string(),
+                },
+            ],
         }
     }
 
@@ -596,6 +639,8 @@ impl MxcControlService {
                 "stdin queue is full; apply host-side backpressure",
             ));
         }
+        let protocol_snapshot = self.protocol_state.clone();
+        let active_snapshot = active.clone();
         self.protocol_state.apply_exec_event(
             record.exec_id,
             ActiveExecEvent::StdinChunk {
@@ -603,8 +648,12 @@ impl MxcControlService {
             },
         )?;
         active.stdin_next_sequence = active.stdin_next_sequence.saturating_add(1);
-        supervisor.queue_stdin(record.exec_id, record.chunk.clone())?;
-        active.stdin_queue_bytes = next_bytes.saturating_sub(record.chunk.len());
+        if let Err(error) = supervisor.queue_stdin(record.exec_id, record.chunk) {
+            self.protocol_state = protocol_snapshot;
+            *active = active_snapshot;
+            return Err(error);
+        }
+        active.stdin_queue_bytes = next_bytes;
         Ok(())
     }
 
@@ -625,6 +674,8 @@ impl MxcControlService {
                 "stdin eof does not match active execution",
             ));
         }
+        let protocol_snapshot = self.protocol_state.clone();
+        let active_snapshot = active.clone();
         self.protocol_state.apply_exec_event(
             record.exec_id,
             ActiveExecEvent::StdinEof {
@@ -632,7 +683,11 @@ impl MxcControlService {
             },
         )?;
         active.stdin_next_sequence = active.stdin_next_sequence.saturating_add(1);
-        supervisor.close_stdin(record.exec_id)?;
+        if let Err(error) = supervisor.close_stdin(record.exec_id) {
+            self.protocol_state = protocol_snapshot;
+            *active = active_snapshot;
+            return Err(error);
+        }
         active.stdin_eof_received = true;
         Ok(())
     }
@@ -1391,6 +1446,57 @@ mod tests {
     }
 
     #[test]
+    fn get_capabilities_reports_only_reachable_phase0_operations() {
+        let service = MxcControlService::new(sample_binding());
+        let capabilities = service.get_capabilities();
+        assert_eq!(
+            capabilities.available_operations,
+            vec![
+                "GetCapabilities".to_string(),
+                "AuthenticateChannel".to_string(),
+                "ConfigureSession".to_string(),
+                "WaitReady".to_string(),
+                "Health".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn get_capabilities_marks_unimplemented_operations_unavailable_with_reasons() {
+        let service = MxcControlService::new(sample_binding());
+        let capabilities = service.get_capabilities();
+
+        let unavailable = capabilities
+            .unavailable_operations
+            .iter()
+            .map(|entry| {
+                assert!(!entry.capability_flag.is_empty());
+                assert!(!entry.reason.is_empty());
+                entry.operation.as_str()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unavailable,
+            std::collections::BTreeSet::from([
+                "Exec",
+                "Streams",
+                "Cancel",
+                "Quiesce",
+                "DisconnectCleanup",
+                "Resume",
+                "Shutdown",
+            ])
+        );
+
+        let advertised = capabilities
+            .available_operations
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(unavailable.is_disjoint(&advertised));
+    }
+
+    #[test]
     fn wait_ready_is_level_triggered_once_configuration_is_applied() {
         let mut service = authenticated_unconfigured_service();
         service
@@ -1626,6 +1732,7 @@ mod tests {
         events: VecDeque<SupervisorEvent>,
         spawned: Vec<CreateProcessRequest>,
         stdin: Vec<Vec<u8>>,
+        fail_next_stdin_backpressure: bool,
         stdin_closed: bool,
         terminated: u32,
         killed: u32,
@@ -1639,6 +1746,13 @@ mod tests {
         }
 
         fn queue_stdin(&mut self, _exec_id: u32, chunk: Vec<u8>) -> Result<(), ServiceError> {
+            if self.fail_next_stdin_backpressure {
+                self.fail_next_stdin_backpressure = false;
+                return Err(ServiceError::new(
+                    ServiceErrorCode::Backpressure,
+                    "stdin queue reached byte limit",
+                ));
+            }
             self.stdin.push(chunk);
             Ok(())
         }
@@ -1703,6 +1817,21 @@ mod tests {
         service
     }
 
+    fn drain_supervisor_messages(
+        service: &mut MxcControlService,
+        supervisor: &mut FakeSupervisor,
+    ) -> Vec<AgentControlMessage> {
+        let mut messages = Vec::new();
+        for _ in 0..512 {
+            let batch = service.pump_supervisor(supervisor).unwrap();
+            messages.extend(batch);
+            if supervisor.events.is_empty() && service.active_exec_id().is_none() {
+                break;
+            }
+        }
+        messages
+    }
+
     #[test]
     fn exec_is_sequential_and_exec_id_not_reused() {
         let mut service = authenticated_service();
@@ -1737,7 +1866,7 @@ mod tests {
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
         supervisor.events.push_back(SupervisorEvent::Exited(0));
-        let messages = service.pump_supervisor(&mut supervisor).unwrap();
+        let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         assert!(matches!(
             messages.last(),
             Some(AgentControlMessage::ExecTerminal { exec_id: 41, .. })
@@ -1809,7 +1938,7 @@ mod tests {
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
         supervisor.events.push_back(SupervisorEvent::Exited(0));
-        let messages = service.pump_supervisor(&mut supervisor).unwrap();
+        let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         assert!(matches!(
             &messages[0],
             AgentControlMessage::StdoutChunk(StdoutChunkRecord { chunk, .. }) if chunk == &vec![1, 0, 2, 0, 3]
@@ -1865,7 +1994,7 @@ mod tests {
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
         supervisor.events.push_back(SupervisorEvent::Signaled(15));
-        let messages = service.pump_supervisor(&mut supervisor).unwrap();
+        let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         let terminals: Vec<_> = messages
             .iter()
             .filter(|message| matches!(message, AgentControlMessage::ExecTerminal { .. }))
@@ -1947,7 +2076,7 @@ mod tests {
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
         supervisor.events.push_back(SupervisorEvent::Signaled(9));
-        let messages = service.pump_supervisor(&mut supervisor).unwrap();
+        let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         assert!(matches!(
             messages.last(),
             Some(AgentControlMessage::ExecTerminal {
@@ -1955,6 +2084,58 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn stdin_backpressure_is_transactional_and_sequence_retry_succeeds() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor::default();
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 61,
+                    argv: vec!["/bin/cat".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 61,
+                stream: StreamName::Stdin,
+                credits: 1,
+            })
+            .unwrap();
+
+        supervisor.fail_next_stdin_backpressure = true;
+        let first_attempt = service.stdin_chunk(
+            StdinChunkRecord {
+                exec_id: 61,
+                sequence: 0,
+                chunk: b"abc".to_vec(),
+            },
+            &mut supervisor,
+        );
+        assert_eq!(
+            first_attempt.unwrap_err().code,
+            ServiceErrorCode::Backpressure
+        );
+        assert!(supervisor.stdin.is_empty());
+
+        service
+            .stdin_chunk(
+                StdinChunkRecord {
+                    exec_id: 61,
+                    sequence: 0,
+                    chunk: b"abc".to_vec(),
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        assert_eq!(supervisor.stdin, vec![b"abc".to_vec()]);
     }
 
     #[test]
@@ -1997,7 +2178,7 @@ mod tests {
         supervisor
             .events
             .push_back(SupervisorEvent::DescendantsCleaned);
-        let messages = service.pump_supervisor(&mut supervisor).unwrap();
+        let messages = drain_supervisor_messages(&mut service, &mut supervisor);
         let terminal_index = messages
             .iter()
             .position(|message| matches!(message, AgentControlMessage::ExecTerminal { .. }))
@@ -2193,7 +2374,13 @@ mod tests {
         assert_eq!(saturated.unwrap_err().code, ServiceErrorCode::Backpressure);
         channel.grant_write_credits(1);
         channel.queue_inner_record(&second).unwrap();
-        assert_eq!(channel.queued_frames.len(), 2);
-        assert!(channel.has_queued_writes());
+        while channel.flush_once().unwrap() {}
+        let written = channel.io.into_inner();
+        let mut readback = HvcFramedChannel::new(Cursor::new(written));
+        let first_out = readback.read_next_inner_record().unwrap().unwrap();
+        let second_out = readback.read_next_inner_record().unwrap().unwrap();
+        assert_eq!(first_out.payload, first.payload);
+        assert_eq!(second_out.payload, second.payload);
+        assert!(readback.read_next_inner_record().unwrap().is_none());
     }
 }

@@ -8,7 +8,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -28,11 +28,21 @@ pub struct LinuxProcessSupervisor {
 
 struct NamespaceHolder {
     cgroup_dir: PathBuf,
-    cgroup_procs_path: CString,
     mount_ns_fd: i32,
     uts_ns_fd: i32,
     ipc_ns_fd: i32,
     pid_ns_fd: i32,
+}
+
+#[derive(Clone)]
+struct PreparedExecCgroup {
+    cgroup_dir: PathBuf,
+    cgroup_procs_path: CString,
+}
+
+#[derive(Clone, Copy)]
+struct ChildCredentialPlan {
+    last_capability_index: i32,
 }
 
 struct ActiveProcess {
@@ -100,12 +110,21 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.process_group(0);
+        let cgroup_root = self
+            .holder
+            .as_ref()
+            .map(|holder| holder.cgroup_dir.as_path())
+            .unwrap_or_else(|| Path::new("/sys/fs/cgroup/nvx.workload"));
+        let prepared_cgroup = prepare_exec_cgroup(cgroup_root, request.exec_id);
+        let credential_plan = prepare_child_credential_plan().ok();
         if let Some(holder) = self.holder.as_ref() {
             let mount_ns_fd = holder.mount_ns_fd;
             let uts_ns_fd = holder.uts_ns_fd;
             let ipc_ns_fd = holder.ipc_ns_fd;
             let pid_ns_fd = holder.pid_ns_fd;
-            let cgroup_procs_path = holder.cgroup_procs_path.clone();
+            let exec_cgroup_procs_path = prepared_cgroup
+                .as_ref()
+                .map(|prepared| prepared.cgroup_procs_path.clone());
             // SAFETY: closure performs direct namespace and identity syscalls before exec.
             unsafe {
                 command.pre_exec(move || {
@@ -113,7 +132,9 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                     setns_checked(uts_ns_fd, libc::CLONE_NEWUTS)?;
                     setns_checked(ipc_ns_fd, libc::CLONE_NEWIPC)?;
                     setns_checked(pid_ns_fd, libc::CLONE_NEWPID)?;
-                    move_self_to_cgroup(&cgroup_procs_path)?;
+                    if let Some(cgroup_procs_path) = exec_cgroup_procs_path.as_ref() {
+                        move_self_to_cgroup(cgroup_procs_path)?;
+                    }
                     let workload_pid = libc::fork();
                     if workload_pid < 0 {
                         return Err(io::Error::last_os_error());
@@ -136,12 +157,7 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                         }
                         libc::_exit(1);
                     }
-                    if libc::setgid(WORKLOAD_GID_MXC) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::setuid(WORKLOAD_UID_MXC) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
+                    apply_workload_exec_credentials(credential_plan)?;
                     Ok(())
                 });
             }
@@ -164,11 +180,14 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
             set_nonblocking(stderr_ref.as_raw_fd())?;
         }
 
-        let cgroup_dir = self
-            .holder
-            .as_ref()
-            .map(|holder| holder.cgroup_dir.clone())
-            .or_else(|| try_prepare_workload_cgroup(request.exec_id, pid));
+        let cgroup_dir = if let Some(prepared) = prepared_cgroup {
+            if self.holder.is_none() {
+                let _ = move_pid_to_exec_cgroup(&prepared.cgroup_procs_path, pid);
+            }
+            Some(prepared.cgroup_dir)
+        } else {
+            try_prepare_workload_cgroup(request.exec_id, pid)
+        };
         self.active = Some(ActiveProcess {
             exec_id: request.exec_id,
             child,
@@ -232,9 +251,26 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
     }
 
     fn poll(&mut self, exec_id: u32) -> Result<Option<SupervisorEvent>, ServiceError> {
-        let active = self.require_active(exec_id)?;
-        refresh_active_state(active)?;
-        Ok(active.event_queue.pop_front())
+        let mut release_cgroup = None;
+        let event = {
+            let active = self.require_active(exec_id)?;
+            refresh_active_state(active)?;
+            let event = active.event_queue.pop_front();
+            if active.exit_status_reported
+                && active.descendants_cleaned_reported
+                && active.stdout_eof
+                && active.stderr_eof
+                && active.event_queue.is_empty()
+            {
+                release_cgroup = active.cgroup_dir.clone();
+            }
+            event
+        };
+        if release_cgroup.is_some() {
+            self.active = None;
+            remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref());
+        }
+        Ok(event)
     }
 
     fn cleanup_for_disconnect(
@@ -256,7 +292,9 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                 && active.stdout_eof
                 && active.stderr_eof
             {
+                let release_cgroup = active.cgroup_dir.clone();
                 self.active = None;
+                remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref());
                 return Ok(true);
             }
             std::thread::sleep(POLL_SLEEP);
@@ -269,7 +307,9 @@ impl ProcessSupervisor for LinuxProcessSupervisor {
                 && active.stdout_eof
                 && active.stderr_eof
             {
+                let release_cgroup = active.cgroup_dir.clone();
                 self.active = None;
+                remove_exec_cgroup(release_cgroup.as_deref(), self.holder.as_ref());
                 return Ok(true);
             }
             std::thread::sleep(POLL_SLEEP);
@@ -294,11 +334,8 @@ impl LinuxProcessSupervisor {
 impl NamespaceHolder {
     fn from_pid(holder_pid: libc::pid_t) -> Result<Self, ServiceError> {
         let cgroup_dir = PathBuf::from("/sys/fs/cgroup/nvx.workload");
-        let cgroup_procs_path = CString::new(format!("{}/cgroup.procs", cgroup_dir.display()))
-            .map_err(|_| supervisor_error("holder cgroup path contains interior NUL"))?;
         Ok(Self {
             cgroup_dir,
-            cgroup_procs_path,
             mount_ns_fd: open_namespace_fd(holder_pid, "mnt")?,
             uts_ns_fd: open_namespace_fd(holder_pid, "uts")?,
             ipc_ns_fd: open_namespace_fd(holder_pid, "ipc")?,
@@ -583,16 +620,205 @@ fn set_nonblocking(fd: i32) -> Result<(), ServiceError> {
 }
 
 fn try_prepare_workload_cgroup(exec_id: u32, pid: i32) -> Option<PathBuf> {
-    let root = PathBuf::from("/sys/fs/cgroup/nvx.workload");
-    let dir = root.join(format!("exec-{exec_id}-{pid}"));
-    if fs::create_dir_all(&dir).is_err() {
+    let root = Path::new("/sys/fs/cgroup/nvx.workload");
+    let prepared = prepare_exec_cgroup(root, exec_id)?;
+    if move_pid_to_exec_cgroup(&prepared.cgroup_procs_path, pid).is_err() {
+        remove_exec_cgroup(Some(prepared.cgroup_dir.as_path()), None);
         return None;
     }
-    let procs = dir.join("cgroup.procs");
-    if fs::write(&procs, format!("{pid}\n")).is_err() {
-        return None;
+    Some(prepared.cgroup_dir)
+}
+
+fn prepare_exec_cgroup(root: &Path, exec_id: u32) -> Option<PreparedExecCgroup> {
+    for attempt in 0..64_u32 {
+        let dir = root.join(format!("exec-{exec_id}-{}-{attempt}", std::process::id()));
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                let cgroup_procs_path =
+                    CString::new(format!("{}/cgroup.procs", dir.display())).ok()?;
+                return Some(PreparedExecCgroup {
+                    cgroup_dir: dir,
+                    cgroup_procs_path,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
     }
-    Some(dir)
+    None
+}
+
+fn move_pid_to_exec_cgroup(cgroup_procs_path: &CString, pid: i32) -> io::Result<()> {
+    // SAFETY: path pointer is NUL-terminated and flags are constants.
+    let fd = unsafe { libc::open(cgroup_procs_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let payload = pid.to_string();
+    // SAFETY: payload pointer is valid for payload bytes.
+    let write_pid = unsafe { libc::write(fd, payload.as_ptr().cast(), payload.len()) };
+    // SAFETY: "\n" literal has static lifetime and length 1.
+    let write_newline = unsafe { libc::write(fd, b"\n".as_ptr().cast(), 1) };
+    // SAFETY: best-effort close for opened descriptor.
+    let _ = unsafe { libc::close(fd) };
+    if write_pid < 0 || write_newline < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn remove_exec_cgroup(path: Option<&Path>, holder: Option<&NamespaceHolder>) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Some(holder) = holder
+        && path == holder.cgroup_dir.as_path()
+    {
+        return;
+    }
+    if let Some(root) = holder.as_ref().map(|value| value.cgroup_dir.as_path())
+        && !path.starts_with(root)
+    {
+        return;
+    }
+    let _ = fs::remove_dir(path);
+}
+
+fn prepare_child_credential_plan() -> io::Result<ChildCredentialPlan> {
+    let raw = fs::read_to_string("/proc/sys/kernel/cap_last_cap")?;
+    let last_capability_index = raw
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cap_last_cap"))?;
+    Ok(ChildCredentialPlan {
+        last_capability_index,
+    })
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxCapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxCapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+fn apply_workload_exec_credentials(plan: Option<ChildCredentialPlan>) -> io::Result<()> {
+    let Some(plan) = plan else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "child credential plan is missing",
+        ));
+    };
+    // SAFETY: setgroups called with zero groups and null pointer.
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: prctl ambient clear has no pointer arguments.
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut capability = 0_i32;
+    while capability <= plan.last_capability_index {
+        // SAFETY: prctl validates capability indexes.
+        let rc = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EPERM) {
+                return Err(error);
+            }
+            break;
+        }
+        capability += 1;
+    }
+    // SAFETY: setgid/setuid use fixed workload identity constants.
+    if unsafe { libc::setgid(WORKLOAD_GID_MXC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: setuid uses fixed workload identity constants.
+    if unsafe { libc::setuid(WORKLOAD_UID_MXC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let header = LinuxCapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [LinuxCapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: syscall receives valid pointers to initialized capability header/data.
+    if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: prctl no_new_privs has no pointer arguments.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    verify_no_capability_regain(plan)
+}
+
+fn verify_no_capability_regain(plan: ChildCredentialPlan) -> io::Result<()> {
+    let mut header = LinuxCapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [LinuxCapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: syscall receives valid pointers to writable header/data structures.
+    if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for entry in data {
+        if entry.effective != 0 || entry.permitted != 0 || entry.inheritable != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "capability set must be empty",
+            ));
+        }
+    }
+    let mut capability = 0_i32;
+    while capability <= plan.last_capability_index {
+        // SAFETY: prctl validates capability indexes and returns 0/1.
+        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
+        if present > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "bounding capability set must be empty",
+            ));
+        }
+        capability += 1;
+    }
+    let no_new_privs = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+    if no_new_privs != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "PR_SET_NO_NEW_PRIVS is not locked",
+        ));
+    }
+    Ok(())
 }
 
 fn would_block(error: &io::Error) -> bool {
@@ -617,6 +843,8 @@ fn supervisor_io(context: impl Into<String>, error: io::Error) -> ServiceError {
 mod tests {
     use super::*;
     use agent_protocol::CreateProcessRequest;
+    use std::fs;
+    use tempfile::tempdir;
 
     fn wait_for_event(
         supervisor: &mut LinuxProcessSupervisor,
@@ -695,6 +923,34 @@ mod tests {
     }
 
     #[test]
+    fn exec_cgroup_cleanup_skips_holder_and_removes_only_exec_children() {
+        let tmp = tempdir().expect("tempdir");
+        let holder_root = tmp.path().join("nvx.workload");
+        fs::create_dir_all(&holder_root).expect("holder root");
+        let exec_dir = holder_root.join("exec-44");
+        fs::create_dir_all(&exec_dir).expect("exec dir");
+        let holder = NamespaceHolder {
+            cgroup_dir: holder_root.clone(),
+            mount_ns_fd: -1,
+            uts_ns_fd: -1,
+            ipc_ns_fd: -1,
+            pid_ns_fd: -1,
+        };
+
+        remove_exec_cgroup(Some(holder_root.as_path()), Some(&holder));
+        assert!(
+            holder_root.exists(),
+            "holder membership cgroup must never be deleted by exec cleanup"
+        );
+
+        remove_exec_cgroup(Some(exec_dir.as_path()), Some(&holder));
+        assert!(
+            !exec_dir.exists(),
+            "exec cleanup must target only per-exec child cgroups"
+        );
+    }
+
+    #[test]
     #[ignore = "requires Linux root privileges and namespace/cgroup write access"]
     fn holder_namespace_execution_matches_holder_namespace_ids() {
         let mut supervisor = LinuxProcessSupervisor::new_with_holder(1).expect("holder");
@@ -711,5 +967,60 @@ mod tests {
                 timeout_ms: None,
             })
             .expect("spawn");
+    }
+
+    #[test]
+    #[ignore = "requires Linux root privileges and namespace/cgroup write access"]
+    fn holder_is_reused_across_two_sequential_execs() {
+        fn run_and_wait(supervisor: &mut LinuxProcessSupervisor, exec_id: u32) {
+            supervisor
+                .spawn(&CreateProcessRequest {
+                    exec_id,
+                    argv: vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        "exit 0".to_string(),
+                    ],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                })
+                .expect("spawn");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let _ = supervisor.poll(exec_id);
+                if supervisor.active.is_none() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("execution did not fully clean up before deadline");
+        }
+
+        let mut supervisor = LinuxProcessSupervisor::new_with_holder(1).expect("holder");
+        let holder_cgroup = supervisor
+            .holder
+            .as_ref()
+            .expect("holder present")
+            .cgroup_dir
+            .clone();
+        run_and_wait(&mut supervisor, 70);
+        assert!(
+            supervisor.holder.is_some(),
+            "holder must remain alive after first exec"
+        );
+        run_and_wait(&mut supervisor, 71);
+        assert!(
+            supervisor.holder.is_some(),
+            "holder must remain alive after second exec"
+        );
+        assert_eq!(
+            supervisor
+                .holder
+                .as_ref()
+                .expect("holder present")
+                .cgroup_dir,
+            holder_cgroup
+        );
     }
 }
