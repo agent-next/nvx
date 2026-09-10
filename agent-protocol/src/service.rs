@@ -182,6 +182,8 @@ impl From<StateError> for ServiceError {
 pub struct MxcControlService {
     binding: LaunchBinding,
     expected_capability: [u8; 32],
+    runtime_isolation_holder_pid: Option<i32>,
+    operation_slice: OperationSlice,
     configured: Option<SessionConfiguration>,
     protocol_state: AgentProtocolState,
     build_status: BuildStatus,
@@ -191,6 +193,12 @@ pub struct MxcControlService {
     quiesced: bool,
     shutting_down: bool,
     active_exec: Option<ActiveExecution>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationSlice {
+    Phase0Readiness,
+    FullLifecycle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -314,6 +322,38 @@ impl MxcControlService {
         )
     }
 
+    pub fn new_pid1_runtime(binding: LaunchBinding, isolation_holder_pid: i32) -> Self {
+        Self::new_pid1_runtime_with_status(
+            binding,
+            BuildStatus {
+                agent_version: "unknown".to_string(),
+                kernel_release: "unknown".to_string(),
+                profile: "mxc-prototype".to_string(),
+            },
+            NetworkStatus {
+                mode: crate::messages::NetworkMode::NoNic,
+                detail: None,
+            },
+            IsolationStatus {
+                pid_namespace: true,
+                mount_namespace: true,
+                uts_namespace: true,
+                ipc_namespace: true,
+                private_proc: true,
+                private_dev: true,
+                private_devpts: true,
+                private_shm: true,
+                read_only_sys: true,
+                capabilities_dropped: true,
+                no_new_privs: true,
+                cgroup_separation: true,
+                orphan_reaping: true,
+            },
+            WorkloadIdentityStatus::mxc_fixed(),
+            isolation_holder_pid,
+        )
+    }
+
     pub fn new_with_status(
         binding: LaunchBinding,
         build_status: BuildStatus,
@@ -324,6 +364,8 @@ impl MxcControlService {
         Self {
             expected_capability: fallback_expected_capability(binding.launch),
             binding,
+            runtime_isolation_holder_pid: None,
+            operation_slice: OperationSlice::Phase0Readiness,
             configured: None,
             protocol_state: AgentProtocolState::new(),
             build_status,
@@ -336,61 +378,95 @@ impl MxcControlService {
         }
     }
 
+    pub fn new_pid1_runtime_with_status(
+        binding: LaunchBinding,
+        build_status: BuildStatus,
+        network: NetworkStatus,
+        isolation_status: IsolationStatus,
+        workload_identity: WorkloadIdentityStatus,
+        isolation_holder_pid: i32,
+    ) -> Self {
+        let mut service = Self::new_with_status(
+            binding,
+            build_status,
+            network,
+            isolation_status,
+            workload_identity,
+        );
+        service.runtime_isolation_holder_pid = Some(isolation_holder_pid);
+        service
+    }
+
     pub fn get_capabilities(&self) -> MxcCapabilities {
+        let mut available_operations = vec![
+            "GetCapabilities".to_string(),
+            "AuthenticateChannel".to_string(),
+            "ConfigureSession".to_string(),
+            "WaitReady".to_string(),
+            "Health".to_string(),
+        ];
+        let unavailable_operations = self.phase0_unavailable_operations();
+        if self.operation_slice == OperationSlice::FullLifecycle {
+            available_operations.extend(
+                unavailable_operations
+                    .iter()
+                    .map(|entry| entry.operation.clone()),
+            );
+        }
         MxcCapabilities {
             protocol_version: self.binding.protocol_version,
             image_version: self.binding.image_version.clone(),
-            available_operations: vec![
-                "GetCapabilities".to_string(),
-                "AuthenticateChannel".to_string(),
-                "ConfigureSession".to_string(),
-                "WaitReady".to_string(),
-                "Health".to_string(),
-            ],
-            unavailable_operations: vec![
-                UnavailableOperation {
-                    operation: "Exec".to_string(),
-                    capability_flag: "exec.phase0".to_string(),
-                    reason:
-                        "phase-0 control slice exposes readiness only; exec lifecycle is disabled"
-                            .to_string(),
-                },
-                UnavailableOperation {
-                    operation: "Streams".to_string(),
-                    capability_flag: "streams.phase0".to_string(),
-                    reason: "phase-0 control slice does not expose process stream transport"
-                        .to_string(),
-                },
-                UnavailableOperation {
-                    operation: "Cancel".to_string(),
-                    capability_flag: "cancel.phase0".to_string(),
-                    reason: "phase-0 control slice does not allow execution cancellation"
-                        .to_string(),
-                },
-                UnavailableOperation {
-                    operation: "Quiesce".to_string(),
-                    capability_flag: "quiesce.phase0".to_string(),
-                    reason: "phase-0 control slice does not expose quiesce transitions".to_string(),
-                },
-                UnavailableOperation {
-                    operation: "DisconnectCleanup".to_string(),
-                    capability_flag: "disconnect_cleanup.phase0".to_string(),
-                    reason: "phase-0 control slice does not expose disconnect cleanup control"
-                        .to_string(),
-                },
-                UnavailableOperation {
-                    operation: "Resume".to_string(),
-                    capability_flag: "resume.phase0".to_string(),
-                    reason: "phase-0 control slice does not expose resume transitions".to_string(),
-                },
-                UnavailableOperation {
-                    operation: "Shutdown".to_string(),
-                    capability_flag: "shutdown.phase0".to_string(),
-                    reason: "phase-0 control slice does not expose in-band shutdown control"
-                        .to_string(),
-                },
-            ],
+            available_operations,
+            unavailable_operations: if self.operation_slice == OperationSlice::Phase0Readiness {
+                unavailable_operations
+            } else {
+                Vec::new()
+            },
         }
+    }
+
+    fn phase0_unavailable_operations(&self) -> Vec<UnavailableOperation> {
+        vec![
+            UnavailableOperation {
+                operation: "Exec".to_string(),
+                capability_flag: "exec.phase0".to_string(),
+                reason: "phase-0 control slice exposes readiness only; exec lifecycle is disabled"
+                    .to_string(),
+            },
+            UnavailableOperation {
+                operation: "Streams".to_string(),
+                capability_flag: "streams.phase0".to_string(),
+                reason: "phase-0 control slice does not expose process stream transport"
+                    .to_string(),
+            },
+            UnavailableOperation {
+                operation: "Cancel".to_string(),
+                capability_flag: "cancel.phase0".to_string(),
+                reason: "phase-0 control slice does not allow execution cancellation".to_string(),
+            },
+            UnavailableOperation {
+                operation: "Quiesce".to_string(),
+                capability_flag: "quiesce.phase0".to_string(),
+                reason: "phase-0 control slice does not expose quiesce transitions".to_string(),
+            },
+            UnavailableOperation {
+                operation: "DisconnectCleanup".to_string(),
+                capability_flag: "disconnect_cleanup.phase0".to_string(),
+                reason: "phase-0 control slice does not expose disconnect cleanup control"
+                    .to_string(),
+            },
+            UnavailableOperation {
+                operation: "Resume".to_string(),
+                capability_flag: "resume.phase0".to_string(),
+                reason: "phase-0 control slice does not expose resume transitions".to_string(),
+            },
+            UnavailableOperation {
+                operation: "Shutdown".to_string(),
+                capability_flag: "shutdown.phase0".to_string(),
+                reason: "phase-0 control slice does not expose in-band shutdown control"
+                    .to_string(),
+            },
+        ]
     }
 
     pub fn update_runtime_isolation(&mut self, isolation: IsolationStatus) {
@@ -570,6 +646,41 @@ impl MxcControlService {
         self.protocol_state.health().launch_admitted
     }
 
+    pub fn activate_full_lifecycle(&mut self) -> Result<(), ServiceError> {
+        if self.operation_slice == OperationSlice::FullLifecycle {
+            return Ok(());
+        }
+        let Some(holder_pid) = self.runtime_isolation_holder_pid else {
+            return Err(ServiceError::new(
+                ServiceErrorCode::UnsupportedOperation,
+                "full lifecycle activation is reserved for pid1 runtime service instances",
+            ));
+        };
+        if holder_pid <= 1 {
+            return Err(ServiceError::new(
+                ServiceErrorCode::LifecycleError,
+                format!(
+                    "invalid runtime isolation holder pid {}; verified holder process is required",
+                    holder_pid
+                ),
+            ));
+        }
+        if !self.authenticated || !self.launch_admitted() {
+            return Err(ServiceError::new(
+                ServiceErrorCode::ConfigurationRequired,
+                "authenticate_channel must complete before full lifecycle activation",
+            ));
+        }
+        if self.configured.is_none() {
+            return Err(ServiceError::new(
+                ServiceErrorCode::ConfigurationRequired,
+                "configure_session must complete before full lifecycle activation",
+            ));
+        }
+        self.operation_slice = OperationSlice::FullLifecycle;
+        Ok(())
+    }
+
     pub fn unsupported_operation(&self, operation: &str) -> Result<(), ServiceError> {
         Err(ServiceError::new(
             ServiceErrorCode::UnsupportedOperation,
@@ -582,6 +693,7 @@ impl MxcControlService {
         request: CreateProcessRequest,
         supervisor: &mut impl ProcessSupervisor,
     ) -> Result<(), ServiceError> {
+        self.require_supported_operation("Exec")?;
         self.require_configured()?;
         validate_create_process_request(&request)?;
         self.protocol_state.create_exec(request.exec_id)?;
@@ -600,6 +712,7 @@ impl MxcControlService {
     }
 
     pub fn grant_flow_credits(&mut self, request: FlowCreditRequest) -> Result<(), ServiceError> {
+        self.require_supported_operation("Streams")?;
         self.protocol_state.apply_exec_event(
             request.exec_id,
             ActiveExecEvent::AddFlowCredits {
@@ -615,6 +728,7 @@ impl MxcControlService {
         record: StdinChunkRecord,
         supervisor: &mut impl ProcessSupervisor,
     ) -> Result<(), ServiceError> {
+        self.require_supported_operation("Streams")?;
         let active = self.active_exec.as_mut().ok_or_else(|| {
             ServiceError::new(
                 ServiceErrorCode::LifecycleError,
@@ -672,6 +786,7 @@ impl MxcControlService {
         record: StdinEofRecord,
         supervisor: &mut impl ProcessSupervisor,
     ) -> Result<(), ServiceError> {
+        self.require_supported_operation("Streams")?;
         let active = self.active_exec.as_mut().ok_or_else(|| {
             ServiceError::new(
                 ServiceErrorCode::LifecycleError,
@@ -715,6 +830,7 @@ impl MxcControlService {
         reason: CancelReason,
         supervisor: &mut impl ProcessSupervisor,
     ) -> Result<(), ServiceError> {
+        self.require_supported_operation("Cancel")?;
         let active = self.active_exec.as_mut().ok_or_else(|| {
             ServiceError::new(
                 ServiceErrorCode::LifecycleError,
@@ -745,18 +861,21 @@ impl MxcControlService {
     }
 
     pub fn quiesce(&mut self) -> Result<AgentControlMessage, ServiceError> {
+        self.require_supported_operation("Quiesce")?;
         let message = self.protocol_state.quiesce()?;
         self.quiesced = true;
         Ok(message)
     }
 
     pub fn resume(&mut self) -> Result<AgentControlMessage, ServiceError> {
+        self.require_supported_operation("Resume")?;
         let message = self.protocol_state.resume()?;
         self.quiesced = false;
         Ok(message)
     }
 
     pub fn shutdown(&mut self) -> Result<AgentControlMessage, ServiceError> {
+        self.require_supported_operation("Shutdown")?;
         let message = self.protocol_state.graceful_shutdown()?;
         self.shutting_down = true;
         Ok(message)
@@ -848,6 +967,13 @@ impl MxcControlService {
                 ServiceErrorCode::ConfigurationRequired,
                 "configure_session must complete before process execution",
             ));
+        }
+        Ok(())
+    }
+
+    fn require_supported_operation(&self, operation: &str) -> Result<(), ServiceError> {
+        if self.operation_slice == OperationSlice::Phase0Readiness {
+            return self.unsupported_operation(operation);
         }
         Ok(())
     }
@@ -1678,6 +1804,84 @@ mod tests {
     }
 
     #[test]
+    fn phase0_rejects_unavailable_operations_without_side_effects() {
+        let mut service = authenticated_unconfigured_service();
+        service
+            .configure_session(ConfigureSessionRequest {
+                protocol_version: PROTOCOL_VERSION,
+                image_version: "img-v1".to_string(),
+                launch: launch(7),
+                channel_generation: 17,
+                idempotent_replay: false,
+                configuration: sample_configuration(),
+            })
+            .unwrap();
+
+        let baseline_health = service.health();
+        let baseline_active_exec = service.active_exec_id();
+        let mut supervisor = FakeSupervisor::default();
+        let baseline_supervisor = supervisor.clone();
+
+        let errors = [
+            service
+                .create_process(
+                    CreateProcessRequest {
+                        exec_id: 41,
+                        argv: vec!["/bin/echo".to_string(), "ok".to_string()],
+                        cwd: Some("/".to_string()),
+                        env: vec![],
+                        timeout_ms: None,
+                    },
+                    &mut supervisor,
+                )
+                .unwrap_err(),
+            service
+                .stdin_chunk(
+                    StdinChunkRecord {
+                        exec_id: 41,
+                        sequence: 0,
+                        chunk: b"input".to_vec(),
+                    },
+                    &mut supervisor,
+                )
+                .unwrap_err(),
+            service
+                .stdin_eof(
+                    StdinEofRecord {
+                        exec_id: 41,
+                        sequence: 1,
+                    },
+                    &mut supervisor,
+                )
+                .unwrap_err(),
+            service
+                .cancel_exec(41, CancelReason::Cancelled, &mut supervisor)
+                .unwrap_err(),
+            service
+                .grant_flow_credits(FlowCreditRequest {
+                    exec_id: 41,
+                    stream: StreamName::Stdout,
+                    credits: 1,
+                })
+                .unwrap_err(),
+            service.quiesce().unwrap_err(),
+            service.resume().unwrap_err(),
+            service.shutdown().unwrap_err(),
+            service
+                .unsupported_operation("DisconnectCleanup")
+                .unwrap_err(),
+        ];
+
+        for error in errors {
+            assert_eq!(error.code, ServiceErrorCode::UnsupportedOperation);
+        }
+
+        assert_eq!(service.active_exec_id(), baseline_active_exec);
+        assert_eq!(service.health(), baseline_health);
+        assert_eq!(supervisor, baseline_supervisor);
+    }
+
+    #[test]
     fn wait_ready_is_level_triggered_once_configuration_is_applied() {
         let mut service = authenticated_unconfigured_service();
         service
@@ -1908,7 +2112,7 @@ mod tests {
         );
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
     struct FakeSupervisor {
         events: VecDeque<SupervisorEvent>,
         spawned: Vec<CreateProcessRequest>,
@@ -1995,7 +2199,7 @@ mod tests {
     }
 
     fn authenticated_service() -> MxcControlService {
-        let mut service = MxcControlService::new(sample_binding());
+        let mut service = MxcControlService::new_pid1_runtime(sample_binding(), 4242);
         let ready = service
             .authenticate_channel(
                 AuthenticateChannelRequest {
@@ -2023,7 +2227,105 @@ mod tests {
                 configuration: sample_configuration(),
             })
             .unwrap();
+        service.activate_full_lifecycle().unwrap();
         service
+    }
+
+    #[test]
+    fn full_lifecycle_activation_requires_runtime_constructor_auth_and_config() {
+        let mut phase0_service = MxcControlService::new(sample_binding());
+        let unsupported = phase0_service.activate_full_lifecycle().unwrap_err();
+        assert_eq!(unsupported.code, ServiceErrorCode::UnsupportedOperation);
+
+        let mut runtime_service = MxcControlService::new_pid1_runtime(sample_binding(), 4242);
+        let before_auth = runtime_service.activate_full_lifecycle().unwrap_err();
+        assert_eq!(before_auth.code, ServiceErrorCode::ConfigurationRequired);
+
+        runtime_service
+            .authenticate_channel(
+                AuthenticateChannelRequest {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    launch: launch(7),
+                    channel_generation: 17,
+                    capability_proof: [7; 32],
+                },
+                1,
+                NetworkStatus {
+                    mode: NetworkMode::NoNic,
+                    detail: None,
+                },
+            )
+            .unwrap();
+        let before_config = runtime_service.activate_full_lifecycle().unwrap_err();
+        assert_eq!(before_config.code, ServiceErrorCode::ConfigurationRequired);
+
+        runtime_service
+            .configure_session(ConfigureSessionRequest {
+                protocol_version: PROTOCOL_VERSION,
+                image_version: "img-v1".to_string(),
+                launch: launch(7),
+                channel_generation: 17,
+                idempotent_replay: false,
+                configuration: sample_configuration(),
+            })
+            .unwrap();
+        runtime_service.activate_full_lifecycle().unwrap();
+
+        let capabilities = runtime_service.get_capabilities();
+        assert!(capabilities.unavailable_operations.is_empty());
+        assert!(
+            capabilities
+                .available_operations
+                .iter()
+                .any(|operation| operation == "Exec")
+        );
+        assert!(
+            capabilities
+                .available_operations
+                .iter()
+                .any(|operation| operation == "Streams")
+        );
+        assert!(
+            capabilities
+                .available_operations
+                .iter()
+                .any(|operation| operation == "Cancel")
+        );
+    }
+
+    #[test]
+    fn full_lifecycle_activation_requires_valid_isolation_holder_pid() {
+        let mut runtime_service = MxcControlService::new_pid1_runtime(sample_binding(), 1);
+        runtime_service
+            .authenticate_channel(
+                AuthenticateChannelRequest {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    launch: launch(7),
+                    channel_generation: 17,
+                    capability_proof: [7; 32],
+                },
+                1,
+                NetworkStatus {
+                    mode: NetworkMode::NoNic,
+                    detail: None,
+                },
+            )
+            .unwrap();
+        runtime_service
+            .configure_session(ConfigureSessionRequest {
+                protocol_version: PROTOCOL_VERSION,
+                image_version: "img-v1".to_string(),
+                launch: launch(7),
+                channel_generation: 17,
+                idempotent_replay: false,
+                configuration: sample_configuration(),
+            })
+            .unwrap();
+
+        let error = runtime_service.activate_full_lifecycle().unwrap_err();
+        assert_eq!(error.code, ServiceErrorCode::LifecycleError);
     }
 
     fn drain_supervisor_messages(
@@ -2048,6 +2350,70 @@ mod tests {
             supervisor.stdin_pending_bytes = supervisor.stdin_pending_bytes.saturating_sub(len);
             supervisor.stdin_drained_bytes = supervisor.stdin_drained_bytes.saturating_add(len);
         }
+    }
+
+    #[test]
+    fn post_activation_runtime_operations_are_supported() {
+        let mut service = authenticated_service();
+        let mut supervisor = FakeSupervisor {
+            cleanup_ok: true,
+            ..FakeSupervisor::default()
+        };
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 91,
+                    argv: vec!["/bin/cat".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 91,
+                stream: StreamName::Stdin,
+                credits: 1,
+            })
+            .unwrap();
+        service
+            .grant_flow_credits(FlowCreditRequest {
+                exec_id: 91,
+                stream: StreamName::Stdout,
+                credits: 1,
+            })
+            .unwrap();
+        service
+            .stdin_chunk(
+                StdinChunkRecord {
+                    exec_id: 91,
+                    sequence: 0,
+                    chunk: b"hello".to_vec(),
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        drain_fake_stdin(&mut supervisor);
+        service
+            .stdin_eof(
+                StdinEofRecord {
+                    exec_id: 91,
+                    sequence: 1,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        service
+            .cancel_exec(91, CancelReason::Cancelled, &mut supervisor)
+            .unwrap();
+        service
+            .begin_disconnect_cleanup(8, &mut supervisor)
+            .unwrap();
+
+        assert_eq!(service.active_exec_id(), None);
+        assert!(!service.health().configured);
     }
 
     #[test]

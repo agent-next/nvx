@@ -41,12 +41,13 @@ pub fn run_runtime() -> Result<()> {
     let build = detect_build_status();
     let network = detect_network_status();
     let isolation_result = apply_and_verify_workload_isolation(&default_isolation_plan())?;
-    let mut service = MxcControlService::new_with_status(
+    let mut service = MxcControlService::new_pid1_runtime_with_status(
         binding.clone(),
         build,
         network.clone(),
         isolation_result.status,
         WorkloadIdentityStatus::mxc_fixed(),
+        isolation_result.holder_pid,
     );
     service.set_expected_capability(launch_config.expected_capability);
     let mut supervisor = LinuxProcessSupervisor::new_with_holder(isolation_result.holder_pid)
@@ -257,6 +258,9 @@ fn handle_host_message(
                     idempotent_replay: false,
                     configuration,
                 })
+                .map_err(|error| AgentError::bad_request(error.to_string()))?;
+            service
+                .activate_full_lifecycle()
                 .map_err(|error| AgentError::bad_request(error.to_string()))?;
             let _ = service.wait_ready(WaitReadyRequest {
                 protocol_version: binding.protocol_version,
@@ -943,7 +947,7 @@ mod tests {
             launch,
             channel_generation: 17,
         };
-        let mut service = MxcControlService::new(binding);
+        let mut service = MxcControlService::new_pid1_runtime(binding, 4242);
         service
             .authenticate_channel(
                 AuthenticateChannelRequest {
@@ -1010,6 +1014,7 @@ mod tests {
                 &mut supervisor,
             )
             .unwrap();
+        service.activate_full_lifecycle().unwrap();
         service
             .grant_flow_credits(FlowCreditRequest {
                 exec_id: 65,
