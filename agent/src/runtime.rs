@@ -672,6 +672,9 @@ fn quiesce_transactional(
         Ok(message) => Ok(message),
         Err(error) => {
             if let Err(rollback_error) = set_frozen(false) {
+                if rollback_error.requires_fail_closed_action() {
+                    return Err(rollback_error);
+                }
                 return Err(AgentError::quiesce(format!(
                     "quiesce lifecycle commit failed after freezing ({error}); rollback thaw failed: {rollback_error}"
                 )));
@@ -696,6 +699,9 @@ fn resume_transactional(
         Ok(message) => Ok(message),
         Err(error) => {
             if let Err(rollback_error) = set_frozen(true) {
+                if rollback_error.requires_fail_closed_action() {
+                    return Err(rollback_error);
+                }
                 return Err(AgentError::quiesce(format!(
                     "resume lifecycle commit failed after thawing ({error}); rollback freeze failed: {rollback_error}"
                 )));
@@ -1319,6 +1325,72 @@ mod tests {
         .unwrap();
         assert!(matches!(message, AgentControlMessage::Resumed));
         assert!(!service.health().quiesced);
+    }
+
+    #[test]
+    fn quiesce_commit_failure_preserves_fail_closed_rollback_error() {
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+        let mut supervisor = RuntimeTestSupervisor::default();
+        service
+            .create_process(
+                CreateProcessRequest {
+                    exec_id: 9,
+                    argv: vec!["/bin/sleep".to_string(), "1".to_string()],
+                    cwd: Some("/".to_string()),
+                    env: vec![],
+                    timeout_ms: None,
+                },
+                &mut supervisor,
+            )
+            .unwrap();
+        assert_eq!(service.active_exec_id(), Some(9));
+
+        let mut transitions = Vec::new();
+        let error = quiesce_transactional(&mut service, |freeze| {
+            transitions.push(freeze);
+            if !freeze {
+                return Err(AgentError::fail_closed(
+                    "injected quiesce rollback uncertainty",
+                ));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(transitions, vec![true, false]);
+        assert!(error.requires_fail_closed_action());
+        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
+        assert_eq!(error.to_string(), "injected quiesce rollback uncertainty");
+        assert!(!service.health().quiesced);
+        assert_eq!(service.active_exec_id(), Some(9));
+    }
+
+    #[test]
+    fn resume_commit_failure_preserves_fail_closed_rollback_error() {
+        let mut service = runtime_test_service();
+        service.activate_full_lifecycle().unwrap();
+        quiesce_transactional(&mut service, |_| Ok(())).unwrap();
+        service.shutdown().unwrap();
+        assert!(service.health().quiesced);
+
+        let mut transitions = Vec::new();
+        let error = resume_transactional(&mut service, |freeze| {
+            transitions.push(freeze);
+            if freeze {
+                return Err(AgentError::fail_closed(
+                    "injected resume rollback uncertainty",
+                ));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(transitions, vec![false, true]);
+        assert!(error.requires_fail_closed_action());
+        assert_eq!(error.code(), crate::error::ErrorCode::FailClosed);
+        assert_eq!(error.to_string(), "injected resume rollback uncertainty");
+        assert!(service.health().quiesced);
     }
 
     #[test]
