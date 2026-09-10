@@ -211,6 +211,7 @@ impl From<StateError> for ServiceError {
 pub struct MxcControlService {
     binding: LaunchBinding,
     expected_capability: [u8; 32],
+    expected_capability_overridden: bool,
     runtime_isolation_holder_pid: Option<i32>,
     operation_slice: OperationSlice,
     configured: Option<SessionConfiguration>,
@@ -410,6 +411,7 @@ impl MxcControlService {
     ) -> Self {
         Self {
             expected_capability: fallback_expected_capability(binding.launch),
+            expected_capability_overridden: false,
             binding,
             runtime_isolation_holder_pid: None,
             operation_slice: OperationSlice::Phase0Readiness,
@@ -531,6 +533,7 @@ impl MxcControlService {
 
     pub fn set_expected_capability(&mut self, capability: [u8; 32]) {
         self.expected_capability = capability;
+        self.expected_capability_overridden = true;
     }
 
     pub fn ready_status(&self, network: NetworkStatus) -> ReadyStatus {
@@ -566,7 +569,12 @@ impl MxcControlService {
                 ),
             ));
         }
-        if !constant_time_eq32(&request.capability_proof, &self.expected_capability) {
+        let expected_capability = if self.expected_capability_overridden {
+            self.expected_capability
+        } else {
+            fallback_expected_capability(request.launch)
+        };
+        if !constant_time_eq32(&request.capability_proof, &expected_capability) {
             return Err(ServiceError::new(
                 ServiceErrorCode::AuthenticationFailed,
                 "capability proof did not match trusted launch capability",
@@ -3704,7 +3712,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 launch: launch(8),
                 channel_generation: 17,
-                capability_proof: [7; 32],
+                capability_proof: [8; 32],
             },
             40,
             no_nic_network_status(),

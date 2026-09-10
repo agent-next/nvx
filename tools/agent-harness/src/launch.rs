@@ -10,11 +10,11 @@ use std::ffi::c_void;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 #[cfg(windows)]
-use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
-};
+use windows::Win32::Foundation::DUPLICATE_SAME_ACCESS;
 #[cfg(windows)]
-use windows::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(all(windows, test))]
+use windows::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::WriteFile;
 #[cfg(windows)]
@@ -27,9 +27,10 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Pipes::CreatePipe;
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
+    CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, INFINITE, InitializeProcThreadAttributeList,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, WaitForSingleObject,
 };
 #[cfg(windows)]
 use windows::core::{PCWSTR, PWSTR};
@@ -223,11 +224,7 @@ pub fn build_launch_plan(output_dir: &Path, artifacts: LaunchArtifacts) -> Launc
 }
 
 pub fn launch_whp_vm(plan: LaunchPlan) -> Result<LaunchedVm, String> {
-    let capability_hex = hex_encode(&plan.launch_capability);
-    let cmdline = format!(
-        "nvx.launch_capability={capability_hex} nvx.channel_generation={}",
-        plan.channel_generation
-    );
+    let cmdline = format!("nvx.channel_generation={}", plan.channel_generation);
     let args = vec![
         "--single-process".to_string(),
         "--machine".to_string(),
@@ -302,6 +299,92 @@ struct InheritedAuthPipe {
 }
 
 #[cfg(windows)]
+struct InheritedStdIoHandles {
+    stdin: HANDLE,
+    stdout: HANDLE,
+    stderr: HANDLE,
+}
+
+#[cfg(windows)]
+struct LaunchFailureGuard {
+    process: Option<OwnedHandle>,
+    thread: Option<OwnedHandle>,
+    job: Option<OwnedHandle>,
+    auth_pipe: Option<InheritedAuthPipe>,
+}
+
+#[cfg(windows)]
+impl LaunchFailureGuard {
+    fn new(process: OwnedHandle, thread: OwnedHandle, auth_pipe: InheritedAuthPipe) -> Self {
+        Self {
+            process: Some(process),
+            thread: Some(thread),
+            job: None,
+            auth_pipe: Some(auth_pipe),
+        }
+    }
+
+    fn process_handle(&self) -> Result<HANDLE, String> {
+        let Some(process) = self.process.as_ref() else {
+            return Err("launch failure guard lost process handle".to_string());
+        };
+        Ok(HANDLE(process.as_raw_handle()))
+    }
+
+    fn set_job(&mut self, job: OwnedHandle) {
+        self.job = Some(job);
+    }
+
+    fn auth_pipe_mut(&mut self) -> Result<&mut InheritedAuthPipe, String> {
+        self.auth_pipe
+            .as_mut()
+            .ok_or_else(|| "launch failure guard lost auth pipe".to_string())
+    }
+
+    fn process_id(&self) -> Result<u32, String> {
+        let process = self.process_handle()?;
+        Ok(unsafe { windows::Win32::System::Threading::GetProcessId(process) })
+    }
+
+    fn take_success(mut self) -> Result<(OwnedHandle, OwnedHandle, u32), String> {
+        let process = self
+            .process
+            .take()
+            .ok_or_else(|| "launch success missing process handle".to_string())?;
+        let job = self
+            .job
+            .take()
+            .ok_or_else(|| "launch success missing kill-on-close job".to_string())?;
+        let pid = self.process_id()?;
+        self.thread.take();
+        if let Some(mut pipe) = self.auth_pipe.take() {
+            let _ = close_handle_if_valid(&mut pipe.read);
+            let _ = close_handle_if_valid(&mut pipe.write);
+        }
+        Ok((process, job, pid))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LaunchFailureGuard {
+    fn drop(&mut self) {
+        if let Some(mut pipe) = self.auth_pipe.take() {
+            let _ = close_handle_if_valid(&mut pipe.read);
+            let _ = close_handle_if_valid(&mut pipe.write);
+        }
+        if let Some(job) = self.job.take() {
+            drop(job);
+        } else if let Some(process) = self.process.as_ref() {
+            let process_handle = HANDLE(process.as_raw_handle());
+            let _ = unsafe { TerminateProcess(process_handle, 1) };
+        }
+        if let Some(process) = self.process.as_ref() {
+            let _ = unsafe { WaitForSingleObject(HANDLE(process.as_raw_handle()), 5_000) };
+        }
+    }
+}
+
+#[cfg(windows)]
 struct ProcThreadAttributeList {
     storage: Vec<u8>,
 }
@@ -371,9 +454,7 @@ impl Drop for ProcThreadAttributeList {
 #[cfg(windows)]
 fn launch_whp_vm_windows(plan: LaunchPlan, mut args: Vec<String>) -> Result<LaunchedVm, String> {
     validate_openvmm_image_path(&plan.artifacts.openvmm_exe)?;
-    let mut auth_pipe = create_inherited_auth_pipe()?;
-    args.insert(args.len() - 2, "--microvm-control-auth-handle".to_string());
-    args.insert(args.len() - 2, format!("{}", auth_pipe.read.0 as usize));
+    let auth_pipe = create_auth_pipe()?;
 
     let stdout_log = OpenOptions::new()
         .create(true)
@@ -393,13 +474,22 @@ fn launch_whp_vm_windows(plan: LaunchPlan, mut args: Vec<String>) -> Result<Laun
         .read(true)
         .open("NUL")
         .map_err(|error| format!("failed to open NUL for OpenVMM stdin: {error}"))?;
+    let mut inherited_stdio =
+        duplicate_inheritable_stdio_handles(&stdin_null, &stdout_log, &stderr_log)?;
+    let mut inherited_auth_read = duplicate_inheritable_handle(auth_pipe.read)?;
+    args.insert(args.len() - 2, "--microvm-control-auth-handle".to_string());
+    args.insert(
+        args.len() - 2,
+        format!("{}", inherited_auth_read.0 as usize),
+    );
 
     let stdio_handles = vec![
-        stdin_null.as_raw_handle() as usize,
-        stdout_log.as_raw_handle() as usize,
-        stderr_log.as_raw_handle() as usize,
+        inherited_stdio.stdin.0 as usize,
+        inherited_stdio.stdout.0 as usize,
+        inherited_stdio.stderr.0 as usize,
     ];
-    let allowlist_usize = startupinfoex_handle_allowlist(auth_pipe.read.0 as usize, &stdio_handles);
+    let allowlist_usize =
+        startupinfoex_handle_allowlist(inherited_auth_read.0 as usize, &stdio_handles);
     let allowlist: Vec<HANDLE> = allowlist_usize
         .iter()
         .map(|value| HANDLE(*value as *mut c_void))
@@ -409,9 +499,9 @@ fn launch_whp_vm_windows(plan: LaunchPlan, mut args: Vec<String>) -> Result<Laun
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = core::mem::size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = HANDLE(stdin_null.as_raw_handle());
-    startup.StartupInfo.hStdOutput = HANDLE(stdout_log.as_raw_handle());
-    startup.StartupInfo.hStdError = HANDLE(stderr_log.as_raw_handle());
+    startup.StartupInfo.hStdInput = inherited_stdio.stdin;
+    startup.StartupInfo.hStdOutput = inherited_stdio.stdout;
+    startup.StartupInfo.hStdError = inherited_stdio.stderr;
     startup.lpAttributeList = attr_list.as_mut_ptr();
 
     let mut process_info = PROCESS_INFORMATION::default();
@@ -425,30 +515,40 @@ fn launch_whp_vm_windows(plan: LaunchPlan, mut args: Vec<String>) -> Result<Laun
             None,
             None,
             true,
-            PROCESS_CREATION_FLAGS(EXTENDED_STARTUPINFO_PRESENT.0),
+            PROCESS_CREATION_FLAGS(EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_SUSPENDED.0),
             None,
             None,
             &startup.StartupInfo,
             &mut process_info,
         )
     };
+    let _ = close_handle_if_valid(&mut inherited_auth_read);
+    let _ = close_handle_if_valid(&mut inherited_stdio.stdin);
+    let _ = close_handle_if_valid(&mut inherited_stdio.stdout);
+    let _ = close_handle_if_valid(&mut inherited_stdio.stderr);
     if let Err(error) = created {
-        let _ = close_handle_if_valid(&mut auth_pipe.read);
-        let _ = close_handle_if_valid(&mut auth_pipe.write);
         return Err(format!("CreateProcessW failed for OpenVMM: {error}"));
     }
-    // SAFETY: thread handle is returned by CreateProcessW and is no longer needed.
-    let _ = unsafe { CloseHandle(process_info.hThread) };
-
-    write_auth_capability_and_close(&mut auth_pipe, &plan.launch_capability)?;
-    let job_handle = create_kill_on_close_job(process_info.hProcess)?;
     let process_handle = owned_from_handle(process_info.hProcess)?;
+    let thread_handle = owned_from_handle(process_info.hThread)?;
+    let mut failure_guard = LaunchFailureGuard::new(process_handle, thread_handle, auth_pipe);
+
+    failpoint(Failpoint::JobCreate)?;
+    let job_handle = create_kill_on_close_job(failure_guard.process_handle()?)?;
+    failure_guard.set_job(job_handle);
+
+    failpoint(Failpoint::CapabilityWrite)?;
+    write_auth_capability_and_close(failure_guard.auth_pipe_mut()?, &plan.launch_capability)?;
+
+    failpoint(Failpoint::ResumeThread)?;
+    resume_thread(failure_guard.thread.as_ref().expect("thread present"))?;
+    let (process_handle, job_handle, pid) = failure_guard.take_success()?;
 
     Ok(LaunchedVm {
         plan,
         process_handle,
         job_handle: Some(job_handle),
-        pid: process_info.dwProcessId,
+        pid,
     })
 }
 
@@ -467,28 +567,49 @@ fn validate_openvmm_image_path(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn create_inherited_auth_pipe() -> Result<InheritedAuthPipe, String> {
+fn create_auth_pipe() -> Result<InheritedAuthPipe, String> {
     let mut read = HANDLE::default();
     let mut write = HANDLE::default();
-    let security = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: std::ptr::null_mut::<SECURITY_DESCRIPTOR>() as *mut _,
-        bInheritHandle: true.into(),
-    };
-    // SAFETY: read/write pointers and SECURITY_ATTRIBUTES are valid for CreatePipe.
-    let ok = unsafe { CreatePipe(&mut read, &mut write, Some(&security), 0) };
+    // SAFETY: read/write pointers are valid for CreatePipe.
+    let ok = unsafe { CreatePipe(&mut read, &mut write, None, 0) };
     if ok.is_err() {
         return Err("CreatePipe for OpenVMM auth handle failed".to_string());
     }
-    // SAFETY: write handle is valid and owned by this process.
-    let non_inherit_write =
-        unsafe { SetHandleInformation(write, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) };
-    if non_inherit_write.is_err() {
-        let _ = close_handle_if_valid(&mut read);
-        let _ = close_handle_if_valid(&mut write);
-        return Err("failed to clear inheritance on auth pipe write handle".to_string());
-    }
     Ok(InheritedAuthPipe { read, write })
+}
+
+#[cfg(windows)]
+fn duplicate_inheritable_stdio_handles(
+    stdin_null: &std::fs::File,
+    stdout_log: &std::fs::File,
+    stderr_log: &std::fs::File,
+) -> Result<InheritedStdIoHandles, String> {
+    Ok(InheritedStdIoHandles {
+        stdin: duplicate_inheritable_handle(HANDLE(stdin_null.as_raw_handle()))?,
+        stdout: duplicate_inheritable_handle(HANDLE(stdout_log.as_raw_handle()))?,
+        stderr: duplicate_inheritable_handle(HANDLE(stderr_log.as_raw_handle()))?,
+    })
+}
+
+#[cfg(windows)]
+fn duplicate_inheritable_handle(source: HANDLE) -> Result<HANDLE, String> {
+    let current = unsafe { GetCurrentProcess() };
+    let mut duplicated = HANDLE::default();
+    let duplicated_ok = unsafe {
+        windows::Win32::Foundation::DuplicateHandle(
+            current,
+            source,
+            current,
+            &mut duplicated,
+            0,
+            true,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if duplicated_ok.is_err() {
+        return Err("DuplicateHandle failed while creating inheritable launch handle".to_string());
+    }
+    Ok(duplicated)
 }
 
 #[cfg(windows)]
@@ -506,9 +627,11 @@ fn write_auth_capability_and_close(
             None,
         )
     };
+    let close_injected_error = failpoint(Failpoint::CapabilityPipeClose).err();
     let read_close = close_handle_if_valid(&mut pipe.read);
     let write_close = close_handle_if_valid(&mut pipe.write);
-    if write_result.is_err()
+    if close_injected_error.is_some()
+        || write_result.is_err()
         || bytes_written != capability.len() as u32
         || read_close.is_err()
         || write_close.is_err()
@@ -520,15 +643,6 @@ fn write_auth_capability_and_close(
 
 fn os_arg(path: &Path) -> String {
     path.as_os_str().to_string_lossy().into_owned()
-}
-
-fn hex_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len() * 2);
-    for byte in data {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
 }
 
 #[cfg(not(windows))]
@@ -579,6 +693,7 @@ fn create_kill_on_close_job(process: HANDLE) -> Result<OwnedHandle, String> {
         let _ = unsafe { CloseHandle(job) };
         return Err("SetInformationJobObject(KILL_ON_JOB_CLOSE) failed".to_string());
     }
+    failpoint(Failpoint::JobAssign)?;
     // SAFETY: job and process handles are valid and owned by this process.
     let assigned = unsafe { AssignProcessToJobObject(job, process) };
     if assigned.is_err() {
@@ -608,6 +723,69 @@ fn owned_from_handle(raw: HANDLE) -> Result<OwnedHandle, String> {
     }
     // SAFETY: raw comes from a successful Win32 handle-creation call and is uniquely owned.
     Ok(unsafe { OwnedHandle::from_raw_handle(raw.0) })
+}
+
+#[cfg(windows)]
+fn resume_thread(thread: &OwnedHandle) -> Result<(), String> {
+    let thread_handle = HANDLE(thread.as_raw_handle());
+    let resumed = unsafe { ResumeThread(thread_handle) };
+    if resumed == u32::MAX {
+        return Err("ResumeThread failed for OpenVMM process".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Failpoint {
+    JobCreate,
+    JobAssign,
+    CapabilityWrite,
+    CapabilityPipeClose,
+    ResumeThread,
+}
+
+#[cfg(windows)]
+fn failpoint(kind: Failpoint) -> Result<(), String> {
+    let _ = kind;
+    #[cfg(test)]
+    {
+        if launch_failpoint::should_fail(kind) {
+            return Err(format!("injected launch failure at {kind:?}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, test))]
+mod launch_failpoint {
+    use super::Failpoint;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static FAILPOINT: AtomicU8 = AtomicU8::new(0);
+
+    pub fn set(kind: Option<Failpoint>) {
+        let id = match kind {
+            Some(Failpoint::JobCreate) => 1,
+            Some(Failpoint::JobAssign) => 2,
+            Some(Failpoint::CapabilityWrite) => 3,
+            Some(Failpoint::CapabilityPipeClose) => 4,
+            Some(Failpoint::ResumeThread) => 5,
+            None => 0,
+        };
+        FAILPOINT.store(id, Ordering::SeqCst);
+    }
+
+    pub fn should_fail(kind: Failpoint) -> bool {
+        let want = match kind {
+            Failpoint::JobCreate => 1,
+            Failpoint::JobAssign => 2,
+            Failpoint::CapabilityWrite => 3,
+            Failpoint::CapabilityPipeClose => 4,
+            Failpoint::ResumeThread => 5,
+        };
+        FAILPOINT.load(Ordering::SeqCst) == want
+    }
 }
 
 #[cfg(windows)]
@@ -691,5 +869,110 @@ mod tests {
     fn startupinfoex_allowlist_contains_only_capability_read_handle() {
         let handles = startupinfoex_handle_allowlist(77, &[]);
         assert_eq!(handles, vec![77]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startupinfoex_allowlist_is_exact_sorted_and_deduped() {
+        let handles = startupinfoex_handle_allowlist(55, &[99, 55, 42, 99]);
+        assert_eq!(handles, vec![42, 55, 99]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn duplicated_stdio_handles_are_inheritable() {
+        let log_path = std::env::temp_dir().join(format!(
+            "agent-harness-dup-{}-{}.log",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let stdout_log = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&log_path)
+            .expect("stdout log");
+        let stderr_log = stdout_log.try_clone().expect("stderr log");
+        let stdin_null = OpenOptions::new().read(true).open("NUL").expect("stdin");
+        let mut duplicates =
+            duplicate_inheritable_stdio_handles(&stdin_null, &stdout_log, &stderr_log)
+                .expect("duplicate inheritable stdio handles");
+        assert!(handle_is_inheritable(duplicates.stdin));
+        assert!(handle_is_inheritable(duplicates.stdout));
+        assert!(handle_is_inheritable(duplicates.stderr));
+        let _ = close_handle_if_valid(&mut duplicates.stdin);
+        let _ = close_handle_if_valid(&mut duplicates.stdout);
+        let _ = close_handle_if_valid(&mut duplicates.stderr);
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[cfg(windows)]
+    fn handle_is_inheritable(handle: HANDLE) -> bool {
+        let mut flags = 0_u32;
+        let ok = unsafe { GetHandleInformation(handle, &mut flags) };
+        ok.is_ok() && (flags & HANDLE_FLAG_INHERIT.0) != 0
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_failpoint_injects_job_create_failure() {
+        launch_failpoint::set(Some(Failpoint::JobCreate));
+        let result = failpoint(Failpoint::JobCreate);
+        launch_failpoint::set(None);
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_failpoint_injects_capability_pipe_close_failure() {
+        launch_failpoint::set(Some(Failpoint::CapabilityPipeClose));
+        let result = failpoint(Failpoint::CapabilityPipeClose);
+        launch_failpoint::set(None);
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_failpoint_injects_job_assign_failure() {
+        launch_failpoint::set(Some(Failpoint::JobAssign));
+        let result = failpoint(Failpoint::JobAssign);
+        launch_failpoint::set(None);
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_failpoint_injects_resume_failure() {
+        launch_failpoint::set(Some(Failpoint::ResumeThread));
+        let result = failpoint(Failpoint::ResumeThread);
+        launch_failpoint::set(None);
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capability_pipe_write_close_failpoint_closes_handles() {
+        let mut pipe = create_auth_pipe().expect("auth pipe");
+        launch_failpoint::set(Some(Failpoint::CapabilityPipeClose));
+        let result = write_auth_capability_and_close(&mut pipe, &[0xAB; 32]);
+        launch_failpoint::set(None);
+        assert!(result.is_err());
+        assert!(pipe.read.0.is_null());
+        assert!(pipe.write.0.is_null());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capability_pipe_write_failpoint_is_reported() {
+        let mut pipe = create_auth_pipe().expect("auth pipe");
+        launch_failpoint::set(Some(Failpoint::CapabilityWrite));
+        let result = failpoint(Failpoint::CapabilityWrite);
+        launch_failpoint::set(None);
+        assert!(result.is_err());
+        let _ = close_handle_if_valid(&mut pipe.read);
+        let _ = close_handle_if_valid(&mut pipe.write);
     }
 }

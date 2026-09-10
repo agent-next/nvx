@@ -12,10 +12,12 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   version 1, fixed 44-byte little-endian header, record types 1..8). The guest
   control leg sends `GuestAttach`, waits for `Reset`, acknowledges exactly
   after `Reset`, then carries inner MXC records through outer `Data`.
-- Launch authentication now validates a trusted 32-byte capability loaded once
-  from an out-of-band boot configuration key (`nvx.launch_capability` /
-  `nvx_launch_capability`) with strict single-key parsing and exact 64-hex
-  decoding. The expected capability is never derived from host requests.
+- Broker launch capability is no longer present on kernel/OpenVMM command
+  lines. It exists only in host harness memory, the inherited anonymous auth
+  pipe, and the outer `HostAttach` payload handled by the broker.
+- Guest launch identity is bound through inner `HostHello` / `Configure` /
+  `WaitReady` (`generation` + random `nonce`) rather than any broker capability
+  value.
 - Capability comparison is constant-time. Successful authentication binds the
   admitted generation+nonce to the authenticated session, and stale/same
   generations remain rejected across reconnect cleanup boundaries.
@@ -116,21 +118,21 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
 - OpenVMM outer-frame accounting now uses the exact frozen header size
   (`OPENVMM_OUTER_FRAME_OVERHEAD_BYTES = 44`) instead of a guessed reserve.
 - On Windows, the live harness launcher uses native `CreateProcessW` with
-  `EXTENDED_STARTUPINFO_PRESENT` and `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
-  The inherited handle list contains exactly the control-auth read handle plus
-  explicitly managed stdio redirection handles used for the OpenVMM process log.
-  The auth pipe write end is non-inheritable and closed after writing the exact
-  32-byte capability. The OpenVMM process is assigned to a KILL_ON_CLOSE job
-  object for teardown.
+  `EXTENDED_STARTUPINFO_PRESENT`, `CREATE_SUSPENDED`, and
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. The inherited handle list contains only
+  duplicated inheritable stdin/stdout/stderr log handles plus the duplicated
+  control-auth read handle. The process is assigned to a KILL_ON_CLOSE job
+  before resume; capability pipe delivery/close happens while suspended.
 - Stream payload and stdin queue bounds are pinned to one protocol-safe limit:
   `PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES` (currently 65,452 bytes), derived from
   the conservative OpenVMM outer-record cap after inner-record framing.
 - `CreateProcess.timeout_ms` is now strictly validated: it must be greater than
   zero and no larger than `MAX_EXEC_TIMEOUT_MS` (24h / 86,400,000 ms). Invalid
   values are rejected before spawn/state mutation.
-- Security boundary: launch capability trust comes only from mxc profile boot
-  configuration; host control traffic proves possession but cannot redefine the
-  trusted expected value.
+- Security boundary: broker launch capability trust is enforced by the outer
+  broker attach path only; inner launch identity trust comes from authenticated
+  protocol state (launch nonce/generation/version checks), not boot cmdline
+  secrets.
 - `legacy` and `broker-ttrpc` paths remain out of scope for this profile.
 
 ## Deterministic WHP harness command

@@ -75,7 +75,6 @@ pub fn run_runtime() -> Result<()> {
         WorkloadIdentityStatus::mxc_fixed(),
         isolation_holder_pid,
     );
-    service.set_expected_capability(launch_config.expected_capability);
     let mut supervisor = LinuxProcessSupervisor::new_with_holder(isolation_result.holder_pid)
         .map_err(|error| AgentError::internal(error.to_string()))?;
     let mut pending_hello: Option<AuthenticateChannelRequest> = None;
@@ -1150,7 +1149,6 @@ fn assert_conservative_openvmm_overhead() -> Result<()> {
 
 struct LaunchRuntimeConfig {
     binding: LaunchBinding,
-    expected_capability: [u8; 32],
     control_tty_device_path: String,
 }
 
@@ -1493,10 +1491,6 @@ fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
         &cmdline,
         &["nvx.channel_generation", "nvx_channel_generation"],
     )?;
-    let expected_capability = parse_required_hex_32_arg(
-        &cmdline,
-        &["nvx.launch_capability", "nvx_launch_capability"],
-    )?;
     let control_tty_device_path = parse_required_control_tty_arg(&cmdline)?;
     Ok(LaunchRuntimeConfig {
         binding: LaunchBinding {
@@ -1508,7 +1502,6 @@ fn read_launch_binding() -> Result<LaunchRuntimeConfig> {
             },
             channel_generation,
         },
-        expected_capability,
         control_tty_device_path,
     })
 }
@@ -1517,12 +1510,6 @@ fn parse_required_u64_arg(cmdline: &str, keys: &[&str]) -> Result<u64> {
     let (key, value) = extract_unique_cmdline_value(cmdline, keys)?;
     value
         .parse::<u64>()
-        .map_err(|error| AgentError::config(format!("invalid {key} value: {error}")))
-}
-
-fn parse_required_hex_32_arg(cmdline: &str, keys: &[&str]) -> Result<[u8; 32]> {
-    let (key, value) = extract_unique_cmdline_value(cmdline, keys)?;
-    parse_hex_32(&value)
         .map_err(|error| AgentError::config(format!("invalid {key} value: {error}")))
 }
 
@@ -1578,6 +1565,7 @@ fn extract_unique_cmdline_value(cmdline: &str, keys: &[&str]) -> Result<(String,
     })
 }
 
+#[cfg(test)]
 fn parse_hex_32(value: &str) -> Result<[u8; 32]> {
     if value.len() != 64 {
         return Err(AgentError::config(
@@ -2093,7 +2081,7 @@ mod tests {
 
     #[test]
     fn cmdline_unique_extraction_rejects_duplicates() {
-        let cmdline = "quiet nvx.channel_generation=7 nvx_channel_generation=8 nvx.launch_capability=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let cmdline = "quiet nvx.channel_generation=7 nvx_channel_generation=8";
         let duplicate = extract_unique_cmdline_value(
             cmdline,
             &["nvx.channel_generation", "nvx_channel_generation"],

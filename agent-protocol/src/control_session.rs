@@ -341,6 +341,7 @@ pub enum SessionError {
     Io(io::Error),
     Protocol(ProtocolError),
     Closed,
+    DeadlineExceeded(&'static str),
     SequenceMismatch { expected: u64, actual: u64 },
     SessionIdentityMismatch,
     UnexpectedRecordType(RecordType),
@@ -352,6 +353,12 @@ impl core::fmt::Display for SessionError {
             Self::Io(error) => write!(f, "{error}"),
             Self::Protocol(error) => write!(f, "{error}"),
             Self::Closed => write!(f, "control session transport closed"),
+            Self::DeadlineExceeded(context) => {
+                write!(
+                    f,
+                    "control session deadline exceeded while waiting for {context}"
+                )
+            }
             Self::SequenceMismatch { expected, actual } => {
                 write!(f, "sequence mismatch: expected {expected}, actual {actual}")
             }
@@ -441,6 +448,29 @@ impl<T: Read + Write> HostControlSession<T> {
         }
     }
 
+    pub fn recv_attach_status_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<HostAttachStatus, SessionError> {
+        let record = self.read_record_until(deadline, "host attach status")?;
+        match record.record_type {
+            RecordType::Wait => {
+                self.track_remote_record(&record)?;
+                Ok(HostAttachStatus::Wait)
+            }
+            RecordType::Ready => {
+                self.track_remote_record(&record)?;
+                Ok(HostAttachStatus::Ready)
+            }
+            RecordType::Error => {
+                self.track_remote_record(&record)?;
+                let code = decode_error_code(&record.payload)?;
+                Ok(HostAttachStatus::Error(code))
+            }
+            other => Err(SessionError::UnexpectedRecordType(other)),
+        }
+    }
+
     pub fn reset_for_reconnect(&mut self) {
         self.parser = Parser::new();
         self.pending_read_bytes.clear();
@@ -469,6 +499,11 @@ impl<T: Read + Write> HostControlSession<T> {
 
     pub fn recv_event_blocking(&mut self) -> Result<HostEvent, SessionError> {
         let record = self.read_record_blocking()?;
+        self.event_from_record(record)
+    }
+
+    pub fn recv_event_until(&mut self, deadline: Instant) -> Result<HostEvent, SessionError> {
+        let record = self.read_record_until(deadline, "host event")?;
         self.event_from_record(record)
     }
 
@@ -563,6 +598,25 @@ impl<T: Read + Write> HostControlSession<T> {
             if let Some(record) = self.try_read_record()? {
                 return Ok(record);
             }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn read_record_until(
+        &mut self,
+        deadline: Instant,
+        context: &'static str,
+    ) -> Result<Record, SessionError> {
+        loop {
+            if let Some(record) = self.try_read_record()? {
+                return Ok(record);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(SessionError::DeadlineExceeded(context));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            thread::sleep(remaining.min(Duration::from_millis(5)));
         }
     }
 
@@ -1078,6 +1132,29 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn host_attach_deadline_returns_typed_timeout() {
+        let mut host = HostControlSession::new(IdleEndpoint::default());
+        host.send_host_attach([0x11; 32]).expect("attach write");
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let result = host.recv_attach_status_until(deadline);
+        assert!(matches!(
+            result,
+            Err(SessionError::DeadlineExceeded("host attach status"))
+        ));
+    }
+
+    #[test]
+    fn host_event_deadline_returns_typed_timeout() {
+        let mut host = HostControlSession::new(IdleEndpoint::default());
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let result = host.recv_event_until(deadline);
+        assert!(matches!(
+            result,
+            Err(SessionError::DeadlineExceeded("host event"))
+        ));
+    }
+
     fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
         if !hex.len().is_multiple_of(2) {
             return Err("odd hex length".into());
@@ -1323,6 +1400,28 @@ mod tests {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, "empty"));
             }
             Ok(read)
+        }
+    }
+
+    #[derive(Default)]
+    struct IdleEndpoint {
+        written: Vec<u8>,
+    }
+
+    impl Read for IdleEndpoint {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "idle"))
+        }
+    }
+
+    impl Write for IdleEndpoint {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
