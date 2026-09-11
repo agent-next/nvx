@@ -18,6 +18,27 @@ const POLICY_SCHEMA_CODE: &str = "policy_schema";
 const POLICY_VALIDATION_CODE: &str = "policy_validation";
 const POLICY_UNKNOWN_FIELD_CODE: &str = "policy_unknown_field";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MxcPhase {
+    Provision,
+    Start,
+    Exec,
+    Stop,
+    Deprovision,
+}
+
+impl MxcPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Provision => "provision",
+            Self::Start => "start",
+            Self::Exec => "exec",
+            Self::Stop => "stop",
+            Self::Deprovision => "deprovision",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CompiledSchema {
     schema: Value,

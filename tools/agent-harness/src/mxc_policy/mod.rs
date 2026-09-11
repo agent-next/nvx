@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod schema;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8,5 +9,7 @@ pub struct PolicyError {
 }
 
 pub use schema::{
-    schema_declares_draft7, schema_normalized_sha256, schema_raw_sha256, validate_config,
+    MxcPhase, schema_declares_draft7, schema_normalized_sha256, schema_raw_sha256, validate_config,
 };
+
+pub use catalog::{CatalogEntry, EvidenceRequirement, PolicyDisposition, catalog_entries};
