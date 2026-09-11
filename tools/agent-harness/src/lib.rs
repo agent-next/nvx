@@ -61,6 +61,7 @@ use windows::Win32::Storage::FileSystem::{
 pub mod client;
 pub mod control_session;
 pub mod launch;
+pub mod mxc_policy;
 pub mod named_pipe;
 #[cfg(not(target_os = "linux"))]
 pub mod scenarios;
