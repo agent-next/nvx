@@ -4403,31 +4403,40 @@ mod tests {
             EVIDENCE_LIVE_WHP_POS_NEG,
             REASON_CONTROL,
         );
-        let cross = CATALOG
-            .iter()
-            .find(|entry| entry.key == "cross.phase.non_provision_requires_sandbox_id")
-            .expect("cross control rule exists");
-        assert_eq!(
-            cross.disposition,
+        assert_group_contract(
+            "cross control",
+            string_set(["cross.phase.non_provision_requires_sandbox_id"]),
+            |key| key == "cross.phase.non_provision_requires_sandbox_id",
             PolicyDisposition::Control,
-            "cross.phase.non_provision_requires_sandbox_id disposition drifted"
-        );
-        assert_eq!(
-            cross.evidence, EVIDENCE_LIVE_WHP_POS_NEG,
-            "cross.phase.non_provision_requires_sandbox_id evidence drifted"
-        );
-        assert_eq!(
-            cross.reason, REASON_CROSS_FIELD_CONTROL,
-            "cross.phase.non_provision_requires_sandbox_id must keep explicit cross-field reason"
-        );
-        assert_eq!(
-            cross.phases, PHASES_NON_PROVISION,
-            "cross.phase.non_provision_requires_sandbox_id phases drifted"
+            PHASES_NON_PROVISION,
+            EVIDENCE_LIVE_WHP_POS_NEG,
+            REASON_CROSS_FIELD_CONTROL,
         );
     }
 
     #[test]
     fn semantic_contract_honored_provision_filesystem_and_network_allow_block_is_exact() {
+        assert_group_contract(
+            "honored provision structural filesystem",
+            string_set([
+                "filesystem",
+                "filesystem#absent",
+                "filesystem#nullable",
+                "filesystem#anyOf[0]=#/definitions/Filesystem",
+                "filesystem#anyOf[1]=null",
+            ]),
+            |key| {
+                key == "filesystem"
+                    || key == "filesystem#absent"
+                    || key == "filesystem#nullable"
+                    || key == "filesystem#anyOf[0]=#/definitions/Filesystem"
+                    || key == "filesystem#anyOf[1]=null"
+            },
+            PolicyDisposition::Honored,
+            PHASES_PROVISION,
+            EVIDENCE_LOCAL_LINUX_RUNTIME,
+            REASON_HONORED_PROVISION,
+        );
         assert_group_contract(
             "honored provision filesystem ro-rw",
             string_set([
@@ -4499,33 +4508,50 @@ mod tests {
             EVIDENCE_LIVE_WHP_POS_NEG,
             REASON_HONORED_PROVISION,
         );
-        let cross = CATALOG
-            .iter()
-            .find(|entry| {
-                entry.key == "cross.phase.provision_uses_filesystem_rw_and_network_allow_block"
-            })
-            .expect("cross provision rule exists");
-        assert_eq!(
-            cross.disposition,
+        assert_group_contract(
+            "cross provision",
+            string_set(["cross.phase.provision_uses_filesystem_rw_and_network_allow_block"]),
+            |key| key == "cross.phase.provision_uses_filesystem_rw_and_network_allow_block",
             PolicyDisposition::Honored,
-            "cross.phase.provision_uses_filesystem_rw_and_network_allow_block disposition drifted"
-        );
-        assert_eq!(
-            cross.phases, PHASES_PROVISION,
-            "cross.phase.provision_uses_filesystem_rw_and_network_allow_block phases drifted"
-        );
-        assert_eq!(
-            cross.evidence, EVIDENCE_LIVE_WHP_POS_NEG,
-            "cross.phase.provision_uses_filesystem_rw_and_network_allow_block evidence drifted"
-        );
-        assert_eq!(
-            cross.reason, REASON_CROSS_FIELD_PROVISION,
-            "cross.phase.provision_uses_filesystem_rw_and_network_allow_block must keep explicit cross-field reason"
+            PHASES_PROVISION,
+            EVIDENCE_LIVE_WHP_POS_NEG,
+            REASON_CROSS_FIELD_PROVISION,
         );
     }
 
     #[test]
     fn semantic_contract_honored_exec_surface_is_exact() {
+        assert_group_contract(
+            "honored exec structural process/runtimeConfig",
+            string_set([
+                "process",
+                "process#absent",
+                "process#nullable",
+                "process#anyOf[0]=#/definitions/Process",
+                "process#anyOf[1]=null",
+                "runtimeConfig",
+                "runtimeConfig#absent",
+                "runtimeConfig#nullable",
+                "runtimeConfig#anyOf[0]=#/definitions/RuntimeConfig",
+                "runtimeConfig#anyOf[1]=null",
+            ]),
+            |key| {
+                key == "process"
+                    || key == "process#absent"
+                    || key == "process#nullable"
+                    || key == "process#anyOf[0]=#/definitions/Process"
+                    || key == "process#anyOf[1]=null"
+                    || key == "runtimeConfig"
+                    || key == "runtimeConfig#absent"
+                    || key == "runtimeConfig#nullable"
+                    || key == "runtimeConfig#anyOf[0]=#/definitions/RuntimeConfig"
+                    || key == "runtimeConfig#anyOf[1]=null"
+            },
+            PolicyDisposition::Honored,
+            PHASES_EXEC,
+            EVIDENCE_LOCAL_LINUX_RUNTIME,
+            REASON_HONORED_EXEC,
+        );
         assert_group_contract(
             "honored exec surface",
             string_set([
@@ -4559,39 +4585,43 @@ mod tests {
             EVIDENCE_LOCAL_LINUX_RUNTIME,
             REASON_HONORED_EXEC,
         );
-        for (key, expected_reason) in [
-            (
+        assert_group_contract(
+            "cross exec",
+            string_set([
                 "cross.phase.exec_uses_process_fields",
-                REASON_CROSS_FIELD_EXEC,
-            ),
-            (
                 "cross.phase.exec_uses_runtime_config_network_proxy",
-                REASON_CROSS_FIELD_EXEC,
-            ),
-        ] {
-            let cross = CATALOG
-                .iter()
-                .find(|entry| entry.key == key)
-                .expect("cross exec rule exists");
-            assert_eq!(
-                cross.disposition,
-                PolicyDisposition::Honored,
-                "{key} disposition drifted"
-            );
-            assert_eq!(cross.phases, PHASES_EXEC, "{key} phases drifted");
-            assert_eq!(
-                cross.evidence, EVIDENCE_LOCAL_LINUX_RUNTIME,
-                "{key} evidence drifted"
-            );
-            assert_eq!(
-                cross.reason, expected_reason,
-                "{key} must keep explicit cross-field reason"
-            );
-        }
+            ]),
+            |key| {
+                key == "cross.phase.exec_uses_process_fields"
+                    || key == "cross.phase.exec_uses_runtime_config_network_proxy"
+            },
+            PolicyDisposition::Honored,
+            PHASES_EXEC,
+            EVIDENCE_LOCAL_LINUX_RUNTIME,
+            REASON_CROSS_FIELD_EXEC,
+        );
     }
 
     #[test]
     fn semantic_contract_rejected_surfaces_are_exact() {
+        assert_group_contract(
+            "rejected filesystem deniedPaths",
+            string_set([
+                "filesystem.deniedPaths",
+                "filesystem.deniedPaths#absent",
+                "filesystem.deniedPaths#nullable",
+                "filesystem.deniedPaths[]",
+            ]),
+            |key| {
+                key == "filesystem.deniedPaths"
+                    || key.starts_with("filesystem.deniedPaths#")
+                    || key == "filesystem.deniedPaths[]"
+            },
+            PolicyDisposition::Rejected,
+            PHASES_ALL,
+            EVIDENCE_UNIT_STATIC,
+            REASON_REJECTED,
+        );
         let expected_rejected_directional_network =
             schema_inventory_keys_for_prefixes(&["network.egress", "network.ingress"]);
         assert_group_contract(
@@ -4713,7 +4743,10 @@ mod tests {
             "processContainer",
             "seatbelt",
             "ui",
-        ]);
+        ])
+        .into_iter()
+        .filter(|key| !is_process_container_network_key(key))
+        .collect::<BTreeSet<_>>();
         assert_group_contract(
             "rejected unsupported/backend",
             expected_rejected_unsupported_backend,
@@ -4728,8 +4761,10 @@ mod tests {
                     || key.starts_with("lxc.")
                     || key.starts_with("lxc#")
                     || key == "processContainer"
-                    || key.starts_with("processContainer.")
-                    || key.starts_with("processContainer#")
+                    || (key.starts_with("processContainer.")
+                        && !is_process_container_network_key(key))
+                    || (key.starts_with("processContainer#")
+                        && !is_process_container_network_key(key))
                     || key == "seatbelt"
                     || key.starts_with("seatbelt.")
                     || key.starts_with("seatbelt#")
@@ -4742,6 +4777,155 @@ mod tests {
             EVIDENCE_UNIT_STATIC,
             REASON_REJECTED,
         );
+    }
+
+    #[test]
+    fn semantic_contract_groups_are_exhaustive_and_disjoint() {
+        type GroupMatcher = (&'static str, fn(&str) -> bool);
+        let groups: [GroupMatcher; 18] = [
+            ("inert annotations", |key| {
+                key == "$schema"
+                    || key.starts_with("$schema#")
+                    || key == "_comment"
+                    || key.starts_with("_comment#")
+            }),
+            ("control fields", |key| {
+                key == "containerId"
+                    || key.starts_with("containerId#")
+                    || key == "containment"
+                    || key.starts_with("containment#")
+                    || key == "phase"
+                    || key.starts_with("phase#")
+                    || key == "sandboxId"
+                    || key.starts_with("sandboxId#")
+                    || key == "version"
+                    || key.starts_with("version#")
+            }),
+            ("cross control", |key| {
+                key == "cross.phase.non_provision_requires_sandbox_id"
+            }),
+            ("honored provision structural filesystem", |key| {
+                key == "filesystem"
+                    || key == "filesystem#absent"
+                    || key == "filesystem#nullable"
+                    || key == "filesystem#anyOf[0]=#/definitions/Filesystem"
+                    || key == "filesystem#anyOf[1]=null"
+            }),
+            ("honored provision filesystem ro-rw", |key| {
+                key.starts_with("filesystem.readonlyPaths")
+                    || key.starts_with("filesystem.readwritePaths")
+            }),
+            ("rejected filesystem deniedPaths", |key| {
+                key == "filesystem.deniedPaths"
+                    || key.starts_with("filesystem.deniedPaths#")
+                    || key == "filesystem.deniedPaths[]"
+            }),
+            ("honored provision structural network", |key| {
+                key == "network"
+                    || key == "network#absent"
+                    || key == "network#nullable"
+                    || key == "network#anyOf[0]=#/definitions/Network"
+                    || key == "network#anyOf[1]=null"
+            }),
+            ("honored provision network allow-block", |key| {
+                key.starts_with("network.allowedHosts")
+                    || key.starts_with("network.blockedHosts")
+                    || key.starts_with("network.defaultPolicy")
+            }),
+            ("cross provision", |key| {
+                key == "cross.phase.provision_uses_filesystem_rw_and_network_allow_block"
+            }),
+            ("honored exec structural process/runtimeConfig", |key| {
+                key == "process"
+                    || key == "process#absent"
+                    || key == "process#nullable"
+                    || key == "process#anyOf[0]=#/definitions/Process"
+                    || key == "process#anyOf[1]=null"
+                    || key == "runtimeConfig"
+                    || key == "runtimeConfig#absent"
+                    || key == "runtimeConfig#nullable"
+                    || key == "runtimeConfig#anyOf[0]=#/definitions/RuntimeConfig"
+                    || key == "runtimeConfig#anyOf[1]=null"
+            }),
+            ("honored exec surface", |key| {
+                key.starts_with("process.commandLine")
+                    || key.starts_with("process.cwd")
+                    || key.starts_with("process.env")
+                    || key.starts_with("process.timeout")
+                    || key == "runtimeConfig.networkProxy"
+                    || key.starts_with("runtimeConfig.networkProxy#")
+            }),
+            ("cross exec", |key| {
+                key == "cross.phase.exec_uses_process_fields"
+                    || key == "cross.phase.exec_uses_runtime_config_network_proxy"
+            }),
+            ("rejected directional network ingress-egress", |key| {
+                key == "network.egress"
+                    || key.starts_with("network.egress.")
+                    || key.starts_with("network.egress#")
+                    || key == "network.ingress"
+                    || key.starts_with("network.ingress.")
+                    || key.starts_with("network.ingress#")
+            }),
+            ("rejected network container-backend-specific", |key| {
+                key == "network.allowLocalNetwork"
+                    || key.starts_with("network.allowLocalNetwork#")
+                    || key == "network.enforcementMode"
+                    || key.starts_with("network.enforcementMode#")
+                    || key == "processContainer.network"
+                    || key.starts_with("processContainer.network.")
+                    || key.starts_with("processContainer.network#")
+            }),
+            ("rejected network.proxy", |key| {
+                key == "network.proxy"
+                    || key.starts_with("network.proxy.")
+                    || key.starts_with("network.proxy#")
+            }),
+            ("rejected telemetry", |key| {
+                key == "telemetry" || key.starts_with("telemetry.") || key.starts_with("telemetry#")
+            }),
+            ("rejected lifecycle", |key| {
+                key == "lifecycle" || key.starts_with("lifecycle.") || key.starts_with("lifecycle#")
+            }),
+            ("rejected unsupported/backend", |key| {
+                key == "experimental"
+                    || key.starts_with("experimental.")
+                    || key.starts_with("experimental#")
+                    || key == "fallback"
+                    || key.starts_with("fallback.")
+                    || key.starts_with("fallback#")
+                    || key == "lxc"
+                    || key.starts_with("lxc.")
+                    || key.starts_with("lxc#")
+                    || key == "processContainer"
+                    || (key.starts_with("processContainer.")
+                        && !is_process_container_network_key(key))
+                    || (key.starts_with("processContainer#")
+                        && !is_process_container_network_key(key))
+                    || key == "seatbelt"
+                    || key.starts_with("seatbelt.")
+                    || key.starts_with("seatbelt#")
+                    || key == "ui"
+                    || key.starts_with("ui.")
+                    || key.starts_with("ui#")
+            }),
+        ];
+
+        for entry in CATALOG {
+            let matching = groups
+                .iter()
+                .filter_map(|(label, belongs_to_group)| {
+                    belongs_to_group(entry.key).then_some(*label)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "semantic coverage drift for {}: expected exactly one group, got [{}]",
+                entry.key,
+                matching.join(", ")
+            );
+        }
     }
 
     fn assert_group_contract(
@@ -4809,28 +4993,31 @@ mod tests {
         expected: impl Iterator<Item = &'a InventoryEntry>,
         label: &str,
     ) {
-        let expected_map = expected
-            .map(|entry| (entry.key.clone(), entry.schema_path.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let actual_map = CATALOG
-            .iter()
-            .filter(|entry| !entry.key.starts_with("cross."))
-            .filter(|entry| match label {
-                "path" => !entry.key.contains('#'),
-                "enum/union" => {
-                    entry.key.contains("#enum=")
-                        || entry.key.contains("#anyOf[")
-                        || entry.key.contains("#oneOf[")
-                }
-                "presence/default" => {
-                    entry.key.contains("#absent")
-                        || entry.key.contains("#nullable")
-                        || entry.key.contains("#default=")
-                }
-                _ => false,
-            })
-            .map(|entry| (entry.key.to_string(), entry.schema_path.to_string()))
-            .collect::<BTreeMap<_, _>>();
+        let expected_map = collect_inventory_map(
+            expected.map(|entry| (entry.key.clone(), entry.schema_path.clone(), entry.kind)),
+            label,
+        );
+        let actual_map = collect_catalog_map(
+            CATALOG
+                .iter()
+                .filter(|entry| !entry.key.starts_with("cross."))
+                .filter(|entry| match label {
+                    "path" => !entry.key.contains('#'),
+                    "enum/union" => {
+                        entry.key.contains("#enum=")
+                            || entry.key.contains("#anyOf[")
+                            || entry.key.contains("#oneOf[")
+                    }
+                    "presence/default" => {
+                        entry.key.contains("#absent")
+                            || entry.key.contains("#nullable")
+                            || entry.key.contains("#default=")
+                    }
+                    _ => false,
+                })
+                .map(|entry| (entry.key.to_string(), entry.schema_path.to_string())),
+            label,
+        );
 
         let expected_keys = expected_map.keys().cloned().collect::<BTreeSet<_>>();
         let actual_keys = actual_map.keys().cloned().collect::<BTreeSet<_>>();
@@ -4885,7 +5072,7 @@ mod tests {
             .expect("definitions object");
 
         let mut out = Vec::new();
-        let mut seen = BTreeSet::new();
+        let mut seen = BTreeMap::new();
         walk_node(&schema, "", "", definitions, &mut out, &mut seen);
         out
     }
@@ -4896,19 +5083,21 @@ mod tests {
         schema_path: &str,
         definitions: &serde_json::Map<String, Value>,
         out: &mut Vec<InventoryEntry>,
-        seen: &mut BTreeSet<String>,
+        seen: &mut BTreeMap<String, (String, InventoryKind)>,
     ) {
         let mut object = match node.as_object() {
             Some(object) => object,
             None => return,
         };
-        if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
-            if let Some(name) = reference.strip_prefix("#/definitions/") {
-                object = definitions
-                    .get(name)
-                    .and_then(Value::as_object)
-                    .expect("definition exists");
-            }
+        if let Some(name) = object
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|reference| reference.strip_prefix("#/definitions/"))
+        {
+            object = definitions
+                .get(name)
+                .and_then(Value::as_object)
+                .expect("definition exists");
         }
         let resolved_node = Value::Object(object.clone());
 
@@ -4964,16 +5153,6 @@ mod tests {
                     }
                 }
 
-                collect_union_entries(
-                    property,
-                    &key,
-                    &property_schema_path,
-                    definitions,
-                    out,
-                    seen,
-                );
-                collect_enum_entries(property, &key, &property_schema_path, out, seen);
-
                 if let Some(items) = property.get("items") {
                     let item_key = format!("{key}[]");
                     let item_schema_path = format!("{property_schema_path}/items");
@@ -5009,7 +5188,7 @@ mod tests {
         schema_path: &str,
         definitions: &serde_json::Map<String, Value>,
         out: &mut Vec<InventoryEntry>,
-        seen: &mut BTreeSet<String>,
+        seen: &mut BTreeMap<String, (String, InventoryKind)>,
     ) {
         for union_key in ["anyOf", "oneOf"] {
             let Some(branches) = node.get(union_key).and_then(Value::as_array) else {
@@ -5053,7 +5232,7 @@ mod tests {
         key_prefix: &str,
         schema_path: &str,
         out: &mut Vec<InventoryEntry>,
-        seen: &mut BTreeSet<String>,
+        seen: &mut BTreeMap<String, (String, InventoryKind)>,
     ) {
         let Some(values) = node.get("enum").and_then(Value::as_array) else {
             return;
@@ -5074,13 +5253,17 @@ mod tests {
 
     fn push_inventory(
         out: &mut Vec<InventoryEntry>,
-        seen: &mut BTreeSet<String>,
+        seen: &mut BTreeMap<String, (String, InventoryKind)>,
         key: &str,
         schema_path: &str,
         kind: InventoryKind,
     ) {
-        if !seen.insert(key.to_string()) {
-            return;
+        if let Some((existing_schema_path, existing_kind)) =
+            seen.insert(key.to_string(), (schema_path.to_string(), kind))
+        {
+            panic!(
+                "duplicate schema inventory key {key}: existing path={existing_schema_path} kind={existing_kind:?}, new path={schema_path} kind={kind:?}"
+            );
         }
         out.push(InventoryEntry {
             key: key.to_string(),
@@ -5104,10 +5287,10 @@ mod tests {
     }
 
     fn allows_null(node: &Value) -> bool {
-        if let Some(types) = node.get("type").and_then(Value::as_array) {
-            if types.iter().any(|value| value.as_str() == Some("null")) {
-                return true;
-            }
+        if let Some(types) = node.get("type").and_then(Value::as_array)
+            && types.iter().any(|value| value.as_str() == Some("null"))
+        {
+            return true;
         }
 
         for union_key in ["anyOf", "oneOf"] {
@@ -5122,6 +5305,50 @@ mod tests {
             }
         }
         false
+    }
+
+    fn collect_inventory_map(
+        entries: impl Iterator<Item = (String, String, InventoryKind)>,
+        label: &str,
+    ) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let mut seen_pairs = BTreeSet::new();
+        for (key, schema_path, kind) in entries {
+            let pair = format!("{key} -> {schema_path}");
+            assert!(
+                seen_pairs.insert(pair.clone()),
+                "{label} inventory duplicate key/path pair {pair} kind={kind:?}",
+            );
+            let previous = out.insert(key.clone(), schema_path.clone());
+            assert!(
+                previous.is_none(),
+                "{label} inventory duplicate key {key}: previous path={} new path={schema_path} kind={kind:?}",
+                previous.expect("checked above"),
+            );
+        }
+        out
+    }
+
+    fn is_process_container_network_key(key: &str) -> bool {
+        key == "processContainer.network"
+            || key.starts_with("processContainer.network.")
+            || key.starts_with("processContainer.network#")
+    }
+
+    fn collect_catalog_map(
+        entries: impl Iterator<Item = (String, String)>,
+        label: &str,
+    ) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for (key, schema_path) in entries {
+            let previous = out.insert(key.clone(), schema_path.clone());
+            assert!(
+                previous.is_none(),
+                "{label} catalog duplicate key {key}: previous path={} new path={schema_path}",
+                previous.expect("checked above"),
+            );
+        }
+        out
     }
 
     fn description_defaults(description: &str) -> Vec<String> {
