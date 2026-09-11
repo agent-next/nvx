@@ -2757,34 +2757,34 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "network.proxy",
         schema_path: "/properties/network/anyOf/0/properties/proxy",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_EXEC,
-        evidence: EVIDENCE_LOCAL_LINUX_RUNTIME,
-        reason: REASON_HONORED_EXEC,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.proxy#absent",
         schema_path: "/properties/network/anyOf/0/properties/proxy",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_EXEC,
-        evidence: EVIDENCE_LOCAL_LINUX_RUNTIME,
-        reason: REASON_HONORED_EXEC,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.proxy#nullable",
         schema_path: "/properties/network/anyOf/0/properties/proxy",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_EXEC,
-        evidence: EVIDENCE_LOCAL_LINUX_RUNTIME,
-        reason: REASON_HONORED_EXEC,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.proxy#anyOf[0]=#/definitions/Proxy",
         schema_path: "/properties/network/anyOf/0/properties/proxy/anyOf/0",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_EXEC,
-        evidence: EVIDENCE_LOCAL_LINUX_RUNTIME,
-        reason: REASON_HONORED_EXEC,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.proxy.builtinTestServer",
@@ -2837,34 +2837,34 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "network.proxy.url",
         schema_path: "/properties/network/anyOf/0/properties/proxy/anyOf/0/properties/url",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_EXEC,
-        evidence: EVIDENCE_LOCAL_LINUX_RUNTIME,
-        reason: REASON_HONORED_EXEC,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.proxy.url#absent",
         schema_path: "/properties/network/anyOf/0/properties/proxy/anyOf/0/properties/url",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_EXEC,
-        evidence: EVIDENCE_LOCAL_LINUX_RUNTIME,
-        reason: REASON_HONORED_EXEC,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.proxy.url#nullable",
         schema_path: "/properties/network/anyOf/0/properties/proxy/anyOf/0/properties/url",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_EXEC,
-        evidence: EVIDENCE_LOCAL_LINUX_RUNTIME,
-        reason: REASON_HONORED_EXEC,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.proxy#anyOf[1]=null",
         schema_path: "/properties/network/anyOf/0/properties/proxy/anyOf/1",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_EXEC,
-        evidence: EVIDENCE_LOCAL_LINUX_RUNTIME,
-        reason: REASON_HONORED_EXEC,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network#anyOf[1]=null",
@@ -4267,8 +4267,8 @@ pub const CATALOG: &[CatalogEntry] = &[
         reason: REASON_CROSS_FIELD_PROVISION,
     },
     CatalogEntry {
-        key: "cross.phase.exec_url_proxy_runtime_config",
-        schema_path: "/properties/runtimeConfig/properties/networkProxy",
+        key: "cross.phase.exec_uses_runtime_config_network_proxy",
+        schema_path: "/properties/runtimeConfig/anyOf/0/properties/networkProxy",
         disposition: PolicyDisposition::Honored,
         phases: PHASES_EXEC,
         evidence: EVIDENCE_LOCAL_LINUX_RUNTIME,
@@ -4343,7 +4343,7 @@ mod tests {
             "cross.phase.non_provision_requires_sandbox_id",
             "cross.phase.exec_uses_process_fields",
             "cross.phase.provision_uses_filesystem_rw_and_network_allow_block",
-            "cross.phase.exec_url_proxy_runtime_config",
+            "cross.phase.exec_uses_runtime_config_network_proxy",
         ]);
         let actual = CATALOG
             .iter()
@@ -4351,6 +4351,95 @@ mod tests {
             .map(|entry| entry.key)
             .collect::<BTreeSet<_>>();
         assert_missing_unexpected(&required, &actual, "cross-field");
+    }
+
+    #[test]
+    fn catalog_exec_network_proxy_source_split_is_exact() {
+        let expected_network_proxy_surface = BTreeSet::from([
+            "network.proxy",
+            "network.proxy#absent",
+            "network.proxy#nullable",
+            "network.proxy#anyOf[0]=#/definitions/Proxy",
+            "network.proxy.builtinTestServer",
+            "network.proxy.builtinTestServer#absent",
+            "network.proxy.builtinTestServer#nullable",
+            "network.proxy.localhost",
+            "network.proxy.localhost#absent",
+            "network.proxy.localhost#nullable",
+            "network.proxy.url",
+            "network.proxy.url#absent",
+            "network.proxy.url#nullable",
+            "network.proxy#anyOf[1]=null",
+        ]);
+        let actual_network_proxy_surface = CATALOG
+            .iter()
+            .filter(|entry| {
+                entry.key == "network.proxy"
+                    || entry.key.starts_with("network.proxy.")
+                    || entry.key.starts_with("network.proxy#")
+            })
+            .map(|entry| entry.key)
+            .collect::<BTreeSet<_>>();
+        assert_missing_unexpected(
+            &expected_network_proxy_surface,
+            &actual_network_proxy_surface,
+            "network.proxy surface",
+        );
+
+        for key in &expected_network_proxy_surface {
+            let entry = CATALOG
+                .iter()
+                .find(|entry| entry.key == *key)
+                .expect("expected network.proxy key exists");
+            assert_eq!(
+                entry.disposition,
+                PolicyDisposition::Rejected,
+                "{key} disposition drifted"
+            );
+            assert_eq!(entry.phases, PHASES_ALL, "{key} phases drifted");
+            assert_eq!(
+                entry.evidence, EVIDENCE_UNIT_STATIC,
+                "{key} evidence drifted"
+            );
+            assert_eq!(entry.reason, REASON_REJECTED, "{key} reason drifted");
+        }
+
+        let expected_runtime_proxy_source = BTreeSet::from([
+            "runtimeConfig.networkProxy",
+            "runtimeConfig.networkProxy#absent",
+            "runtimeConfig.networkProxy#nullable",
+        ]);
+        let actual_runtime_proxy_source = CATALOG
+            .iter()
+            .filter(|entry| {
+                entry.key == "runtimeConfig.networkProxy"
+                    || entry.key.starts_with("runtimeConfig.networkProxy#")
+            })
+            .map(|entry| entry.key)
+            .collect::<BTreeSet<_>>();
+        assert_missing_unexpected(
+            &expected_runtime_proxy_source,
+            &actual_runtime_proxy_source,
+            "runtimeConfig.networkProxy source surface",
+        );
+
+        for key in &expected_runtime_proxy_source {
+            let entry = CATALOG
+                .iter()
+                .find(|entry| entry.key == *key)
+                .expect("expected runtimeConfig.networkProxy key exists");
+            assert_eq!(
+                entry.disposition,
+                PolicyDisposition::Honored,
+                "{key} disposition drifted"
+            );
+            assert_eq!(entry.phases, PHASES_EXEC, "{key} phases drifted");
+            assert_eq!(
+                entry.evidence, EVIDENCE_LOCAL_LINUX_RUNTIME,
+                "{key} evidence drifted"
+            );
+            assert_eq!(entry.reason, REASON_HONORED_EXEC, "{key} reason drifted");
+        }
     }
 
     fn assert_catalog_subset_matches<'a>(
