@@ -187,11 +187,13 @@ fn escape_json_pointer_token(token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use serde_json::json;
     use serde_json::{Map, Value};
 
     use super::{
-        REPO_GITATTRIBUTES, SCHEMA_PROVENANCE, SchemaProvenance, schema_declares_draft7,
+        MxcPhase, REPO_GITATTRIBUTES, SCHEMA_PROVENANCE, SchemaProvenance, schema_declares_draft7,
         schema_normalized_sha256, schema_raw_sha256, validate_config,
     };
 
@@ -230,6 +232,54 @@ mod tests {
                 .lines()
                 .any(|line| line.trim() == required_rule),
             "missing required .gitattributes rule: {required_rule}"
+        );
+    }
+
+    #[test]
+    fn mxc_phase_enum_matches_schema_phase_enum_exactly() {
+        let schema_json: Value =
+            serde_json::from_slice(super::SCHEMA_BYTES).expect("schema parses");
+        let schema_phases = schema_json
+            .get("definitions")
+            .and_then(|value| value.get("Phase"))
+            .and_then(|value| value.get("enum"))
+            .and_then(Value::as_array)
+            .expect("schema definitions.Phase.enum is present");
+        let schema_phase_set = schema_phases
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("phase enum values are strings")
+                    .to_string()
+            })
+            .collect::<BTreeSet<_>>();
+
+        let rust_phases = [
+            MxcPhase::Provision,
+            MxcPhase::Start,
+            MxcPhase::Exec,
+            MxcPhase::Stop,
+            MxcPhase::Deprovision,
+        ];
+        let rust_phase_set = rust_phases
+            .into_iter()
+            .map(|phase| phase.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+
+        let missing_in_rust = schema_phase_set
+            .difference(&rust_phase_set)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let missing_in_schema = rust_phase_set
+            .difference(&schema_phase_set)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            missing_in_rust.is_empty() && missing_in_schema.is_empty(),
+            "MxcPhase/schema Phase drift. missing in rust: [{}]; missing in schema: [{}]",
+            missing_in_rust.join(", "),
+            missing_in_schema.join(", ")
         );
     }
 
