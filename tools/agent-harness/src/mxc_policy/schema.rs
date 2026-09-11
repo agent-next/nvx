@@ -9,6 +9,8 @@ use super::PolicyError;
 
 const SCHEMA_BYTES: &[u8] = include_bytes!("../../schemas/mxc-config.schema.0.9.0-dev.json");
 #[cfg(test)]
+const REPO_GITATTRIBUTES: &str = include_str!("../../../../.gitattributes");
+#[cfg(test)]
 const SCHEMA_PROVENANCE: &str =
     include_str!("../../schemas/mxc-config.schema.0.9.0-dev.provenance.json");
 const DRAFT7_META_SCHEMA: &str = "http://json-schema.org/draft-07/schema#";
@@ -168,8 +170,8 @@ mod tests {
     use serde_json::{Map, Value};
 
     use super::{
-        SCHEMA_PROVENANCE, SchemaProvenance, schema_declares_draft7, schema_normalized_sha256,
-        schema_raw_sha256, validate_config,
+        REPO_GITATTRIBUTES, SCHEMA_PROVENANCE, SchemaProvenance, schema_declares_draft7,
+        schema_normalized_sha256, schema_raw_sha256, validate_config,
     };
 
     #[test]
@@ -196,6 +198,17 @@ mod tests {
         assert_eq!(
             schema_normalized_sha256().expect("schema compiles"),
             provenance.normalized_sha256
+        );
+    }
+
+    #[test]
+    fn schema_has_explicit_non_normalizing_gitattributes_rule() {
+        let required_rule = "tools/agent-harness/schemas/mxc-config.schema.0.9.0-dev.json -text";
+        assert!(
+            REPO_GITATTRIBUTES
+                .lines()
+                .any(|line| line.trim() == required_rule),
+            "missing required .gitattributes rule: {required_rule}"
         );
     }
 

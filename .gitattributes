@@ -7,3 +7,4 @@
 *.sh.in text eol=lf
 alpine/* text eol=lf
 Dockerfile text eol=lf
+tools/agent-harness/schemas/mxc-config.schema.0.9.0-dev.json -text
