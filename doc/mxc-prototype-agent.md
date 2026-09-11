@@ -196,3 +196,70 @@ The `mxc-prototype` guest image now runs an operational PID1 control runtime for
   output directory on failures.
 - No run may be claimed as `live-whp` conformance unless all 12 live invariants
   pass and canonical attestations are emitted.
+
+## Future state-aware MXC policy verification
+
+`test-mxc-policy` is a separate compatibility suite. It verifies the proposed
+state-aware NVX contract against real MXC `0.9.0-dev` JSON; it does not claim
+legacy NanVix behavior or byte-for-byte parity with MXC's current parser.
+`test-mxc-agent` and req01–req12 retain their existing command and semantics.
+
+The suite vendors `schemas/dev/mxc-config.schema.0.9.0-dev.json` from
+`microsoft/mxc@20960eeba8627e5e9e5f4249f89e757368f32094` as Draft 7. Its raw
+SHA-256 is
+`ad4a080ced7b73a4bcbe294551b5d61f703a1603bc85c161fa9a94e7a20e5c52`;
+its recursively key-sorted compact-JSON SHA-256 is
+`9bdc64c7ff1c3b520cde841776b260e6816328f92a835b09f1a054e068b25652`.
+Refreshing the source requires updating provenance, reviewing every generated
+inventory/catalog diff, extending the checked-in case corpus, and collecting
+new live evidence.
+
+| Disposition | NVX contract |
+|---|---|
+| Honored | Provision: RO/RW child mappings and allow/block network posture. Exec: `commandLine`, `cwd`, `env`, timeout, and URL proxy. |
+| Accepted inert | Only `$schema` and `_comment`. |
+| Control | Exact version, phase, IDs, and `containment: "vm"`; `--backend whp` selects NVX. |
+| Rejected | Telemetry, UI, denied paths, host/directional rules, lifecycle, fallback, process-container, LXC, Seatbelt, experimental backend fields, and non-URL proxy variants. |
+
+Provision is the only phase that may set filesystem or network posture. Exec is
+the only phase that may set process or cooperative proxy values. Start, stop,
+and deprovision accept no policy mutation. Post-provision phases require a
+non-empty safe `sandboxId`; provision forbids one.
+
+`process.commandLine` is deliberately lowered without interpretation to
+`["/bin/sh", "-c", commandLine]`. Null and empty strings reject. Shell quoting,
+expansion, exit status, timeout/tree termination, cwd, and environment behavior
+are therefore part of the NVX contract. URL proxy configuration rejects
+conflicting caller proxy variables and injects only `HTTP_PROXY` and
+`HTTPS_PROXY`; an absent proxy injects nothing.
+
+Schema validation and semantic adaptation finish before the `HostEffects`
+boundary. Rejected corpus cases mechanically assert zero root preparation,
+fixture creation, discovery, launch-plan construction, process launch, and
+output creation, and assert that no per-case output directory exists.
+
+Evidence is reported as `unit-static`, `local-linux-runtime`, or paired
+`live-whp-positive-negative`. A policy report passes only with no uncovered
+catalog constructs, unexpected results, failed/blocked required live profiles,
+or rejection effects. `blocked` means required infrastructure could not
+produce evidence and is never treated as a pass.
+
+```powershell
+# Full corpus and required live WHP evidence
+python scripts\nvx.py test-mxc-policy --backend whp `
+  --output-dir A:\Temp\nvx-mxc-policy-all-pass `
+  --openvmm-exe openvmm\target\release\openvmm.exe `
+  --kernel build\vmlinux `
+  --mxc-initramfs build\initramfs-mxc-agent.cpio.gz `
+  --common-root A:\Temp\nvx-mxc-policy-common
+
+# Static catalog/corpus diagnostics, or one real MXC JSON document
+python scripts\nvx.py test-mxc-policy --backend whp --static-only
+python scripts\nvx.py test-mxc-policy --backend whp --static-only --config policy.json
+```
+
+The report schema is `nvx.mxc.policy.harness.report.v1`. Freshness pins include
+the source schema and commit, raw/normalized schema hashes, catalog, adapter,
+protocol source/version, case corpus, kernel, initramfs, workload probe,
+OpenVMM, and harness identities. `report.json` and `diagnostics.log` are covered
+by a detached SHA-256 manifest.

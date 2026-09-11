@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 #[cfg(windows)]
 use std::fs;
 #[cfg(windows)]
-use std::net::IpAddr;
+use std::net::{IpAddr, TcpListener};
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -229,6 +230,173 @@ impl ExecCollectionLimits {
 }
 
 static LIVE_STATE: OnceLock<Mutex<LiveHarnessState>> = OnceLock::new();
+
+#[derive(Clone, Debug)]
+pub(crate) struct PolicyLiveEvidence {
+    pub passed: bool,
+    pub evidence: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+struct PolicyNetworkReport {
+    non_loopback_interfaces: Vec<String>,
+    has_default_route: bool,
+    dns_servers: Vec<String>,
+    outbound_connect_succeeded: Option<bool>,
+}
+
+#[cfg(windows)]
+pub(crate) fn run_live_policy_process_profiles(
+    options: &HarnessOptions,
+) -> BTreeMap<String, PolicyLiveEvidence> {
+    let mut state = fresh_policy_live_state();
+    let mut results = BTreeMap::new();
+    if let Err(error) = ensure_live_initialized(&mut state, options) {
+        for id in ["process-shell", "proxy-environment"] {
+            results.insert(
+                id.to_string(),
+                PolicyLiveEvidence {
+                    passed: false,
+                    evidence: Vec::new(),
+                    error: Some(format!("live WHP bootstrap failed: {error}")),
+                },
+            );
+        }
+        return results;
+    }
+    let process = run_policy_shell_contract(&mut state);
+    let proxy = run_policy_proxy_contract(&mut state);
+    results.insert("process-shell".to_string(), process);
+    results.insert("proxy-environment".to_string(), proxy);
+    if let Err(error) = teardown_live_session(&mut state) {
+        for result in results.values_mut() {
+            result.passed = false;
+            result.error = Some(format!(
+                "{}; teardown failed: {error}",
+                result.error.as_deref().unwrap_or("profile checks passed")
+            ));
+        }
+    }
+    results
+}
+
+#[cfg(windows)]
+pub(crate) fn run_live_policy_network_profile(options: &HarnessOptions) -> PolicyLiveEvidence {
+    policy_live_evidence((|| {
+        let mut no_nic_state = fresh_policy_live_state();
+        ensure_live_initialized(&mut no_nic_state, options)?;
+        let no_nic = run_network_probe(&mut no_nic_state, 1_321, Some("192.0.2.1:9"))?;
+        teardown_live_session(&mut no_nic_state)?;
+        if !no_nic.non_loopback_interfaces.is_empty()
+            || no_nic.has_default_route
+            || no_nic.outbound_connect_succeeded != Some(false)
+        {
+            return Err(format!("no-NIC negative probe failed: {no_nic:?}"));
+        }
+
+        let listener = TcpListener::bind("0.0.0.0:0")
+            .map_err(|error| format!("controlled outbound listener bind failed: {error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("controlled listener nonblocking failed: {error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| format!("controlled listener address failed: {error}"))?
+            .port();
+        let acceptor = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => return true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return false,
+                }
+            }
+            false
+        });
+        let mut portable_options = options.clone();
+        portable_options.output_dir = options.output_dir.join("portable-network-profile");
+        let mut overrides = portable_options
+            .launch_overrides
+            .clone()
+            .unwrap_or_default();
+        overrides.common_root = Some(
+            options
+                .output_dir
+                .join("portable-network-profile")
+                .join("common-root"),
+        );
+        overrides.portable_network = Some("10.0.0.2/24".to_string());
+        portable_options.launch_overrides = Some(overrides);
+        let mut portable_state = fresh_policy_live_state();
+        ensure_live_initialized(&mut portable_state, &portable_options)?;
+        let endpoint = format!("10.0.0.1:{port}");
+        let portable = run_network_probe(&mut portable_state, 1_322, Some(&endpoint))?;
+        teardown_live_session(&mut portable_state)?;
+        let accepted = acceptor
+            .join()
+            .map_err(|_| "controlled outbound listener thread panicked".to_string())?;
+        if portable.non_loopback_interfaces.is_empty()
+            || !portable.has_default_route
+            || portable.dns_servers.is_empty()
+            || portable.outbound_connect_succeeded != Some(true)
+            || !accepted
+        {
+            return Err(format!(
+                "portable-network positive probe failed: report={portable:?} hostAccepted={accepted}"
+            ));
+        }
+        Ok(vec![
+            "no-NIC live profile exposed no non-loopback interface/default route and rejected an outbound connect".to_string(),
+            format!(
+                "portable-network live profile exposed interface/route/DNS and reached controlled host endpoint {endpoint}"
+            ),
+        ])
+    })())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn run_live_policy_network_profile(_options: &HarnessOptions) -> PolicyLiveEvidence {
+    PolicyLiveEvidence {
+        passed: false,
+        evidence: Vec::new(),
+        error: Some("live WHP policy profiles require Windows".to_string()),
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn run_live_policy_process_profiles(
+    _options: &HarnessOptions,
+) -> BTreeMap<String, PolicyLiveEvidence> {
+    ["process-shell", "proxy-environment"]
+        .into_iter()
+        .map(|id| {
+            (
+                id.to_string(),
+                PolicyLiveEvidence {
+                    passed: false,
+                    evidence: Vec::new(),
+                    error: Some("live WHP policy profiles require Windows".to_string()),
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn fresh_policy_live_state() -> LiveHarnessState {
+    LiveHarnessState {
+        run_key: None,
+        init_error: None,
+        first_failure: None,
+        req1_evidence: Vec::new(),
+        session: None,
+    }
+}
 
 fn state() -> &'static Mutex<LiveHarnessState> {
     LIVE_STATE.get_or_init(|| {
@@ -3127,6 +3295,217 @@ fn start_probe_exec(
         })
         .map_err(|error| format!("create process for exec {exec_id} failed: {error}"))?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn run_policy_shell_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence {
+    let result = (|| {
+        let session = state
+            .session
+            .as_mut()
+            .ok_or_else(|| "live session unavailable".to_string())?;
+        let observed = run_policy_command(
+            session,
+            1_301,
+            "printf '%s|%s' \"quoted:$NVX_VALUE\" \"$PWD\"",
+            Some("/".to_string()),
+            vec!["NVX_VALUE=expanded".to_string()],
+            None,
+            Duration::from_secs(10),
+        )?;
+        if observed.stdout != b"quoted:expanded|/"
+            || observed.disposition != Some(ExecDisposition::ExitCode(0))
+        {
+            return Err(format!(
+                "shell quoting/expansion/cwd mismatch: disposition={:?} stdout={:?}",
+                observed.disposition,
+                String::from_utf8_lossy(&observed.stdout)
+            ));
+        }
+        let nonzero = run_policy_command(
+            session,
+            1_302,
+            "exit 23",
+            None,
+            Vec::new(),
+            None,
+            Duration::from_secs(10),
+        )?;
+        if nonzero.disposition != Some(ExecDisposition::ExitCode(23)) {
+            return Err(format!(
+                "nonzero shell exit was not preserved: {:?}",
+                nonzero.disposition
+            ));
+        }
+        let timeout = run_policy_command(
+            session,
+            1_303,
+            "sleep 30 & echo $! > /mnt/virtiofs/rw/policy-timeout.pid; wait",
+            None,
+            Vec::new(),
+            Some(250),
+            Duration::from_secs(10),
+        )?;
+        if timeout.disposition != Some(ExecDisposition::TimedOut) || timeout.termination.is_none() {
+            return Err(format!(
+                "timeout did not terminate the shell tree: disposition={:?} termination={:?}",
+                timeout.disposition, timeout.termination
+            ));
+        }
+        let descendant = run_policy_command(
+            session,
+            1_304,
+            "pid=$(cat /mnt/virtiofs/rw/policy-timeout.pid) && test ! -d \"/proc/$pid\"",
+            None,
+            Vec::new(),
+            None,
+            Duration::from_secs(10),
+        )?;
+        if descendant.disposition != Some(ExecDisposition::ExitCode(0)) {
+            return Err(format!(
+                "timed-out shell descendant remained visible: {:?}",
+                descendant.disposition
+            ));
+        }
+        Ok(vec![
+            "live /bin/sh -c preserved quoting, expansion, explicit cwd, and environment"
+                .to_string(),
+            "live shell preserved nonzero exit code 23".to_string(),
+            "live timeout terminated the shell process tree before terminal delivery".to_string(),
+        ])
+    })();
+    policy_live_evidence(result)
+}
+
+#[cfg(windows)]
+fn run_policy_proxy_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence {
+    let result = (|| {
+        let session = state
+            .session
+            .as_mut()
+            .ok_or_else(|| "live session unavailable".to_string())?;
+        let command = "printf '%s|%s|%s|%s|%s' \"${HTTP_PROXY-unset}\" \"${HTTPS_PROXY-unset}\" \"${http_proxy-unset}\" \"${https_proxy-unset}\" \"${NO_PROXY-unset}\"";
+        let absent = run_policy_command(
+            session,
+            1_311,
+            command,
+            None,
+            Vec::new(),
+            None,
+            Duration::from_secs(10),
+        )?;
+        if absent.stdout != b"unset|unset|unset|unset|unset"
+            || absent.disposition != Some(ExecDisposition::ExitCode(0))
+        {
+            return Err(format!(
+                "absent proxy variables were not scrubbed: {:?}",
+                String::from_utf8_lossy(&absent.stdout)
+            ));
+        }
+        let proxy = "http://proxy.example:8080";
+        let injected = run_policy_command(
+            session,
+            1_312,
+            command,
+            None,
+            vec![
+                format!("HTTP_PROXY={proxy}"),
+                format!("HTTPS_PROXY={proxy}"),
+            ],
+            None,
+            Duration::from_secs(10),
+        )?;
+        let expected = format!("{proxy}|{proxy}|unset|unset|unset");
+        if injected.stdout != expected.as_bytes()
+            || injected.disposition != Some(ExecDisposition::ExitCode(0))
+        {
+            return Err(format!(
+                "proxy variables were not injected exactly: {:?}",
+                String::from_utf8_lossy(&injected.stdout)
+            ));
+        }
+        Ok(vec![
+            "live child environment scrubbed all proxy variables when proxy was absent".to_string(),
+            "live child received exactly HTTP_PROXY and HTTPS_PROXY for URL proxy".to_string(),
+        ])
+    })();
+    policy_live_evidence(result)
+}
+
+#[cfg(windows)]
+fn run_policy_command(
+    session: &mut LiveWhpSession,
+    exec_id: u32,
+    command_line: &str,
+    cwd: Option<String>,
+    env: Vec<String>,
+    timeout_ms: Option<u64>,
+    timeout: Duration,
+) -> Result<ExecObservation, String> {
+    session
+        .client
+        .send_create_process(HostControlMessage::CreateProcess {
+            exec_id,
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                command_line.to_string(),
+            ],
+            cwd,
+            env,
+            timeout_ms,
+        })
+        .map_err(|error| format!("policy create process {exec_id} failed: {error}"))?;
+    grant_stream(session, exec_id, StreamName::Stdout, 1)?;
+    grant_stream(session, exec_id, StreamName::Stderr, 1)?;
+    collect_exec_until_terminal(
+        session,
+        exec_id,
+        timeout,
+        true,
+        ExecCollectionLimits::small_probe(timeout),
+    )
+}
+
+#[cfg(windows)]
+fn run_network_probe(
+    state: &mut LiveHarnessState,
+    exec_id: u32,
+    endpoint: Option<&str>,
+) -> Result<PolicyNetworkReport, String> {
+    let session = state
+        .session
+        .as_mut()
+        .ok_or_else(|| "live session unavailable".to_string())?;
+    let mut args = vec!["network-policy-json"];
+    if let Some(endpoint) = endpoint {
+        args.push(endpoint);
+    }
+    let (disposition, stdout, stderr) = run_simple_probe_exec(session, exec_id, &args)?;
+    if disposition != ExecDisposition::ExitCode(0) {
+        return Err(format!(
+            "network policy probe failed: disposition={disposition:?} stderr={:?}",
+            String::from_utf8_lossy(&stderr)
+        ));
+    }
+    serde_json::from_slice(&stdout)
+        .map_err(|error| format!("network policy probe returned invalid JSON: {error}"))
+}
+
+#[cfg(windows)]
+fn policy_live_evidence(result: Result<Vec<String>, String>) -> PolicyLiveEvidence {
+    match result {
+        Ok(evidence) => PolicyLiveEvidence {
+            passed: true,
+            evidence,
+            error: None,
+        },
+        Err(error) => PolicyLiveEvidence {
+            passed: false,
+            evidence: Vec::new(),
+            error: Some(error),
+        },
+    }
 }
 
 #[cfg(windows)]

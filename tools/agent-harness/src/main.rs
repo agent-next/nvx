@@ -1,23 +1,38 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use agent_harness::mxc_policy::{PolicyHarnessMode, PolicyHarnessOptions, execute_policy_harness};
 use agent_harness::{HarnessBackend, HarnessMode, HarnessOptions, execute_harness};
 
 fn print_usage() {
+    eprintln!("usage:");
     eprintln!(
-        "usage: agent-harness --backend whp [--static-only] [--output-dir <path>] [--openvmm-exe <path>] [--kernel <path>] [--mxc-initramfs <path>] [--common-root <path>]"
+        "  agent-harness [conformance] --backend whp [--static-only] [--output-dir <path>] [artifact overrides]"
     );
     eprintln!(
-        "  --static-only runs validation/static checks only; canonical WHP conformance remains non-passing by design"
+        "  agent-harness mxc-policy --backend whp [--config <json>] [--static-only] [--output-dir <path>] [artifact overrides]"
     );
 }
 
-fn parse_args() -> Result<HarnessOptions, String> {
-    let mut backend: Option<HarnessBackend> = None;
-    let mut mode = HarnessMode::LiveWhp;
-    let mut output_dir = PathBuf::from("build").join("mxc-agent-harness");
+fn parse_common(
+    arguments: impl IntoIterator<Item = String>,
+    default_output: PathBuf,
+) -> Result<
+    (
+        HarnessBackend,
+        bool,
+        PathBuf,
+        agent_harness::launch::LaunchOverrides,
+        Option<PathBuf>,
+    ),
+    String,
+> {
+    let mut backend = None;
+    let mut static_only = false;
+    let mut output_dir = default_output;
     let mut launch_overrides = agent_harness::launch::LaunchOverrides::default();
-    let mut args = std::env::args().skip(1);
+    let mut config = None;
+    let mut args = arguments.into_iter();
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--backend" => {
@@ -26,36 +41,42 @@ fn parse_args() -> Result<HarnessOptions, String> {
                     .ok_or_else(|| "--backend requires a value".to_string())?;
                 backend = Some(HarnessBackend::parse(&value)?);
             }
-            "--static-only" => mode = HarnessMode::StaticOnly,
+            "--static-only" => static_only = true,
             "--output-dir" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--output-dir requires a value".to_string())?;
-                output_dir = PathBuf::from(value);
+                output_dir = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--output-dir requires a value".to_string())?,
+                );
             }
             "--openvmm-exe" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--openvmm-exe requires a value".to_string())?;
-                launch_overrides.openvmm_exe = Some(PathBuf::from(value));
+                launch_overrides.openvmm_exe =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "--openvmm-exe requires a value".to_string()
+                    })?));
             }
             "--kernel" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--kernel requires a value".to_string())?;
-                launch_overrides.kernel = Some(PathBuf::from(value));
+                launch_overrides.kernel = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--kernel requires a value".to_string())?,
+                ));
             }
             "--mxc-initramfs" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--mxc-initramfs requires a value".to_string())?;
-                launch_overrides.mxc_initramfs = Some(PathBuf::from(value));
+                launch_overrides.mxc_initramfs =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "--mxc-initramfs requires a value".to_string()
+                    })?));
             }
             "--common-root" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--common-root requires a value".to_string())?;
-                launch_overrides.common_root = Some(PathBuf::from(value));
+                launch_overrides.common_root =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "--common-root requires a value".to_string()
+                    })?));
+            }
+            "--config" => {
+                config = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--config requires a value".to_string())?,
+                ));
             }
             "--help" | "-h" => {
                 print_usage();
@@ -64,58 +85,126 @@ fn parse_args() -> Result<HarnessOptions, String> {
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(HarnessOptions {
-        backend: backend.ok_or_else(|| "--backend is required".to_string())?,
-        mode,
+    Ok((
+        backend.ok_or_else(|| "--backend is required".to_string())?,
+        static_only,
+        output_dir,
+        launch_overrides,
+        config,
+    ))
+}
+
+fn run_conformance(arguments: Vec<String>) -> ExitCode {
+    let (backend, static_only, output_dir, launch_overrides, config) =
+        match parse_common(arguments, PathBuf::from("build").join("mxc-agent-harness")) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("error: {error}");
+                print_usage();
+                return ExitCode::FAILURE;
+            }
+        };
+    if config.is_some() {
+        eprintln!("error: --config is valid only for mxc-policy");
+        return ExitCode::FAILURE;
+    }
+    let options = HarnessOptions {
+        backend,
+        mode: if static_only {
+            HarnessMode::StaticOnly
+        } else {
+            HarnessMode::LiveWhp
+        },
         output_dir,
         launch_overrides: Some(launch_overrides),
-    })
-}
-
-fn print_summary(run: &agent_harness::HarnessRun) {
-    println!(
-        "mode={:?} backend={} platform={} report={}",
-        run.report.mode,
-        run.report.backend,
-        run.report.platform,
-        run.report_path.display()
-    );
-    for scenario in &run.report.scenarios {
-        let conformance = format!("{:?}", scenario.status);
-        let check = format!("{:?}", scenario.check_status);
-        let evidence = format!("{:?}", scenario.evidence_source);
-        let required = format!("{:?}", scenario.required_evidence_source);
-        println!(
-            "req{:02} {:<36} conformance={:<9} check={:<7} evidence={:<20} required={} {}",
-            scenario.requirement_number,
-            scenario.id,
-            conformance,
-            check,
-            evidence,
-            required,
-            scenario.error.as_deref().unwrap_or("ok"),
-        );
-    }
-}
-
-fn main() -> ExitCode {
-    let options = match parse_args() {
-        Ok(options) => options,
-        Err(error) => {
-            eprintln!("error: {error}");
-            print_usage();
-            return ExitCode::FAILURE;
-        }
     };
-
     match execute_harness(options) {
         Ok(run) => {
-            print_summary(&run);
+            println!(
+                "mode={:?} backend={} platform={} report={}",
+                run.report.mode,
+                run.report.backend,
+                run.report.platform,
+                run.report_path.display()
+            );
+            for scenario in &run.report.scenarios {
+                println!(
+                    "req{:02} {:<36} conformance={:?} check={:?} evidence={:?} required={:?} {}",
+                    scenario.requirement_number,
+                    scenario.id,
+                    scenario.status,
+                    scenario.check_status,
+                    scenario.evidence_source,
+                    scenario.required_evidence_source,
+                    scenario.error.as_deref().unwrap_or("ok"),
+                );
+            }
             run.exit_code()
         }
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn run_policy(arguments: Vec<String>) -> ExitCode {
+    let (backend, static_only, output_dir, launch_overrides, config) =
+        match parse_common(arguments, PathBuf::from("build").join("mxc-policy-harness")) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("error: {error}");
+                print_usage();
+                return ExitCode::FAILURE;
+            }
+        };
+    let options = PolicyHarnessOptions {
+        backend,
+        mode: if static_only {
+            PolicyHarnessMode::StaticOnly
+        } else {
+            PolicyHarnessMode::LiveWhp
+        },
+        output_dir,
+        config,
+        launch_overrides,
+    };
+    match execute_policy_harness(options) {
+        Ok(run) => {
+            println!(
+                "mode={:?} backend={} report={} passed={} uncovered={} unexpected={} blocked={} failed={}",
+                run.report.mode,
+                run.report.backend,
+                run.report_path.display(),
+                run.report.passed,
+                run.report.uncovered.len(),
+                run.report.unexpected.len(),
+                run.report.blocked.len(),
+                run.report.failed.len()
+            );
+            run.exit_code()
+        }
+        Err(error) => {
+            eprintln!(
+                "error: code={} path={} message={}",
+                error.code, error.instance_path, error.message
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    match arguments.first().map(String::as_str) {
+        Some("mxc-policy") => {
+            arguments.remove(0);
+            run_policy(arguments)
+        }
+        Some("conformance") => {
+            arguments.remove(0);
+            run_conformance(arguments)
+        }
+        _ => run_conformance(arguments),
     }
 }

@@ -66,6 +66,7 @@ pub struct LaunchOverrides {
     pub kernel: Option<PathBuf>,
     pub mxc_initramfs: Option<PathBuf>,
     pub common_root: Option<PathBuf>,
+    pub portable_network: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +82,7 @@ pub struct LaunchArtifacts {
     pub kernel: PathBuf,
     pub mxc_initramfs: PathBuf,
     pub common_root: PathBuf,
+    pub portable_network: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -253,6 +255,7 @@ pub fn discover_artifacts(
         kernel: absolute_artifact_path("kernel", &kernel)?,
         mxc_initramfs: absolute_artifact_path("mxc_initramfs", &mxc_initramfs)?,
         common_root: absolute_artifact_path("common_root", &common_root)?,
+        portable_network: overrides.portable_network.clone(),
     })
 }
 
@@ -331,7 +334,7 @@ fn sanitize_pipe_name_component(input: &str) -> String {
 pub fn launch_whp_vm(plan: LaunchPlan) -> Result<LaunchedVm, String> {
     let cmdline = format!("nvx.channel_generation={}", plan.channel_generation);
     let mount = mount_argument_for_common_root(&plan.artifacts.common_root)?;
-    let args = vec![
+    let mut args = vec![
         "--single-process".to_string(),
         "--machine".to_string(),
         "microvm".to_string(),
@@ -352,6 +355,14 @@ pub fn launch_whp_vm(plan: LaunchPlan) -> Result<LaunchedVm, String> {
         "--cmdline".to_string(),
         cmdline,
     ];
+    if let Some(network) = &plan.artifacts.portable_network {
+        args.extend([
+            "--net".to_string(),
+            network.clone(),
+            "--network-profile".to_string(),
+            "portable".to_string(),
+        ]);
+    }
     #[cfg(windows)]
     {
         launch_whp_vm_windows(plan, args)
@@ -1292,6 +1303,7 @@ mod tests {
             kernel: Some(kernel),
             mxc_initramfs: Some(initramfs),
             common_root: Some(relative_root.join("common")),
+            portable_network: None,
         };
 
         let artifacts =
@@ -1313,6 +1325,7 @@ mod tests {
             kernel: PathBuf::from("vmlinux"),
             mxc_initramfs: PathBuf::from("initramfs"),
             common_root: root.join("common"),
+            portable_network: None,
         };
         let plan = build_launch_plan(&root, artifacts);
         assert_eq!(plan.launch_capability.len(), 32);
@@ -1568,6 +1581,7 @@ mod tests {
                 kernel: PathBuf::from("vmlinux"),
                 mxc_initramfs: PathBuf::from("initramfs-mxc-agent.cpio.gz"),
                 common_root: std::env::temp_dir().join("common-root"),
+                portable_network: None,
             },
         );
         let mut vm = LaunchedVm {
@@ -1602,6 +1616,7 @@ mod tests {
                 kernel: PathBuf::from("vmlinux"),
                 mxc_initramfs: PathBuf::from("initramfs-mxc-agent.cpio.gz"),
                 common_root: std::env::temp_dir().join("common-root"),
+                portable_network: None,
             },
         );
         let mut vm = LaunchedVm {

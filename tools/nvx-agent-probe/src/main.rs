@@ -39,8 +39,81 @@ fn run() -> Result<()> {
         "identity-json" => run_identity_json(),
         "isolation-json" => run_isolation_json(args.collect()),
         "mapping-check" => run_mapping_check(args.collect()),
+        "policy-env-json" => run_policy_env_json(args.collect()),
+        "network-policy-json" => run_network_policy_json(args.collect()),
         other => Err(format!("unknown subcommand {other:?}")),
     }
+}
+
+#[derive(Serialize)]
+struct PolicyEnvironmentReport {
+    cwd: String,
+    values: BTreeMap<String, Option<String>>,
+}
+
+fn run_policy_env_json(args: Vec<String>) -> Result<()> {
+    let mut values = BTreeMap::new();
+    for key in args {
+        if key.is_empty() || key.contains('=') {
+            return Err(format!("invalid environment key {key:?}"));
+        }
+        values.insert(key.clone(), std::env::var(&key).ok());
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("reading current directory failed: {error}"))?
+        .to_string_lossy()
+        .into_owned();
+    write_json(&PolicyEnvironmentReport { cwd, values })
+}
+
+#[derive(Serialize)]
+struct NetworkPolicyReport {
+    non_loopback_interfaces: Vec<String>,
+    has_default_route: bool,
+    dns_servers: Vec<String>,
+    outbound_connect_succeeded: Option<bool>,
+}
+
+fn run_network_policy_json(args: Vec<String>) -> Result<()> {
+    let non_loopback_interfaces = fs::read_dir("/sys/class/net")
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(std::result::Result::ok))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name != "lo")
+        .collect::<Vec<_>>();
+    let has_default_route = fs::read_to_string("/proc/net/route")
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .any(|line| line.split_whitespace().nth(1) == Some("00000000"));
+    let dns_servers = fs::read_to_string("/etc/resolv.conf")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.strip_prefix("nameserver "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let outbound_connect_succeeded = match args.as_slice() {
+        [] => None,
+        [endpoint] => Some(
+            std::net::TcpStream::connect_timeout(
+                &endpoint
+                    .parse()
+                    .map_err(|error| format!("invalid socket endpoint {endpoint:?}: {error}"))?,
+                Duration::from_secs(3),
+            )
+            .is_ok(),
+        ),
+        _ => return Err("network-policy-json accepts at most one IP:PORT endpoint".to_string()),
+    };
+    write_json(&NetworkPolicyReport {
+        non_loopback_interfaces,
+        has_default_route,
+        dns_servers,
+        outbound_connect_succeeded,
+    })
 }
 
 #[cfg(target_os = "linux")]

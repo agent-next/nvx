@@ -1,0 +1,187 @@
+[
+  {
+    "id": "schema-inventory-static",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "provision"
+    },
+    "expectedDisposition": "accepted",
+    "requiredEvidence": "unit-static",
+    "catalogKeys": ["__schema_inventory__"]
+  },
+  {
+    "id": "annotations-inert",
+    "config": {
+      "$schema": "https://example.invalid/mxc.json",
+      "_comment": {"purpose": "annotation"},
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "provision"
+    },
+    "expectedDisposition": "accepted",
+    "requiredEvidence": "unit-static",
+    "catalogKeys": ["$schema", "_comment"]
+  },
+  {
+    "id": "provision-filesystem-no-nic",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "provision",
+      "containerId": "container-1",
+      "filesystem": {
+        "readwritePaths": ["C:\\nvx-policy-common\\rw"],
+        "readonlyPaths": ["C:\\nvx-policy-common\\ro"]
+      },
+      "network": {"defaultPolicy": "block"}
+    },
+    "expectedDisposition": "accepted",
+    "requiredEvidence": "live-whp-positive-negative",
+    "catalogKeys": [
+      "filesystem.readwritePaths",
+      "filesystem.readonlyPaths",
+      "network.defaultPolicy"
+    ]
+  },
+  {
+    "id": "provision-portable-network",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "provision",
+      "network": {"defaultPolicy": "allow"}
+    },
+    "expectedDisposition": "accepted",
+    "requiredEvidence": "live-whp-positive-negative",
+    "catalogKeys": ["network.defaultPolicy#value=\"allow\""]
+  },
+  {
+    "id": "exec-shell-env-cwd-timeout",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "exec",
+      "sandboxId": "nvx:policy",
+      "process": {
+        "commandLine": "printf '%s' \"$NVX_VALUE\"",
+        "cwd": "/work",
+        "env": ["NVX_VALUE=expanded"],
+        "timeout": 1000
+      }
+    },
+    "expectedDisposition": "accepted",
+    "requiredEvidence": "live-whp-positive-negative",
+    "catalogKeys": [
+      "process.commandLine",
+      "process.cwd",
+      "process.env",
+      "process.timeout"
+    ]
+  },
+  {
+    "id": "exec-url-proxy",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "exec",
+      "sandboxId": "nvx:policy",
+      "process": {"commandLine": "env"},
+      "network": {"proxy": {"url": "http://proxy.example:8080"}}
+    },
+    "expectedDisposition": "accepted",
+    "requiredEvidence": "live-whp-positive-negative",
+    "catalogKeys": ["network.proxy.url"]
+  },
+  {
+    "id": "reject-telemetry",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "provision",
+      "telemetry": {"enabled": false}
+    },
+    "expectedDisposition": "rejected",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "telemetry",
+    "requiredEvidence": "unit-static",
+    "catalogKeys": ["telemetry", "telemetry.enabled"]
+  },
+  {
+    "id": "reject-denied-paths",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "provision",
+      "filesystem": {"deniedPaths": ["C:\\nvx-policy-common\\secret"]}
+    },
+    "expectedDisposition": "rejected",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "filesystem.deniedPaths",
+    "requiredEvidence": "unit-static",
+    "catalogKeys": ["filesystem.deniedPaths"]
+  },
+  {
+    "id": "reject-host-rules",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "provision",
+      "network": {"allowedHosts": ["example.com"]}
+    },
+    "expectedDisposition": "rejected",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "network.allowedHosts",
+    "requiredEvidence": "unit-static",
+    "catalogKeys": ["network.allowedHosts"]
+  },
+  {
+    "id": "reject-proxy-conflict",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "exec",
+      "sandboxId": "nvx:policy",
+      "process": {
+        "commandLine": "env",
+        "env": ["HTTP_PROXY=http://untrusted"]
+      },
+      "network": {"proxy": {"url": "http://proxy.example:8080"}}
+    },
+    "expectedDisposition": "rejected",
+    "expectedCode": "cross_field_conflict",
+    "expectedPath": "process.env",
+    "requiredEvidence": "unit-static",
+    "catalogKeys": ["network.proxy.url", "process.env"]
+  },
+  {
+    "id": "reject-empty-command",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "exec",
+      "sandboxId": "nvx:policy",
+      "process": {"commandLine": ""}
+    },
+    "expectedDisposition": "rejected",
+    "expectedCode": "invalid_value",
+    "expectedPath": "process.commandLine",
+    "requiredEvidence": "unit-static",
+    "catalogKeys": ["process.commandLine#absent", "process.commandLine#null"]
+  },
+  {
+    "id": "reject-post-provision-policy",
+    "config": {
+      "version": "0.9.0-dev",
+      "containment": "vm",
+      "phase": "start",
+      "sandboxId": "nvx:policy",
+      "filesystem": {}
+    },
+    "expectedDisposition": "rejected",
+    "expectedCode": "invalid_phase",
+    "expectedPath": "filesystem",
+    "requiredEvidence": "unit-static",
+    "catalogKeys": ["phase#value=\"start\"", "filesystem"]
+  }
+]

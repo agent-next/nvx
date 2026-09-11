@@ -257,6 +257,50 @@ def command_test_mxc_agent(args: argparse.Namespace) -> None:
     _run(command, cwd=REPO_ROOT)
 
 
+def command_test_mxc_policy(args: argparse.Namespace) -> None:
+    openvmm_exe = args.openvmm_exe or openvmm_binary_path()
+    kernel = args.kernel or artifact_path("vmlinux")
+    mxc_initramfs = args.mxc_initramfs or artifact_path(MXC_PROTOTYPE_INITRAMFS_NAME)
+    common_root = args.common_root or (args.output_dir / "common-root")
+    if not args.static_only:
+        _validate_mxc_agent_live_inputs(
+            openvmm_exe=openvmm_exe,
+            kernel=kernel,
+            mxc_initramfs=mxc_initramfs,
+            common_root=common_root,
+        )
+    command: list[str | os.PathLike[str]] = [
+        "cargo",
+        "run",
+        "-p",
+        "agent-harness",
+        "--",
+        "mxc-policy",
+        "--backend",
+        args.backend,
+        "--output-dir",
+        args.output_dir,
+        "--common-root",
+        common_root,
+    ]
+    if args.config is not None:
+        command.extend(("--config", args.config))
+    if args.static_only:
+        command.append("--static-only")
+    else:
+        command.extend(
+            (
+                "--openvmm-exe",
+                openvmm_exe,
+                "--kernel",
+                kernel,
+                "--mxc-initramfs",
+                mxc_initramfs,
+            )
+        )
+    _run(command, cwd=REPO_ROOT)
+
+
 def _validate_mxc_agent_live_inputs(
     *,
     openvmm_exe: Path,
@@ -670,6 +714,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="override common-root host path used by the harness",
     )
     mxc_agent_tests.set_defaults(handler=command_test_mxc_agent)
+
+    mxc_policy_tests = subparsers.add_parser(
+        "test-mxc-policy",
+        help="verify real MXC 0.9.0-dev JSON against the future state-aware NVX contract",
+    )
+    mxc_policy_tests.add_argument("--backend", choices=("whp",), required=True)
+    mxc_policy_tests.add_argument(
+        "--config",
+        type=Path,
+        help="run one diagnostic MXC JSON config instead of the checked-in corpus",
+    )
+    mxc_policy_tests.add_argument(
+        "--static-only",
+        action="store_true",
+        help="run schema, catalog, adapter, corpus, and zero-effect checks only",
+    )
+    mxc_policy_tests.add_argument(
+        "--output-dir",
+        type=Path,
+        default=BUILD_DIR / "mxc-policy-harness",
+    )
+    mxc_policy_tests.add_argument("--openvmm-exe", type=Path)
+    mxc_policy_tests.add_argument("--kernel", type=Path)
+    mxc_policy_tests.add_argument("--mxc-initramfs", type=Path)
+    mxc_policy_tests.add_argument("--common-root", type=Path)
+    mxc_policy_tests.set_defaults(handler=command_test_mxc_policy)
 
     microvm_tests = subparsers.add_parser(
         "test-microvm",

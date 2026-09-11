@@ -583,6 +583,15 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(mxc_agent_tests.common_root)
         self.assertIs(mxc_agent_tests.handler, nvx.command_test_mxc_agent)
 
+        mxc_policy_tests = nvx.parse_args(["test-mxc-policy", "--backend", "whp"])
+        self.assertEqual(mxc_policy_tests.backend, "whp")
+        self.assertEqual(
+            mxc_policy_tests.output_dir, common.BUILD_DIR / "mxc-policy-harness"
+        )
+        self.assertFalse(mxc_policy_tests.static_only)
+        self.assertIsNone(mxc_policy_tests.config)
+        self.assertIs(mxc_policy_tests.handler, nvx.command_test_mxc_policy)
+
     def test_test_mxc_agent_builds_canonical_command(self):
         args = nvx.parse_args(
             [
@@ -639,6 +648,80 @@ class CliTests(unittest.TestCase):
         message = str(context.exception)
         self.assertIn("\"kind\": \"missing-prerequisite\"", message)
         self.assertIn("\"field\": \"openvmm_exe\"", message)
+
+    def test_test_mxc_policy_builds_static_config_command(self):
+        args = nvx.parse_args(
+            [
+                "test-mxc-policy",
+                "--backend",
+                "whp",
+                "--static-only",
+                "--config",
+                "policy.json",
+                "--output-dir",
+                str(Path("artifacts/policy")),
+                "--common-root",
+                str(Path("C:/common")),
+            ]
+        )
+        with patch.object(nvx, "_run") as run:
+            nvx.command_test_mxc_policy(args)
+        self.assertEqual(
+            [str(value) for value in run.call_args.args[0]],
+            [
+                "cargo",
+                "run",
+                "-p",
+                "agent-harness",
+                "--",
+                "mxc-policy",
+                "--backend",
+                "whp",
+                "--output-dir",
+                str(Path("artifacts/policy")),
+                "--common-root",
+                str(Path("C:/common")),
+                "--config",
+                "policy.json",
+                "--static-only",
+            ],
+        )
+
+    def test_test_mxc_policy_live_validates_and_pins_artifacts(self):
+        args = nvx.parse_args(
+            [
+                "test-mxc-policy",
+                "--backend",
+                "whp",
+                "--output-dir",
+                "artifacts/policy",
+            ]
+        )
+        with (
+            patch.object(nvx, "_run") as run,
+            patch.object(nvx, "_validate_mxc_agent_live_inputs") as validate,
+            patch.object(nvx, "openvmm_binary_path", return_value=Path("openvmm.exe")),
+            patch.object(nvx, "artifact_path", side_effect=lambda name: Path("build") / name),
+        ):
+            nvx.command_test_mxc_policy(args)
+        validate.assert_called_once()
+        command = [str(value) for value in run.call_args.args[0]]
+        self.assertEqual(
+            command[:8],
+            [
+                "cargo",
+                "run",
+                "-p",
+                "agent-harness",
+                "--",
+                "mxc-policy",
+                "--backend",
+                "whp",
+            ],
+        )
+        self.assertIn("--openvmm-exe", command)
+        self.assertIn("--kernel", command)
+        self.assertIn("--mxc-initramfs", command)
 
     def test_sandbox_command_parses_typed_launch_contract(self):
         args = nvx.parse_args(
