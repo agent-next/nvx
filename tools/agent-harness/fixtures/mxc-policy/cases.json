@@ -602,12 +602,12 @@
   {
     "id": "0030-containment-oneOf-9--string",
     "config": {
-      "containment": "custom",
+      "containment": "isolation_session",
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "invalid_value",
     "expectedPath": "/containment",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -632,12 +632,12 @@
   {
     "id": "0032-containment-oneOf-10--string",
     "config": {
-      "containment": "mock",
+      "containment": "bubblewrap",
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "invalid_value",
     "expectedPath": "/containment",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -904,7 +904,7 @@
       "experimental": {
         "isolation_session": {
           "provision": {
-            "appId": {}
+            "appId": "generated"
           }
         }
       },
@@ -912,7 +912,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1075,14 +1075,14 @@
       "containment": "vm",
       "experimental": {
         "seatbelt": {
-          "extraMachLookups": {}
+          "extraMachLookups": []
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1134,9 +1134,7 @@
       "experimental": {
         "seatbelt": {
           "extraMachLookups": [
-            [
-              "generated"
-            ]
+            "generated"
           ]
         }
       },
@@ -1144,7 +1142,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1157,14 +1155,14 @@
       "containment": "vm",
       "experimental": {
         "seatbelt": {
-          "guiAccess": {}
+          "guiAccess": false
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1215,14 +1213,14 @@
       "containment": "vm",
       "experimental": {
         "seatbelt": {
-          "keychainAccess": {}
+          "keychainAccess": false
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1273,14 +1271,14 @@
       "containment": "vm",
       "experimental": {
         "seatbelt": {
-          "launchMethod": {}
+          "launchMethod": "exec"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1331,14 +1329,14 @@
       "containment": "vm",
       "experimental": {
         "seatbelt": {
-          "launchMethod": {}
+          "launchMethod": "exec"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1351,14 +1349,14 @@
       "containment": "vm",
       "experimental": {
         "seatbelt": {
-          "launchMethod": "spawn"
+          "launchMethod": "exec"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1409,7 +1407,7 @@
       "containment": "vm",
       "experimental": {
         "seatbelt": {
-          "launchMethod": "exec"
+          "launchMethod": "open"
         }
       },
       "phase": "provision",
@@ -1469,14 +1467,14 @@
       "containment": "vm",
       "experimental": {
         "seatbelt": {
-          "nestedPty": {}
+          "nestedPty": false
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1545,14 +1543,14 @@
       "containment": "vm",
       "experimental": {
         "seatbelt": {
-          "profileOverride": {}
+          "profileOverride": "generated"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1691,14 +1689,14 @@
       "containment": "vm",
       "experimental": {
         "test": {
-          "message": {}
+          "message": "generated"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1837,14 +1835,14 @@
       "containment": "vm",
       "experimental": {
         "windows_sandbox": {
-          "daemonPipeName": {}
+          "daemonPipeName": "generated"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1895,14 +1893,14 @@
       "containment": "vm",
       "experimental": {
         "windows_sandbox": {
-          "idleTimeout": {}
+          "idleTimeout": 1
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -1953,14 +1951,14 @@
       "containment": "vm",
       "experimental": {
         "windows_sandbox": {
-          "idleTimeoutMs": {}
+          "idleTimeoutMs": 1
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2099,14 +2097,14 @@
       "containment": "vm",
       "experimental": {
         "wslc": {
-          "cpuCount": {}
+          "cpuCount": 1
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2157,14 +2155,14 @@
       "containment": "vm",
       "experimental": {
         "wslc": {
-          "gpu": {}
+          "gpu": false
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2273,14 +2271,14 @@
       "containment": "vm",
       "experimental": {
         "wslc": {
-          "imageTarPath": {}
+          "imageTarPath": "generated"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2331,14 +2329,14 @@
       "containment": "vm",
       "experimental": {
         "wslc": {
-          "memoryMb": {}
+          "memoryMb": 1
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2389,14 +2387,14 @@
       "containment": "vm",
       "experimental": {
         "wslc": {
-          "portMappings": {}
+          "portMappings": []
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2448,9 +2446,10 @@
       "experimental": {
         "wslc": {
           "portMappings": [
-            [
-              "generated"
-            ]
+            {
+              "containerPort": 1,
+              "windowsPort": 1
+            }
           ]
         }
       },
@@ -2458,7 +2457,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2473,7 +2472,8 @@
         "wslc": {
           "portMappings": [
             {
-              "containerPort": {}
+              "containerPort": 1,
+              "windowsPort": 1
             }
           ]
         }
@@ -2482,7 +2482,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2497,7 +2497,9 @@
         "wslc": {
           "portMappings": [
             {
-              "protocol": {}
+              "containerPort": 1,
+              "protocol": "tcp",
+              "windowsPort": 1
             }
           ]
         }
@@ -2506,7 +2508,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2520,7 +2522,10 @@
       "experimental": {
         "wslc": {
           "portMappings": [
-            {}
+            {
+              "containerPort": 1,
+              "windowsPort": 1
+            }
           ]
         }
       },
@@ -2528,7 +2533,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2543,7 +2548,9 @@
         "wslc": {
           "portMappings": [
             {
-              "protocol": null
+              "containerPort": 1,
+              "protocol": null,
+              "windowsPort": 1
             }
           ]
         }
@@ -2552,7 +2559,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2567,7 +2574,9 @@
         "wslc": {
           "portMappings": [
             {
-              "protocol": {}
+              "containerPort": 1,
+              "protocol": "tcp",
+              "windowsPort": 1
             }
           ]
         }
@@ -2576,7 +2585,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2591,7 +2600,9 @@
         "wslc": {
           "portMappings": [
             {
-              "protocol": "tcp"
+              "containerPort": 1,
+              "protocol": "tcp",
+              "windowsPort": 1
             }
           ]
         }
@@ -2600,7 +2611,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2615,7 +2626,9 @@
         "wslc": {
           "portMappings": [
             {
-              "protocol": null
+              "containerPort": 1,
+              "protocol": null,
+              "windowsPort": 1
             }
           ]
         }
@@ -2624,7 +2637,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2639,7 +2652,8 @@
         "wslc": {
           "portMappings": [
             {
-              "windowsPort": {}
+              "containerPort": 1,
+              "windowsPort": 1
             }
           ]
         }
@@ -2648,7 +2662,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2824,7 +2838,7 @@
       "experimental": {
         "wslc": {
           "provision": {
-            "imageTarPath": {}
+            "imageTarPath": "generated"
           }
         }
       },
@@ -2832,7 +2846,7 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2907,14 +2921,14 @@
       "containment": "vm",
       "experimental": {
         "wslc": {
-          "storagePath": {}
+          "storagePath": "generated"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -2965,14 +2979,14 @@
       "containment": "vm",
       "experimental": {
         "wslc": {
-          "targetOs": {}
+          "targetOs": "generated"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/experimental",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -3131,13 +3145,13 @@
     "config": {
       "containment": "vm",
       "fallback": {
-        "allowDaclMutation": {}
+        "allowDaclMutation": false
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/fallback",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -3763,7 +3777,7 @@
     "config": {
       "containment": "vm",
       "lifecycle": {
-        "destroyOnExit": true
+        "destroyOnExit": false
       },
       "phase": "provision",
       "version": "0.9.0-dev"
@@ -3831,7 +3845,7 @@
     "config": {
       "containment": "vm",
       "lifecycle": {
-        "preservePolicy": true
+        "preservePolicy": false
       },
       "phase": "provision",
       "version": "0.9.0-dev"
@@ -3990,13 +4004,13 @@
     "config": {
       "containment": "vm",
       "lxc": {
-        "distribution": {}
+        "distribution": "generated"
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/lxc",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -4042,13 +4056,13 @@
     "config": {
       "containment": "vm",
       "lxc": {
-        "release": {}
+        "release": "generated"
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/lxc",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -4221,14 +4235,14 @@
     "config": {
       "containment": "vm",
       "network": {
-        "allowLocalNetwork": {}
+        "allowLocalNetwork": false
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/allowLocalNetwork",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.allowLocalNetwork"
@@ -4545,7 +4559,7 @@
     "config": {
       "containment": "vm",
       "network": {
-        "defaultPolicy": "block"
+        "defaultPolicy": "allow"
       },
       "phase": "provision",
       "version": "0.9.0-dev"
@@ -4559,7 +4573,7 @@
       "provision": {
         "commonRoot": "C:\\nvx-policy-common",
         "mappings": [],
-        "defaultNetworkPolicy": "block"
+        "defaultNetworkPolicy": "allow"
       },
       "exec": null
     },
@@ -4748,15 +4762,15 @@
       "containment": "vm",
       "network": {
         "egress": {
-          "allow": {}
+          "allow": []
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow"
@@ -4807,9 +4821,7 @@
       "network": {
         "egress": {
           "allow": [
-            [
-              "generated"
-            ]
+            {}
           ]
         }
       },
@@ -4817,8 +4829,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[]"
@@ -4832,7 +4844,9 @@
         "egress": {
           "allow": [
             {
-              "ports": {}
+              "ports": [
+                {}
+              ]
             }
           ]
         }
@@ -4841,8 +4855,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].ports"
@@ -4903,9 +4917,7 @@
           "allow": [
             {
               "ports": [
-                [
-                  "generated"
-                ]
+                {}
               ]
             }
           ]
@@ -4915,8 +4927,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].ports[]"
@@ -4932,7 +4944,7 @@
             {
               "ports": [
                 {
-                  "endPort": {}
+                  "endPort": 1
                 }
               ]
             }
@@ -4943,8 +4955,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].ports[].endPort"
@@ -5014,7 +5026,7 @@
             {
               "ports": [
                 {
-                  "port": {}
+                  "port": 1
                 }
               ]
             }
@@ -5025,8 +5037,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].ports[].port"
@@ -5096,7 +5108,7 @@
             {
               "ports": [
                 {
-                  "protocol": {}
+                  "protocol": "tcp"
                 }
               ]
             }
@@ -5107,8 +5119,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].ports[].protocol"
@@ -5178,7 +5190,7 @@
             {
               "ports": [
                 {
-                  "protocol": {}
+                  "protocol": "tcp"
                 }
               ]
             }
@@ -5189,8 +5201,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].ports[].protocol#anyOf[0]=#/definitions/NetworkProtocol"
@@ -5370,7 +5382,11 @@
         "egress": {
           "allow": [
             {
-              "to": "generated"
+              "to": [
+                {
+                  "cidr": "generated"
+                }
+              ]
             }
           ]
         }
@@ -5379,8 +5395,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].to"
@@ -5441,9 +5457,9 @@
           "allow": [
             {
               "to": [
-                [
-                  "generated"
-                ]
+                {
+                  "cidr": "generated"
+                }
               ]
             }
           ]
@@ -5453,8 +5469,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].to[]"
@@ -5498,7 +5514,8 @@
             {
               "to": [
                 {
-                  "except": {}
+                  "cidr": "generated",
+                  "except": []
                 }
               ]
             }
@@ -5509,8 +5526,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].to[].except"
@@ -5525,7 +5542,9 @@
           "allow": [
             {
               "to": [
-                {}
+                {
+                  "cidr": "generated"
+                }
               ]
             }
           ]
@@ -5535,8 +5554,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].to[].except#absent"
@@ -5552,6 +5571,7 @@
             {
               "to": [
                 {
+                  "cidr": "generated",
                   "except": null
                 }
               ]
@@ -5563,8 +5583,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].to[].except#nullable"
@@ -5580,10 +5600,9 @@
             {
               "to": [
                 {
+                  "cidr": "generated",
                   "except": [
-                    [
-                      "generated"
-                    ]
+                    "generated"
                   ]
                 }
               ]
@@ -5595,8 +5614,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.allow[].to[].except[]"
@@ -5608,15 +5627,15 @@
       "containment": "vm",
       "network": {
         "egress": {
-          "default": {}
+          "default": "allow"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.default"
@@ -5666,15 +5685,15 @@
       "containment": "vm",
       "network": {
         "egress": {
-          "default": {}
+          "default": "allow"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.default#anyOf[0]=#/definitions/NetworkAction"
@@ -5764,15 +5783,15 @@
       "containment": "vm",
       "network": {
         "egress": {
-          "deny": {}
+          "deny": []
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny"
@@ -5823,9 +5842,7 @@
       "network": {
         "egress": {
           "deny": [
-            [
-              "generated"
-            ]
+            {}
           ]
         }
       },
@@ -5833,8 +5850,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[]"
@@ -5848,7 +5865,9 @@
         "egress": {
           "deny": [
             {
-              "ports": {}
+              "ports": [
+                {}
+              ]
             }
           ]
         }
@@ -5857,8 +5876,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].ports"
@@ -5919,9 +5938,7 @@
           "deny": [
             {
               "ports": [
-                [
-                  "generated"
-                ]
+                {}
               ]
             }
           ]
@@ -5931,8 +5948,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].ports[]"
@@ -5948,7 +5965,7 @@
             {
               "ports": [
                 {
-                  "endPort": {}
+                  "endPort": 1
                 }
               ]
             }
@@ -5959,8 +5976,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].ports[].endPort"
@@ -6030,7 +6047,7 @@
             {
               "ports": [
                 {
-                  "port": {}
+                  "port": 1
                 }
               ]
             }
@@ -6041,8 +6058,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].ports[].port"
@@ -6112,7 +6129,7 @@
             {
               "ports": [
                 {
-                  "protocol": {}
+                  "protocol": "tcp"
                 }
               ]
             }
@@ -6123,8 +6140,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].ports[].protocol"
@@ -6194,7 +6211,7 @@
             {
               "ports": [
                 {
-                  "protocol": {}
+                  "protocol": "tcp"
                 }
               ]
             }
@@ -6205,8 +6222,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].ports[].protocol#anyOf[0]=#/definitions/NetworkProtocol"
@@ -6386,7 +6403,11 @@
         "egress": {
           "deny": [
             {
-              "to": "generated"
+              "to": [
+                {
+                  "cidr": "generated"
+                }
+              ]
             }
           ]
         }
@@ -6395,8 +6416,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].to"
@@ -6457,9 +6478,9 @@
           "deny": [
             {
               "to": [
-                [
-                  "generated"
-                ]
+                {
+                  "cidr": "generated"
+                }
               ]
             }
           ]
@@ -6469,8 +6490,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].to[]"
@@ -6514,7 +6535,8 @@
             {
               "to": [
                 {
-                  "except": {}
+                  "cidr": "generated",
+                  "except": []
                 }
               ]
             }
@@ -6525,8 +6547,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].to[].except"
@@ -6541,7 +6563,9 @@
           "deny": [
             {
               "to": [
-                {}
+                {
+                  "cidr": "generated"
+                }
               ]
             }
           ]
@@ -6551,8 +6575,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].to[].except#absent"
@@ -6568,6 +6592,7 @@
             {
               "to": [
                 {
+                  "cidr": "generated",
                   "except": null
                 }
               ]
@@ -6579,8 +6604,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].to[].except#nullable"
@@ -6596,10 +6621,9 @@
             {
               "to": [
                 {
+                  "cidr": "generated",
                   "except": [
-                    [
-                      "generated"
-                    ]
+                    "generated"
                   ]
                 }
               ]
@@ -6611,8 +6635,8 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/egress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.egress.deny[].to[].except[]"
@@ -6641,14 +6665,14 @@
     "config": {
       "containment": "vm",
       "network": {
-        "enforcementMode": {}
+        "enforcementMode": "capabilities"
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/enforcementMode",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.enforcementMode"
@@ -6705,14 +6729,14 @@
     "config": {
       "containment": "vm",
       "network": {
-        "enforcementMode": {}
+        "enforcementMode": "capabilities"
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/enforcementMode",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.enforcementMode#anyOf[0]=#/definitions/NetworkEnforcement"
@@ -6723,14 +6747,14 @@
     "config": {
       "containment": "vm",
       "network": {
-        "enforcementMode": "none"
+        "enforcementMode": "capabilities"
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/enforcementMode",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.enforcementMode#oneOf[0]=string"
@@ -6759,14 +6783,14 @@
     "config": {
       "containment": "vm",
       "network": {
-        "enforcementMode": "audit"
+        "enforcementMode": "firewall"
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/enforcementMode",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.enforcementMode#oneOf[1]=string"
@@ -6795,14 +6819,14 @@
     "config": {
       "containment": "vm",
       "network": {
-        "enforcementMode": "enforce"
+        "enforcementMode": "both"
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/enforcementMode",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.enforcementMode#oneOf[2]=string"
@@ -6932,15 +6956,15 @@
       "containment": "vm",
       "network": {
         "ingress": {
-          "default": {}
+          "default": "allow"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/ingress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.ingress.default"
@@ -6990,15 +7014,15 @@
       "containment": "vm",
       "network": {
         "ingress": {
-          "default": {}
+          "default": "allow"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/ingress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.ingress.default#anyOf[0]=#/definitions/NetworkAction"
@@ -7070,15 +7094,15 @@
       "containment": "vm",
       "network": {
         "ingress": {
-          "hostLoopback": {}
+          "hostLoopback": "allow"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/ingress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.ingress.hostLoopback"
@@ -7128,15 +7152,15 @@
       "containment": "vm",
       "network": {
         "ingress": {
-          "hostLoopback": {}
+          "hostLoopback": "allow"
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/ingress",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.ingress.hostLoopback#anyOf[0]=#/definitions/NetworkAction"
@@ -7308,15 +7332,15 @@
       "containment": "vm",
       "network": {
         "proxy": {
-          "builtinTestServer": {}
+          "builtinTestServer": false
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/proxy",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.proxy.builtinTestServer"
@@ -7366,15 +7390,15 @@
       "containment": "vm",
       "network": {
         "proxy": {
-          "localhost": true
+          "localhost": 1
         }
       },
       "phase": "provision",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
-    "expectedPath": "/network",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/proxy",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.proxy.localhost"
@@ -8429,13 +8453,13 @@
         "commandLine": "echo generated"
       },
       "processContainer": {
-        "capabilities": {}
+        "capabilities": []
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -8494,16 +8518,14 @@
       },
       "processContainer": {
         "capabilities": [
-          [
-            "generated"
-          ]
+          "generated"
         ]
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -8606,14 +8628,14 @@
       },
       "processContainer": {
         "captureDenials": {
-          "mode": "generated"
+          "mode": "block"
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -8676,14 +8698,14 @@
       },
       "processContainer": {
         "captureDenials": {
-          "mode": "generated"
+          "mode": "block"
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -8700,14 +8722,14 @@
       },
       "processContainer": {
         "captureDenials": {
-          "mode": "none"
+          "mode": "block"
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -8748,14 +8770,14 @@
       },
       "processContainer": {
         "captureDenials": {
-          "mode": "full"
+          "mode": "allow"
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -8842,14 +8864,14 @@
       },
       "processContainer": {
         "captureDenials": {
-          "outputPath": {}
+          "outputPath": "generated"
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -8912,14 +8934,14 @@
       },
       "processContainer": {
         "captureDenials": {
-          "retainEtl": {}
+          "retainEtl": false
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -9025,13 +9047,13 @@
         "commandLine": "echo generated"
       },
       "processContainer": {
-        "learningMode": {}
+        "learningMode": false
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -9089,13 +9111,13 @@
         "commandLine": "echo generated"
       },
       "processContainer": {
-        "leastPrivilege": {}
+        "leastPrivilege": false
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -9240,14 +9262,14 @@
       },
       "processContainer": {
         "network": {
-          "allowedProxyPeer": {}
+          "allowedProxyPeer": "generated"
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -9418,14 +9440,14 @@
       },
       "processContainer": {
         "ui": {
-          "desktopSystemControl": {}
+          "desktopSystemControl": false
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -9488,14 +9510,14 @@
       },
       "processContainer": {
         "ui": {
-          "ime": {}
+          "ime": false
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -9558,14 +9580,14 @@
       },
       "processContainer": {
         "ui": {
-          "isolation": {}
+          "isolation": "desktop"
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -9628,14 +9650,14 @@
       },
       "processContainer": {
         "ui": {
-          "isolation": {}
+          "isolation": "desktop"
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -9772,14 +9794,14 @@
       },
       "processContainer": {
         "ui": {
-          "systemSettings": {}
+          "systemSettings": "generated"
         }
       },
       "sandboxId": "sandbox-1",
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/processContainer",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -10328,12 +10350,12 @@
       "containment": "vm",
       "phase": "provision",
       "seatbelt": {
-        "extraMachLookups": {}
+        "extraMachLookups": []
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/seatbelt",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -10381,15 +10403,13 @@
       "phase": "provision",
       "seatbelt": {
         "extraMachLookups": [
-          [
-            "generated"
-          ]
+          "generated"
         ]
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/seatbelt",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -10402,12 +10422,12 @@
       "containment": "vm",
       "phase": "provision",
       "seatbelt": {
-        "guiAccess": {}
+        "guiAccess": false
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/seatbelt",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -10454,12 +10474,12 @@
       "containment": "vm",
       "phase": "provision",
       "seatbelt": {
-        "keychainAccess": {}
+        "keychainAccess": false
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/seatbelt",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -10506,12 +10526,12 @@
       "containment": "vm",
       "phase": "provision",
       "seatbelt": {
-        "launchMethod": {}
+        "launchMethod": "exec"
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/seatbelt",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -10558,12 +10578,12 @@
       "containment": "vm",
       "phase": "provision",
       "seatbelt": {
-        "launchMethod": {}
+        "launchMethod": "exec"
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/seatbelt",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -10576,12 +10596,12 @@
       "containment": "vm",
       "phase": "provision",
       "seatbelt": {
-        "launchMethod": "spawn"
+        "launchMethod": "exec"
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/seatbelt",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -10628,7 +10648,7 @@
       "containment": "vm",
       "phase": "provision",
       "seatbelt": {
-        "launchMethod": "exec"
+        "launchMethod": "open"
       },
       "version": "0.9.0-dev"
     },
@@ -10682,12 +10702,12 @@
       "containment": "vm",
       "phase": "provision",
       "seatbelt": {
-        "nestedPty": {}
+        "nestedPty": false
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/seatbelt",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -10750,12 +10770,12 @@
       "containment": "vm",
       "phase": "provision",
       "seatbelt": {
-        "profileOverride": {}
+        "profileOverride": "generated"
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/seatbelt",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -10893,7 +10913,7 @@
       "containment": "vm",
       "phase": "provision",
       "telemetry": {
-        "enabled": true
+        "enabled": false
       },
       "version": "0.9.0-dev"
     },
@@ -11052,12 +11072,12 @@
       "containment": "vm",
       "phase": "provision",
       "ui": {
-        "clipboard": {}
+        "clipboard": "none"
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/ui",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -11104,12 +11124,12 @@
       "containment": "vm",
       "phase": "provision",
       "ui": {
-        "clipboard": {}
+        "clipboard": "none"
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/ui",
     "requiredEvidence": "unit-static",
     "catalogKeys": [
@@ -11212,7 +11232,7 @@
       "containment": "vm",
       "phase": "provision",
       "ui": {
-        "disable": true
+        "disable": false
       },
       "version": "0.9.0-dev"
     },
@@ -11280,12 +11300,12 @@
       "containment": "vm",
       "phase": "provision",
       "ui": {
-        "injection": {}
+        "injection": false
       },
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "rejected",
-    "expectedCode": "schema_validation",
+    "expectedCode": "unsupported_field",
     "expectedPath": "/ui",
     "requiredEvidence": "unit-static",
     "catalogKeys": [

@@ -689,7 +689,10 @@ fn collect_attested_files(
                 ),
             )
         })?;
-        if entry.file_name() == "common-root" {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| PolicyError::new("report_io", "$", "attested path escaped output root"))?;
+        if is_excluded_runtime_common_root(relative) {
             if !file_type.is_dir() {
                 return Err(PolicyError::new(
                     "report_io",
@@ -712,6 +715,15 @@ fn collect_attested_files(
         }
     }
     Ok(())
+}
+
+fn is_excluded_runtime_common_root(relative: &Path) -> bool {
+    matches!(
+        relative.to_string_lossy().replace('\\', "/").as_str(),
+        "live-network-evidence/network-allow-profile/common-root"
+            | "live-network-evidence/network-block-profile/common-root"
+            | "live-network-evidence/network-default-absent-profile/common-root"
+    )
 }
 
 pub fn verify_policy_run(run: &PolicyHarnessRun) -> Result<(), PolicyError> {
@@ -932,8 +944,8 @@ mod tests {
         })
         .expect("static report");
         let nested = output.join("evidence").join("common-root");
-        fs::create_dir_all(nested.parent().expect("nested parent")).expect("create parent");
-        fs::write(&nested, b"unreferenced").expect("write nested artifact");
+        fs::create_dir_all(&nested).expect("create nested directory");
+        fs::write(nested.join("forged.log"), b"unreferenced").expect("write nested artifact");
         assert!(verify_policy_run(&run).is_err());
         fs::remove_dir_all(output).expect("cleanup");
     }

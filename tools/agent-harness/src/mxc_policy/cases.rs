@@ -21,6 +21,7 @@ const SCHEMA_BYTES: &[u8] = include_bytes!("../../schemas/mxc-config.schema.0.9.
 static CORPUS_OUTPUT_NONCE: AtomicU64 = AtomicU64::new(0);
 static CORPUS_SCHEMA_VALIDATOR: OnceLock<Result<jsonschema::Validator, PolicyError>> =
     OnceLock::new();
+static CORPUS_SCHEMA_VALUE: OnceLock<Value> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -592,17 +593,19 @@ pub fn default_static_common_root() -> PathBuf {
 }
 
 pub fn generated_corpus() -> Vec<PolicyCase> {
+    let schema = corpus_schema_value();
     catalog_entries()
         .iter()
         .enumerate()
-        .map(|(index, entry)| generated_case_for_entry(index, entry))
+        .map(|(index, entry)| generated_case_for_entry(index, entry, schema))
         .collect()
 }
 
-fn generated_case_for_entry(index: usize, entry: &CatalogEntry) -> PolicyCase {
+fn generated_case_for_entry(index: usize, entry: &CatalogEntry, schema: &Value) -> PolicyCase {
     let mut config = base_config_for_entry(entry, entry.key);
-    apply_catalog_key_to_config(&mut config, entry.key);
-    let expected = expected_outcome_from_contract(&config);
+    apply_catalog_entry_to_config(&mut config, entry, schema);
+    complete_instance_against_schema(&mut config, schema, schema);
+    let expected = expected_outcome_for_entry(entry);
     let id = format!("{index:04}-{}", sanitize_id(entry.key));
     let expected_plan = (expected.0 == ExpectedDisposition::Accepted).then(|| {
         contract_expected_plan(&id, &config, &default_static_common_root())
@@ -794,28 +797,24 @@ fn union_branch_present(
     if !schema_path.ends_with(&format!("/{kind}/{index}")) {
         return false;
     }
-    if kind == "anyOf" {
-        if label == "null" {
-            return path_has_null(config, path);
-        }
-        return path_has_non_null_value(config, path);
-    }
-    if kind != "oneOf" {
-        return path_present(config, path);
-    }
-    match label {
-        "string" => one_of_enum_value(path, index)
-            .map(|value| path_has_string_value(config, path, value))
-            .unwrap_or_else(|| path_values(config, path).into_iter().any(Value::is_string)),
-        "integer" => path_values(config, path)
+    let Some(branch) = schema_node_at_path(corpus_schema_value(), schema_path) else {
+        return false;
+    };
+    if label.starts_with("#/definitions/") {
+        return path_values(config, path)
             .into_iter()
-            .any(|value| value.as_i64().is_some() || value.as_u64().is_some()),
-        "number" => path_values(config, path)
-            .into_iter()
-            .any(|value| value.as_f64().is_some()),
-        "boolean" => path_values(config, path).into_iter().any(Value::is_boolean),
-        _ => path_present(config, path),
+            .any(|value| schema_branch_matches_instance(branch, value, corpus_schema_value()));
     }
+    let expected = minimal_schema_value(branch, corpus_schema_value());
+    let type_matches_label = match label {
+        "null" => expected.is_null(),
+        "string" => expected.is_string(),
+        "integer" => expected.as_i64().is_some() || expected.as_u64().is_some(),
+        "number" => expected.is_number(),
+        "boolean" => expected.is_boolean(),
+        _ => true,
+    };
+    type_matches_label && path_values(config, path).contains(&&expected)
 }
 
 fn observes_cross_field(config: &Value, key: &str) -> bool {
@@ -1010,12 +1009,6 @@ fn parent_absent_child(parent: &Value, child: &PathSegment<'_>) -> bool {
     false
 }
 
-fn path_has_non_null_value(config: &Value, path: &str) -> bool {
-    path_values(config, path)
-        .into_iter()
-        .any(|value| !value.is_null())
-}
-
 fn path_has_null(config: &Value, path: &str) -> bool {
     path_values(config, path).into_iter().any(Value::is_null)
 }
@@ -1079,7 +1072,8 @@ fn base_config_for_entry(entry: &CatalogEntry, key: &str) -> Value {
     base_provision()
 }
 
-fn apply_catalog_key_to_config(config: &mut Value, key: &str) {
+fn apply_catalog_entry_to_config(config: &mut Value, entry: &CatalogEntry, schema: &Value) {
+    let key = entry.key;
     if key.starts_with("cross.") {
         apply_cross_field_case(config, key);
         return;
@@ -1092,8 +1086,17 @@ fn apply_catalog_key_to_config(config: &mut Value, key: &str) {
         KeyQualifier::Default(_) => None,
         KeyQualifier::Enum(enum_value) => Some(Value::String(enum_value.to_string())),
         KeyQualifier::Union { label: "null", .. } => Some(Value::Null),
-        KeyQualifier::Union { index, label, .. } => Some(value_for_union_label(path, index, label)),
-        KeyQualifier::Plain => Some(value_for_path(path)),
+        KeyQualifier::Union { label, .. }
+            if label.starts_with("#/definitions/") && path_present(config, path) =>
+        {
+            None
+        }
+        KeyQualifier::Union { .. } => Some(
+            schema_node_at_path(schema, entry.schema_path)
+                .map(|node| minimal_schema_value(node, schema))
+                .unwrap_or_else(|| value_for_path(path)),
+        ),
+        KeyQualifier::Plain => Some(value_for_entry_path(path, entry.schema_path, schema)),
     };
 
     if matches!(qualifier, KeyQualifier::Default(_) | KeyQualifier::Absent) {
@@ -1101,6 +1104,191 @@ fn apply_catalog_key_to_config(config: &mut Value, key: &str) {
         remove_path(config, path);
     } else if let Some(value) = value {
         set_path_value(config, path, value);
+    }
+}
+
+fn value_for_entry_path(path: &str, schema_path: &str, schema: &Value) -> Value {
+    match path {
+        "$schema"
+        | "_comment"
+        | "version"
+        | "containment"
+        | "phase"
+        | "sandboxId"
+        | "containerId"
+        | "filesystem"
+        | "filesystem.readonlyPaths"
+        | "filesystem.readonlyPaths[]"
+        | "filesystem.readwritePaths"
+        | "filesystem.readwritePaths[]"
+        | "filesystem.deniedPaths"
+        | "filesystem.deniedPaths[]"
+        | "network"
+        | "network.allowedHosts"
+        | "network.allowedHosts[]"
+        | "network.blockedHosts"
+        | "network.blockedHosts[]"
+        | "network.defaultPolicy"
+        | "network.proxy.url"
+        | "runtimeConfig.networkProxy"
+        | "process"
+        | "process.commandLine"
+        | "process.cwd"
+        | "process.env"
+        | "process.env[]"
+        | "process.timeout" => value_for_path(path),
+        _ => schema_node_at_path(schema, schema_path)
+            .map(|node| minimal_schema_value(node, schema))
+            .unwrap_or_else(|| value_for_path(path)),
+    }
+}
+
+fn schema_node_at_path<'a>(schema: &'a Value, schema_path: &str) -> Option<&'a Value> {
+    let mut node = schema;
+    for encoded in schema_path.trim_start_matches('/').split('/') {
+        node = resolve_schema_ref(node, schema).unwrap_or(node);
+        let token = encoded.replace("~1", "/").replace("~0", "~");
+        node = match node {
+            Value::Object(object) => object.get(&token)?,
+            Value::Array(values) => values.get(token.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(resolve_schema_ref(node, schema).unwrap_or(node))
+}
+
+fn resolve_schema_ref<'a>(node: &'a Value, schema: &'a Value) -> Option<&'a Value> {
+    let reference = node.get("$ref").and_then(Value::as_str)?;
+    schema.pointer(reference.strip_prefix('#')?)
+}
+
+fn minimal_schema_value(node: &Value, schema: &Value) -> Value {
+    let resolved = resolve_schema_ref(node, schema).unwrap_or(node);
+    if let Some(value) = resolved.get("const") {
+        return value.clone();
+    }
+    if let Some(value) = resolved
+        .get("enum")
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+    {
+        return value.clone();
+    }
+    for union in ["anyOf", "oneOf"] {
+        if let Some(branch) = resolved
+            .get(union)
+            .and_then(Value::as_array)
+            .and_then(|branches| {
+                branches
+                    .iter()
+                    .find(|branch| schema_type(branch, schema) != Some("null"))
+                    .or_else(|| branches.first())
+            })
+        {
+            return minimal_schema_value(branch, schema);
+        }
+    }
+    match schema_type(resolved, schema) {
+        Some("object") | None if resolved.get("properties").is_some() => {
+            let mut object = Map::new();
+            if let Some(required) = resolved.get("required").and_then(Value::as_array)
+                && let Some(properties) = resolved.get("properties").and_then(Value::as_object)
+            {
+                for name in required.iter().filter_map(Value::as_str) {
+                    if let Some(property) = properties.get(name) {
+                        object.insert(name.to_string(), minimal_schema_value(property, schema));
+                    }
+                }
+            }
+            Value::Object(object)
+        }
+        Some("array") => {
+            let minimum = resolved
+                .get("minItems")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            let item = resolved
+                .get("items")
+                .map(|items| minimal_schema_value(items, schema));
+            Value::Array(item.into_iter().cycle().take(minimum).collect())
+        }
+        Some("string") => Value::String("generated".to_string()),
+        Some("integer") | Some("number") => {
+            Value::from(resolved.get("minimum").and_then(Value::as_i64).unwrap_or(1))
+        }
+        Some("boolean") => Value::Bool(false),
+        Some("null") => Value::Null,
+        _ => Value::Object(Map::new()),
+    }
+}
+
+fn schema_type<'a>(node: &'a Value, schema: &'a Value) -> Option<&'a str> {
+    let resolved = resolve_schema_ref(node, schema).unwrap_or(node);
+    match resolved.get("type")? {
+        Value::String(value) => Some(value),
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|value| *value != "null")
+            .or_else(|| values.iter().find_map(Value::as_str)),
+        _ => None,
+    }
+}
+
+fn complete_instance_against_schema(instance: &mut Value, node: &Value, schema: &Value) {
+    let resolved = resolve_schema_ref(node, schema).unwrap_or(node);
+    for union in ["anyOf", "oneOf"] {
+        if let Some(branches) = resolved.get(union).and_then(Value::as_array)
+            && let Some(branch) = branches
+                .iter()
+                .find(|branch| schema_branch_matches_instance(branch, instance, schema))
+        {
+            complete_instance_against_schema(instance, branch, schema);
+            return;
+        }
+    }
+    if let Some(object) = instance.as_object_mut() {
+        let Some(properties) = resolved.get("properties").and_then(Value::as_object) else {
+            return;
+        };
+        if let Some(required) = resolved.get("required").and_then(Value::as_array) {
+            for name in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(name)
+                    && let Some(property) = properties.get(name)
+                {
+                    object.insert(name.to_string(), minimal_schema_value(property, schema));
+                }
+            }
+        }
+        for (name, value) in object {
+            if let Some(property) = properties.get(name) {
+                complete_instance_against_schema(value, property, schema);
+            }
+        }
+    } else if let Some(values) = instance.as_array_mut()
+        && let Some(items) = resolved.get("items")
+    {
+        for value in values {
+            complete_instance_against_schema(value, items, schema);
+        }
+    }
+}
+
+fn schema_branch_matches_instance(branch: &Value, instance: &Value, schema: &Value) -> bool {
+    let resolved = resolve_schema_ref(branch, schema).unwrap_or(branch);
+    if let Some(values) = resolved.get("enum").and_then(Value::as_array) {
+        return values.contains(instance);
+    }
+    match schema_type(resolved, schema) {
+        Some("object") => instance.is_object(),
+        Some("array") => instance.is_array(),
+        Some("string") => instance.is_string(),
+        Some("integer") => instance.as_i64().is_some() || instance.as_u64().is_some(),
+        Some("number") => instance.is_number(),
+        Some("boolean") => instance.is_boolean(),
+        Some("null") => instance.is_null(),
+        None => true,
+        _ => false,
     }
 }
 
@@ -1162,54 +1350,6 @@ fn apply_cross_field_case(config: &mut Value, key: &str) {
         }
         _ => {}
     }
-}
-
-fn value_for_union_label(path: &str, index: usize, label: &str) -> Value {
-    if label == "string" {
-        if let Some(value) = one_of_enum_value(path, index) {
-            return Value::String(value.to_string());
-        }
-        return Value::String("generated".to_string());
-    }
-    if label == "integer" || label == "number" {
-        return Value::from(1);
-    }
-    if label == "boolean" {
-        return Value::Bool(true);
-    }
-    if label == "null" {
-        return Value::Null;
-    }
-    if label.starts_with("#/definitions/") {
-        return value_for_path(path);
-    }
-    value_for_path(path)
-}
-
-fn one_of_enum_value(path: &str, index: usize) -> Option<&'static str> {
-    let values = match path {
-        "containment" => &[
-            "process",
-            "processcontainer",
-            "vm",
-            "windows_sandbox",
-            "lxc",
-            "microvm",
-            "hyperlight",
-            "wslc",
-            "seatbelt",
-            "custom",
-            "mock",
-        ][..],
-        "phase" => &["provision", "start", "exec", "stop", "deprovision"][..],
-        "network.enforcementMode" => &["none", "audit", "enforce"][..],
-        "processContainer.captureDenials.mode" => &["none", "full"][..],
-        "processContainer.ui.isolation" => &["allow", "strict"][..],
-        "seatbelt.launchMethod" | "experimental.seatbelt.launchMethod" => &["spawn", "exec"][..],
-        "ui.clipboard" => &["allow", "deny"][..],
-        _ => return None,
-    };
-    values.get(index).copied()
 }
 
 fn value_for_path(path: &str) -> Value {
@@ -1407,6 +1547,12 @@ fn unique_case_output_dir(root: &Path, case_id: &str) -> PathBuf {
     let nonce = CORPUS_OUTPUT_NONCE.fetch_add(1, Ordering::Relaxed);
     let process_id = std::process::id();
     root.join(format!("{case_id}-{process_id}-{now_nanos}-{nonce}"))
+}
+
+fn corpus_schema_value() -> &'static Value {
+    CORPUS_SCHEMA_VALUE.get_or_init(|| {
+        serde_json::from_slice(SCHEMA_BYTES).expect("embedded MXC corpus schema must parse")
+    })
 }
 
 fn corpus_schema_validator() -> Result<&'static jsonschema::Validator, PolicyError> {
@@ -1806,7 +1952,7 @@ mod tests {
     fn checked_in_corpus_hash_is_pinned() {
         assert_eq!(
             content_sha256_hex_bytes(CASES_BYTES),
-            "934e412442e964f099327ba28a43c1e09cce51db0acf9f36447b718ca396f45c",
+            "bc25ea50fc99d8003ffe02df4e841f2b1509ff48741c6c38898242f279aab052",
             "corpus hash changed: regenerate fixture and update pin"
         );
     }
