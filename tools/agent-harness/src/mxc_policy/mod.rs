@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod catalog;
+pub mod effects;
 pub mod schema;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -15,3 +16,7 @@ pub use schema::{
 
 pub use adapter::{NvxExecPolicy, NvxPolicyPlan, NvxProvisionPolicy, adapt_policy};
 pub use catalog::{CatalogEntry, EvidenceRequirement, PolicyDisposition, catalog_entries};
+pub use effects::{
+    CountingHostEffects, EffectCounters, HostEffects, PolicyExecutionError, PolicyRunError,
+    ProductionHostEffects, run_policy_production, run_with_effects,
+};
