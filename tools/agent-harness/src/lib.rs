@@ -2140,7 +2140,7 @@ fn rel_artifact_path(path: &Path) -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
-fn read_artifact_checked(
+pub(crate) fn read_artifact_checked(
     output_dir: &Path,
     relative_path: &str,
 ) -> Result<(PathBuf, Vec<u8>), String> {
@@ -2199,7 +2199,7 @@ fn verify_no_symlink_or_reparse_components(
     Ok(())
 }
 
-fn reject_symlink_or_reparse_metadata(
+pub(crate) fn reject_symlink_or_reparse_metadata(
     path: &Path,
     trusted_output_dir: &Path,
 ) -> Result<(), String> {

@@ -1445,7 +1445,8 @@ fn run_req6_terminal_semantics(state: &mut LiveHarnessState) -> CheckOutcome {
         Ok(value) => value,
         Err(error) => return fail_check(error),
     };
-    let timeout_tree = match run_timeout_tree_exec(session, 606, true, 100) {
+    let timeout_tree = match run_timeout_tree_exec(session, 606, true, 100, ProbeLaunchMode::Direct)
+    {
         Ok(value) => value,
         Err(error) => return fail_check(error),
     };
@@ -1600,10 +1601,11 @@ fn run_req8_full_isolation_verification(state: &mut LiveHarnessState) -> CheckOu
         Ok(value) => value,
         Err(error) => return fail_check(error),
     };
-    let timeout_cleanup_ok = match run_timeout_tree_exec(session, 804, true, 100) {
-        Ok(value) => value,
-        Err(error) => return fail_check(error),
-    };
+    let timeout_cleanup_ok =
+        match run_timeout_tree_exec(session, 804, true, 100, ProbeLaunchMode::Direct) {
+            Ok(value) => value,
+            Err(error) => return fail_check(error),
+        };
     if core_isolation_ok
         && probe_isolation_ok
         && fd_allowlist_ok
@@ -1626,6 +1628,14 @@ fn run_req8_full_isolation_verification(state: &mut LiveHarnessState) -> CheckOu
 
 #[cfg(windows)]
 fn run_req9_mapping_containment(state: &mut LiveHarnessState) -> CheckOutcome {
+    run_mapping_containment(state, ProbeLaunchMode::Direct)
+}
+
+#[cfg(windows)]
+fn run_mapping_containment(
+    state: &mut LiveHarnessState,
+    launch_mode: ProbeLaunchMode,
+) -> CheckOutcome {
     let Some(session) = state.session.as_mut() else {
         return fail_check("live session unavailable".to_string());
     };
@@ -1649,7 +1659,11 @@ fn run_req9_mapping_containment(state: &mut LiveHarnessState) -> CheckOutcome {
         "--output-name",
         "guest-rw.bin",
     ];
-    let (disposition, stdout, stderr) = match run_simple_probe_exec(session, 901, &mapping_args) {
+    let probe_result = match launch_mode {
+        ProbeLaunchMode::Direct => run_simple_probe_exec(session, 901, &mapping_args),
+        ProbeLaunchMode::Policy => run_policy_probe_exec(session, 901, &mapping_args),
+    };
+    let (disposition, stdout, stderr) = match probe_result {
         Ok(value) => value,
         Err(error) => return fail_check(error),
     };
@@ -2116,7 +2130,13 @@ fn run_req12_channel_loss_generation(state: &mut LiveHarnessState) -> CheckOutco
             ));
         }
     };
-    let tree_gone = match run_pid_check(session, 1_202, tree_pids.child, tree_pids.grandchild) {
+    let tree_gone = match run_pid_check(
+        session,
+        1_202,
+        tree_pids.child,
+        tree_pids.grandchild,
+        ProbeLaunchMode::Direct,
+    ) {
         Ok(value) => value,
         Err(error) => return fail_check(error),
     };
@@ -2274,6 +2294,7 @@ fn run_normal_tree_exec_cleanup(
         890 + exec_id,
         tree_pids.child,
         tree_pids.grandchild,
+        ProbeLaunchMode::Direct,
     )
 }
 
@@ -3258,6 +3279,7 @@ fn run_cancelled_tree_exec(
         690 + exec_id,
         tree_pids.child,
         tree_pids.grandchild,
+        ProbeLaunchMode::Direct,
     )
 }
 
@@ -3267,12 +3289,13 @@ fn run_timeout_tree_exec(
     exec_id: u32,
     ignore_term: bool,
     timeout_ms: u64,
+    launch_mode: ProbeLaunchMode,
 ) -> Result<bool, String> {
     let mut args = vec!["spawn-tree", "--hold-ms", "30000"];
     if ignore_term {
         args.push("--ignore-term");
     }
-    start_probe_exec(session, exec_id, &args, Some(timeout_ms))?;
+    start_probe_exec_with_mode(session, exec_id, &args, Some(timeout_ms), launch_mode)?;
     grant_stream(session, exec_id, StreamName::Stdout, 1)?;
     grant_stream(session, exec_id, StreamName::Stderr, 1)?;
     let mut output = Vec::new();
@@ -3351,6 +3374,7 @@ fn run_timeout_tree_exec(
         790 + exec_id,
         tree_pids.child,
         tree_pids.grandchild,
+        launch_mode,
     )
 }
 
@@ -3360,8 +3384,9 @@ fn run_pid_check(
     exec_id: u32,
     child: u32,
     grandchild: u32,
+    launch_mode: ProbeLaunchMode,
 ) -> Result<bool, String> {
-    start_probe_exec(
+    start_probe_exec_with_mode(
         session,
         exec_id,
         &[
@@ -3370,6 +3395,7 @@ fn run_pid_check(
             &grandchild.to_string(),
         ],
         None,
+        launch_mode,
     )?;
     grant_stream(session, exec_id, StreamName::Stdout, 1)?;
     grant_stream(session, exec_id, StreamName::Stderr, 1)?;
@@ -3407,6 +3433,27 @@ fn parse_tree_pids(buffer: &[u8]) -> Option<TreePids> {
 struct TreePids {
     child: u32,
     grandchild: u32,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum ProbeLaunchMode {
+    Direct,
+    Policy,
+}
+
+#[cfg(windows)]
+fn start_probe_exec_with_mode(
+    session: &mut LiveWhpSession,
+    exec_id: u32,
+    args: &[&str],
+    timeout_ms: Option<u64>,
+    launch_mode: ProbeLaunchMode,
+) -> Result<(), String> {
+    match launch_mode {
+        ProbeLaunchMode::Direct => start_probe_exec(session, exec_id, args, timeout_ms),
+        ProbeLaunchMode::Policy => start_policy_probe_exec(session, exec_id, args, timeout_ms),
+    }
 }
 
 #[cfg(windows)]
@@ -3458,6 +3505,31 @@ fn start_probe_exec(
 const POLICY_SCHEMA_VERSION: &str = "0.9.0-dev";
 #[cfg(windows)]
 const POLICY_PROBE_CAPABILITY_VERSION: &str = "policy-suite-capabilities-v1";
+
+#[cfg(windows)]
+fn checked_in_live_policy(phase: &str) -> Result<serde_json::Value, String> {
+    let file_name = match phase {
+        "provision" => "provision.json",
+        "start" => "start.json",
+        "exec" => "exec.json",
+        "stop" => "stop.json",
+        "deprovision" => "deprovision.json",
+        other => return Err(format!("no checked-in live MXC policy for phase `{other}`")),
+    };
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("mxc-policy")
+        .join("live")
+        .join(file_name);
+    let source = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "reading checked-in live MXC policy {}: {error}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&source)
+        .map_err(|error| format!("checked-in {phase} live MXC policy is invalid JSON: {error}"))
+}
 #[cfg(windows)]
 const POLICY_REQUIRED_PROBE_COMMANDS: &[&str] = &[
     "capabilities-json",
@@ -3476,7 +3548,7 @@ struct PolicyProbeCapabilitiesReport {
 
 #[cfg(windows)]
 fn run_policy_filesystem_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence {
-    let outcome = run_req9_mapping_containment(state);
+    let outcome = run_mapping_containment(state, ProbeLaunchMode::Policy);
     match outcome.check_status {
         EvidenceCheckStatus::Pass => PolicyLiveEvidence {
             positive_passed: true,
@@ -3555,7 +3627,7 @@ fn run_policy_shell_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence
             ));
         }
         evidence.push("live shell preserved nonzero exit code 23".to_string());
-        if !run_timeout_tree_exec(session, 1_303, true, 250)? {
+        if !run_timeout_tree_exec(session, 1_303, true, 250, ProbeLaunchMode::Policy)? {
             return Err(
                 "timeout workload did not prove child+grandchild cleanup and terminal ordering"
                     .to_string(),
@@ -3573,7 +3645,7 @@ fn run_policy_shell_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence
             .ok_or_else(|| "live session unavailable".to_string())?;
         let empty = adapt_policy(
             "policy-live-empty-command",
-            &policy_exec_config("", None, Vec::new(), None, None),
+            &policy_exec_config("", None, Vec::new(), None, None)?,
             &session.vm.plan.artifacts.common_root,
         );
         let empty = match empty {
@@ -3612,7 +3684,7 @@ fn run_policy_proxy_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence
             .ok_or_else(|| "live session unavailable".to_string())?;
         let command = "printf '%s|%s|%s|%s|%s' \"${HTTP_PROXY-unset}\" \"${HTTPS_PROXY-unset}\" \"${http_proxy-unset}\" \"${https_proxy-unset}\" \"${NO_PROXY-unset}\"";
         let proxy = "http://127.0.0.1:18080";
-        let config = policy_exec_config(command, None, Vec::new(), None, Some(proxy));
+        let config = policy_exec_config(command, None, Vec::new(), None, Some(proxy))?;
         let adapted = adapt_policy(
             "policy-live-proxy-env",
             &config,
@@ -3657,7 +3729,7 @@ fn run_policy_proxy_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence
         let absent = run_policy_exec_from_adapter(
             session,
             1_311,
-            policy_exec_config(command, None, Vec::new(), None, None),
+            policy_exec_config(command, None, Vec::new(), None, None)?,
             Duration::from_secs(10),
         )?;
         if absent.stdout != b"unset|unset|unset|unset|unset"
@@ -3751,14 +3823,10 @@ fn run_control_lifecycle_dedicated_session(
                 },
             })
             .map_err(|error| format!("control lifecycle provision/configure failed: {error}"))?;
+        let start_config = checked_in_live_policy("start")?;
         adapt_policy(
             "policy-live-control-lifecycle-start",
-            &serde_json::json!({
-                "version": POLICY_SCHEMA_VERSION,
-                "containment": "vm",
-                "phase": "start",
-                "sandboxId": "policy-live-lifecycle-sandbox",
-            }),
+            &start_config,
             &vm.plan.artifacts.common_root,
         )
         .map_err(|errors| format!("control lifecycle start adaptation failed: {errors:?}"))?;
@@ -3788,16 +3856,14 @@ fn run_control_lifecycle_dedicated_session(
             }
         }
 
+        let mut exec_config = checked_in_live_policy("exec")?;
+        exec_config["sandboxId"] =
+            serde_json::Value::String("policy-live-lifecycle-sandbox".to_string());
+        exec_config["containerId"] =
+            serde_json::Value::String("policy-live-lifecycle-container".to_string());
         let exec = adapt_policy(
             "policy-live-control-lifecycle-exec",
-            &serde_json::json!({
-                "version": POLICY_SCHEMA_VERSION,
-                "containment": "vm",
-                "phase": "exec",
-                "sandboxId": "policy-live-lifecycle-sandbox",
-                "containerId": "policy-live-lifecycle-container",
-                "process": { "commandLine": ":", "env": [] }
-            }),
+            &exec_config,
             &vm.plan.artifacts.common_root,
         )
         .map_err(|errors| format!("control lifecycle exec adaptation failed: {errors:?}"))?
@@ -3842,14 +3908,10 @@ fn run_control_lifecycle_dedicated_session(
             }
         }
 
+        let stop_config = checked_in_live_policy("stop")?;
         adapt_policy(
             "policy-live-control-lifecycle-stop",
-            &serde_json::json!({
-                "version": POLICY_SCHEMA_VERSION,
-                "containment": "vm",
-                "phase": "stop",
-                "sandboxId": "policy-live-lifecycle-sandbox",
-            }),
+            &stop_config,
             &vm.plan.artifacts.common_root,
         )
         .map_err(|errors| format!("control lifecycle stop adaptation failed: {errors:?}"))?;
@@ -3884,14 +3946,10 @@ fn run_control_lifecycle_dedicated_session(
                     .to_string(),
             );
         }
+        let deprovision_config = checked_in_live_policy("deprovision")?;
         adapt_policy(
             "policy-live-control-lifecycle-deprovision",
-            &serde_json::json!({
-                "version": POLICY_SCHEMA_VERSION,
-                "containment": "vm",
-                "phase": "deprovision",
-                "sandboxId": "policy-live-lifecycle-sandbox",
-            }),
+            &deprovision_config,
             &vm.plan.artifacts.common_root,
         )
         .map_err(|errors| format!("control lifecycle deprovision adaptation failed: {errors:?}"))?;
@@ -4018,15 +4076,11 @@ fn adapt_live_provision_policy(
     common_root: &Path,
     network: serde_json::Value,
 ) -> Result<NvxProvisionPolicy, String> {
-    let mut config = serde_json::json!({
-        "version": POLICY_SCHEMA_VERSION,
-        "containment": "vm",
-        "phase": "provision",
-        "filesystem": {
-            "readonlyPaths": [common_root.join(RO_CHILD).to_string_lossy().into_owned()],
-            "readwritePaths": [common_root.join(RW_CHILD).to_string_lossy().into_owned()]
-        }
-    });
+    let mut config = checked_in_live_policy("provision")?;
+    config["filesystem"]["readonlyPaths"] =
+        serde_json::json!([common_root.join(RO_CHILD).to_string_lossy().into_owned()]);
+    config["filesystem"]["readwritePaths"] =
+        serde_json::json!([common_root.join(RW_CHILD).to_string_lossy().into_owned()]);
     if !network.is_null() {
         config["network"] = network;
     }
@@ -4057,17 +4111,10 @@ fn policy_exec_config(
     env: Vec<String>,
     timeout_ms: Option<u64>,
     runtime_proxy: Option<&str>,
-) -> serde_json::Value {
-    let mut config = serde_json::json!({
-        "version": POLICY_SCHEMA_VERSION,
-        "containment": "vm",
-        "phase": "exec",
-        "sandboxId": "policy-live-sandbox",
-        "process": {
-            "commandLine": command_line,
-            "env": env,
-        }
-    });
+) -> Result<serde_json::Value, String> {
+    let mut config = checked_in_live_policy("exec")?;
+    config["process"]["commandLine"] = serde_json::Value::String(command_line.to_string());
+    config["process"]["env"] = serde_json::json!(env);
     if let Some(cwd) = cwd {
         config["process"]["cwd"] = serde_json::Value::String(cwd.to_string());
     }
@@ -4077,7 +4124,70 @@ fn policy_exec_config(
     if let Some(proxy) = runtime_proxy {
         config["runtimeConfig"] = serde_json::json!({ "networkProxy": proxy });
     }
-    config
+    Ok(config)
+}
+
+#[cfg(windows)]
+fn shell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn start_policy_probe_exec(
+    session: &mut LiveWhpSession,
+    exec_id: u32,
+    args: &[&str],
+    timeout_ms: Option<u64>,
+) -> Result<(), String> {
+    let mut command_line = format!("exec {}", shell_quote(PROBE_PATH));
+    let mut env = Vec::with_capacity(args.len());
+    for (index, argument) in args.iter().enumerate() {
+        let name = format!("A{index}");
+        command_line.push_str(&format!(" \"${{{name}}}\""));
+        env.push(format!("{name}={argument}"));
+    }
+    let config = policy_exec_config(&command_line, Some("/"), env, timeout_ms, None)?;
+    let exec = adapt_policy(
+        format!("policy-live-probe-{exec_id}"),
+        &config,
+        &session.vm.plan.artifacts.common_root,
+    )
+    .map_err(|errors| format!("policy adapter rejected live probe config: {errors:?}"))?
+    .exec
+    .ok_or_else(|| "policy adapter omitted exec plan for live probe".to_string())?;
+    session
+        .client
+        .send_create_process(HostControlMessage::CreateProcess {
+            exec_id,
+            argv: exec.argv,
+            cwd: exec.cwd,
+            env: exec.env,
+            timeout_ms: exec.timeout_ms,
+        })
+        .map(|_| ())
+        .map_err(|error| format!("create policy probe process for exec {exec_id} failed: {error}"))
+}
+
+#[cfg(windows)]
+fn run_policy_probe_exec(
+    session: &mut LiveWhpSession,
+    exec_id: u32,
+    args: &[&str],
+) -> Result<(ExecDisposition, Vec<u8>, Vec<u8>), String> {
+    start_policy_probe_exec(session, exec_id, args, None)?;
+    grant_stream(session, exec_id, StreamName::Stdout, 1)?;
+    grant_stream(session, exec_id, StreamName::Stderr, 1)?;
+    let observed = collect_exec_until_terminal(
+        session,
+        exec_id,
+        LIVE_TIMEOUT,
+        true,
+        ExecCollectionLimits::small_probe(LIVE_TIMEOUT),
+    )?;
+    let disposition = observed
+        .disposition
+        .ok_or_else(|| format!("policy exec {exec_id} did not produce a terminal disposition"))?;
+    Ok((disposition, observed.stdout, observed.stderr))
 }
 
 #[cfg(windows)]
@@ -4130,7 +4240,7 @@ fn run_policy_command(
     run_policy_exec_from_adapter(
         session,
         exec_id,
-        policy_exec_config(command_line, cwd.as_deref(), env, timeout_ms, None),
+        policy_exec_config(command_line, cwd.as_deref(), env, timeout_ms, None)?,
         timeout,
     )
 }
@@ -4149,7 +4259,7 @@ fn run_network_probe(
     if let Some(endpoint) = endpoint {
         args.push(endpoint);
     }
-    let (disposition, stdout, stderr) = run_simple_probe_exec(session, exec_id, &args)?;
+    let (disposition, stdout, stderr) = run_policy_probe_exec(session, exec_id, &args)?;
     if disposition != ExecDisposition::ExitCode(0) {
         return Err(format!(
             "network policy probe failed: disposition={disposition:?} stderr={:?}",
@@ -4167,7 +4277,7 @@ fn ensure_policy_probe_capabilities(state: &mut LiveHarnessState) -> Result<(), 
         .as_mut()
         .ok_or_else(|| "live session unavailable".to_string())?;
     let (disposition, stdout, stderr) =
-        run_simple_probe_exec(session, 1_390, &["capabilities-json"])?;
+        run_policy_probe_exec(session, 1_390, &["capabilities-json"])?;
     if disposition != ExecDisposition::ExitCode(0) {
         let stderr_text = String::from_utf8_lossy(&stderr);
         if stderr_text.contains("unknown subcommand") {
@@ -4686,6 +4796,32 @@ mod tests {
             first_failure: None,
             req1_evidence: vec!["req1 evidence".to_string()],
             session: None,
+        }
+    }
+
+    #[test]
+    fn checked_in_live_policy_inputs_all_validate_through_adapter() {
+        let root = Path::new(r"C:\nvx-policy-common");
+        let provision =
+            adapt_live_provision_policy("fixture-provision", root, serde_json::Value::Null)
+                .expect("checked-in provision policy");
+        assert_eq!(provision.mappings.len(), 2);
+
+        let exec =
+            policy_exec_config(":", None, Vec::new(), None, None).expect("checked-in exec policy");
+        assert!(
+            adapt_policy("fixture-exec", &exec, root)
+                .expect("adapt checked-in exec policy")
+                .exec
+                .is_some()
+        );
+
+        for phase in ["start", "stop", "deprovision"] {
+            let config = checked_in_live_policy(phase).expect("checked-in lifecycle policy");
+            let plan = adapt_policy(format!("fixture-{phase}"), &config, root)
+                .expect("adapt checked-in lifecycle policy");
+            assert!(plan.provision.is_none());
+            assert!(plan.exec.is_none());
         }
     }
 

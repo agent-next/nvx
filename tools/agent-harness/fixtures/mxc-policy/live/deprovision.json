@@ -1,0 +1,6 @@
+{
+  "version": "0.9.0-dev",
+  "containment": "vm",
+  "phase": "deprovision",
+  "sandboxId": "policy-live-lifecycle-sandbox"
+}

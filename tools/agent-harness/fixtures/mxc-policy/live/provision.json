@@ -1,0 +1,9 @@
+{
+  "version": "0.9.0-dev",
+  "containment": "vm",
+  "phase": "provision",
+  "filesystem": {
+    "readonlyPaths": ["C:\\nvx-policy-common\\ro"],
+    "readwritePaths": ["C:\\nvx-policy-common\\rw"]
+  }
+}

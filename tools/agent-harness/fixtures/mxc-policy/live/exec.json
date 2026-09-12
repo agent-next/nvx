@@ -1,0 +1,10 @@
+{
+  "version": "0.9.0-dev",
+  "containment": "vm",
+  "phase": "exec",
+  "sandboxId": "policy-live-sandbox",
+  "process": {
+    "commandLine": ":",
+    "env": []
+  }
+}

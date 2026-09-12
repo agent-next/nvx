@@ -15,6 +15,7 @@ use super::schema::{normalized_sha256, provenance, raw_sha256};
 use crate::launch::LaunchOverrides;
 use crate::{HarnessBackend, content_sha256_hex_bytes, write_bytes_atomic, write_json_atomic};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const REPORT_SCHEMA: &str = "nvx.mxc.policy.harness.report.v1";
 const REPORT_VERSION: u32 = 1;
@@ -48,6 +49,7 @@ pub struct FreshnessPins {
     pub protocol_version: u32,
     pub protocol_source_sha256: String,
     pub case_corpus_sha256: String,
+    pub live_profile_inputs_sha256: String,
     pub kernel_sha256: Option<String>,
     pub initramfs_sha256: Option<String>,
     pub probe_sha256: Option<String>,
@@ -102,6 +104,7 @@ pub struct PolicyManifest {
 #[serde(rename_all = "camelCase")]
 pub struct PolicyAttestedArtifact {
     pub path: String,
+    pub kind: String,
     pub size_bytes: u64,
     pub sha256: String,
 }
@@ -112,7 +115,7 @@ pub struct PolicyHarnessRun {
     pub report_path: PathBuf,
     pub diagnostics_path: PathBuf,
     pub attestation_manifest_path: PathBuf,
-    trusted_artifacts: BTreeMap<String, (u64, String)>,
+    trusted_artifacts: BTreeMap<String, (String, u64, String)>,
 }
 
 impl PolicyHarnessRun {
@@ -272,14 +275,18 @@ pub fn execute_policy_harness(
         .map_err(|error| PolicyError::new("report_io", "$", error))?;
     write_json_atomic(&report_path, &report)
         .map_err(|error| PolicyError::new("report_io", "$", error))?;
-    let manifest = build_manifest(&options.output_dir, &[&report_path, &diagnostics_path])?;
+    let manifest = build_manifest(&options.output_dir)?;
     let trusted_artifacts = manifest
         .artifacts
         .iter()
         .map(|artifact| {
             (
                 artifact.path.clone(),
-                (artifact.size_bytes, artifact.sha256.clone()),
+                (
+                    artifact.kind.clone(),
+                    artifact.size_bytes,
+                    artifact.sha256.clone(),
+                ),
             )
         })
         .collect();
@@ -465,6 +472,7 @@ fn freshness_pins(options: &PolicyHarnessOptions) -> Result<FreshnessPins, Polic
         protocol_source_sha256: hash_optional(&protocol_path)
             .unwrap_or_else(|| "missing".to_string()),
         case_corpus_sha256: content_sha256_hex_bytes(super::cases::corpus_bytes()),
+        live_profile_inputs_sha256: live_profile_inputs_hash()?,
         kernel_sha256: options
             .launch_overrides
             .kernel
@@ -488,6 +496,35 @@ fn freshness_pins(options: &PolicyHarnessOptions) -> Result<FreshnessPins, Polic
     })
 }
 
+fn live_profile_inputs_hash() -> Result<String, PolicyError> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("mxc-policy")
+        .join("live");
+    let mut hasher = Sha256::new();
+    for name in [
+        "provision.json",
+        "start.json",
+        "exec.json",
+        "stop.json",
+        "deprovision.json",
+    ] {
+        let path = root.join(name);
+        let bytes = fs::read(&path).map_err(|error| {
+            PolicyError::new(
+                "freshness_io",
+                path.display().to_string(),
+                format!("reading live policy input: {error}"),
+            )
+        })?;
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn hash_optional(path: &Path) -> Option<String> {
     fs::read(path)
         .ok()
@@ -508,21 +545,21 @@ fn diagnostics_text(report: &PolicyHarnessReport) -> String {
     )
 }
 
-fn build_manifest(root: &Path, paths: &[&Path]) -> Result<PolicyManifest, PolicyError> {
+fn build_manifest(root: &Path) -> Result<PolicyManifest, PolicyError> {
+    let mut paths = Vec::new();
+    collect_attested_files(root, root, &mut paths)?;
+    paths.sort();
     let mut artifacts = Vec::new();
-    for path in paths {
-        let bytes = fs::read(path).map_err(|error| {
-            PolicyError::new(
-                "report_io",
-                "$",
-                format!("failed to read {} for attestation: {error}", path.display()),
-            )
-        })?;
+    for path in &paths {
         let relative = path
             .strip_prefix(root)
             .map_err(|_| PolicyError::new("report_io", "$", "attested path escaped output root"))?;
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let (_, bytes) = crate::read_artifact_checked(root, &relative)
+            .map_err(|error| PolicyError::new("report_io", relative.clone(), error))?;
         artifacts.push(PolicyAttestedArtifact {
-            path: relative.to_string_lossy().replace('\\', "/"),
+            path: relative,
+            kind: "file".to_string(),
             size_bytes: bytes.len() as u64,
             sha256: content_sha256_hex_bytes(&bytes),
         });
@@ -534,17 +571,64 @@ fn build_manifest(root: &Path, paths: &[&Path]) -> Result<PolicyManifest, Policy
     })
 }
 
+fn collect_attested_files(
+    root: &Path,
+    directory: &Path,
+    paths: &mut Vec<PathBuf>,
+) -> Result<(), PolicyError> {
+    crate::reject_symlink_or_reparse_metadata(directory, root)
+        .map_err(|error| PolicyError::new("report_io", "$", error))?;
+    for entry in fs::read_dir(directory).map_err(|error| {
+        PolicyError::new(
+            "report_io",
+            "$",
+            format!(
+                "failed to enumerate {} for attestation: {error}",
+                directory.display()
+            ),
+        )
+    })? {
+        let entry = entry.map_err(|error| PolicyError::new("report_io", "$", error.to_string()))?;
+        let path = entry.path();
+        if path == root.join("attestation-manifest.json") {
+            continue;
+        }
+        if entry.file_name() == "common-root" {
+            continue;
+        }
+        crate::reject_symlink_or_reparse_metadata(&path, root)
+            .map_err(|error| PolicyError::new("report_io", "$", error))?;
+        let file_type = entry.file_type().map_err(|error| {
+            PolicyError::new(
+                "report_io",
+                "$",
+                format!(
+                    "failed to inspect {} for attestation: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if file_type.is_dir() {
+            collect_attested_files(root, &path, paths)?;
+        } else if file_type.is_file() {
+            paths.push(path);
+        } else {
+            return Err(PolicyError::new(
+                "report_io",
+                "$",
+                format!("unsupported attestation input type {}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn verify_policy_run(run: &PolicyHarnessRun) -> Result<(), PolicyError> {
     let root = run.report_path.parent().ok_or_else(|| {
         PolicyError::new("attestation_failed", "$", "report has no parent directory")
     })?;
-    let bytes = fs::read(&run.attestation_manifest_path).map_err(|error| {
-        PolicyError::new(
-            "attestation_failed",
-            "$",
-            format!("failed reading attestation manifest: {error}"),
-        )
-    })?;
+    let (_, bytes) = crate::read_artifact_checked(root, "attestation-manifest.json")
+        .map_err(|error| PolicyError::new("attestation_failed", "$", error))?;
     let manifest: PolicyManifest = serde_json::from_slice(&bytes).map_err(|error| {
         PolicyError::new(
             "attestation_failed",
@@ -565,7 +649,11 @@ pub fn verify_policy_run(run: &PolicyHarnessRun) -> Result<(), PolicyError> {
         .map(|artifact| {
             (
                 artifact.path.clone(),
-                (artifact.size_bytes, artifact.sha256.clone()),
+                (
+                    artifact.kind.clone(),
+                    artifact.size_bytes,
+                    artifact.sha256.clone(),
+                ),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -589,13 +677,15 @@ pub fn verify_policy_run(run: &PolicyHarnessRun) -> Result<(), PolicyError> {
                 "attestation path is not a contained relative path",
             ));
         }
-        let bytes = fs::read(root.join(relative)).map_err(|error| {
-            PolicyError::new(
+        if artifact.kind != "file" {
+            return Err(PolicyError::new(
                 "attestation_failed",
-                "$",
-                format!("failed reading attested artifact: {error}"),
-            )
-        })?;
+                artifact.path,
+                "unsupported artifact type",
+            ));
+        }
+        let (_, bytes) = crate::read_artifact_checked(root, &artifact.path)
+            .map_err(|error| PolicyError::new("attestation_failed", "$", error))?;
         if bytes.len() as u64 != artifact.size_bytes
             || content_sha256_hex_bytes(&bytes) != artifact.sha256
         {
@@ -676,6 +766,26 @@ mod tests {
     }
 
     #[test]
+    fn manifest_covers_nested_live_evidence_artifacts() {
+        let output = test_output("policy-nested-evidence");
+        let evidence = output.join("live-profile").join("boot-console.log");
+        fs::create_dir_all(evidence.parent().expect("evidence parent")).expect("create evidence");
+        fs::write(&evidence, b"trusted live evidence").expect("write evidence");
+        let run = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::StaticOnly,
+            output_dir: output.clone(),
+            config: None,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect("static report");
+        verify_policy_run(&run).expect("nested evidence is attested");
+        fs::write(&evidence, b"tampered live evidence").expect("tamper evidence");
+        assert!(verify_policy_run(&run).is_err());
+        fs::remove_dir_all(output).expect("cleanup");
+    }
+
+    #[test]
     fn freshness_pins_schema_catalog_adapter_protocol_and_corpus() {
         let pins = freshness_pins(&PolicyHarnessOptions {
             backend: HarnessBackend::Whp,
@@ -691,6 +801,10 @@ mod tests {
         );
         assert_ne!(pins.catalog_sha256, pins.adapter_sha256);
         assert_ne!(pins.protocol_source_sha256, "missing");
+        assert_eq!(
+            pins.live_profile_inputs_sha256,
+            "4f2edf717254c782aa5cf4ec693390735470116cf6924ddd77671857babe9b28"
+        );
         assert_eq!(schema_bytes().len(), 41_154);
     }
 

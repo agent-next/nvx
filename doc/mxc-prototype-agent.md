@@ -253,6 +253,12 @@ catalog constructs, unexpected results, failed/blocked required live profiles,
 or rejection effects. `blocked` means required infrastructure could not
 produce evidence and is never treated as a pass.
 
+Live Configure and CreateProcess requests are derived from checked-in MXC JSON
+under `tools/agent-harness/fixtures/mxc-policy/live/`, validated, and adapted
+before protocol messages are created. The freshness pins cover those inputs;
+the detached manifest recursively attests the report, diagnostics, and all
+live-profile evidence files under the output directory.
+
 ```powershell
 # Full corpus and required live WHP evidence
 python scripts\nvx.py test-mxc-policy --backend whp `
