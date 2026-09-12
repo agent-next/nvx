@@ -44,6 +44,7 @@ pub fn run_live_profiles(options: &PolicyHarnessOptions) -> BTreeMap<String, Liv
                 "network-positive-negative",
                 "process-shell",
                 "proxy-environment",
+                "control-lifecycle",
             ] {
                 profiles.insert(
                     id.to_string(),
@@ -113,6 +114,13 @@ pub fn run_live_profiles(options: &PolicyHarnessOptions) -> BTreeMap<String, Liv
                     blocked(id, "live WHP policy profiles require Windows".to_string()),
                 );
             }
+            profiles.insert(
+                "control-lifecycle".to_string(),
+                blocked(
+                    "control-lifecycle",
+                    "control lifecycle profile is not implemented in this task".to_string(),
+                ),
+            );
         }
     }
     profiles

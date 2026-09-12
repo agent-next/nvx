@@ -1,13 +1,30 @@
 pub mod adapter;
+pub mod cases;
 pub mod catalog;
 pub mod effects;
+pub mod live;
+pub mod report;
 pub mod schema;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PolicyError {
     pub code: String,
     pub instance_path: String,
     pub message: String,
+}
+
+impl PolicyError {
+    pub fn new(
+        code: impl Into<String>,
+        instance_path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            instance_path: instance_path.into(),
+            message: message.into(),
+        }
+    }
 }
 
 pub use schema::{
@@ -19,4 +36,7 @@ pub use catalog::{CatalogEntry, EvidenceRequirement, PolicyDisposition, catalog_
 pub use effects::{
     CountingHostEffects, EffectCounters, HostEffects, PolicyExecutionError, PolicyRunError,
     ProductionHostEffects, run_policy_production, run_with_effects,
+};
+pub use report::{
+    PolicyHarnessMode, PolicyHarnessOptions, PolicyHarnessRun, execute_policy_harness,
 };

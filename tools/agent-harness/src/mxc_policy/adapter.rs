@@ -66,6 +66,13 @@ pub fn adapt_policy(
 
     let phase = parse_phase(object.get("phase"))?;
     let sandbox_id = optional_non_empty_string(object.get("sandboxId"), "/sandboxId")?;
+    if phase == MxcPhase::Provision && sandbox_id.is_some() {
+        return Err(vec![error(
+            "invalid_phase",
+            "/sandboxId",
+            "sandboxId identifies a prior provision and must be null or absent",
+        )]);
+    }
     if phase != MxcPhase::Provision && sandbox_id.is_none() {
         return Err(vec![error(
             "invalid_phase",
@@ -711,6 +718,15 @@ mod tests {
             adapt(&start_with_null_policy).expect_err("policy presence after provision")[0].code,
             "invalid_phase"
         );
+    }
+
+    #[test]
+    fn provision_rejects_non_null_sandbox_id() {
+        let mut config = base("provision");
+        insert(&mut config, "sandboxId", json!("sandbox-1"));
+        let error = &adapt(&config).expect_err("provision sandboxId must be null/absent")[0];
+        assert_eq!(error.code, "invalid_phase");
+        assert_eq!(error.instance_path, "/sandboxId");
     }
 
     #[test]

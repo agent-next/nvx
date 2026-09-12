@@ -10,7 +10,6 @@ use super::PolicyError;
 const SCHEMA_BYTES: &[u8] = include_bytes!("../../schemas/mxc-config.schema.0.9.0-dev.json");
 #[cfg(test)]
 const REPO_GITATTRIBUTES: &str = include_str!("../../../../.gitattributes");
-#[cfg(test)]
 const SCHEMA_PROVENANCE: &str =
     include_str!("../../schemas/mxc-config.schema.0.9.0-dev.provenance.json");
 const DRAFT7_META_SCHEMA: &str = "http://json-schema.org/draft-07/schema#";
@@ -18,7 +17,7 @@ const POLICY_SCHEMA_CODE: &str = "policy_schema";
 const POLICY_VALIDATION_CODE: &str = "policy_validation";
 const POLICY_UNKNOWN_FIELD_CODE: &str = "policy_unknown_field";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MxcPhase {
     Provision,
     Start,
@@ -47,13 +46,30 @@ struct CompiledSchema {
     normalized_sha256: String,
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, serde::Deserialize)]
-struct SchemaProvenance {
+struct SchemaProvenanceFile {
+    #[serde(rename = "sourceCommit")]
+    source_commit: String,
     #[serde(rename = "rawSha256")]
     raw_sha256: String,
     #[serde(rename = "normalizedSha256")]
     normalized_sha256: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SchemaProvenance {
+    #[serde(default = "default_draft_value")]
+    pub draft: Value,
+    #[serde(rename = "sourceCommit")]
+    pub source_commit: String,
+    #[serde(rename = "rawSha256")]
+    pub raw_sha256: String,
+    #[serde(rename = "normalizedSha256")]
+    pub normalized_sha256: String,
+}
+
+fn default_draft_value() -> Value {
+    Value::String(DRAFT7_META_SCHEMA.to_string())
 }
 
 static COMPILED_SCHEMA: OnceLock<Result<CompiledSchema, PolicyError>> = OnceLock::new();
@@ -63,6 +79,14 @@ fn compiled_schema() -> Result<&'static CompiledSchema, PolicyError> {
         .get_or_init(compile_schema)
         .as_ref()
         .map_err(Clone::clone)
+}
+
+pub fn schema() -> Result<Value, PolicyError> {
+    compiled_schema().map(|compiled| compiled.schema.clone())
+}
+
+pub fn schema_bytes() -> &'static [u8] {
+    SCHEMA_BYTES
 }
 
 fn compile_schema() -> Result<CompiledSchema, PolicyError> {
@@ -86,6 +110,31 @@ fn compile_schema() -> Result<CompiledSchema, PolicyError> {
 
 pub fn schema_raw_sha256() -> Result<String, PolicyError> {
     compiled_schema().map(|compiled| compiled.raw_sha256.clone())
+}
+
+pub fn raw_sha256() -> String {
+    sha256_hex(SCHEMA_BYTES)
+}
+
+pub fn normalized_sha256() -> Result<String, PolicyError> {
+    schema_normalized_sha256()
+}
+
+pub fn provenance() -> Result<SchemaProvenance, PolicyError> {
+    let parsed: SchemaProvenanceFile =
+        serde_json::from_str(SCHEMA_PROVENANCE).map_err(|error| {
+            PolicyError::new(
+                POLICY_SCHEMA_CODE,
+                "",
+                format!("failed to parse embedded schema provenance: {error}"),
+            )
+        })?;
+    Ok(SchemaProvenance {
+        draft: Value::String(DRAFT7_META_SCHEMA.to_string()),
+        source_commit: parsed.source_commit,
+        raw_sha256: parsed.raw_sha256,
+        normalized_sha256: parsed.normalized_sha256,
+    })
 }
 
 pub fn schema_normalized_sha256() -> Result<String, PolicyError> {

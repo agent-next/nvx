@@ -1,6 +1,9 @@
-use super::schema::MxcPhase;
+use super::PolicyError;
+pub use super::schema::MxcPhase;
+use sha2::{Digest, Sha256};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum PolicyDisposition {
     Honored,
     AcceptedInert,
@@ -8,14 +11,15 @@ pub enum PolicyDisposition {
     Control,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum EvidenceRequirement {
     UnitStatic,
     LocalLinuxRuntime,
     LiveWhpPositiveNegative,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CatalogEntry {
     pub key: &'static str,
     pub schema_path: &'static str,
@@ -354,10 +358,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "experimental#absent",
         schema_path: "/properties/experimental",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "experimental#nullable",
@@ -1330,10 +1334,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "fallback#absent",
         schema_path: "/properties/fallback",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "fallback#nullable",
@@ -1426,10 +1430,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "filesystem.deniedPaths#absent",
         schema_path: "/properties/filesystem/anyOf/0/properties/deniedPaths",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "filesystem.deniedPaths#nullable",
@@ -1530,10 +1534,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "lifecycle#absent",
         schema_path: "/properties/lifecycle",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "lifecycle#nullable",
@@ -1634,10 +1638,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "lxc#absent",
         schema_path: "/properties/lxc",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "lxc#nullable",
@@ -1754,10 +1758,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "network.allowLocalNetwork#absent",
         schema_path: "/properties/network/anyOf/0/properties/allowLocalNetwork",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "network.allowLocalNetwork#nullable",
@@ -1898,10 +1902,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "network.egress#absent",
         schema_path: "/properties/network/anyOf/0/properties/egress",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "network.egress#nullable",
@@ -2530,10 +2534,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "network.enforcementMode#absent",
         schema_path: "/properties/network/anyOf/0/properties/enforcementMode",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "network.enforcementMode#nullable",
@@ -2618,10 +2622,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "network.ingress#absent",
         schema_path: "/properties/network/anyOf/0/properties/ingress",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "network.ingress#nullable",
@@ -2770,10 +2774,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "network.proxy#absent",
         schema_path: "/properties/network/anyOf/0/properties/proxy",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "network.proxy#nullable",
@@ -3114,10 +3118,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "processContainer#absent",
         schema_path: "/properties/processContainer",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "processContainer#nullable",
@@ -3746,10 +3750,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "seatbelt#absent",
         schema_path: "/properties/seatbelt",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "seatbelt#nullable",
@@ -4002,10 +4006,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "telemetry#absent",
         schema_path: "/properties/telemetry",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "telemetry#nullable",
@@ -4074,10 +4078,10 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "ui#absent",
         schema_path: "/properties/ui",
-        disposition: PolicyDisposition::Rejected,
+        disposition: PolicyDisposition::AcceptedInert,
         phases: PHASES_ALL,
         evidence: EVIDENCE_UNIT_STATIC,
-        reason: REASON_REJECTED,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "ui#nullable",
@@ -4293,6 +4297,23 @@ pub fn catalog_entries() -> &'static [CatalogEntry] {
     CATALOG
 }
 
+pub fn catalog() -> Result<Vec<CatalogEntry>, PolicyError> {
+    Ok(CATALOG.to_vec())
+}
+
+pub fn catalog_hash() -> Result<String, PolicyError> {
+    let bytes = serde_json::to_vec(CATALOG).map_err(|error| {
+        PolicyError::new(
+            "catalog_internal",
+            "",
+            format!("failed to serialize catalog for hashing: {error}"),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4377,21 +4398,36 @@ mod tests {
     }
 
     #[test]
-    fn semantic_contract_inert_annotations_is_exact() {
+    fn semantic_contract_accepted_inert_surfaces_are_exact() {
         assert_group_contract(
-            "inert annotations",
+            "accepted inert surfaces",
             string_set([
                 "$schema",
                 "$schema#absent",
                 "$schema#nullable",
                 "_comment",
                 "_comment#absent",
+                "experimental#absent",
+                "fallback#absent",
+                "filesystem.deniedPaths#absent",
+                "lifecycle#absent",
+                "lxc#absent",
+                "network.allowLocalNetwork#absent",
+                "network.egress#absent",
+                "network.enforcementMode#absent",
+                "network.ingress#absent",
+                "network.proxy#absent",
+                "processContainer#absent",
+                "seatbelt#absent",
+                "telemetry#absent",
+                "ui#absent",
             ]),
             |key| {
                 key == "$schema"
                     || key.starts_with("$schema#")
                     || key == "_comment"
                     || key.starts_with("_comment#")
+                    || is_compat_absent_inert_key(key)
             },
             PolicyDisposition::AcceptedInert,
             PHASES_ALL,
@@ -4634,13 +4670,13 @@ mod tests {
             "rejected filesystem deniedPaths",
             string_set([
                 "filesystem.deniedPaths",
-                "filesystem.deniedPaths#absent",
                 "filesystem.deniedPaths#nullable",
                 "filesystem.deniedPaths[]",
             ]),
             |key| {
                 key == "filesystem.deniedPaths"
-                    || key.starts_with("filesystem.deniedPaths#")
+                    || (key.starts_with("filesystem.deniedPaths#")
+                        && key != "filesystem.deniedPaths#absent")
                     || key == "filesystem.deniedPaths[]"
             },
             PolicyDisposition::Rejected,
@@ -4649,17 +4685,20 @@ mod tests {
             REASON_REJECTED,
         );
         let expected_rejected_directional_network =
-            schema_inventory_keys_for_prefixes(&["network.egress", "network.ingress"]);
+            schema_inventory_keys_for_prefixes(&["network.egress", "network.ingress"])
+                .into_iter()
+                .filter(|key| !is_compat_absent_inert_key(key))
+                .collect::<BTreeSet<_>>();
         assert_group_contract(
             "rejected directional network ingress-egress",
             expected_rejected_directional_network,
             |key| {
                 key == "network.egress"
                     || key.starts_with("network.egress.")
-                    || key.starts_with("network.egress#")
+                    || (key.starts_with("network.egress#") && !is_compat_absent_inert_key(key))
                     || key == "network.ingress"
                     || key.starts_with("network.ingress.")
-                    || key.starts_with("network.ingress#")
+                    || (key.starts_with("network.ingress#") && !is_compat_absent_inert_key(key))
             },
             PolicyDisposition::Rejected,
             PHASES_ALL,
@@ -4670,15 +4709,20 @@ mod tests {
             "network.allowLocalNetwork",
             "network.enforcementMode",
             "processContainer.network",
-        ]);
+        ])
+        .into_iter()
+        .filter(|key| !is_compat_absent_inert_key(key))
+        .collect::<BTreeSet<_>>();
         assert_group_contract(
             "rejected network container-backend-specific",
             expected_rejected_network_backend_specific,
             |key| {
                 key == "network.allowLocalNetwork"
-                    || key.starts_with("network.allowLocalNetwork#")
+                    || (key.starts_with("network.allowLocalNetwork#")
+                        && !is_compat_absent_inert_key(key))
                     || key == "network.enforcementMode"
-                    || key.starts_with("network.enforcementMode#")
+                    || (key.starts_with("network.enforcementMode#")
+                        && !is_compat_absent_inert_key(key))
                     || key == "processContainer.network"
                     || key.starts_with("processContainer.network.")
                     || key.starts_with("processContainer.network#")
@@ -4692,7 +4736,6 @@ mod tests {
             "rejected network.proxy",
             string_set([
                 "network.proxy",
-                "network.proxy#absent",
                 "network.proxy#nullable",
                 "network.proxy#anyOf[0]=#/definitions/Proxy",
                 "network.proxy.builtinTestServer",
@@ -4709,7 +4752,7 @@ mod tests {
             |key| {
                 key == "network.proxy"
                     || key.starts_with("network.proxy.")
-                    || key.starts_with("network.proxy#")
+                    || (key.starts_with("network.proxy#") && !is_compat_absent_inert_key(key))
             },
             PolicyDisposition::Rejected,
             PHASES_ALL,
@@ -4720,7 +4763,6 @@ mod tests {
             "rejected telemetry",
             string_set([
                 "telemetry",
-                "telemetry#absent",
                 "telemetry#nullable",
                 "telemetry#anyOf[0]=#/definitions/Telemetry",
                 "telemetry.enabled",
@@ -4730,7 +4772,9 @@ mod tests {
                 "telemetry#anyOf[1]=null",
             ]),
             |key| {
-                key == "telemetry" || key.starts_with("telemetry.") || key.starts_with("telemetry#")
+                key == "telemetry"
+                    || key.starts_with("telemetry.")
+                    || (key.starts_with("telemetry#") && !is_compat_absent_inert_key(key))
             },
             PolicyDisposition::Rejected,
             PHASES_ALL,
@@ -4741,7 +4785,6 @@ mod tests {
             "rejected lifecycle",
             string_set([
                 "lifecycle",
-                "lifecycle#absent",
                 "lifecycle#nullable",
                 "lifecycle#anyOf[0]=#/definitions/Lifecycle",
                 "lifecycle.destroyOnExit",
@@ -4755,7 +4798,9 @@ mod tests {
                 "lifecycle#anyOf[1]=null",
             ]),
             |key| {
-                key == "lifecycle" || key.starts_with("lifecycle.") || key.starts_with("lifecycle#")
+                key == "lifecycle"
+                    || key.starts_with("lifecycle.")
+                    || (key.starts_with("lifecycle#") && !is_compat_absent_inert_key(key))
             },
             PolicyDisposition::Rejected,
             PHASES_ALL,
@@ -4772,6 +4817,7 @@ mod tests {
         ])
         .into_iter()
         .filter(|key| !is_process_container_network_key(key))
+        .filter(|key| !is_compat_absent_inert_key(key))
         .collect::<BTreeSet<_>>();
         assert_group_contract(
             "rejected unsupported/backend",
@@ -4779,24 +4825,25 @@ mod tests {
             |key| {
                 key == "experimental"
                     || key.starts_with("experimental.")
-                    || key.starts_with("experimental#")
+                    || (key.starts_with("experimental#") && !is_compat_absent_inert_key(key))
                     || key == "fallback"
                     || key.starts_with("fallback.")
-                    || key.starts_with("fallback#")
+                    || (key.starts_with("fallback#") && !is_compat_absent_inert_key(key))
                     || key == "lxc"
                     || key.starts_with("lxc.")
-                    || key.starts_with("lxc#")
+                    || (key.starts_with("lxc#") && !is_compat_absent_inert_key(key))
                     || key == "processContainer"
                     || (key.starts_with("processContainer.")
                         && !is_process_container_network_key(key))
                     || (key.starts_with("processContainer#")
-                        && !is_process_container_network_key(key))
+                        && !is_process_container_network_key(key)
+                        && !is_compat_absent_inert_key(key))
                     || key == "seatbelt"
                     || key.starts_with("seatbelt.")
-                    || key.starts_with("seatbelt#")
+                    || (key.starts_with("seatbelt#") && !is_compat_absent_inert_key(key))
                     || key == "ui"
                     || key.starts_with("ui.")
-                    || key.starts_with("ui#")
+                    || (key.starts_with("ui#") && !is_compat_absent_inert_key(key))
             },
             PolicyDisposition::Rejected,
             PHASES_ALL,
@@ -4809,11 +4856,12 @@ mod tests {
     fn semantic_contract_groups_are_exhaustive_and_disjoint() {
         type GroupMatcher = (&'static str, fn(&str) -> bool);
         let groups: [GroupMatcher; 18] = [
-            ("inert annotations", |key| {
+            ("accepted inert surfaces", |key| {
                 key == "$schema"
                     || key.starts_with("$schema#")
                     || key == "_comment"
                     || key.starts_with("_comment#")
+                    || is_compat_absent_inert_key(key)
             }),
             ("control fields", |key| {
                 key == "containerId"
@@ -4843,7 +4891,8 @@ mod tests {
             }),
             ("rejected filesystem deniedPaths", |key| {
                 key == "filesystem.deniedPaths"
-                    || key.starts_with("filesystem.deniedPaths#")
+                    || (key.starts_with("filesystem.deniedPaths#")
+                        && key != "filesystem.deniedPaths#absent")
                     || key == "filesystem.deniedPaths[]"
             }),
             ("honored provision structural network", |key| {
@@ -4888,16 +4937,18 @@ mod tests {
             ("rejected directional network ingress-egress", |key| {
                 key == "network.egress"
                     || key.starts_with("network.egress.")
-                    || key.starts_with("network.egress#")
+                    || (key.starts_with("network.egress#") && !is_compat_absent_inert_key(key))
                     || key == "network.ingress"
                     || key.starts_with("network.ingress.")
-                    || key.starts_with("network.ingress#")
+                    || (key.starts_with("network.ingress#") && !is_compat_absent_inert_key(key))
             }),
             ("rejected network container-backend-specific", |key| {
                 key == "network.allowLocalNetwork"
-                    || key.starts_with("network.allowLocalNetwork#")
+                    || (key.starts_with("network.allowLocalNetwork#")
+                        && !is_compat_absent_inert_key(key))
                     || key == "network.enforcementMode"
-                    || key.starts_with("network.enforcementMode#")
+                    || (key.starts_with("network.enforcementMode#")
+                        && !is_compat_absent_inert_key(key))
                     || key == "processContainer.network"
                     || key.starts_with("processContainer.network.")
                     || key.starts_with("processContainer.network#")
@@ -4905,35 +4956,40 @@ mod tests {
             ("rejected network.proxy", |key| {
                 key == "network.proxy"
                     || key.starts_with("network.proxy.")
-                    || key.starts_with("network.proxy#")
+                    || (key.starts_with("network.proxy#") && !is_compat_absent_inert_key(key))
             }),
             ("rejected telemetry", |key| {
-                key == "telemetry" || key.starts_with("telemetry.") || key.starts_with("telemetry#")
+                key == "telemetry"
+                    || key.starts_with("telemetry.")
+                    || (key.starts_with("telemetry#") && !is_compat_absent_inert_key(key))
             }),
             ("rejected lifecycle", |key| {
-                key == "lifecycle" || key.starts_with("lifecycle.") || key.starts_with("lifecycle#")
+                key == "lifecycle"
+                    || key.starts_with("lifecycle.")
+                    || (key.starts_with("lifecycle#") && !is_compat_absent_inert_key(key))
             }),
             ("rejected unsupported/backend", |key| {
                 key == "experimental"
                     || key.starts_with("experimental.")
-                    || key.starts_with("experimental#")
+                    || (key.starts_with("experimental#") && !is_compat_absent_inert_key(key))
                     || key == "fallback"
                     || key.starts_with("fallback.")
-                    || key.starts_with("fallback#")
+                    || (key.starts_with("fallback#") && !is_compat_absent_inert_key(key))
                     || key == "lxc"
                     || key.starts_with("lxc.")
-                    || key.starts_with("lxc#")
+                    || (key.starts_with("lxc#") && !is_compat_absent_inert_key(key))
                     || key == "processContainer"
                     || (key.starts_with("processContainer.")
                         && !is_process_container_network_key(key))
                     || (key.starts_with("processContainer#")
-                        && !is_process_container_network_key(key))
+                        && !is_process_container_network_key(key)
+                        && !is_compat_absent_inert_key(key))
                     || key == "seatbelt"
                     || key.starts_with("seatbelt.")
-                    || key.starts_with("seatbelt#")
+                    || (key.starts_with("seatbelt#") && !is_compat_absent_inert_key(key))
                     || key == "ui"
                     || key.starts_with("ui.")
-                    || key.starts_with("ui#")
+                    || (key.starts_with("ui#") && !is_compat_absent_inert_key(key))
             }),
         ];
 
@@ -4952,6 +5008,26 @@ mod tests {
                 matching.join(", ")
             );
         }
+    }
+
+    fn is_compat_absent_inert_key(key: &str) -> bool {
+        matches!(
+            key,
+            "experimental#absent"
+                | "fallback#absent"
+                | "filesystem.deniedPaths#absent"
+                | "lifecycle#absent"
+                | "lxc#absent"
+                | "network.allowLocalNetwork#absent"
+                | "network.egress#absent"
+                | "network.enforcementMode#absent"
+                | "network.ingress#absent"
+                | "network.proxy#absent"
+                | "processContainer#absent"
+                | "seatbelt#absent"
+                | "telemetry#absent"
+                | "ui#absent"
+        )
     }
 
     fn assert_group_contract(

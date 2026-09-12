@@ -97,7 +97,7 @@ impl core::fmt::Display for PolicyExecutionError {
 
 impl std::error::Error for PolicyExecutionError {}
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct EffectCounters {
     pub root_preparations: usize,
     pub fixture_creations: usize,
@@ -105,6 +105,17 @@ pub struct EffectCounters {
     pub launch_plan_constructions: usize,
     pub process_launches: usize,
     pub output_artifact_creations: usize,
+}
+
+impl EffectCounters {
+    pub fn is_zero(&self) -> bool {
+        self.root_preparations == 0
+            && self.fixture_creations == 0
+            && self.artifact_discoveries == 0
+            && self.launch_plan_constructions == 0
+            && self.process_launches == 0
+            && self.output_artifact_creations == 0
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -138,6 +149,7 @@ impl HostEffects for CountingHostEffects {
             kernel: PathBuf::from("counting-kernel"),
             mxc_initramfs: PathBuf::from("counting-initramfs"),
             common_root: PathBuf::from("counting-common-root"),
+            portable_network: None,
         })
     }
 

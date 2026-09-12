@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use super::PolicyError;
 use super::cases::{
-    ExpectedDisposition, StaticCaseResult, live_profile_for_path, load_corpus, load_single_config,
-    run_static_cases, validate_corpus,
+    ExpectedDisposition, PolicyCase, StaticCaseResult, live_profile_for_path, load_corpus,
+    load_single_config, run_static_cases, validate_case_disposition_contract, validate_corpus,
 };
 use super::catalog::{CatalogEntry, EvidenceRequirement, PolicyDisposition, catalog, catalog_hash};
 use super::live::{LiveProfileResult, LiveProfileStatus, run_live_profiles};
-use super::schema::{PolicyError, normalized_sha256, provenance, raw_sha256};
+use super::schema::{normalized_sha256, provenance, raw_sha256};
 use crate::launch::LaunchOverrides;
 use crate::{HarnessBackend, content_sha256_hex_bytes, write_bytes_atomic, write_json_atomic};
 use serde::{Deserialize, Serialize};
@@ -174,25 +175,40 @@ pub fn execute_policy_harness(
         .collect::<Vec<_>>();
     let mut blocked = Vec::new();
     let mut failed = Vec::new();
+    let static_results_by_id = static_results
+        .iter()
+        .map(|result| (result.id.as_str(), result))
+        .collect::<BTreeMap<_, _>>();
+    let case_by_id = cases
+        .iter()
+        .map(|case| (case.id.as_str(), case))
+        .collect::<BTreeMap<_, _>>();
     let mut catalog_results = Vec::with_capacity(catalog_entries.len());
     for entry in catalog_entries {
-        let case_ids = coverage.get(&entry.key).cloned().unwrap_or_default();
+        let case_ids = coverage.get(entry.key).cloned().unwrap_or_default();
         if options.config.is_none() && case_ids.is_empty() {
-            uncovered.push(entry.key.clone());
+            uncovered.push(entry.key.to_string());
         }
-        let (actual_outcome, error, artifacts) =
-            actual_outcome(&entry, &live_profiles, options.mode);
+        let (actual_outcome, error, artifacts) = actual_outcome(
+            &entry,
+            &case_ids,
+            &case_by_id,
+            &static_results_by_id,
+            &live_profiles,
+            options.mode,
+            options.config.is_none(),
+        );
         match actual_outcome.as_str() {
-            "blocked" => blocked.push(entry.key.clone()),
-            "failed" => failed.push(entry.key.clone()),
-            "unexpected" => unexpected.push(entry.key.clone()),
+            "blocked" => blocked.push(entry.key.to_string()),
+            "failed" => failed.push(entry.key.to_string()),
+            "unexpected" => unexpected.push(entry.key.to_string()),
             _ => {}
         }
         catalog_results.push(CatalogResult {
-            key: entry.key,
-            schema_path: entry.schema_path,
+            key: entry.key.to_string(),
+            schema_path: entry.schema_path.to_string(),
             disposition: entry.disposition,
-            phases: entry.phases,
+            phases: entry.phases.to_vec(),
             case_ids,
             expected_outcome: expected_outcome(entry.disposition).to_string(),
             actual_outcome,
@@ -280,31 +296,40 @@ pub fn execute_policy_harness(
 
 fn actual_outcome(
     entry: &CatalogEntry,
+    case_ids: &[String],
+    cases: &BTreeMap<&str, &PolicyCase>,
+    static_results: &BTreeMap<&str, &StaticCaseResult>,
     live: &BTreeMap<String, LiveProfileResult>,
     mode: PolicyHarnessMode,
+    enforce_static_links: bool,
 ) -> (String, Option<String>, Vec<String>) {
+    let (static_status, static_error, mut artifacts) =
+        static_outcome(entry, case_ids, cases, static_results, enforce_static_links);
+    if static_status != "passed" {
+        return (static_status, static_error, artifacts);
+    }
     if entry.evidence != EvidenceRequirement::LiveWhpPositiveNegative {
-        return ("passed".to_string(), None, Vec::new());
+        return ("passed".to_string(), None, artifacts);
     }
     if mode == PolicyHarnessMode::StaticOnly {
         return (
             "blocked".to_string(),
             Some("live WHP positive/negative evidence was not requested".to_string()),
-            Vec::new(),
+            artifacts,
         );
     }
-    let Some(profile_id) = live_profile_for_path(&entry.schema_path) else {
+    let Some(profile_id) = live_profile_for_path(entry.key) else {
         return (
             "failed".to_string(),
             Some("no live profile maps this honored construct".to_string()),
-            Vec::new(),
+            artifacts,
         );
     };
     let Some(profile) = live.get(profile_id) else {
         return (
             "failed".to_string(),
             Some(format!("live profile {profile_id} did not run")),
-            Vec::new(),
+            artifacts,
         );
     };
     let status = match profile.status {
@@ -313,11 +338,85 @@ fn actual_outcome(
         LiveProfileStatus::Fail => "failed",
         LiveProfileStatus::Blocked => "blocked",
     };
-    (
-        status.to_string(),
-        profile.error.clone(),
-        vec![format!("live-canonical-evidence:{}", profile.id)],
-    )
+    artifacts.push(format!("live-canonical-evidence:{}", profile.id));
+    (status.to_string(), profile.error.clone(), artifacts)
+}
+
+fn static_outcome(
+    entry: &CatalogEntry,
+    case_ids: &[String],
+    cases: &BTreeMap<&str, &PolicyCase>,
+    static_results: &BTreeMap<&str, &StaticCaseResult>,
+    enforce_static_links: bool,
+) -> (String, Option<String>, Vec<String>) {
+    let artifacts = case_ids
+        .iter()
+        .map(|id| format!("static-case:{id}"))
+        .collect::<Vec<_>>();
+    if case_ids.is_empty() {
+        if enforce_static_links {
+            return (
+                "failed".to_string(),
+                Some("catalog entry has no linked static case results".to_string()),
+                artifacts,
+            );
+        }
+        return ("passed".to_string(), None, artifacts);
+    }
+
+    let mut missing = Vec::new();
+    let mut unexpected = Vec::new();
+    for case_id in case_ids {
+        let Some(case) = cases.get(case_id.as_str()) else {
+            missing.push(case_id.clone());
+            continue;
+        };
+        if let Err(message) = validate_case_disposition_contract(entry, case.expected_disposition) {
+            unexpected.push(format!("{case_id}:contract:{message}"));
+            continue;
+        }
+        let Some(result) = static_results.get(case_id.as_str()) else {
+            missing.push(case_id.clone());
+            continue;
+        };
+        if !result.passed {
+            let detail = match &result.error {
+                Some(error) => format!(
+                    "{}:{}@{}",
+                    case_id,
+                    error.code,
+                    if error.instance_path.is_empty() {
+                        "$"
+                    } else {
+                        error.instance_path.as_str()
+                    }
+                ),
+                None => case_id.clone(),
+            };
+            unexpected.push(detail);
+        }
+    }
+    if !missing.is_empty() {
+        return (
+            "failed".to_string(),
+            Some(format!(
+                "linked static cases did not run: {}",
+                missing.join(", ")
+            )),
+            artifacts,
+        );
+    }
+    if !unexpected.is_empty() {
+        return (
+            "unexpected".to_string(),
+            Some(format!(
+                "linked static cases had unexpected outcomes: {}",
+                unexpected.join(", ")
+            )),
+            artifacts,
+        );
+    }
+    ("passed".to_string(), None, artifacts)
 }
 
 fn expected_outcome(disposition: PolicyDisposition) -> &'static str {
@@ -564,5 +663,61 @@ mod tests {
         fs::write(&run.attestation_manifest_path, b"{}").expect("tamper manifest");
         assert!(verify_policy_run(&run).is_err());
         fs::remove_dir_all(output).expect("cleanup");
+    }
+
+    #[test]
+    fn contradictory_linked_static_result_cannot_report_passed() {
+        let entry = CatalogEntry {
+            key: "process.commandLine",
+            schema_path: "/properties/process/anyOf/0/properties/commandLine",
+            disposition: PolicyDisposition::Honored,
+            phases: &[crate::mxc_policy::MxcPhase::Exec],
+            evidence: EvidenceRequirement::UnitStatic,
+            reason: "test",
+        };
+        let case = PolicyCase {
+            id: "contradictory-case".to_string(),
+            config: serde_json::json!({
+                "version": "0.9.0-dev",
+                "containment": "vm",
+                "phase": "exec",
+                "sandboxId": "sandbox-1",
+                "process": { "commandLine": "echo ok" }
+            }),
+            expected_disposition: ExpectedDisposition::Rejected,
+            expected_code: Some("invalid_value".to_string()),
+            expected_path: Some("/process/commandLine".to_string()),
+            required_evidence: EvidenceRequirement::UnitStatic,
+            catalog_keys: vec![entry.key.to_string()],
+        };
+        let failing = StaticCaseResult {
+            id: "contradictory-case".to_string(),
+            passed: true,
+            expected_disposition: ExpectedDisposition::Rejected,
+            actual_disposition: ExpectedDisposition::Rejected,
+            error: None,
+            effect_counters: super::super::effects::EffectCounters::default(),
+            output_directory_created: false,
+            catalog_keys: vec![entry.key.to_string()],
+        };
+        let case_map = [(&case.id[..], &case)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let static_results = [(&failing.id[..], &failing)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let (outcome, error, _) = actual_outcome(
+            &entry,
+            std::slice::from_ref(&failing.id),
+            &case_map,
+            &static_results,
+            &BTreeMap::new(),
+            PolicyHarnessMode::StaticOnly,
+            true,
+        );
+        assert_eq!(outcome, "unexpected");
+        assert!(error.is_some_and(|message| {
+            message.contains("contradictory-case") && message.contains("contract")
+        }));
     }
 }
