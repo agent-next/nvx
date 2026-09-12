@@ -916,6 +916,25 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_missing_live_evidence_artifacts() {
+        let output = test_output("policy-missing-evidence");
+        let evidence = output.join("live-profile").join("boot-console.log");
+        fs::create_dir_all(evidence.parent().expect("evidence parent")).expect("create evidence");
+        fs::write(&evidence, b"trusted live evidence").expect("write evidence");
+        let run = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::StaticOnly,
+            output_dir: output.clone(),
+            config: None,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect("static report");
+        fs::remove_file(&evidence).expect("remove attested evidence");
+        assert!(verify_policy_run(&run).is_err());
+        fs::remove_dir_all(output).expect("cleanup");
+    }
+
+    #[test]
     fn manifest_rejects_unreferenced_output_artifacts() {
         let output = test_output("policy-unreferenced-evidence");
         let run = execute_policy_harness(PolicyHarnessOptions {
@@ -928,6 +947,36 @@ mod tests {
         .expect("static report");
         fs::write(output.join("unreferenced.log"), b"not attested")
             .expect("write unreferenced artifact");
+        assert!(verify_policy_run(&run).is_err());
+        fs::remove_dir_all(output).expect("cleanup");
+    }
+
+    #[test]
+    fn manifest_rejects_escaping_artifact_paths() {
+        let output = test_output("policy-escaping-evidence");
+        let mut run = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::StaticOnly,
+            output_dir: output.clone(),
+            config: None,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect("static report");
+        let bytes = fs::read(&run.attestation_manifest_path).expect("read manifest");
+        let mut manifest: PolicyManifest = serde_json::from_slice(&bytes).expect("parse manifest");
+        let artifact = manifest.artifacts.first_mut().expect("manifest artifact");
+        let old_path = std::mem::replace(&mut artifact.path, "../escape.log".to_string());
+        let identity = run
+            .trusted_artifacts
+            .remove(&old_path)
+            .expect("trusted identity");
+        run.trusted_artifacts
+            .insert("../escape.log".to_string(), identity);
+        fs::write(
+            &run.attestation_manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write forged manifest");
         assert!(verify_policy_run(&run).is_err());
         fs::remove_dir_all(output).expect("cleanup");
     }

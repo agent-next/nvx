@@ -1993,6 +1993,39 @@ mod tests {
     }
 
     #[test]
+    fn reserved_proxy_environment_rejects_without_runtime_proxy_before_effects() {
+        for key in ["HTTP_PROXY", "https_proxy", "No_PrOxY"] {
+            let case = PolicyCase {
+                id: format!("reserved-proxy-{key}"),
+                config: json!({
+                    "version": SCHEMA_VERSION,
+                    "containment": "vm",
+                    "phase": "exec",
+                    "sandboxId": "sandbox-1",
+                    "process": {
+                        "commandLine": "true",
+                        "env": [format!("{key}=caller")]
+                    }
+                }),
+                expected_disposition: ExpectedDisposition::Rejected,
+                expected_plan: None,
+                expected_code: Some("cross_field_conflict".to_string()),
+                expected_path: Some("/process/env".to_string()),
+                required_evidence: EvidenceRequirement::UnitStatic,
+                catalog_keys: Vec::new(),
+            };
+            let result = run_static_case(
+                &case,
+                &default_static_common_root(),
+                Path::new("target/rejected-policy-output"),
+            );
+            assert!(result.passed, "{key}: {:?}", result.error);
+            assert_eq!(result.effect_counters, EffectCounters::default(), "{key}");
+            assert!(!result.output_directory_created, "{key}");
+        }
+    }
+
+    #[test]
     fn accepted_case_rejects_typed_plan_drift() {
         let mut cases = load_corpus().expect("corpus");
         let case = cases
