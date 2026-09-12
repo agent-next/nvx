@@ -494,7 +494,9 @@ fn run_static_case(
                 .expected_plan
                 .as_ref()
                 .map(|plan| materialize_expected_plan(plan, common_root));
-            let plan_matches = expected_plan.as_ref() == effects.prepared_plan();
+            let plan_matches = expected_plan
+                .as_ref()
+                .is_none_or(|expected| effects.prepared_plan() == Some(expected));
             let error = (!plan_matches).then(|| {
                 PolicyError::new(
                     "unexpected_plan",
@@ -1764,6 +1766,30 @@ mod tests {
             result.error.as_ref().map(|error| error.code.as_str()),
             Some("unexpected_plan")
         );
+    }
+
+    #[test]
+    fn ad_hoc_accepted_config_does_not_require_a_corpus_oracle() {
+        let case = PolicyCase {
+            id: "single-config".to_string(),
+            config: json!({
+                "version": SCHEMA_VERSION,
+                "containment": "vm",
+                "phase": "provision"
+            }),
+            expected_disposition: ExpectedDisposition::Accepted,
+            expected_plan: None,
+            expected_code: None,
+            expected_path: None,
+            required_evidence: EvidenceRequirement::UnitStatic,
+            catalog_keys: Vec::new(),
+        };
+        let result = run_static_case(
+            &case,
+            &default_static_common_root(),
+            Path::new("target/rejected-policy-output"),
+        );
+        assert!(result.passed, "{:?}", result.error);
     }
 
     #[test]

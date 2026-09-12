@@ -612,6 +612,206 @@ mod tests {
     }
 
     #[test]
+    fn raw_json_rejection_contract_is_table_driven_and_exact() {
+        struct Case {
+            name: &'static str,
+            json: &'static str,
+            code: &'static str,
+            path: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "missing version",
+                json: r#"{"containment":"vm","phase":"provision"}"#,
+                code: "invalid_value",
+                path: "/version",
+            },
+            Case {
+                name: "null version",
+                json: r#"{"version":null,"containment":"vm","phase":"provision"}"#,
+                code: "invalid_value",
+                path: "/version",
+            },
+            Case {
+                name: "wrong version",
+                json: r#"{"version":"0.8.0","containment":"vm","phase":"provision"}"#,
+                code: "invalid_value",
+                path: "/version",
+            },
+            Case {
+                name: "missing containment",
+                json: r#"{"version":"0.9.0-dev","phase":"provision"}"#,
+                code: "invalid_value",
+                path: "/containment",
+            },
+            Case {
+                name: "foreign containment",
+                json: r#"{"version":"0.9.0-dev","containment":"process","phase":"provision"}"#,
+                code: "invalid_value",
+                path: "/containment",
+            },
+            Case {
+                name: "provision sandbox id",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"provision","sandboxId":"prior"}"#,
+                code: "invalid_phase",
+                path: "/sandboxId",
+            },
+            Case {
+                name: "exec without sandbox id",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","process":{"commandLine":"true"}}"#,
+                code: "invalid_phase",
+                path: "/sandboxId",
+            },
+            Case {
+                name: "provision process payload",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"provision","process":{"commandLine":"true"}}"#,
+                code: "invalid_phase",
+                path: "/process",
+            },
+            Case {
+                name: "exec network payload",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","sandboxId":"sandbox-1","process":{"commandLine":"true"},"network":null}"#,
+                code: "invalid_phase",
+                path: "/network",
+            },
+            Case {
+                name: "missing command line",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","sandboxId":"sandbox-1","process":{}}"#,
+                code: "invalid_value",
+                path: "/process/commandLine",
+            },
+            Case {
+                name: "null command line",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","sandboxId":"sandbox-1","process":{"commandLine":null}}"#,
+                code: "invalid_value",
+                path: "/process/commandLine",
+            },
+            Case {
+                name: "empty command line",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","sandboxId":"sandbox-1","process":{"commandLine":""}}"#,
+                code: "invalid_value",
+                path: "/process/commandLine",
+            },
+            Case {
+                name: "invalid environment entry",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","sandboxId":"sandbox-1","process":{"commandLine":"true","env":["NOVALUE"]}}"#,
+                code: "invalid_value",
+                path: "/process/env/0",
+            },
+            Case {
+                name: "reserved proxy environment without runtime proxy",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","sandboxId":"sandbox-1","process":{"commandLine":"true","env":["https_proxy=caller"]}}"#,
+                code: "cross_field_conflict",
+                path: "/process/env",
+            },
+            Case {
+                name: "reserved proxy environment with runtime proxy",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","sandboxId":"sandbox-1","process":{"commandLine":"true","env":["NO_PROXY=caller"]},"runtimeConfig":{"networkProxy":"http://127.0.0.1:8080"}}"#,
+                code: "cross_field_conflict",
+                path: "/process/env",
+            },
+            Case {
+                name: "non-loopback runtime proxy",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","sandboxId":"sandbox-1","process":{"commandLine":"true"},"runtimeConfig":{"networkProxy":"https://example.com:443"}}"#,
+                code: "invalid_value",
+                path: "/runtimeConfig/networkProxy",
+            },
+            Case {
+                name: "legacy network proxy",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"provision","network":{"proxy":{"url":"http://127.0.0.1:8080"}}}"#,
+                code: "unsupported_field",
+                path: "/network/proxy",
+            },
+            Case {
+                name: "denied paths",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"provision","filesystem":{"deniedPaths":[]}}"#,
+                code: "unsupported_field",
+                path: "/filesystem/deniedPaths",
+            },
+            Case {
+                name: "mapping outside common root",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"provision","filesystem":{"readonlyPaths":["C:\\other\\file"]}}"#,
+                code: "mapping_outside_root",
+                path: "/filesystem/readonlyPaths/0",
+            },
+            Case {
+                name: "duplicate mapping",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"provision","filesystem":{"readonlyPaths":["C:\\mxc-root\\same","C:\\mxc-root\\same"]}}"#,
+                code: "cross_field_conflict",
+                path: "/filesystem",
+            },
+            Case {
+                name: "ancestor-overlap mapping",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"provision","filesystem":{"readwritePaths":["C:\\mxc-root\\parent","C:\\mxc-root\\parent\\child"]}}"#,
+                code: "cross_field_conflict",
+                path: "/filesystem",
+            },
+            Case {
+                name: "host rules",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"provision","network":{"allowedHosts":["example.test"]}}"#,
+                code: "unsupported_field",
+                path: "/network/allowedHosts",
+            },
+            Case {
+                name: "foreign backend",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"provision","lxc":null}"#,
+                code: "unsupported_field",
+                path: "/lxc",
+            },
+        ];
+
+        for case in cases {
+            let config: Value = serde_json::from_str(case.json).expect(case.name);
+            let errors = adapt(&config).expect_err(case.name);
+            assert_eq!(errors[0].code, case.code, "{}", case.name);
+            assert_eq!(errors[0].instance_path, case.path, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn raw_json_success_contract_preserves_shell_and_uses_only_runtime_proxy() {
+        struct Case {
+            name: &'static str,
+            json: &'static str,
+            expected_env: &'static [&'static str],
+        }
+
+        let cases = [
+            Case {
+                name: "shell quoting without proxy",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","sandboxId":"sandbox-1","process":{"commandLine":"printf '%s' \"$VALUE\"","cwd":"/work","env":["VALUE=a b","EMPTY="]}}"#,
+                expected_env: &["VALUE=a b", "EMPTY="],
+            },
+            Case {
+                name: "runtime proxy injection",
+                json: r#"{"version":"0.9.0-dev","containment":"vm","phase":"exec","sandboxId":"sandbox-1","process":{"commandLine":"printf '%s' \"$VALUE\"","cwd":"/work","env":["VALUE=a b"]},"runtimeConfig":{"networkProxy":"https://localhost:8443"}}"#,
+                expected_env: &[
+                    "VALUE=a b",
+                    "HTTP_PROXY=https://localhost:8443/",
+                    "HTTPS_PROXY=https://localhost:8443/",
+                ],
+            },
+        ];
+
+        for case in cases {
+            let config: Value = serde_json::from_str(case.json).expect(case.name);
+            let exec = adapt(&config)
+                .unwrap_or_else(|errors| panic!("{}: {errors:?}", case.name))
+                .exec
+                .expect("exec plan");
+            assert_eq!(
+                exec.argv,
+                ["/bin/sh", "-c", "printf '%s' \"$VALUE\""],
+                "{}",
+                case.name
+            );
+            assert_eq!(exec.cwd.as_deref(), Some("/work"), "{}", case.name);
+            assert_eq!(exec.env, case.expected_env, "{}", case.name);
+        }
+    }
+
+    #[test]
     fn provision_maps_children_and_network_posture() {
         let mut config = base("provision");
         insert(

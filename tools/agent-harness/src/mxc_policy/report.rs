@@ -621,9 +621,6 @@ fn collect_attested_files(
         if path == root.join("attestation-manifest.json") {
             continue;
         }
-        if entry.file_name() == "common-root" {
-            continue;
-        }
         crate::reject_symlink_or_reparse_metadata(&path, root)
             .map_err(|error| PolicyError::new("report_io", "$", error))?;
         let file_type = entry.file_type().map_err(|error| {
@@ -636,6 +633,16 @@ fn collect_attested_files(
                 ),
             )
         })?;
+        if path == root.join("common-root") {
+            if !file_type.is_dir() {
+                return Err(PolicyError::new(
+                    "report_io",
+                    "$",
+                    "excluded common-root artifact must be a real directory",
+                ));
+            }
+            continue;
+        }
         if file_type.is_dir() {
             collect_attested_files(root, &path, paths)?;
         } else if file_type.is_file() {
@@ -853,6 +860,24 @@ mod tests {
         .expect("static report");
         fs::write(output.join("unreferenced.log"), b"not attested")
             .expect("write unreferenced artifact");
+        assert!(verify_policy_run(&run).is_err());
+        fs::remove_dir_all(output).expect("cleanup");
+    }
+
+    #[test]
+    fn manifest_does_not_ignore_nested_common_root_artifacts() {
+        let output = test_output("policy-nested-common-root");
+        let run = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::StaticOnly,
+            output_dir: output.clone(),
+            config: None,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect("static report");
+        let nested = output.join("evidence").join("common-root");
+        fs::create_dir_all(nested.parent().expect("nested parent")).expect("create parent");
+        fs::write(&nested, b"unreferenced").expect("write nested artifact");
         assert!(verify_policy_run(&run).is_err());
         fs::remove_dir_all(output).expect("cleanup");
     }
