@@ -45,6 +45,7 @@ pub struct FreshnessPins {
     pub schema_raw_sha256: String,
     pub schema_normalized_sha256: String,
     pub catalog_sha256: String,
+    pub catalog_source_sha256: String,
     pub adapter_sha256: String,
     pub protocol_version: u32,
     pub protocol_source_sha256: String,
@@ -482,24 +483,50 @@ fn freshness_pins(options: &PolicyHarnessOptions) -> Result<FreshnessPins, Polic
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let protocol_path = repo_root
-        .join("agent-protocol")
-        .join("src")
-        .join("messages.rs");
+    let schema_raw_sha256 = hash_checked_source(
+        &repo_root,
+        Path::new("tools/agent-harness/schemas/mxc-config.schema.0.9.0-dev.json"),
+        super::schema::schema_bytes(),
+        "MXC schema",
+    )?;
+    let catalog_source_sha256 = hash_checked_source(
+        &repo_root,
+        Path::new("tools/agent-harness/src/mxc_policy/catalog.rs"),
+        include_bytes!("catalog.rs"),
+        "policy catalog source",
+    )?;
+    let adapter_sha256 = hash_checked_source(
+        &repo_root,
+        Path::new("tools/agent-harness/src/mxc_policy/adapter.rs"),
+        include_bytes!("adapter.rs"),
+        "policy adapter source",
+    )?;
+    let protocol_source_sha256 = hash_checked_source(
+        &repo_root,
+        Path::new("agent-protocol/src/messages.rs"),
+        include_bytes!("../../../../agent-protocol/src/messages.rs"),
+        "agent protocol source",
+    )?;
+    let case_corpus_sha256 = hash_checked_source(
+        &repo_root,
+        Path::new("tools/agent-harness/fixtures/mxc-policy/cases.json"),
+        super::cases::corpus_bytes(),
+        "policy case corpus",
+    )?;
     let probe_path = repo_root
         .join("build")
         .join("nvx-agent-probe-mxc-prototype");
     Ok(FreshnessPins {
         schema_version: "0.9.0-dev".to_string(),
         schema_source_commit: provenance.source_commit,
-        schema_raw_sha256: raw_sha256(),
+        schema_raw_sha256,
         schema_normalized_sha256: normalized_sha256()?,
         catalog_sha256: catalog_hash()?,
-        adapter_sha256: content_sha256_hex_bytes(include_bytes!("adapter.rs")),
+        catalog_source_sha256,
+        adapter_sha256,
         protocol_version: agent_protocol::PROTOCOL_VERSION,
-        protocol_source_sha256: hash_optional(&protocol_path)
-            .unwrap_or_else(|| "missing".to_string()),
-        case_corpus_sha256: content_sha256_hex_bytes(super::cases::corpus_bytes()),
+        protocol_source_sha256,
+        case_corpus_sha256,
         live_profile_inputs_sha256: live_profile_inputs_hash()?,
         kernel_sha256: options
             .launch_overrides
@@ -522,6 +549,35 @@ fn freshness_pins(options: &PolicyHarnessOptions) -> Result<FreshnessPins, Polic
             .as_deref()
             .and_then(hash_optional),
     })
+}
+
+fn hash_checked_source(
+    repo_root: &Path,
+    relative: &Path,
+    embedded: &[u8],
+    label: &str,
+) -> Result<String, PolicyError> {
+    let relative_string = relative.to_string_lossy();
+    let (_, reopened) =
+        crate::read_artifact_checked(repo_root, &relative_string).map_err(|error| {
+            PolicyError::new(
+                "freshness_io",
+                relative.display().to_string(),
+                format!("reading {label}: {error}"),
+            )
+        })?;
+    let reopened_hash = content_sha256_hex_bytes(&reopened);
+    let embedded_hash = content_sha256_hex_bytes(embedded);
+    if reopened_hash != embedded_hash {
+        return Err(PolicyError::new(
+            "freshness_drift",
+            relative.display().to_string(),
+            format!(
+                "{label} differs from the bytes embedded in this harness: embedded={embedded_hash}, checkout={reopened_hash}"
+            ),
+        ));
+    }
+    Ok(reopened_hash)
 }
 
 fn live_profile_inputs_hash() -> Result<String, PolicyError> {
@@ -633,7 +689,7 @@ fn collect_attested_files(
                 ),
             )
         })?;
-        if path == root.join("common-root") {
+        if entry.file_name() == "common-root" {
             if !file_type.is_dir() {
                 return Err(PolicyError::new(
                     "report_io",
@@ -946,6 +1002,29 @@ mod tests {
             "4f2edf717254c782aa5cf4ec693390735470116cf6924ddd77671857babe9b28"
         );
         assert_eq!(schema_bytes().len(), 41_154);
+    }
+
+    #[test]
+    fn freshness_inputs_fail_closed_when_checkout_bytes_drift() {
+        let root = test_output("policy-freshness-inputs");
+        fs::create_dir_all(&root).expect("create freshness root");
+        for (name, label) in [
+            ("schema.json", "MXC schema"),
+            ("catalog.rs", "policy catalog source"),
+            ("adapter.rs", "policy adapter source"),
+            ("messages.rs", "agent protocol source"),
+            ("cases.json", "policy case corpus"),
+        ] {
+            let path = root.join(name);
+            fs::write(&path, b"embedded bytes").expect("write matching input");
+            hash_checked_source(&root, Path::new(name), b"embedded bytes", label)
+                .expect("matching source");
+            fs::write(&path, b"tampered checkout bytes").expect("tamper source input");
+            let error = hash_checked_source(&root, Path::new(name), b"embedded bytes", label)
+                .expect_err("drift must fail closed");
+            assert_eq!(error.code, "freshness_drift", "{label}");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
