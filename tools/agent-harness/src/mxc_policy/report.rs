@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -66,6 +66,7 @@ pub struct CatalogResult {
     pub phases: Vec<super::catalog::MxcPhase>,
     pub case_ids: Vec<String>,
     pub expected_outcome: String,
+    pub expected_instance_outcome: String,
     pub actual_outcome: String,
     pub evidence_tier: EvidenceRequirement,
     pub duration_ms: u64,
@@ -207,6 +208,8 @@ pub fn execute_policy_harness(
             "unexpected" => unexpected.push(entry.key.to_string()),
             _ => {}
         }
+        let expected_instance_outcome =
+            linked_expected_instance_outcome(&case_ids, &case_by_id).to_string();
         catalog_results.push(CatalogResult {
             key: entry.key.to_string(),
             schema_path: entry.schema_path.to_string(),
@@ -214,8 +217,9 @@ pub fn execute_policy_harness(
             phases: entry.phases.to_vec(),
             case_ids,
             expected_outcome: expected_outcome(entry.disposition).to_string(),
+            expected_instance_outcome,
             actual_outcome,
-            evidence_tier: entry.evidence,
+            evidence_tier: entry.required_evidence(),
             duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             error,
             artifact_references: artifacts,
@@ -329,7 +333,7 @@ fn actual_outcome(
     if static_status != "passed" {
         return (static_status, static_error, artifacts);
     }
-    if entry.evidence != EvidenceRequirement::LiveWhpPositiveNegative {
+    if entry.required_evidence() != EvidenceRequirement::LiveWhpPositiveNegative {
         return ("passed".to_string(), None, artifacts);
     }
     if mode == PolicyHarnessMode::StaticOnly {
@@ -438,6 +442,30 @@ fn static_outcome(
         );
     }
     ("passed".to_string(), None, artifacts)
+}
+
+fn linked_expected_instance_outcome(
+    case_ids: &[String],
+    cases: &BTreeMap<&str, &PolicyCase>,
+) -> &'static str {
+    let mut accepted = false;
+    let mut rejected = false;
+    for case_id in case_ids {
+        match cases
+            .get(case_id.as_str())
+            .map(|case| case.expected_disposition)
+        {
+            Some(ExpectedDisposition::Accepted) => accepted = true,
+            Some(ExpectedDisposition::Rejected) => rejected = true,
+            None => return "missing",
+        }
+    }
+    match (accepted, rejected) {
+        (true, false) => "accepted",
+        (false, true) => "rejected",
+        (true, true) => "mixed",
+        (false, false) => "missing",
+    }
 }
 
 fn expected_outcome(disposition: PolicyDisposition) -> &'static str {
@@ -664,6 +692,33 @@ pub fn verify_policy_run(run: &PolicyHarnessRun) -> Result<(), PolicyError> {
             "manifest differs from in-memory trusted artifact identities",
         ));
     }
+    let mut current_paths = Vec::new();
+    collect_attested_files(root, root, &mut current_paths)
+        .map_err(|error| PolicyError::new("attestation_failed", "$", error.message))?;
+    let current_paths = current_paths
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(root)
+                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                .map_err(|_| {
+                    PolicyError::new(
+                        "attestation_failed",
+                        "$",
+                        "attested path escaped output root",
+                    )
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let manifest_paths = manifest_artifacts.keys().cloned().collect::<BTreeSet<_>>();
+    if current_paths != manifest_paths {
+        return Err(PolicyError::new(
+            "attestation_failed",
+            "$",
+            format!(
+                "output artifact set differs from manifest: expected {manifest_paths:?}, actual {current_paths:?}"
+            ),
+        ));
+    }
     for artifact in manifest.artifacts {
         let relative = Path::new(&artifact.path);
         if relative.is_absolute()
@@ -786,6 +841,66 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_unreferenced_output_artifacts() {
+        let output = test_output("policy-unreferenced-evidence");
+        let run = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::StaticOnly,
+            output_dir: output.clone(),
+            config: None,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect("static report");
+        fs::write(output.join("unreferenced.log"), b"not attested")
+            .expect("write unreferenced artifact");
+        assert!(verify_policy_run(&run).is_err());
+        fs::remove_dir_all(output).expect("cleanup");
+    }
+
+    #[test]
+    fn report_distinguishes_invalid_controls_from_absent_unsupported_fields() {
+        let output = test_output("policy-instance-outcomes");
+        let run = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::StaticOnly,
+            output_dir: output.clone(),
+            config: None,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect("static report");
+        for key in [
+            "version#absent",
+            "cross.version.must_equal_0.9.0-dev",
+            "containment#nullable",
+            "containment#enum=process",
+        ] {
+            let result = run
+                .report
+                .catalog_results
+                .iter()
+                .find(|result| result.key == key)
+                .expect("invalid control result");
+            assert_eq!(result.expected_instance_outcome, "rejected", "{key}");
+            assert_eq!(
+                result.evidence_tier,
+                EvidenceRequirement::UnitStatic,
+                "{key}"
+            );
+        }
+        for key in ["experimental#absent", "network.proxy#absent"] {
+            let result = run
+                .report
+                .catalog_results
+                .iter()
+                .find(|result| result.key == key)
+                .expect("unsupported omission result");
+            assert_eq!(result.expected_instance_outcome, "accepted", "{key}");
+            assert_eq!(result.expected_outcome, "accepted-inert", "{key}");
+        }
+        fs::remove_dir_all(output).expect("cleanup");
+    }
+
+    #[test]
     fn freshness_pins_schema_catalog_adapter_protocol_and_corpus() {
         let pins = freshness_pins(&PolicyHarnessOptions {
             backend: HarnessBackend::Whp,
@@ -844,6 +959,7 @@ mod tests {
                 "process": { "commandLine": "echo ok" }
             }),
             expected_disposition: ExpectedDisposition::Rejected,
+            expected_plan: None,
             expected_code: Some("invalid_value".to_string()),
             expected_path: Some("/process/commandLine".to_string()),
             required_evidence: EvidenceRequirement::UnitStatic,

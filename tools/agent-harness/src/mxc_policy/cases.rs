@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use super::adapter::{NvxPolicyPlan, adapt_policy};
-use super::catalog::{CatalogEntry, EvidenceRequirement, PolicyDisposition, catalog_entries};
+use super::adapter::{NvxExecPolicy, NvxPolicyPlan, NvxProvisionPolicy, adapt_policy};
+use super::catalog::{
+    CatalogEntry, EvidenceRequirement, ExpectedInstanceBehavior, PolicyDisposition, catalog_entries,
+};
 use super::effects::{CountingHostEffects, EffectCounters, PolicyExecutionError, run_with_effects};
 use super::{MxcPhase, PolicyError};
 
@@ -33,6 +35,8 @@ pub struct PolicyCase {
     pub id: String,
     pub config: Value,
     pub expected_disposition: ExpectedDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_plan: Option<NvxPolicyPlan>,
     #[serde(default)]
     pub expected_code: Option<String>,
     #[serde(default)]
@@ -107,6 +111,7 @@ pub fn load_single_config(path: &Path) -> Result<PolicyCase, PolicyError> {
         id: "single-config".to_string(),
         config,
         expected_disposition: ExpectedDisposition::Accepted,
+        expected_plan: None,
         expected_code: None,
         expected_path: None,
         required_evidence: EvidenceRequirement::UnitStatic,
@@ -137,6 +142,26 @@ pub fn validate_corpus(cases: &[PolicyCase]) -> Result<BTreeMap<String, Vec<Stri
                 "$",
                 format!("rejected case {:?} lacks expected code/path", case.id),
             ));
+        }
+        match (case.expected_disposition, &case.expected_plan) {
+            (ExpectedDisposition::Accepted, None) => {
+                return Err(PolicyError::new(
+                    "corpus_internal",
+                    "$",
+                    format!("accepted case {:?} lacks an expected typed plan", case.id),
+                ));
+            }
+            (ExpectedDisposition::Rejected, Some(_)) => {
+                return Err(PolicyError::new(
+                    "corpus_internal",
+                    "$",
+                    format!(
+                        "rejected case {:?} unexpectedly declares a typed plan",
+                        case.id
+                    ),
+                ));
+            }
+            _ => {}
         }
 
         let observed = observe_catalog_keys(&case.config, &catalog);
@@ -183,7 +208,7 @@ pub fn validate_corpus(cases: &[PolicyCase]) -> Result<BTreeMap<String, Vec<Stri
 
     for entry in catalog.values() {
         if entry.disposition == PolicyDisposition::Honored
-            && entry.evidence == EvidenceRequirement::LiveWhpPositiveNegative
+            && entry.required_evidence() == EvidenceRequirement::LiveWhpPositiveNegative
             && live_profile_for_path(entry.key).is_none()
         {
             return Err(PolicyError::new(
@@ -218,13 +243,15 @@ fn validate_catalog_case_semantics(
                     format!("catalog key {key:?} links unknown case id {case_id:?}"),
                 )
             })?;
-            if case.required_evidence != entry.evidence {
+            if case.required_evidence != entry.required_evidence() {
                 return Err(PolicyError::new(
                     "corpus_internal",
                     entry.schema_path,
                     format!(
                         "catalog key {key:?} evidence mismatch: entry={:?}, case {:?}={:?}",
-                        entry.evidence, case.id, case.required_evidence
+                        entry.required_evidence(),
+                        case.id,
+                        case.required_evidence
                     ),
                 ));
             }
@@ -267,13 +294,11 @@ fn disposition_contract_allows(entry: &CatalogEntry, expected: ExpectedDispositi
                 || (expected == ExpectedDisposition::Rejected
                     && honored_key_allows_rejection(entry.key))
         }
-        PolicyDisposition::Control => {
-            if control_key_requires_rejection(entry.key) {
-                expected == ExpectedDisposition::Rejected
-            } else {
-                expected == ExpectedDisposition::Accepted
-            }
-        }
+        PolicyDisposition::Control => match entry.expected_instance_behavior() {
+            ExpectedInstanceBehavior::Accepted => expected == ExpectedDisposition::Accepted,
+            ExpectedInstanceBehavior::Rejected => expected == ExpectedDisposition::Rejected,
+            ExpectedInstanceBehavior::Derived => true,
+        },
     }
 }
 
@@ -282,45 +307,6 @@ fn honored_key_allows_rejection(key: &str) -> bool {
         parse_key(key).1,
         KeyQualifier::Absent | KeyQualifier::Nullable | KeyQualifier::Union { label: "null", .. }
     )
-}
-
-fn control_key_requires_rejection(key: &str) -> bool {
-    if key == "cross.phase.non_provision_requires_sandbox_id" {
-        return true;
-    }
-    let (path, qualifier) = parse_key(key);
-    match (path, qualifier) {
-        ("version", KeyQualifier::Absent | KeyQualifier::Nullable) => true,
-        ("containment", KeyQualifier::Absent | KeyQualifier::Nullable) => true,
-        (
-            "containment",
-            KeyQualifier::Union {
-                kind: "anyOf",
-                label: "null",
-                ..
-            },
-        ) => true,
-        ("containment", KeyQualifier::Enum(value)) => value != "vm",
-        (
-            "containment",
-            KeyQualifier::Union {
-                kind: "oneOf",
-                index,
-                label: "string",
-            },
-        ) => index != 2,
-        ("phase", KeyQualifier::Absent | KeyQualifier::Nullable) => true,
-        (
-            "phase",
-            KeyQualifier::Union {
-                kind: "anyOf",
-                label: "null",
-                ..
-            },
-        ) => true,
-        ("sandboxId", KeyQualifier::Plain) => true,
-        _ => false,
-    }
 }
 
 pub fn live_profile_for_path(key: &str) -> Option<&'static str> {
@@ -503,11 +489,28 @@ fn run_static_case(
     let result = run_with_effects(&case.id, &config, common_root, &output_dir, &mut effects);
     let counters = effects.counters().clone();
     let (actual_disposition, error, passed) = match result {
-        Ok(_session) => (
-            ExpectedDisposition::Accepted,
-            None,
-            case.expected_disposition == ExpectedDisposition::Accepted,
-        ),
+        Ok(_session) => {
+            let expected_plan = case
+                .expected_plan
+                .as_ref()
+                .map(|plan| materialize_expected_plan(plan, common_root));
+            let plan_matches = expected_plan.as_ref() == effects.prepared_plan();
+            let error = (!plan_matches).then(|| {
+                PolicyError::new(
+                    "unexpected_plan",
+                    "$",
+                    format!(
+                        "adapted plan differs from corpus oracle: expected {expected_plan:?}, actual {:?}",
+                        effects.prepared_plan()
+                    ),
+                )
+            });
+            (
+                ExpectedDisposition::Accepted,
+                error,
+                case.expected_disposition == ExpectedDisposition::Accepted && plan_matches,
+            )
+        }
         Err(PolicyExecutionError::Policy(errors)) => {
             let actual = errors.first().cloned();
             let expected_matches = case.expected_disposition == ExpectedDisposition::Rejected
@@ -562,6 +565,14 @@ fn materialize_common_root(config: &Value, common_root: &Path) -> Value {
     config
 }
 
+fn materialize_expected_plan(plan: &NvxPolicyPlan, common_root: &Path) -> NvxPolicyPlan {
+    let mut plan = plan.clone();
+    if let Some(provision) = &mut plan.provision {
+        provision.common_root = common_root.to_path_buf();
+    }
+    plan
+}
+
 pub fn accepted_plan(case: &PolicyCase, common_root: &Path) -> Result<NvxPolicyPlan, PolicyError> {
     adapt_policy(&case.id, &case.config, common_root).map_err(|errors| {
         errors.into_iter().next().unwrap_or_else(|| {
@@ -590,15 +601,144 @@ fn generated_case_for_entry(index: usize, entry: &CatalogEntry) -> PolicyCase {
     let mut config = base_config_for_entry(entry, entry.key);
     apply_catalog_key_to_config(&mut config, entry.key);
     let expected = expected_outcome_from_contract(&config);
+    let id = format!("{index:04}-{}", sanitize_id(entry.key));
+    let expected_plan = (expected.0 == ExpectedDisposition::Accepted).then(|| {
+        contract_expected_plan(&id, &config, &default_static_common_root())
+            .expect("accepted generated case must have an independent typed-plan oracle")
+    });
     PolicyCase {
-        id: format!("{index:04}-{}", sanitize_id(entry.key)),
+        id,
         config,
         expected_disposition: expected.0,
+        expected_plan,
         expected_code: expected.1,
         expected_path: expected.2,
-        required_evidence: entry.evidence,
+        required_evidence: entry.required_evidence(),
         catalog_keys: vec![entry.key.to_string()],
     }
+}
+
+fn contract_expected_plan(
+    case_id: &str,
+    config: &Value,
+    common_root: &Path,
+) -> Result<NvxPolicyPlan, String> {
+    let object = config
+        .as_object()
+        .ok_or_else(|| "policy must be an object".to_string())?;
+    let phase = match object.get("phase").and_then(Value::as_str) {
+        Some("provision") => MxcPhase::Provision,
+        Some("start") => MxcPhase::Start,
+        Some("exec") => MxcPhase::Exec,
+        Some("stop") => MxcPhase::Stop,
+        Some("deprovision") => MxcPhase::Deprovision,
+        value => return Err(format!("unsupported phase in accepted oracle: {value:?}")),
+    };
+    let sandbox_id = oracle_optional_string(object.get("sandboxId"));
+    let container_id = oracle_optional_string(object.get("containerId"));
+    let provision = (phase == MxcPhase::Provision)
+        .then(|| contract_expected_provision(config, common_root))
+        .transpose()?;
+    let exec = (phase == MxcPhase::Exec)
+        .then(|| contract_expected_exec(config))
+        .transpose()?;
+    Ok(NvxPolicyPlan {
+        case_id: case_id.to_string(),
+        phase,
+        sandbox_id,
+        container_id,
+        provision,
+        exec,
+    })
+}
+
+fn contract_expected_provision(
+    config: &Value,
+    common_root: &Path,
+) -> Result<NvxProvisionPolicy, String> {
+    let mut mappings = Vec::new();
+    if let Some(filesystem) = config.get("filesystem").and_then(Value::as_object) {
+        for (field, access) in [
+            ("readonlyPaths", agent_protocol::AccessMode::ReadOnly),
+            ("readwritePaths", agent_protocol::AccessMode::ReadWrite),
+        ] {
+            for source in filesystem
+                .get(field)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                let child = oracle_mapping_child(source)?;
+                let child = agent_protocol::RelativeChildPath::parse(child)
+                    .map_err(|error| format!("invalid oracle mapping child: {error}"))?;
+                mappings.push(agent_protocol::ChildMapping { child, access });
+            }
+        }
+    }
+    let default_network_policy = config
+        .get("network")
+        .and_then(Value::as_object)
+        .and_then(|network| oracle_optional_string(network.get("defaultPolicy")));
+    Ok(NvxProvisionPolicy {
+        common_root: common_root.to_path_buf(),
+        mappings,
+        default_network_policy,
+    })
+}
+
+fn oracle_mapping_child(source: &str) -> Result<String, String> {
+    const ROOT: &str = r"C:\nvx-policy-common";
+    let suffix = source
+        .strip_prefix(ROOT)
+        .ok_or_else(|| format!("oracle source is outside common root: {source}"))?;
+    Ok(suffix.trim_start_matches(['\\', '/']).replace('\\', "/"))
+}
+
+fn contract_expected_exec(config: &Value) -> Result<NvxExecPolicy, String> {
+    let process = config
+        .get("process")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "accepted exec case lacks process".to_string())?;
+    let command_line = process
+        .get("commandLine")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "accepted exec case lacks commandLine".to_string())?;
+    let cwd = oracle_optional_string(process.get("cwd"));
+    let mut env = process
+        .get("env")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if let Some(proxy) = config
+        .get("runtimeConfig")
+        .and_then(Value::as_object)
+        .and_then(|runtime| runtime.get("networkProxy"))
+        .and_then(Value::as_str)
+    {
+        let proxy = Url::parse(proxy)
+            .map_err(|error| format!("invalid accepted oracle proxy: {error}"))?
+            .to_string();
+        env.push(format!("HTTP_PROXY={proxy}"));
+        env.push(format!("HTTPS_PROXY={proxy}"));
+    }
+    Ok(NvxExecPolicy {
+        argv: vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            command_line.to_string(),
+        ],
+        cwd,
+        env,
+        timeout_ms: process.get("timeout").and_then(Value::as_u64),
+    })
+}
+
+fn oracle_optional_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(str::to_string)
 }
 
 fn catalog_by_key() -> BTreeMap<String, CatalogEntry> {
@@ -682,6 +822,9 @@ fn observes_cross_field(config: &Value, key: &str) -> bool {
         .and_then(Value::as_str)
         .unwrap_or("provision");
     match key {
+        "cross.version.must_equal_0.9.0-dev" => {
+            config.get("version").and_then(Value::as_str) != Some(SCHEMA_VERSION)
+        }
         "cross.phase.non_provision_requires_sandbox_id" => phase != "provision",
         "cross.phase.exec_uses_process_fields" => {
             phase == "exec" && path_present(config, "process")
@@ -888,6 +1031,9 @@ fn sanitize_id(key: &str) -> String {
 }
 
 fn base_config_for_entry(entry: &CatalogEntry, key: &str) -> Value {
+    if key == "cross.version.must_equal_0.9.0-dev" {
+        return base_provision();
+    }
     if key == "cross.phase.non_provision_requires_sandbox_id" {
         return json!({
             "version": SCHEMA_VERSION,
@@ -958,6 +1104,9 @@ fn apply_catalog_key_to_config(config: &mut Value, key: &str) {
 
 fn apply_cross_field_case(config: &mut Value, key: &str) {
     match key {
+        "cross.version.must_equal_0.9.0-dev" => {
+            set_path_value(config, "version", Value::String("0.8.0".to_string()));
+        }
         "cross.phase.non_provision_requires_sandbox_id" => {
             remove_path(config, "sandboxId");
             set_path_value(config, "phase", Value::String("exec".to_string()));
@@ -1468,32 +1617,24 @@ fn contract_error(config: &Value) -> Option<PolicyError> {
                             "environment entries must be non-empty KEY=VALUE strings without NUL",
                         ));
                     }
+                    if is_proxy_environment_key(entry) {
+                        return Some(PolicyError::new(
+                            "cross_field_conflict",
+                            "/process/env",
+                            "caller environment may not set reserved proxy variables",
+                        ));
+                    }
                 }
             }
             if let Some(runtime) = object.get("runtimeConfig").and_then(Value::as_object)
                 && let Some(proxy) = runtime.get("networkProxy").and_then(Value::as_str)
+                && !is_valid_loopback_proxy(proxy)
             {
-                if !is_valid_loopback_proxy(proxy) {
-                    return Some(PolicyError::new(
-                        "invalid_value",
-                        "/runtimeConfig/networkProxy",
-                        "networkProxy must be an HTTP/S loopback endpoint with an explicit port",
-                    ));
-                }
-                let has_proxy_env = process
-                    .get("env")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .any(is_proxy_environment_key);
-                if has_proxy_env {
-                    return Some(PolicyError::new(
-                        "cross_field_conflict",
-                        "/process/env",
-                        "caller environment conflicts with runtimeConfig.networkProxy",
-                    ));
-                }
+                return Some(PolicyError::new(
+                    "invalid_value",
+                    "/runtimeConfig/networkProxy",
+                    "networkProxy must be an HTTP/S loopback endpoint with an explicit port",
+                ));
             }
         }
         "start" | "stop" | "deprovision" => {
@@ -1595,6 +1736,37 @@ mod tests {
     }
 
     #[test]
+    fn accepted_case_rejects_typed_plan_drift() {
+        let mut cases = load_corpus().expect("corpus");
+        let case = cases
+            .iter_mut()
+            .find(|case| {
+                case.expected_plan
+                    .as_ref()
+                    .and_then(|plan| plan.exec.as_ref())
+                    .is_some()
+            })
+            .expect("accepted exec case");
+        case.expected_plan
+            .as_mut()
+            .and_then(|plan| plan.exec.as_mut())
+            .expect("exec plan")
+            .argv
+            .push("forged".to_string());
+
+        let result = run_static_case(
+            case,
+            &default_static_common_root(),
+            Path::new("target/rejected-policy-output"),
+        );
+        assert!(!result.passed);
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("unexpected_plan")
+        );
+    }
+
+    #[test]
     fn generated_corpus_matches_checked_in_fixture_exactly() {
         let checked_in = load_corpus().expect("corpus fixture");
         let generated = generated_corpus();
@@ -1608,7 +1780,7 @@ mod tests {
     fn checked_in_corpus_hash_is_pinned() {
         assert_eq!(
             content_sha256_hex_bytes(CASES_BYTES),
-            "90757d34649e8643425d4fd840ea6dd4c9b884abace829d6bb4032d2b1c7aa56",
+            "934e412442e964f099327ba28a43c1e09cce51db0acf9f36447b718ca396f45c",
             "corpus hash changed: regenerate fixture and update pin"
         );
     }
@@ -1754,11 +1926,16 @@ mod tests {
     #[test]
     fn rejected_catalog_keys_require_rejected_linked_cases() {
         let mut cases = load_corpus().expect("corpus");
+        let accepted_plan = cases
+            .iter()
+            .find_map(|case| case.expected_plan.clone())
+            .expect("accepted plan exists");
         let case = cases
             .iter_mut()
             .find(|case| case.catalog_keys.contains(&"network.egress".to_string()))
             .expect("network.egress case exists");
         case.expected_disposition = ExpectedDisposition::Accepted;
+        case.expected_plan = Some(accepted_plan);
         case.expected_code = None;
         case.expected_path = None;
 
@@ -1780,6 +1957,7 @@ mod tests {
             })
             .expect("process.commandLine case exists");
         case.expected_disposition = ExpectedDisposition::Rejected;
+        case.expected_plan = None;
         case.expected_code = Some("invalid_value".to_string());
         case.expected_path = Some("/process/commandLine".to_string());
 
@@ -1795,7 +1973,9 @@ mod tests {
         let catalog = catalog_entries();
         let required_live = catalog
             .iter()
-            .filter(|entry| entry.evidence == EvidenceRequirement::LiveWhpPositiveNegative)
+            .filter(|entry| {
+                entry.required_evidence() == EvidenceRequirement::LiveWhpPositiveNegative
+            })
             .map(|entry| entry.key)
             .collect::<BTreeSet<_>>();
         let mapped = mapped_live_profile_keys();

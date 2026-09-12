@@ -121,11 +121,16 @@ impl EffectCounters {
 #[derive(Clone, Debug, Default)]
 pub struct CountingHostEffects {
     counters: EffectCounters,
+    prepared_plan: Option<NvxPolicyPlan>,
 }
 
 impl CountingHostEffects {
     pub fn counters(&self) -> &EffectCounters {
         &self.counters
+    }
+
+    pub fn prepared_plan(&self) -> Option<&NvxPolicyPlan> {
+        self.prepared_plan.as_ref()
     }
 }
 
@@ -134,11 +139,12 @@ impl HostEffects for CountingHostEffects {
 
     fn prepare_common_root(
         &mut self,
-        _plan: &NvxPolicyPlan,
+        plan: &NvxPolicyPlan,
         _common_root: &Path,
     ) -> Result<(), PolicyRunError> {
         self.counters.root_preparations += 1;
         self.counters.fixture_creations += 1;
+        self.prepared_plan = Some(plan.clone());
         Ok(())
     }
 

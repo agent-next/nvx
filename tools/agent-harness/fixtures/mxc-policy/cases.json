@@ -8,6 +8,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0000--schema",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -23,6 +35,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0001--schema-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -39,6 +63,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0002--schema-nullable",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -57,6 +93,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0003--comment",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -72,6 +120,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0004--comment-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -88,6 +148,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0005-containerId",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": "container-1",
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -103,9 +175,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0006-containerId-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containerId#absent"
     ]
@@ -119,9 +203,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0007-containerId-nullable",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containerId#nullable"
     ]
@@ -134,6 +230,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0008-containment",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -150,7 +258,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#absent"
     ]
@@ -165,7 +273,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#nullable"
     ]
@@ -178,9 +286,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0011-containment-anyOf-0----definitions-Containment",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#anyOf[0]=#/definitions/Containment"
     ]
@@ -195,7 +315,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[0]=string"
     ]
@@ -210,7 +330,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#enum=process"
     ]
@@ -225,7 +345,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[1]=string"
     ]
@@ -240,7 +360,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#enum=processcontainer"
     ]
@@ -253,9 +373,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0016-containment-oneOf-2--string",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[2]=string"
     ]
@@ -268,6 +400,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0017-containment-enum-vm",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -285,7 +429,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[3]=string"
     ]
@@ -300,7 +444,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#enum=windows_sandbox"
     ]
@@ -315,7 +459,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[4]=string"
     ]
@@ -330,7 +474,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#enum=lxc"
     ]
@@ -345,7 +489,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[5]=string"
     ]
@@ -360,7 +504,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#enum=microvm"
     ]
@@ -375,7 +519,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[6]=string"
     ]
@@ -390,7 +534,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#enum=hyperlight"
     ]
@@ -405,7 +549,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[7]=string"
     ]
@@ -420,7 +564,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#enum=wslc"
     ]
@@ -435,7 +579,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[8]=string"
     ]
@@ -450,7 +594,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#enum=seatbelt"
     ]
@@ -465,7 +609,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "schema_validation",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[9]=string"
     ]
@@ -480,7 +624,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#enum=isolation_session"
     ]
@@ -495,7 +639,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "schema_validation",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#oneOf[10]=string"
     ]
@@ -510,7 +654,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#enum=bubblewrap"
     ]
@@ -525,7 +669,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/containment",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "containment#anyOf[1]=null"
     ]
@@ -554,6 +698,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0036-experimental-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -2919,6 +3075,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0158-fallback-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -3035,6 +3203,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0165-filesystem",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -3050,9 +3230,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0166-filesystem-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "filesystem#absent"
     ]
@@ -3066,9 +3258,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0167-filesystem-nullable",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "filesystem#nullable"
     ]
@@ -3082,9 +3286,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0168-filesystem-anyOf-0----definitions-Filesystem",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "filesystem#anyOf[0]=#/definitions/Filesystem"
     ]
@@ -3118,6 +3334,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0170-filesystem-deniedPaths-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -3176,6 +3404,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0173-filesystem-readonlyPaths",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [
+          {
+            "child": "ro",
+            "access": "readOnly"
+          }
+        ],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -3192,9 +3437,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0174-filesystem-readonlyPaths-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "filesystem.readonlyPaths#absent"
     ]
@@ -3210,9 +3467,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0175-filesystem-readonlyPaths-nullable",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "filesystem.readonlyPaths#nullable"
     ]
@@ -3230,6 +3499,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0176-filesystem-readonlyPaths--",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [
+          {
+            "child": "ro",
+            "access": "readOnly"
+          }
+        ],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -3250,6 +3536,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0177-filesystem-readwritePaths",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [
+          {
+            "child": "rw",
+            "access": "readWrite"
+          }
+        ],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -3266,9 +3569,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0178-filesystem-readwritePaths-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "filesystem.readwritePaths#absent"
     ]
@@ -3284,9 +3599,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0179-filesystem-readwritePaths-nullable",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "filesystem.readwritePaths#nullable"
     ]
@@ -3304,6 +3631,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0180-filesystem-readwritePaths--",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [
+          {
+            "child": "rw",
+            "access": "readWrite"
+          }
+        ],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -3320,9 +3664,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0181-filesystem-anyOf-1--null",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "filesystem#anyOf[1]=null"
     ]
@@ -3351,6 +3707,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0183-lifecycle-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -3566,6 +3934,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0196-lxc-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -3734,6 +4114,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0206-network",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -3749,9 +4141,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0207-network-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network#absent"
     ]
@@ -3765,9 +4169,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0208-network-nullable",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network#nullable"
     ]
@@ -3781,9 +4197,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0209-network-anyOf-0----definitions-Network",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network#anyOf[0]=#/definitions/Network"
     ]
@@ -3815,6 +4243,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0211-network-allowLocalNetwork-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -3869,6 +4309,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0214-network-allowedHosts-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -3943,6 +4395,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0218-network-blockedHosts-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -3999,6 +4463,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0221-network-defaultPolicy",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": "block"
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -4015,9 +4491,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0222-network-defaultPolicy-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.defaultPolicy#absent"
     ]
@@ -4033,9 +4521,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0223-network-defaultPolicy-nullable",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.defaultPolicy#nullable"
     ]
@@ -4051,9 +4551,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0224-network-defaultPolicy-anyOf-0----definitions-NetworkPolicy",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": "block"
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.defaultPolicy#anyOf[0]=#/definitions/NetworkPolicy"
     ]
@@ -4069,6 +4581,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0225-network-defaultPolicy-enum-allow",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": "allow"
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -4087,6 +4611,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0226-network-defaultPolicy-enum-block",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": "block"
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -4105,9 +4641,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0227-network-defaultPolicy-anyOf-1--null",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.defaultPolicy#anyOf[1]=null"
     ]
@@ -4139,6 +4687,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0229-network-egress-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -6103,6 +6663,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0308-network-enforcementMode-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -6299,6 +6871,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0319-network-ingress-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -6663,6 +7247,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0338-network-proxy-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -6907,9 +7503,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0351-network-anyOf-1--null",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network#anyOf[1]=null"
     ]
@@ -6922,6 +7530,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0352-phase",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -6938,7 +7558,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_phase",
     "expectedPath": "/phase",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "phase#absent"
     ]
@@ -6953,7 +7573,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_phase",
     "expectedPath": "/phase",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "phase#nullable"
     ]
@@ -6966,9 +7586,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0355-phase-anyOf-0----definitions-Phase",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "phase#anyOf[0]=#/definitions/Phase"
     ]
@@ -6981,6 +7613,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0356-phase-enum-provision",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -6997,6 +7641,14 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0357-phase-enum-start",
+      "phase": "Start",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -7016,6 +7668,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0358-phase-enum-exec",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -7032,6 +7701,14 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0359-phase-enum-stop",
+      "phase": "Stop",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -7048,6 +7725,14 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0360-phase-enum-deprovision",
+      "phase": "Deprovision",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -7065,7 +7750,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_phase",
     "expectedPath": "/phase",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "phase#anyOf[1]=null"
     ]
@@ -7082,6 +7767,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0362-process",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -7100,7 +7802,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_phase",
     "expectedPath": "/process",
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process#absent"
     ]
@@ -7117,7 +7819,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_phase",
     "expectedPath": "/process",
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process#nullable"
     ]
@@ -7134,9 +7836,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0365-process-anyOf-0----definitions-Process",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process#anyOf[0]=#/definitions/Process"
     ]
@@ -7153,6 +7872,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0366-process-commandLine",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -7172,7 +7908,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/process/commandLine",
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process.commandLine#absent"
     ]
@@ -7191,7 +7927,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/process/commandLine",
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process.commandLine#nullable"
     ]
@@ -7209,6 +7945,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0369-process-cwd",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": "/work",
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -7228,9 +7981,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0370-process-cwd-absent",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process.cwd#absent"
     ]
@@ -7248,9 +8018,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0371-process-cwd-nullable",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process.cwd#nullable"
     ]
@@ -7270,6 +8057,25 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0372-process-env",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [
+          "A=B"
+        ],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -7289,9 +8095,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0373-process-env-absent",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process.env#absent"
     ]
@@ -7309,9 +8132,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0374-process-env-nullable",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process.env#nullable"
     ]
@@ -7331,6 +8171,25 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0375-process-env--",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [
+          "A=B"
+        ],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -7351,6 +8210,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0376-process-timeout",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": 1000
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -7370,9 +8246,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0377-process-timeout-absent",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process.timeout#absent"
     ]
@@ -7390,9 +8283,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0378-process-timeout-nullable",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process.timeout#nullable"
     ]
@@ -7409,7 +8319,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_phase",
     "expectedPath": "/process",
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "process#anyOf[1]=null"
     ]
@@ -7446,6 +8356,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0381-processContainer-absent",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -8960,6 +9887,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0448-runtimeConfig",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -8979,9 +9923,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0449-runtimeConfig-absent",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "runtimeConfig#absent"
     ]
@@ -8999,9 +9960,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0450-runtimeConfig-nullable",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "runtimeConfig#nullable"
     ]
@@ -9019,9 +9997,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0451-runtimeConfig-anyOf-0----definitions-RuntimeConfig",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "runtimeConfig#anyOf[0]=#/definitions/RuntimeConfig"
     ]
@@ -9041,6 +10036,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0452-runtimeConfig-networkProxy",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [
+          "HTTP_PROXY=http://127.0.0.1:8080/",
+          "HTTPS_PROXY=http://127.0.0.1:8080/"
+        ],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -9061,9 +10076,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0453-runtimeConfig-networkProxy-absent",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "runtimeConfig.networkProxy#absent"
     ]
@@ -9083,9 +10115,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0454-runtimeConfig-networkProxy-nullable",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "runtimeConfig.networkProxy#nullable"
     ]
@@ -9103,9 +10152,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0455-runtimeConfig-anyOf-1--null",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "local-linux-runtime",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "runtimeConfig#anyOf[1]=null"
     ]
@@ -9134,9 +10200,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0457-sandboxId-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "sandboxId#absent"
     ]
@@ -9150,9 +10228,21 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0458-sandboxId-nullable",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "sandboxId#nullable"
     ]
@@ -9181,6 +10271,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0460-seatbelt-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -9734,6 +10836,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0492-telemetry-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -9881,6 +10995,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0501-ui-absent",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "unit-static",
@@ -10224,6 +11350,18 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0521-version",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [],
+        "defaultNetworkPolicy": null
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -10240,7 +11378,7 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/version",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "version#absent"
     ]
@@ -10255,13 +11393,28 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_value",
     "expectedPath": "/version",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "version#nullable"
     ]
   },
   {
-    "id": "0524-cross-phase-non-provision-requires-sandbox-id",
+    "id": "0524-cross-version-must-equal-0-9-0-dev",
+    "config": {
+      "containment": "vm",
+      "phase": "provision",
+      "version": "0.8.0"
+    },
+    "expectedDisposition": "rejected",
+    "expectedCode": "invalid_value",
+    "expectedPath": "/version",
+    "requiredEvidence": "unit-static",
+    "catalogKeys": [
+      "cross.version.must_equal_0.9.0-dev"
+    ]
+  },
+  {
+    "id": "0525-cross-phase-non-provision-requires-sandbox-id",
     "config": {
       "containment": "vm",
       "phase": "exec",
@@ -10273,13 +11426,13 @@
     "expectedDisposition": "rejected",
     "expectedCode": "invalid_phase",
     "expectedPath": "/sandboxId",
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "cross.phase.non_provision_requires_sandbox_id"
     ]
   },
   {
-    "id": "0525-cross-phase-exec-uses-process-fields",
+    "id": "0526-cross-phase-exec-uses-process-fields",
     "config": {
       "containment": "vm",
       "phase": "exec",
@@ -10290,6 +11443,23 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0526-cross-phase-exec-uses-process-fields",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",
@@ -10298,7 +11468,7 @@
     ]
   },
   {
-    "id": "0526-cross-phase-provision-uses-filesystem-rw-and-network-allow-block",
+    "id": "0527-cross-phase-provision-uses-filesystem-rw-and-network-allow-block",
     "config": {
       "containment": "vm",
       "filesystem": {
@@ -10316,6 +11486,27 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0527-cross-phase-provision-uses-filesystem-rw-and-network-allow-block",
+      "phase": "Provision",
+      "sandboxId": null,
+      "containerId": null,
+      "provision": {
+        "commonRoot": "C:\\nvx-policy-common",
+        "mappings": [
+          {
+            "child": "ro",
+            "access": "readOnly"
+          },
+          {
+            "child": "rw",
+            "access": "readWrite"
+          }
+        ],
+        "defaultNetworkPolicy": "block"
+      },
+      "exec": null
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "live-whp-positive-negative",
@@ -10324,7 +11515,7 @@
     ]
   },
   {
-    "id": "0527-cross-phase-exec-uses-runtime-config-network-proxy",
+    "id": "0528-cross-phase-exec-uses-runtime-config-network-proxy",
     "config": {
       "containment": "vm",
       "phase": "exec",
@@ -10338,6 +11529,26 @@
       "version": "0.9.0-dev"
     },
     "expectedDisposition": "accepted",
+    "expectedPlan": {
+      "caseId": "0528-cross-phase-exec-uses-runtime-config-network-proxy",
+      "phase": "Exec",
+      "sandboxId": "sandbox-1",
+      "containerId": null,
+      "provision": null,
+      "exec": {
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "echo generated"
+        ],
+        "cwd": null,
+        "env": [
+          "HTTP_PROXY=http://127.0.0.1:8080/",
+          "HTTPS_PROXY=http://127.0.0.1:8080/"
+        ],
+        "timeoutMs": null
+      }
+    },
     "expectedCode": null,
     "expectedPath": null,
     "requiredEvidence": "local-linux-runtime",

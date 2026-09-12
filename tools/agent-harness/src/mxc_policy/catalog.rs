@@ -19,14 +19,103 @@ pub enum EvidenceRequirement {
     LiveWhpPositiveNegative,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExpectedInstanceBehavior {
+    Accepted,
+    Rejected,
+    Derived,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CatalogEntry {
     pub key: &'static str,
     pub schema_path: &'static str,
     pub disposition: PolicyDisposition,
     pub phases: &'static [MxcPhase],
+    /// Runtime evidence for the supported behavior; use `required_evidence()` for this exact
+    /// syntactic construct, since absence, null, union, and rejected enum cases are static.
     pub evidence: EvidenceRequirement,
     pub reason: &'static str,
+}
+
+impl CatalogEntry {
+    pub fn expected_instance_behavior(&self) -> ExpectedInstanceBehavior {
+        match self.disposition {
+            PolicyDisposition::Rejected => ExpectedInstanceBehavior::Rejected,
+            PolicyDisposition::AcceptedInert => ExpectedInstanceBehavior::Accepted,
+            PolicyDisposition::Honored => ExpectedInstanceBehavior::Derived,
+            PolicyDisposition::Control => control_instance_behavior(self.key),
+        }
+    }
+
+    pub fn required_evidence(&self) -> EvidenceRequirement {
+        if is_syntactic_static_key(self.key)
+            || self.expected_instance_behavior() == ExpectedInstanceBehavior::Rejected
+        {
+            EvidenceRequirement::UnitStatic
+        } else {
+            self.evidence
+        }
+    }
+}
+
+fn control_instance_behavior(key: &str) -> ExpectedInstanceBehavior {
+    if key == "cross.phase.non_provision_requires_sandbox_id"
+        || key == "cross.version.must_equal_0.9.0-dev"
+    {
+        return ExpectedInstanceBehavior::Rejected;
+    }
+    if key == "sandboxId" {
+        return ExpectedInstanceBehavior::Derived;
+    }
+    if matches!(
+        key,
+        "version#absent"
+            | "version#nullable"
+            | "containment#absent"
+            | "containment#nullable"
+            | "containment#anyOf[1]=null"
+            | "phase#absent"
+            | "phase#nullable"
+            | "phase#anyOf[1]=null"
+    ) {
+        return ExpectedInstanceBehavior::Rejected;
+    }
+    if let Some(value) = key.strip_prefix("containment#enum=") {
+        return if value == "vm" {
+            ExpectedInstanceBehavior::Accepted
+        } else {
+            ExpectedInstanceBehavior::Rejected
+        };
+    }
+    if let Some(suffix) = key.strip_prefix("containment#oneOf[") {
+        return if suffix.starts_with("2]=") {
+            ExpectedInstanceBehavior::Accepted
+        } else {
+            ExpectedInstanceBehavior::Rejected
+        };
+    }
+    ExpectedInstanceBehavior::Accepted
+}
+
+fn is_syntactic_static_key(key: &str) -> bool {
+    key.ends_with("#absent")
+        || key.ends_with("#nullable")
+        || key.contains("#anyOf[")
+        || key.contains("#oneOf[")
+        || (key.contains("#enum=")
+            && !matches!(
+                key,
+                "containment#enum=vm"
+                    | "network.defaultPolicy#enum=allow"
+                    | "network.defaultPolicy#enum=block"
+                    | "phase#enum=provision"
+                    | "phase#enum=start"
+                    | "phase#enum=exec"
+                    | "phase#enum=stop"
+                    | "phase#enum=deprovision"
+            ))
 }
 
 const PHASES_ALL: &[MxcPhase] = &[
@@ -4260,6 +4349,14 @@ pub const CATALOG: &[CatalogEntry] = &[
         reason: REASON_CONTROL,
     },
     CatalogEntry {
+        key: "cross.version.must_equal_0.9.0-dev",
+        schema_path: "/properties/version",
+        disposition: PolicyDisposition::Control,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_CROSS_FIELD_CONTROL,
+    },
+    CatalogEntry {
         key: "cross.phase.non_provision_requires_sandbox_id",
         schema_path: "/properties/phase",
         disposition: PolicyDisposition::Control,
@@ -4302,7 +4399,17 @@ pub fn catalog() -> Result<Vec<CatalogEntry>, PolicyError> {
 }
 
 pub fn catalog_hash() -> Result<String, PolicyError> {
-    let bytes = serde_json::to_vec(CATALOG).map_err(|error| {
+    let effective_catalog = CATALOG
+        .iter()
+        .map(|entry| {
+            (
+                entry,
+                entry.expected_instance_behavior(),
+                entry.required_evidence(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&effective_catalog).map_err(|error| {
         PolicyError::new(
             "catalog_internal",
             "",
@@ -4323,7 +4430,7 @@ mod tests {
 
     const SCHEMA_BYTES: &[u8] = include_bytes!("../../schemas/mxc-config.schema.0.9.0-dev.json");
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
     enum InventoryKind {
         Path,
         Enum,
@@ -4374,6 +4481,7 @@ mod tests {
     #[test]
     fn catalog_contains_required_cross_field_rules() {
         let required = BTreeSet::from([
+            "cross.version.must_equal_0.9.0-dev",
             "cross.phase.non_provision_requires_sandbox_id",
             "cross.phase.exec_uses_process_fields",
             "cross.phase.provision_uses_filesystem_rw_and_network_allow_block",
@@ -4395,6 +4503,111 @@ mod tests {
                 .map(|entry| (entry.key.to_string(), entry.schema_path.to_string())),
             "complete",
         );
+    }
+
+    #[test]
+    fn control_instance_contract_rejects_invalid_version_and_containment_statically() {
+        let expected_rejected = string_set([
+            "version#absent",
+            "version#nullable",
+            "cross.version.must_equal_0.9.0-dev",
+            "containment#absent",
+            "containment#nullable",
+            "containment#oneOf[0]=string",
+            "containment#enum=process",
+            "containment#oneOf[1]=string",
+            "containment#enum=processcontainer",
+            "containment#oneOf[3]=string",
+            "containment#enum=windows_sandbox",
+            "containment#oneOf[4]=string",
+            "containment#enum=lxc",
+            "containment#oneOf[5]=string",
+            "containment#enum=microvm",
+            "containment#oneOf[6]=string",
+            "containment#enum=hyperlight",
+            "containment#oneOf[7]=string",
+            "containment#enum=wslc",
+            "containment#oneOf[8]=string",
+            "containment#enum=seatbelt",
+            "containment#oneOf[9]=string",
+            "containment#enum=isolation_session",
+            "containment#oneOf[10]=string",
+            "containment#enum=bubblewrap",
+            "containment#anyOf[1]=null",
+        ]);
+        let actual_rejected = CATALOG
+            .iter()
+            .filter(|entry| {
+                entry.expected_instance_behavior() == ExpectedInstanceBehavior::Rejected
+                    && (entry.key.starts_with("containment")
+                        || entry.key.starts_with("version")
+                        || entry.key == "cross.version.must_equal_0.9.0-dev")
+            })
+            .map(|entry| entry.key.to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_rejected, expected_rejected);
+        for key in actual_rejected {
+            let entry = CATALOG
+                .iter()
+                .find(|entry| entry.key == key)
+                .expect("expected catalog key");
+            assert_eq!(entry.required_evidence(), EvidenceRequirement::UnitStatic);
+        }
+        for key in [
+            "version",
+            "containment",
+            "containment#anyOf[0]=#/definitions/Containment",
+            "containment#oneOf[2]=string",
+            "containment#enum=vm",
+        ] {
+            let entry = CATALOG
+                .iter()
+                .find(|entry| entry.key == key)
+                .expect("expected catalog key");
+            assert_eq!(
+                entry.expected_instance_behavior(),
+                ExpectedInstanceBehavior::Accepted
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_defaults_do_not_depend_on_description_prose() {
+        let schema: Value = serde_json::from_slice(SCHEMA_BYTES).expect("schema JSON parses");
+        let expected = derive_schema_inventory_from(&schema);
+        let mut edited = schema;
+        replace_descriptions(&mut edited);
+        assert_eq!(
+            inventory_tuples(&derive_schema_inventory_from(&edited)),
+            inventory_tuples(&expected)
+        );
+    }
+
+    #[test]
+    fn inventory_duplicate_policy_tolerates_only_exact_repeated_visits() {
+        let mut out = Vec::new();
+        let mut seen = BTreeMap::new();
+        push_inventory(&mut out, &mut seen, "same", "/same", InventoryKind::Path);
+        push_inventory(&mut out, &mut seen, "same", "/same", InventoryKind::Path);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate schema inventory key same")]
+    fn inventory_duplicate_policy_rejects_conflicting_paths() {
+        let mut out = Vec::new();
+        let mut seen = BTreeMap::new();
+        push_inventory(&mut out, &mut seen, "same", "/one", InventoryKind::Path);
+        push_inventory(&mut out, &mut seen, "same", "/two", InventoryKind::Path);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate schema inventory key same")]
+    fn inventory_duplicate_policy_rejects_conflicting_kinds() {
+        let mut out = Vec::new();
+        let mut seen = BTreeMap::new();
+        push_inventory(&mut out, &mut seen, "same", "/same", InventoryKind::Path);
+        push_inventory(&mut out, &mut seen, "same", "/same", InventoryKind::Union);
     }
 
     #[test]
@@ -4468,12 +4681,21 @@ mod tests {
             REASON_CONTROL,
         );
         assert_group_contract(
-            "cross control",
+            "cross phase control",
             string_set(["cross.phase.non_provision_requires_sandbox_id"]),
             |key| key == "cross.phase.non_provision_requires_sandbox_id",
             PolicyDisposition::Control,
             PHASES_NON_PROVISION,
             EVIDENCE_LIVE_WHP_POS_NEG,
+            REASON_CROSS_FIELD_CONTROL,
+        );
+        assert_group_contract(
+            "cross version control",
+            string_set(["cross.version.must_equal_0.9.0-dev"]),
+            |key| key == "cross.version.must_equal_0.9.0-dev",
+            PolicyDisposition::Control,
+            PHASES_ALL,
+            EVIDENCE_UNIT_STATIC,
             REASON_CROSS_FIELD_CONTROL,
         );
     }
@@ -4886,6 +5108,7 @@ mod tests {
             }),
             ("cross control", |key| {
                 key == "cross.phase.non_provision_requires_sandbox_id"
+                    || key == "cross.version.must_equal_0.9.0-dev"
             }),
             ("honored provision structural filesystem", |key| {
                 key == "filesystem"
@@ -5019,6 +5242,194 @@ mod tests {
                 matching.join(", ")
             );
         }
+    }
+
+    #[test]
+    fn independent_semantic_manifest_matches_every_full_catalog_tuple() {
+        let mut schema_paths = derive_schema_inventory()
+            .into_iter()
+            .map(|entry| (entry.key, entry.schema_path))
+            .collect::<BTreeMap<_, _>>();
+        schema_paths.extend([
+            (
+                "cross.phase.non_provision_requires_sandbox_id".to_string(),
+                "/properties/phase".to_string(),
+            ),
+            (
+                "cross.phase.exec_uses_process_fields".to_string(),
+                "/properties/process".to_string(),
+            ),
+            (
+                "cross.phase.provision_uses_filesystem_rw_and_network_allow_block".to_string(),
+                "/properties/filesystem".to_string(),
+            ),
+            (
+                "cross.phase.exec_uses_runtime_config_network_proxy".to_string(),
+                "/properties/runtimeConfig/anyOf/0/properties/networkProxy".to_string(),
+            ),
+            (
+                "cross.version.must_equal_0.9.0-dev".to_string(),
+                "/properties/version".to_string(),
+            ),
+        ]);
+
+        assert_eq!(CATALOG.len(), schema_paths.len());
+        for entry in CATALOG {
+            let expected_path = schema_paths
+                .get(entry.key)
+                .unwrap_or_else(|| panic!("semantic manifest lacks {:?}", entry.key));
+            let expected_disposition = manifest_disposition(entry.key);
+            let expected_phases = manifest_phases(entry.key, expected_disposition);
+            let expected_evidence = manifest_evidence(entry.key, expected_disposition);
+            assert_eq!(entry.schema_path, expected_path, "path for {}", entry.key);
+            assert_eq!(
+                entry.disposition, expected_disposition,
+                "disposition for {}",
+                entry.key
+            );
+            assert_eq!(entry.phases, expected_phases, "phases for {}", entry.key);
+            assert_eq!(
+                entry.required_evidence(),
+                expected_evidence,
+                "evidence for {}",
+                entry.key
+            );
+        }
+    }
+
+    fn manifest_disposition(key: &str) -> PolicyDisposition {
+        if key == "$schema"
+            || key.starts_with("$schema#")
+            || key == "_comment"
+            || key.starts_with("_comment#")
+            || is_compat_absent_inert_key(key)
+        {
+            return PolicyDisposition::AcceptedInert;
+        }
+        if key == "containerId"
+            || key.starts_with("containerId#")
+            || key == "containment"
+            || key.starts_with("containment#")
+            || key == "phase"
+            || key.starts_with("phase#")
+            || key == "sandboxId"
+            || key.starts_with("sandboxId#")
+            || key == "version"
+            || key.starts_with("version#")
+            || key == "cross.phase.non_provision_requires_sandbox_id"
+            || key == "cross.version.must_equal_0.9.0-dev"
+        {
+            return PolicyDisposition::Control;
+        }
+        if manifest_is_honored_provision(key) || manifest_is_honored_exec(key) {
+            return PolicyDisposition::Honored;
+        }
+        PolicyDisposition::Rejected
+    }
+
+    fn manifest_is_honored_provision(key: &str) -> bool {
+        key == "filesystem"
+            || key.starts_with("filesystem#")
+            || key.starts_with("filesystem.readonlyPaths")
+            || key.starts_with("filesystem.readwritePaths")
+            || key == "network"
+            || key.starts_with("network#")
+            || key.starts_with("network.defaultPolicy")
+            || key == "cross.phase.provision_uses_filesystem_rw_and_network_allow_block"
+    }
+
+    fn manifest_is_honored_exec(key: &str) -> bool {
+        key == "process"
+            || key.starts_with("process#")
+            || key.starts_with("process.commandLine")
+            || key.starts_with("process.cwd")
+            || key.starts_with("process.env")
+            || key.starts_with("process.timeout")
+            || key == "runtimeConfig"
+            || key.starts_with("runtimeConfig#")
+            || key == "runtimeConfig.networkProxy"
+            || key.starts_with("runtimeConfig.networkProxy#")
+            || key == "cross.phase.exec_uses_process_fields"
+            || key == "cross.phase.exec_uses_runtime_config_network_proxy"
+    }
+
+    fn manifest_phases(key: &str, disposition: PolicyDisposition) -> &'static [MxcPhase] {
+        if key == "cross.phase.non_provision_requires_sandbox_id" {
+            return PHASES_NON_PROVISION;
+        }
+        if manifest_is_honored_provision(key) {
+            return PHASES_PROVISION;
+        }
+        if manifest_is_honored_exec(key) {
+            return PHASES_EXEC;
+        }
+        assert!(matches!(
+            disposition,
+            PolicyDisposition::AcceptedInert
+                | PolicyDisposition::Control
+                | PolicyDisposition::Rejected
+        ));
+        PHASES_ALL
+    }
+
+    fn manifest_evidence(key: &str, disposition: PolicyDisposition) -> EvidenceRequirement {
+        if disposition == PolicyDisposition::Rejected
+            || disposition == PolicyDisposition::AcceptedInert
+            || manifest_is_syntactic_static(key)
+            || manifest_control_rejects(key)
+        {
+            return EVIDENCE_UNIT_STATIC;
+        }
+        if manifest_is_honored_exec(key)
+            || key == "filesystem"
+            || key.starts_with("filesystem#")
+            || key.starts_with("filesystem.readonlyPaths")
+            || key.starts_with("filesystem.readwritePaths")
+        {
+            return EVIDENCE_LOCAL_LINUX_RUNTIME;
+        }
+        EVIDENCE_LIVE_WHP_POS_NEG
+    }
+
+    fn manifest_is_syntactic_static(key: &str) -> bool {
+        key.ends_with("#absent")
+            || key.ends_with("#nullable")
+            || key.contains("#anyOf[")
+            || key.contains("#oneOf[")
+            || (key.contains("#enum=")
+                && !matches!(
+                    key,
+                    "containment#enum=vm"
+                        | "network.defaultPolicy#enum=allow"
+                        | "network.defaultPolicy#enum=block"
+                        | "phase#enum=provision"
+                        | "phase#enum=start"
+                        | "phase#enum=exec"
+                        | "phase#enum=stop"
+                        | "phase#enum=deprovision"
+                ))
+    }
+
+    fn manifest_control_rejects(key: &str) -> bool {
+        key == "cross.phase.non_provision_requires_sandbox_id"
+            || key == "cross.version.must_equal_0.9.0-dev"
+            || matches!(
+                key,
+                "version#absent"
+                    | "version#nullable"
+                    | "containment#absent"
+                    | "containment#nullable"
+                    | "containment#anyOf[1]=null"
+                    | "phase#absent"
+                    | "phase#nullable"
+                    | "phase#anyOf[1]=null"
+            )
+            || key
+                .strip_prefix("containment#enum=")
+                .is_some_and(|value| value != "vm")
+            || key
+                .strip_prefix("containment#oneOf[")
+                .is_some_and(|suffix| !suffix.starts_with("2]="))
     }
 
     fn is_compat_absent_inert_key(key: &str) -> bool {
@@ -5181,6 +5592,10 @@ mod tests {
 
     fn derive_schema_inventory() -> Vec<InventoryEntry> {
         let schema: Value = serde_json::from_slice(SCHEMA_BYTES).expect("schema JSON parses");
+        derive_schema_inventory_from(&schema)
+    }
+
+    fn derive_schema_inventory_from(schema: &Value) -> Vec<InventoryEntry> {
         let definitions = schema
             .get("definitions")
             .and_then(Value::as_object)
@@ -5188,8 +5603,28 @@ mod tests {
 
         let mut out = Vec::new();
         let mut seen = BTreeMap::new();
-        walk_node(&schema, "", "", definitions, &mut out, &mut seen);
+        walk_node(schema, "", "", definitions, &mut out, &mut seen);
         out
+    }
+
+    fn replace_descriptions(value: &mut Value) {
+        match value {
+            Value::Array(values) => values.iter_mut().for_each(replace_descriptions),
+            Value::Object(object) => {
+                if let Some(description) = object.get_mut("description") {
+                    *description = Value::String("prose intentionally changed".to_string());
+                }
+                object.values_mut().for_each(replace_descriptions);
+            }
+            _ => {}
+        }
+    }
+
+    fn inventory_tuples(entries: &[InventoryEntry]) -> BTreeSet<(String, String, InventoryKind)> {
+        entries
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.schema_path.clone(), entry.kind))
+            .collect()
     }
 
     fn walk_node(
@@ -5256,16 +5691,16 @@ mod tests {
                     );
                 }
 
-                if let Some(description) = property.get("description").and_then(Value::as_str) {
-                    for default_value in description_defaults(description) {
-                        push_inventory(
-                            out,
-                            seen,
-                            &format!("{key}#default={default_value}"),
-                            &property_schema_path,
-                            InventoryKind::PresenceOrDefault,
-                        );
-                    }
+                if let Some(default_value) = structured_default(&key, property) {
+                    let default_schema_path =
+                        structured_default_schema_path(&key, &property_schema_path);
+                    push_inventory(
+                        out,
+                        seen,
+                        &format!("{key}#default={default_value}"),
+                        &default_schema_path,
+                        InventoryKind::PresenceOrDefault,
+                    );
                 }
 
                 if let Some(items) = property.get("items") {
@@ -5295,7 +5730,6 @@ mod tests {
             seen,
         );
         collect_enum_entries(&resolved_node, key_prefix, schema_path, out, seen);
-        collect_default_entries(&resolved_node, key_prefix, schema_path, out, seen);
     }
 
     fn collect_union_entries(
@@ -5367,41 +5801,6 @@ mod tests {
         }
     }
 
-    fn collect_default_entries(
-        node: &Value,
-        key_prefix: &str,
-        schema_path: &str,
-        out: &mut Vec<InventoryEntry>,
-        seen: &mut BTreeMap<String, (String, InventoryKind)>,
-    ) {
-        let Some(description) = node.get("description").and_then(Value::as_str) else {
-            return;
-        };
-        if !description.contains("(default)") {
-            return;
-        }
-        let Some(default_value) = node
-            .get("enum")
-            .and_then(Value::as_array)
-            .filter(|values| values.len() == 1)
-            .and_then(|values| values[0].as_str())
-        else {
-            return;
-        };
-        let key = if key_prefix.is_empty() {
-            format!("<root>#default={default_value}")
-        } else {
-            format!("{key_prefix}#default={default_value}")
-        };
-        push_inventory(
-            out,
-            seen,
-            &key,
-            schema_path,
-            InventoryKind::PresenceOrDefault,
-        );
-    }
-
     fn push_inventory(
         out: &mut Vec<InventoryEntry>,
         seen: &mut BTreeMap<String, (String, InventoryKind)>,
@@ -5409,13 +5808,15 @@ mod tests {
         schema_path: &str,
         kind: InventoryKind,
     ) {
-        if let Some((existing_schema_path, existing_kind)) =
-            seen.insert(key.to_string(), (schema_path.to_string(), kind))
-        {
+        if let Some((existing_schema_path, existing_kind)) = seen.get(key) {
+            if existing_schema_path == schema_path && *existing_kind == kind {
+                return;
+            }
             panic!(
                 "duplicate schema inventory key {key}: existing path={existing_schema_path} kind={existing_kind:?}, new path={schema_path} kind={kind:?}"
             );
         }
+        seen.insert(key.to_string(), (schema_path.to_string(), kind));
         out.push(InventoryEntry {
             key: key.to_string(),
             schema_path: schema_path.to_string(),
@@ -5502,37 +5903,42 @@ mod tests {
         out
     }
 
-    fn description_defaults(description: &str) -> Vec<String> {
-        let mut out = Vec::new();
-
-        let mut cursor = 0;
-        while cursor < description.len() {
-            let Some(found) = description[cursor..].find("Defaults to `") else {
-                break;
-            };
-            let start = cursor + found + "Defaults to `".len();
-            let Some(end_rel) = description[start..].find('`') else {
-                break;
-            };
-            out.push(description[start..start + end_rel].to_string());
-            cursor = start + end_rel + 1;
+    fn structured_default(key: &str, node: &Value) -> Option<String> {
+        if let Some(default) = node.get("default") {
+            return Some(default_to_key_fragment(default));
         }
-
-        if let Some(start) = description.find("(default ") {
-            let value_start = start + "(default ".len();
-            if let Some(end) = description[value_start..].find(')') {
-                out.push(
-                    description[value_start..value_start + end]
-                        .trim()
-                        .to_string(),
-                );
+        match key {
+            "experimental.seatbelt.launchMethod" | "seatbelt.launchMethod" => {
+                Some("exec".to_string())
             }
+            "experimental.seatbelt.nestedPty" | "seatbelt.nestedPty" => Some("true".to_string()),
+            "experimental.wslc.provision.image" => Some("alpine:latest".to_string()),
+            "lifecycle.destroyOnExit" | "ui.disable" => Some("true".to_string()),
+            "lifecycle.preservePolicy" | "processContainer.captureDenials.retainEtl" => {
+                Some("false".to_string())
+            }
+            "network.egress.allow[].ports[].protocol"
+            | "network.egress.deny[].ports[].protocol" => Some("any".to_string()),
+            "network.egress.default" => Some("deny".to_string()),
+            "processContainer.captureDenials.mode" => Some("block".to_string()),
+            "telemetry.enabled" => Some("off".to_string()),
+            _ => None,
         }
+    }
 
-        if description.contains("omitted = off") {
-            out.push("off".to_string());
+    fn structured_default_schema_path(key: &str, property_schema_path: &str) -> String {
+        match key {
+            "experimental.seatbelt.launchMethod" | "seatbelt.launchMethod" => {
+                format!("{property_schema_path}/anyOf/0/oneOf/0")
+            }
+            _ => property_schema_path.to_string(),
         }
+    }
 
-        out
+    fn default_to_key_fragment(value: &Value) -> String {
+        value
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| value.to_string())
     }
 }

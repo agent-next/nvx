@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use agent_protocol::{
     AccessMode, ChildMapping, MAX_EXEC_TIMEOUT_MS, RelativeChildPath, validate_mapping_set,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
@@ -11,7 +12,8 @@ use super::{MxcPhase, PolicyError, validate_config};
 const SCHEMA_VERSION: &str = "0.9.0-dev";
 const SHELL: &str = "/bin/sh";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NvxPolicyPlan {
     pub case_id: String,
     pub phase: MxcPhase,
@@ -21,14 +23,16 @@ pub struct NvxPolicyPlan {
     pub exec: Option<NvxExecPolicy>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NvxProvisionPolicy {
     pub common_root: PathBuf,
     pub mappings: Vec<ChildMapping>,
     pub default_network_policy: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NvxExecPolicy {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
@@ -317,6 +321,13 @@ fn adapt_exec(
     let cwd = optional_non_empty_string(process.get("cwd"), "/process/cwd")?;
     let mut env = string_array(process.get("env"), "/process/env")?;
     validate_environment(&env)?;
+    if env.iter().any(|entry| is_proxy_environment_key(entry)) {
+        return Err(vec![error(
+            "cross_field_conflict",
+            "/process/env",
+            "caller environment may not set reserved proxy variables",
+        )]);
+    }
     let timeout_ms = process.get("timeout").and_then(Value::as_u64);
     if timeout_ms.is_some_and(|timeout| timeout == 0 || timeout > MAX_EXEC_TIMEOUT_MS) {
         return Err(vec![error(
@@ -339,13 +350,6 @@ fn adapt_exec(
             "/runtimeConfig/networkProxy",
         )? {
             let proxy = normalize_loopback_proxy(&proxy)?;
-            if env.iter().any(|entry| is_proxy_environment_key(entry)) {
-                return Err(vec![error(
-                    "cross_field_conflict",
-                    "/process/env",
-                    "caller environment conflicts with runtimeConfig.networkProxy",
-                )]);
-            }
             env.push(format!("HTTP_PROXY={proxy}"));
             env.push(format!("HTTPS_PROXY={proxy}"));
         }
@@ -833,6 +837,10 @@ mod tests {
                 "process",
                 json!({"commandLine": "true", "env": [format!("{key}=caller")]}),
             );
+            let without_runtime_proxy = adapt(&config).expect_err("reserved proxy environment");
+            assert_eq!(without_runtime_proxy[0].code, "cross_field_conflict");
+            assert_eq!(without_runtime_proxy[0].instance_path, "/process/env");
+
             insert(
                 &mut config,
                 "runtimeConfig",
