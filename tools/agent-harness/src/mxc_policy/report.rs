@@ -230,11 +230,13 @@ pub fn execute_policy_harness(
     if !freshness_complete {
         failed.push("freshness-identities".to_string());
     }
+    let live_profiles_complete = live_profiles_complete(options.mode, &live_profiles);
     let passed = uncovered.is_empty()
         && unexpected.is_empty()
         && failed.is_empty()
         && blocked.is_empty()
-        && rejection_effects_zero;
+        && rejection_effects_zero
+        && live_profiles_complete;
     let report = PolicyHarnessReport {
         schema: REPORT_SCHEMA.to_string(),
         version: REPORT_VERSION,
@@ -292,6 +294,18 @@ pub fn execute_policy_harness(
     };
     verify_policy_run(&run)?;
     Ok(run)
+}
+
+fn live_profiles_complete(
+    mode: PolicyHarnessMode,
+    profiles: &BTreeMap<String, LiveProfileResult>,
+) -> bool {
+    mode == PolicyHarnessMode::StaticOnly
+        || profiles.values().all(|profile| {
+            profile.status == LiveProfileStatus::Pass
+                && profile.positive_passed
+                && profile.negative_passed
+        })
 }
 
 fn actual_outcome(
@@ -611,6 +625,37 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn live_report_requires_every_positive_and_negative_profile_assertion() {
+        let mut profiles = BTreeMap::from([(
+            "process-shell".to_string(),
+            LiveProfileResult {
+                id: "process-shell".to_string(),
+                status: LiveProfileStatus::Pass,
+                positive_passed: true,
+                negative_passed: true,
+                evidence: Vec::new(),
+                error: None,
+            },
+        )]);
+        assert!(live_profiles_complete(
+            PolicyHarnessMode::LiveWhp,
+            &profiles
+        ));
+        profiles
+            .get_mut("process-shell")
+            .expect("profile")
+            .positive_passed = false;
+        assert!(!live_profiles_complete(
+            PolicyHarnessMode::LiveWhp,
+            &profiles
+        ));
+        assert!(live_profiles_complete(
+            PolicyHarnessMode::StaticOnly,
+            &profiles
+        ));
     }
 
     #[test]

@@ -467,8 +467,11 @@ def build_mxc_prototype_guest_agent(
         ],
         cwd=REPO_ROOT,
     )
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", REPO_ROOT / "target"))
+    if not target_dir.is_absolute():
+        target_dir = REPO_ROOT / target_dir
     built_agent = require_file(
-        REPO_ROOT / "target" / GUEST_AGENT_TARGET / "release" / GUEST_AGENT_ARTIFACT_NAME,
+        target_dir / GUEST_AGENT_TARGET / "release" / GUEST_AGENT_ARTIFACT_NAME,
         "built in-repo MXC prototype agent",
     )
     validate_static_x86_64_elf(built_agent)
@@ -539,12 +542,11 @@ def build_mxc_prototype_probe_helper(
         ],
         cwd=REPO_ROOT,
     )
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", REPO_ROOT / "target"))
+    if not target_dir.is_absolute():
+        target_dir = REPO_ROOT / target_dir
     built_probe = require_file(
-        REPO_ROOT
-        / "target"
-        / GUEST_AGENT_TARGET
-        / "release"
-        / "nvx-agent-probe",
+        target_dir / GUEST_AGENT_TARGET / "release" / "nvx-agent-probe",
         "built in-repo MXC prototype workload probe",
     )
     validate_static_x86_64_elf(built_probe)
@@ -1021,6 +1023,48 @@ def _prepare_agent_root(
         helper.chmod(0o755)
     (root / "init").symlink_to(f"sbin/{GUEST_AGENT_ARTIFACT_NAME}")
     return root
+
+
+def _install_agent_runtime_shell(config: AlpineBuildConfig, root: Path) -> tuple[str, str]:
+    if config.version != DEFAULT_ALPINE_VERSION:
+        raise ScriptError(
+            "this source tree pins Alpine "
+            f"{DEFAULT_ALPINE_VERSION}; requested {config.version}"
+        )
+    tarball = _alpine_tarball(config)
+    _download_verified(
+        "https://dl-cdn.alpinelinux.org/alpine/"
+        f"{config.branch}/releases/x86_64/{tarball.name}",
+        tarball,
+        DEFAULT_ALPINE_MINIROOTFS_SHA256,
+    )
+    require_tool("tar")
+    run_checked(
+        [
+            "tar",
+            "--extract",
+            "--gzip",
+            "--file",
+            tarball,
+            "--directory",
+            root,
+            "--numeric-owner",
+            "--no-same-owner",
+            "--same-permissions",
+            "./bin/busybox",
+            "./lib/ld-musl-x86_64.so.1",
+            "./lib/libc.musl-x86_64.so.1",
+        ]
+    )
+    shell = root / "bin" / "sh"
+    shutil.copyfile(root / "bin" / "busybox", shell)
+    shell.chmod(0o755)
+    loader = root / "lib" / "ld-musl-x86_64.so.1"
+    libc_alias = root / "lib" / "libc.musl-x86_64.so.1"
+    libc_alias.unlink()
+    shutil.copyfile(loader, libc_alias)
+    libc_alias.chmod(0o755)
+    return sha256_file(shell), sha256_file(loader)
 
 
 def _linux_filesystem_type(path: Path) -> str:
@@ -1547,12 +1591,26 @@ def verify_agent_initramfs(
     path: Path,
     expected_sha256: str,
     expected_helpers: dict[str, str] | None = None,
+    expected_shell_sha256: str | None = None,
+    expected_runtime_lib_sha256: str | None = None,
 ) -> None:
     entries = _validated_initramfs_entries(path, agent_profile=True)
     helper_entries = {
         helper_path.removeprefix("/")
         for helper_path in (expected_helpers or {}).keys()
     }
+    shell_entries = (
+        {
+            "bin",
+            "bin/busybox",
+            "bin/sh",
+            "lib",
+            "lib/ld-musl-x86_64.so.1",
+            "lib/libc.musl-x86_64.so.1",
+        }
+        if expected_shell_sha256
+        else set()
+    )
     expected_entries = {
         ".",
         "etc",
@@ -1561,7 +1619,7 @@ def verify_agent_initramfs(
         "init",
         "sbin",
         "sbin/nvx-agent",
-    } | helper_entries
+    } | helper_entries | shell_entries
     if set(entries) != expected_entries:
         raise ScriptError(
             f"{path} agent profile contains unexpected entries: "
@@ -1608,6 +1666,33 @@ def verify_agent_initramfs(
                 f"{path} embedded helper {helper_path!r} SHA-256 is "
                 f"{helper_entry.data_sha256}, expected {helper_sha256}"
             )
+    if expected_shell_sha256 is not None:
+        for name in ("bin/busybox", "bin/sh"):
+            entry = entries[name]
+            if (
+                stat.S_IFMT(entry.mode) != stat.S_IFREG
+                or stat.S_IMODE(entry.mode) != 0o755
+                or entry.uid != 0
+                or entry.gid != 0
+                or entry.data_sha256 != expected_shell_sha256
+            ):
+                raise ScriptError(
+                    f"{path} contains {name!r} with unexpected bytes or metadata"
+                )
+        if expected_runtime_lib_sha256 is None:
+            raise ScriptError("runtime library SHA-256 is required with an agent shell")
+        for name in ("lib/ld-musl-x86_64.so.1", "lib/libc.musl-x86_64.so.1"):
+            entry = entries[name]
+            if (
+                stat.S_IFMT(entry.mode) != stat.S_IFREG
+                or stat.S_IMODE(entry.mode) != 0o755
+                or entry.uid != 0
+                or entry.gid != 0
+                or entry.data_sha256 != expected_runtime_lib_sha256
+            ):
+                raise ScriptError(
+                    f"{path} contains {name!r} with unexpected bytes or metadata"
+                )
     if (
         stat.S_IFMT(init_entry.mode) != stat.S_IFLNK
         or stat.S_IMODE(init_entry.mode) != 0o777
@@ -1669,6 +1754,8 @@ def build_initramfs(config: AlpineBuildConfig) -> None:
     mxc_helper_source: Path | None = None
     mxc_helper_sha256: str | None = None
     mxc_helper_manifest: dict[str, object] | None = None
+    runtime_shell_sha256: str | None = None
+    runtime_lib_sha256: str | None = None
     if config.profile == MXC_PROTOTYPE_TRANSPORT:
         (
             agent_source,
@@ -1708,6 +1795,8 @@ def build_initramfs(config: AlpineBuildConfig) -> None:
             }
             expected_helpers[MXC_GUEST_PROBE_INSTALLED_PATH] = mxc_helper_sha256
         root = _prepare_agent_root(config.work, agent_source, helper_sources)
+        if config.profile == MXC_PROTOTYPE_TRANSPORT:
+            runtime_shell_sha256, runtime_lib_sha256 = _install_agent_runtime_shell(config, root)
         trusted_owners: dict[str, tuple[int, int]] = {}
     else:
         root = _prepare_alpine_root(config)
@@ -1797,6 +1886,8 @@ def build_initramfs(config: AlpineBuildConfig) -> None:
             native_output,
             agent_sha256,
             expected_helpers if config.profile == MXC_PROTOTYPE_TRANSPORT else None,
+            runtime_shell_sha256,
+            runtime_lib_sha256,
         )
     else:
         verify_legacy_initramfs(native_output)

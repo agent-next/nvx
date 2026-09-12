@@ -231,7 +231,16 @@ non-empty safe `sandboxId`; provision forbids one.
 expansion, exit status, timeout/tree termination, cwd, and environment behavior
 are therefore part of the NVX contract. URL proxy configuration rejects
 conflicting caller proxy variables and injects only `HTTP_PROXY` and
-`HTTPS_PROXY`; an absent proxy injects nothing.
+`HTTPS_PROXY`; an absent proxy injects nothing. Only exec-phase
+`runtimeConfig.networkProxy` is honored. Any legacy `network.proxy` object,
+including `network.proxy.url`, rejects as `unsupported_field` at
+`/network/proxy`.
+
+The MXC initramfs includes the pinned Alpine BusyBox `/bin/sh` and its musl
+runtime because shell execution is part of this contract. Portable networking
+strictly parses OpenVMM's `virtnet_ip`, `virtnet_mask`, and `virtnet_gw`
+kernel parameters, configures the guest interface and default route before
+Ready, and publishes the gateway as the guest DNS resolver.
 
 Schema validation and semantic adaptation finish before the `HostEffects`
 boundary. Rejected corpus cases mechanically assert zero root preparation,

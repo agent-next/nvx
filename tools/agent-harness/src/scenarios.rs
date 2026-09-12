@@ -375,7 +375,6 @@ pub(crate) fn run_live_policy_network_profile(options: &HarnessOptions) -> Polic
             "policy-live-network-allow",
             &allow_root,
             serde_json::json!({
-                "allowedHosts": ["10.0.0.1"],
                 "defaultPolicy": "allow"
             }),
         )?;
@@ -400,7 +399,7 @@ pub(crate) fn run_live_policy_network_profile(options: &HarnessOptions) -> Polic
             ));
         }
         positive_evidence.push(format!(
-            "defaultPolicy=allow (allowedHosts set) produced portable network and reached controlled host endpoint {endpoint}"
+            "defaultPolicy=allow produced portable network and reached controlled host endpoint {endpoint}"
         ));
         Ok(())
     })();
@@ -416,7 +415,6 @@ pub(crate) fn run_live_policy_network_profile(options: &HarnessOptions) -> Polic
             "policy-live-network-block",
             &block_root,
             serde_json::json!({
-                "blockedHosts": ["10.0.0.1"],
                 "defaultPolicy": "block"
             }),
         )?;
@@ -436,8 +434,7 @@ pub(crate) fn run_live_policy_network_profile(options: &HarnessOptions) -> Polic
             ));
         }
         negative_evidence.push(
-            "defaultPolicy=block (blockedHosts set) produced no-NIC posture and rejected outbound connect"
-                .to_string(),
+            "defaultPolicy=block produced no-NIC posture and rejected outbound connect".to_string(),
         );
 
         let mut absent_options = options.clone();
@@ -448,9 +445,7 @@ pub(crate) fn run_live_policy_network_profile(options: &HarnessOptions) -> Polic
         let absent_provision = adapt_live_provision_policy(
             "policy-live-network-default-absent",
             &absent_root,
-            serde_json::json!({
-                "allowedHosts": ["10.0.0.1"]
-            }),
+            serde_json::json!({}),
         )?;
         absent_overrides.portable_network =
             portable_network_override_from_provision(&absent_provision)?;
@@ -836,8 +831,8 @@ fn ensure_live_initialized(
                 }
                 if status.network.setup_state != NetworkSetupState::Ready {
                     return Err(format!(
-                        "ready network setup_state was {:?}, expected Ready",
-                        status.network.setup_state
+                        "ready network status was {:?}, expected setup_state Ready",
+                        status.network
                     ));
                 }
                 evidence.push(format!(
@@ -3091,12 +3086,21 @@ fn is_expected_channel_close_error(error: &ClientError) -> bool {
 fn is_expected_channel_close_session_error(source: &SessionError) -> bool {
     match source {
         SessionError::Closed => true,
-        SessionError::Io(error) => matches!(
-            error.kind(),
-            std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::ConnectionReset
-        ),
+        SessionError::Io(error) => {
+            let windows_pipe_closed = error.kind() == std::io::ErrorKind::Other
+                && ["(0x8007006D)", "(0x800700E8)", "(0x800700E9)"]
+                    .iter()
+                    .any(|suffix| error.to_string().ends_with(suffix));
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+            ) || matches!(
+                error.raw_os_error(),
+                Some(109 | 232 | 233 | -2_147_024_787 | -2_147_024_664 | -2_147_024_663)
+            ) || windows_pipe_closed
+        }
         SessionError::Protocol(_)
         | SessionError::DeadlineExceeded(_)
         | SessionError::SequenceMismatch { .. }
@@ -3792,7 +3796,7 @@ fn run_control_lifecycle_dedicated_session(
                 "phase": "exec",
                 "sandboxId": "policy-live-lifecycle-sandbox",
                 "containerId": "policy-live-lifecycle-container",
-                "process": { "commandLine": "echo lifecycle", "cwd": "/", "env": [], "timeout": 1000 }
+                "process": { "commandLine": ":", "env": [] }
             }),
             &vm.plan.artifacts.common_root,
         )
@@ -3867,7 +3871,7 @@ fn run_control_lifecycle_dedicated_session(
                 Err(error) if is_expected_channel_close_error(&error) => break true,
                 Err(error) => {
                     return Err(format!(
-                        "control lifecycle stop channel-close observation failed: {error}"
+                        "control lifecycle stop channel-close observation failed: {error:?} ({error})"
                     ));
                 }
                 Ok(Some(_)) => {}
@@ -5036,6 +5040,13 @@ mod tests {
                 operation: "poll",
                 source: SessionError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
             },
+            ClientError::Control(SessionError::Io(std::io::Error::from_raw_os_error(233))),
+            ClientError::Control(SessionError::Io(std::io::Error::from_raw_os_error(
+                -2_147_024_663,
+            ))),
+            ClientError::Control(SessionError::Io(std::io::Error::other(
+                "No process is on the other end of the pipe. (0x800700E9)",
+            ))),
         ];
         for error in accepted {
             assert!(

@@ -25,8 +25,6 @@ pub struct NvxPolicyPlan {
 pub struct NvxProvisionPolicy {
     pub common_root: PathBuf,
     pub mappings: Vec<ChildMapping>,
-    pub allowed_hosts: Vec<String>,
-    pub blocked_hosts: Vec<String>,
     pub default_network_policy: Option<String>,
 }
 
@@ -163,8 +161,6 @@ fn adapt_provision(
     })?;
     validate_windows_mapping_equivalence(&mappings)?;
 
-    let mut allowed_hosts = Vec::new();
-    let mut blocked_hosts = Vec::new();
     let mut default_network_policy = None;
     if let Some(network) = non_null(network) {
         let object = network.as_object().ok_or_else(|| {
@@ -176,6 +172,8 @@ fn adapt_provision(
         })?;
         for field in [
             "allowLocalNetwork",
+            "allowedHosts",
+            "blockedHosts",
             "egress",
             "enforcementMode",
             "ingress",
@@ -183,8 +181,6 @@ fn adapt_provision(
         ] {
             reject_nested_present(object, field, "/network", "unsupported_field")?;
         }
-        allowed_hosts = string_array(object.get("allowedHosts"), "/network/allowedHosts")?;
-        blocked_hosts = string_array(object.get("blockedHosts"), "/network/blockedHosts")?;
         default_network_policy =
             optional_non_empty_string(object.get("defaultPolicy"), "/network/defaultPolicy")?;
     }
@@ -192,8 +188,6 @@ fn adapt_provision(
     Ok(NvxProvisionPolicy {
         common_root: common_root.to_path_buf(),
         mappings,
-        allowed_hosts,
-        blocked_hosts,
         default_network_policy,
     })
 }
@@ -628,8 +622,6 @@ mod tests {
             &mut config,
             "network",
             json!({
-                "allowedHosts": ["allowed.example"],
-                "blockedHosts": ["blocked.example"],
                 "defaultPolicy": "block"
             }),
         );
@@ -640,8 +632,6 @@ mod tests {
         assert_eq!(provision.mappings[0].access, AccessMode::ReadOnly);
         assert_eq!(provision.mappings[1].child.as_str(), "write");
         assert_eq!(provision.mappings[1].access, AccessMode::ReadWrite);
-        assert_eq!(provision.allowed_hosts, ["allowed.example"]);
-        assert_eq!(provision.blocked_hosts, ["blocked.example"]);
         assert_eq!(provision.default_network_policy.as_deref(), Some("block"));
     }
 
@@ -871,6 +861,8 @@ mod tests {
 
         for (field, value) in [
             ("allowLocalNetwork", json!(true)),
+            ("allowedHosts", json!(["allowed.example"])),
+            ("blockedHosts", json!(["blocked.example"])),
             ("egress", json!({})),
             ("enforcementMode", json!("firewall")),
             ("ingress", json!({})),

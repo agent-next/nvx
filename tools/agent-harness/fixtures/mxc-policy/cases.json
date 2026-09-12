@@ -3852,10 +3852,10 @@
       "phase": "provision",
       "version": "0.9.0-dev"
     },
-    "expectedDisposition": "accepted",
-    "expectedCode": null,
-    "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "expectedDisposition": "rejected",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/allowedHosts",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.allowedHosts"
     ]
@@ -3871,7 +3871,7 @@
     "expectedDisposition": "accepted",
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.allowedHosts#absent"
     ]
@@ -3886,10 +3886,10 @@
       "phase": "provision",
       "version": "0.9.0-dev"
     },
-    "expectedDisposition": "accepted",
-    "expectedCode": null,
-    "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "expectedDisposition": "rejected",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/allowedHosts",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.allowedHosts#nullable"
     ]
@@ -3906,10 +3906,10 @@
       "phase": "provision",
       "version": "0.9.0-dev"
     },
-    "expectedDisposition": "accepted",
-    "expectedCode": null,
-    "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "expectedDisposition": "rejected",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/allowedHosts",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.allowedHosts[]"
     ]
@@ -3926,10 +3926,10 @@
       "phase": "provision",
       "version": "0.9.0-dev"
     },
-    "expectedDisposition": "accepted",
-    "expectedCode": null,
-    "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "expectedDisposition": "rejected",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/blockedHosts",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.blockedHosts"
     ]
@@ -3945,7 +3945,7 @@
     "expectedDisposition": "accepted",
     "expectedCode": null,
     "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.blockedHosts#absent"
     ]
@@ -3960,10 +3960,10 @@
       "phase": "provision",
       "version": "0.9.0-dev"
     },
-    "expectedDisposition": "accepted",
-    "expectedCode": null,
-    "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "expectedDisposition": "rejected",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/blockedHosts",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.blockedHosts#nullable"
     ]
@@ -3980,10 +3980,10 @@
       "phase": "provision",
       "version": "0.9.0-dev"
     },
-    "expectedDisposition": "accepted",
-    "expectedCode": null,
-    "expectedPath": null,
-    "requiredEvidence": "live-whp-positive-negative",
+    "expectedDisposition": "rejected",
+    "expectedCode": "unsupported_field",
+    "expectedPath": "/network/blockedHosts",
+    "requiredEvidence": "unit-static",
     "catalogKeys": [
       "network.blockedHosts[]"
     ]

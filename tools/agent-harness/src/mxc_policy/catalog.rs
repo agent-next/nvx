@@ -1774,66 +1774,66 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "network.allowedHosts",
         schema_path: "/properties/network/anyOf/0/properties/allowedHosts",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_PROVISION,
-        evidence: EVIDENCE_LIVE_WHP_POS_NEG,
-        reason: REASON_HONORED_PROVISION,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.allowedHosts#absent",
         schema_path: "/properties/network/anyOf/0/properties/allowedHosts",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_PROVISION,
-        evidence: EVIDENCE_LIVE_WHP_POS_NEG,
-        reason: REASON_HONORED_PROVISION,
+        disposition: PolicyDisposition::AcceptedInert,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "network.allowedHosts#nullable",
         schema_path: "/properties/network/anyOf/0/properties/allowedHosts",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_PROVISION,
-        evidence: EVIDENCE_LIVE_WHP_POS_NEG,
-        reason: REASON_HONORED_PROVISION,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.allowedHosts[]",
         schema_path: "/properties/network/anyOf/0/properties/allowedHosts/items",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_PROVISION,
-        evidence: EVIDENCE_LIVE_WHP_POS_NEG,
-        reason: REASON_HONORED_PROVISION,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.blockedHosts",
         schema_path: "/properties/network/anyOf/0/properties/blockedHosts",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_PROVISION,
-        evidence: EVIDENCE_LIVE_WHP_POS_NEG,
-        reason: REASON_HONORED_PROVISION,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.blockedHosts#absent",
         schema_path: "/properties/network/anyOf/0/properties/blockedHosts",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_PROVISION,
-        evidence: EVIDENCE_LIVE_WHP_POS_NEG,
-        reason: REASON_HONORED_PROVISION,
+        disposition: PolicyDisposition::AcceptedInert,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_ACCEPTED_INERT,
     },
     CatalogEntry {
         key: "network.blockedHosts#nullable",
         schema_path: "/properties/network/anyOf/0/properties/blockedHosts",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_PROVISION,
-        evidence: EVIDENCE_LIVE_WHP_POS_NEG,
-        reason: REASON_HONORED_PROVISION,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.blockedHosts[]",
         schema_path: "/properties/network/anyOf/0/properties/blockedHosts/items",
-        disposition: PolicyDisposition::Honored,
-        phases: PHASES_PROVISION,
-        evidence: EVIDENCE_LIVE_WHP_POS_NEG,
-        reason: REASON_HONORED_PROVISION,
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
     },
     CatalogEntry {
         key: "network.defaultPolicy",
@@ -4413,6 +4413,8 @@ mod tests {
                 "lifecycle#absent",
                 "lxc#absent",
                 "network.allowLocalNetwork#absent",
+                "network.allowedHosts#absent",
+                "network.blockedHosts#absent",
                 "network.egress#absent",
                 "network.enforcementMode#absent",
                 "network.ingress#absent",
@@ -4542,16 +4544,8 @@ mod tests {
             REASON_HONORED_PROVISION,
         );
         assert_group_contract(
-            "honored provision network allow-block",
+            "honored provision network default policy",
             string_set([
-                "network.allowedHosts",
-                "network.allowedHosts#absent",
-                "network.allowedHosts#nullable",
-                "network.allowedHosts[]",
-                "network.blockedHosts",
-                "network.blockedHosts#absent",
-                "network.blockedHosts#nullable",
-                "network.blockedHosts[]",
                 "network.defaultPolicy",
                 "network.defaultPolicy#absent",
                 "network.defaultPolicy#nullable",
@@ -4560,11 +4554,7 @@ mod tests {
                 "network.defaultPolicy#enum=block",
                 "network.defaultPolicy#anyOf[1]=null",
             ]),
-            |key| {
-                key.starts_with("network.allowedHosts")
-                    || key.starts_with("network.blockedHosts")
-                    || key.starts_with("network.defaultPolicy")
-            },
+            |key| key.starts_with("network.defaultPolicy"),
             PolicyDisposition::Honored,
             PHASES_PROVISION,
             EVIDENCE_LIVE_WHP_POS_NEG,
@@ -4733,6 +4723,25 @@ mod tests {
             REASON_REJECTED,
         );
         assert_group_contract(
+            "rejected network host rules",
+            string_set([
+                "network.allowedHosts",
+                "network.allowedHosts#nullable",
+                "network.allowedHosts[]",
+                "network.blockedHosts",
+                "network.blockedHosts#nullable",
+                "network.blockedHosts[]",
+            ]),
+            |key| {
+                (key.starts_with("network.allowedHosts") || key.starts_with("network.blockedHosts"))
+                    && !is_compat_absent_inert_key(key)
+            },
+            PolicyDisposition::Rejected,
+            PHASES_ALL,
+            EVIDENCE_UNIT_STATIC,
+            REASON_REJECTED,
+        );
+        assert_group_contract(
             "rejected network.proxy",
             string_set([
                 "network.proxy",
@@ -4855,7 +4864,7 @@ mod tests {
     #[test]
     fn semantic_contract_groups_are_exhaustive_and_disjoint() {
         type GroupMatcher = (&'static str, fn(&str) -> bool);
-        let groups: [GroupMatcher; 18] = [
+        let groups: [GroupMatcher; 19] = [
             ("accepted inert surfaces", |key| {
                 key == "$schema"
                     || key.starts_with("$schema#")
@@ -4902,10 +4911,8 @@ mod tests {
                     || key == "network#anyOf[0]=#/definitions/Network"
                     || key == "network#anyOf[1]=null"
             }),
-            ("honored provision network allow-block", |key| {
-                key.starts_with("network.allowedHosts")
-                    || key.starts_with("network.blockedHosts")
-                    || key.starts_with("network.defaultPolicy")
+            ("honored provision network default policy", |key| {
+                key.starts_with("network.defaultPolicy")
             }),
             ("cross provision", |key| {
                 key == "cross.phase.provision_uses_filesystem_rw_and_network_allow_block"
@@ -4952,6 +4959,10 @@ mod tests {
                     || key == "processContainer.network"
                     || key.starts_with("processContainer.network.")
                     || key.starts_with("processContainer.network#")
+            }),
+            ("rejected network host rules", |key| {
+                (key.starts_with("network.allowedHosts") || key.starts_with("network.blockedHosts"))
+                    && !is_compat_absent_inert_key(key)
             }),
             ("rejected network.proxy", |key| {
                 key == "network.proxy"
@@ -5019,6 +5030,8 @@ mod tests {
                 | "lifecycle#absent"
                 | "lxc#absent"
                 | "network.allowLocalNetwork#absent"
+                | "network.allowedHosts#absent"
+                | "network.blockedHosts#absent"
                 | "network.egress#absent"
                 | "network.enforcementMode#absent"
                 | "network.ingress#absent"

@@ -359,14 +359,6 @@ const LIVE_PROFILE_MAPPINGS: &[(&str, &str)] = &[
         "network-positive-negative",
     ),
     ("network#anyOf[1]=null", "network-positive-negative"),
-    ("network.allowedHosts", "network-positive-negative"),
-    ("network.allowedHosts#absent", "network-positive-negative"),
-    ("network.allowedHosts#nullable", "network-positive-negative"),
-    ("network.allowedHosts[]", "network-positive-negative"),
-    ("network.blockedHosts", "network-positive-negative"),
-    ("network.blockedHosts#absent", "network-positive-negative"),
-    ("network.blockedHosts#nullable", "network-positive-negative"),
-    ("network.blockedHosts[]", "network-positive-negative"),
     ("network.defaultPolicy", "network-positive-negative"),
     ("network.defaultPolicy#absent", "network-positive-negative"),
     (
@@ -1411,6 +1403,8 @@ fn contract_error(config: &Value) -> Option<PolicyError> {
             if let Some(network) = object.get("network").and_then(Value::as_object) {
                 for field in [
                     "allowLocalNetwork",
+                    "allowedHosts",
+                    "blockedHosts",
                     "egress",
                     "enforcementMode",
                     "ingress",
@@ -1614,7 +1608,7 @@ mod tests {
     fn checked_in_corpus_hash_is_pinned() {
         assert_eq!(
             content_sha256_hex_bytes(CASES_BYTES),
-            "7a0543d54e9286554cf83099d5a593a823621a29dac60d3a4bff8b4c96ab551b",
+            "90757d34649e8643425d4fd840ea6dd4c9b884abace829d6bb4032d2b1c7aa56",
             "corpus hash changed: regenerate fixture and update pin"
         );
     }

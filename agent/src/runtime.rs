@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::ffi::CString;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io;
@@ -80,7 +81,7 @@ pub fn run_runtime() -> Result<()> {
         open_control_tty_raw_nonblocking(&launch_config.control_tty_device_path)?;
     let binding = launch_config.binding;
     let build = detect_build_status();
-    let network = detect_network_status();
+    let network = configure_and_detect_network_status();
     let isolation_result = apply_and_verify_workload_isolation(&default_isolation_plan())?;
     let isolation_holder_pid = isolation_result.holder_pid;
     let mut service = MxcControlService::new_pid1_runtime_with_status(
@@ -480,7 +481,7 @@ fn handle_host_message<S: ProcessSupervisor>(
                     shutdown_deadline: None,
                 });
             };
-            let network = detect_network_status();
+            let network = configure_and_detect_network_status();
             let guest_mount_root = GuestMountRoot::parse(DEFAULT_GUEST_MAPPING_ROOT.to_string())?;
             let _ = dispatch.service.authenticate_channel(
                 authentication,
@@ -743,6 +744,198 @@ fn detect_network_status() -> NetworkStatus {
         Ok(adapters) if adapters.is_empty() => no_nic_network_status(),
         Ok(_) => detect_portable_network_status(NETWORK_READY_TIMEOUT),
         Err(failure) => failed_portable_network_status(failure),
+    }
+}
+
+fn configure_and_detect_network_status() -> NetworkStatus {
+    match configure_portable_network_from_cmdline() {
+        Ok(()) => detect_network_status(),
+        Err(failure) => failed_portable_network_status(failure),
+    }
+}
+
+fn configure_portable_network_from_cmdline() -> std::result::Result<(), NetworkFailureStatus> {
+    let interfaces = list_non_loopback_interfaces()?;
+    let Some(interface) = interfaces.first() else {
+        return Ok(());
+    };
+    let cmdline = read_limited_text(Path::new(PROC_CMDLINE_PATH), MAX_PROC_TEXT_BYTES)?;
+    let Some((address, netmask, gateway)) = parse_portable_network_cmdline(&cmdline)? else {
+        return Err(NetworkFailureStatus {
+                code: NetworkFailureCode::AddressMissing,
+                detail: "portable-network interface exists but virtnet_ip, virtnet_mask, or virtnet_gw is missing"
+                    .to_string(),
+            });
+    };
+    configure_interface_ipv4(interface, address, netmask, gateway)?;
+    std::fs::create_dir_all("/etc").map_err(|error| NetworkFailureStatus {
+        code: NetworkFailureCode::Io,
+        detail: bounded_network_text(&format!("creating /etc failed: {error}")),
+    })?;
+    std::fs::write("/etc/resolv.conf", format!("nameserver {gateway}\n")).map_err(|error| {
+        NetworkFailureStatus {
+            code: NetworkFailureCode::Io,
+            detail: bounded_network_text(&format!("writing /etc/resolv.conf failed: {error}")),
+        }
+    })
+}
+
+fn parse_portable_network_cmdline(
+    cmdline: &str,
+) -> std::result::Result<Option<(Ipv4Addr, Ipv4Addr, Ipv4Addr)>, NetworkFailureStatus> {
+    let mut address = None;
+    let mut netmask = None;
+    let mut gateway = None;
+    for field in cmdline.split_ascii_whitespace() {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        let destination = match key {
+            "virtnet_ip" => &mut address,
+            "virtnet_mask" => &mut netmask,
+            "virtnet_gw" => &mut gateway,
+            _ => continue,
+        };
+        if destination.is_some() {
+            return Err(NetworkFailureStatus {
+                code: NetworkFailureCode::Io,
+                detail: format!("duplicate {key} kernel parameter"),
+            });
+        }
+        *destination = Some(
+            value
+                .parse::<Ipv4Addr>()
+                .map_err(|error| NetworkFailureStatus {
+                    code: NetworkFailureCode::Io,
+                    detail: bounded_network_text(&format!("invalid {key} value: {error}")),
+                })?,
+        );
+    }
+    match (address, netmask, gateway) {
+        (None, None, None) => Ok(None),
+        (Some(address), Some(netmask), Some(gateway)) => Ok(Some((address, netmask, gateway))),
+        _ => Err(NetworkFailureStatus {
+            code: NetworkFailureCode::AddressMissing,
+            detail: "virtnet_ip, virtnet_mask, and virtnet_gw must be supplied together"
+                .to_string(),
+        }),
+    }
+}
+
+fn configure_interface_ipv4(
+    interface: &str,
+    address: Ipv4Addr,
+    netmask: Ipv4Addr,
+    gateway: Ipv4Addr,
+) -> std::result::Result<(), NetworkFailureStatus> {
+    let interface = CString::new(interface).map_err(|_| NetworkFailureStatus {
+        code: NetworkFailureCode::Io,
+        detail: "network interface name contains an interior NUL".to_string(),
+    })?;
+    if interface.as_bytes().len() >= libc::IFNAMSIZ {
+        return Err(NetworkFailureStatus {
+            code: NetworkFailureCode::Io,
+            detail: "network interface name exceeds IFNAMSIZ".to_string(),
+        });
+    }
+    // SAFETY: the socket and ioctl arguments below use initialized Linux ABI structs,
+    // bounded interface names, and remain valid for each synchronous syscall.
+    unsafe {
+        let socket = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if socket < 0 {
+            return Err(last_network_io_failure(
+                "opening network configuration socket",
+            ));
+        }
+        let result = (|| {
+            let mut request: libc::ifreq = std::mem::zeroed();
+            std::ptr::copy_nonoverlapping(
+                interface.as_ptr(),
+                request.ifr_name.as_mut_ptr(),
+                interface.as_bytes().len(),
+            );
+            request.ifr_ifru.ifru_addr = ipv4_sockaddr(address);
+            network_ioctl(
+                socket,
+                libc::SIOCSIFADDR as libc::c_int,
+                &mut request,
+                "assigning IPv4 address",
+            )?;
+            request.ifr_ifru.ifru_netmask = ipv4_sockaddr(netmask);
+            network_ioctl(
+                socket,
+                libc::SIOCSIFNETMASK as libc::c_int,
+                &mut request,
+                "assigning IPv4 netmask",
+            )?;
+            network_ioctl(
+                socket,
+                libc::SIOCGIFFLAGS as libc::c_int,
+                &mut request,
+                "reading interface flags",
+            )?;
+            request.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+            network_ioctl(
+                socket,
+                libc::SIOCSIFFLAGS as libc::c_int,
+                &mut request,
+                "bringing interface up",
+            )?;
+
+            let mut route: libc::rtentry = std::mem::zeroed();
+            route.rt_dst = ipv4_sockaddr(Ipv4Addr::UNSPECIFIED);
+            route.rt_gateway = ipv4_sockaddr(gateway);
+            route.rt_genmask = ipv4_sockaddr(Ipv4Addr::UNSPECIFIED);
+            route.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as libc::c_ushort;
+            route.rt_dev = interface.as_ptr().cast_mut();
+            if libc::ioctl(socket, libc::SIOCADDRT as libc::c_int, &route) < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(NetworkFailureStatus {
+                        code: NetworkFailureCode::Io,
+                        detail: bounded_network_text(&format!(
+                            "installing default IPv4 route failed: {error}"
+                        )),
+                    });
+                }
+            }
+            Ok(())
+        })();
+        libc::close(socket);
+        result
+    }
+}
+
+unsafe fn network_ioctl(
+    socket: RawFd,
+    operation: libc::c_int,
+    request: &mut libc::ifreq,
+    action: &str,
+) -> std::result::Result<(), NetworkFailureStatus> {
+    // SAFETY: caller provides a live datagram socket and initialized ifreq.
+    if unsafe { libc::ioctl(socket, operation, request) } < 0 {
+        return Err(last_network_io_failure(action));
+    }
+    Ok(())
+}
+
+fn ipv4_sockaddr(address: Ipv4Addr) -> libc::sockaddr {
+    let value = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(address.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: sockaddr_in and sockaddr have the same Linux ABI size and alignment here.
+    unsafe { std::mem::transmute(value) }
+}
+
+fn last_network_io_failure(action: &str) -> NetworkFailureStatus {
+    NetworkFailureStatus {
+        code: NetworkFailureCode::Io,
+        detail: bounded_network_text(&format!("{action} failed: {}", io::Error::last_os_error())),
     }
 }
 
@@ -3039,6 +3232,35 @@ mod tests {
         assert!(status.default_gateway.is_none());
         assert!(status.dns.ready);
         assert!(status.failure.is_none());
+    }
+
+    #[test]
+    fn portable_network_cmdline_requires_one_complete_ipv4_tuple() {
+        assert_eq!(
+            parse_portable_network_cmdline(
+                "quiet virtnet_ip=10.0.0.2 virtnet_mask=255.255.255.0 virtnet_gw=10.0.0.1"
+            )
+            .expect("complete tuple"),
+            Some((
+                "10.0.0.2".parse().expect("test IPv4 address"),
+                "255.255.255.0".parse().expect("test IPv4 netmask"),
+                "10.0.0.1".parse().expect("test IPv4 gateway"),
+            ))
+        );
+        assert_eq!(
+            parse_portable_network_cmdline("quiet console=hvc1").expect("absent tuple"),
+            None
+        );
+        assert!(
+            parse_portable_network_cmdline("virtnet_ip=10.0.0.2 virtnet_mask=255.255.255.0")
+                .is_err()
+        );
+        assert!(
+            parse_portable_network_cmdline(
+                "virtnet_ip=10.0.0.2 virtnet_ip=10.0.0.3 virtnet_mask=255.255.255.0 virtnet_gw=10.0.0.1"
+            )
+            .is_err()
+        );
     }
 
     #[test]

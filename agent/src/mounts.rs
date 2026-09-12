@@ -15,6 +15,14 @@ use crate::error::{AgentError, Result};
 const READ_ONLY_FLAG: libc::c_ulong = libc::MS_RDONLY;
 #[cfg(not(target_os = "linux"))]
 const READ_ONLY_FLAG: libc::c_ulong = 1;
+#[cfg(target_os = "linux")]
+const NOSUID_FLAG: libc::c_ulong = libc::MS_NOSUID;
+#[cfg(not(target_os = "linux"))]
+const NOSUID_FLAG: libc::c_ulong = 2;
+#[cfg(target_os = "linux")]
+const NODEV_FLAG: libc::c_ulong = libc::MS_NODEV;
+#[cfg(not(target_os = "linux"))]
+const NODEV_FLAG: libc::c_ulong = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MountSpec {
@@ -38,7 +46,7 @@ pub fn private_mount_specs() -> Vec<MountSpec> {
             source: "tmpfs",
             target: "/dev",
             fstype: "tmpfs",
-            flags: libc::MS_NOSUID | libc::MS_NODEV,
+            flags: NOSUID_FLAG | NODEV_FLAG,
             data: Some("mode=755"),
         },
         MountSpec {
@@ -52,7 +60,7 @@ pub fn private_mount_specs() -> Vec<MountSpec> {
             source: "tmpfs",
             target: "/dev/shm",
             fstype: "tmpfs",
-            flags: libc::MS_NOSUID | libc::MS_NODEV,
+            flags: NOSUID_FLAG | NODEV_FLAG,
             data: Some("mode=1777"),
         },
         MountSpec {
@@ -156,8 +164,8 @@ mod tests {
                 .iter()
                 .find(|spec| spec.target == target)
                 .expect("tmpfs mount");
-            assert_ne!(mount.flags & libc::MS_NOSUID, 0);
-            assert_ne!(mount.flags & libc::MS_NODEV, 0);
+            assert_ne!(mount.flags & NOSUID_FLAG, 0);
+            assert_ne!(mount.flags & NODEV_FLAG, 0);
             let data = mount.data.expect("tmpfs mount data");
             assert!(!data.contains("nosuid"));
             assert!(!data.contains("nodev"));

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Deterministic phase-0 scenario harness for the NVX MXC agent prototype."
+default-run = "agent-harness"
 
 [dependencies]
 agent-protocol = { path = "../../agent-protocol" }
