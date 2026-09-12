@@ -640,6 +640,14 @@ pub const CATALOG: &[CatalogEntry] = &[
         reason: REASON_REJECTED,
     },
     CatalogEntry {
+        key: "experimental.seatbelt.launchMethod#default=exec",
+        schema_path: "/properties/experimental/anyOf/0/properties/seatbelt/anyOf/0/properties/launchMethod/anyOf/0/oneOf/0",
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
+    },
+    CatalogEntry {
         key: "experimental.seatbelt.launchMethod#oneOf[1]=string",
         schema_path: "/properties/experimental/anyOf/0/properties/seatbelt/anyOf/0/properties/launchMethod/anyOf/0/oneOf/1",
         disposition: PolicyDisposition::Rejected,
@@ -3888,6 +3896,14 @@ pub const CATALOG: &[CatalogEntry] = &[
         reason: REASON_REJECTED,
     },
     CatalogEntry {
+        key: "seatbelt.launchMethod#default=exec",
+        schema_path: "/properties/seatbelt/anyOf/0/properties/launchMethod/anyOf/0/oneOf/0",
+        disposition: PolicyDisposition::Rejected,
+        phases: PHASES_ALL,
+        evidence: EVIDENCE_UNIT_STATIC,
+        reason: REASON_REJECTED,
+    },
+    CatalogEntry {
         key: "seatbelt.launchMethod#oneOf[1]=string",
         schema_path: "/properties/seatbelt/anyOf/0/properties/launchMethod/anyOf/0/oneOf/1",
         disposition: PolicyDisposition::Rejected,
@@ -4348,6 +4364,16 @@ mod tests {
             .map(|entry| entry.key)
             .collect::<BTreeSet<_>>();
         assert_missing_unexpected(&required, &actual, "cross-field");
+    }
+
+    #[test]
+    fn catalog_keys_are_unique() {
+        collect_catalog_map(
+            CATALOG
+                .iter()
+                .map(|entry| (entry.key.to_string(), entry.schema_path.to_string())),
+            "complete",
+        );
     }
 
     #[test]
@@ -5180,6 +5206,7 @@ mod tests {
             seen,
         );
         collect_enum_entries(&resolved_node, key_prefix, schema_path, out, seen);
+        collect_default_entries(&resolved_node, key_prefix, schema_path, out, seen);
     }
 
     fn collect_union_entries(
@@ -5249,6 +5276,41 @@ mod tests {
             let enum_schema_path = join_schema_path(schema_path, &format!("/enum/{index}"));
             push_inventory(out, seen, &key, &enum_schema_path, InventoryKind::Enum);
         }
+    }
+
+    fn collect_default_entries(
+        node: &Value,
+        key_prefix: &str,
+        schema_path: &str,
+        out: &mut Vec<InventoryEntry>,
+        seen: &mut BTreeMap<String, (String, InventoryKind)>,
+    ) {
+        let Some(description) = node.get("description").and_then(Value::as_str) else {
+            return;
+        };
+        if !description.contains("(default)") {
+            return;
+        }
+        let Some(default_value) = node
+            .get("enum")
+            .and_then(Value::as_array)
+            .filter(|values| values.len() == 1)
+            .and_then(|values| values[0].as_str())
+        else {
+            return;
+        };
+        let key = if key_prefix.is_empty() {
+            format!("<root>#default={default_value}")
+        } else {
+            format!("{key_prefix}#default={default_value}")
+        };
+        push_inventory(
+            out,
+            seen,
+            &key,
+            schema_path,
+            InventoryKind::PresenceOrDefault,
+        );
     }
 
     fn push_inventory(

@@ -104,33 +104,152 @@ pub fn schema_declares_draft7() -> Result<bool, PolicyError> {
 
 pub fn validate_config(config: &Value) -> Result<(), Vec<PolicyError>> {
     let compiled = compiled_schema().map_err(|error| vec![error])?;
-    let errors = compiled
-        .validator
-        .iter_errors(config)
-        .map(policy_error_from_validation)
-        .collect::<Vec<_>>();
+    let mut errors = unknown_field_errors(config, &compiled.schema);
+    errors.extend(
+        compiled
+            .validator
+            .iter_errors(config)
+            .flat_map(policy_errors_from_validation),
+    );
     if errors.is_empty() {
         return Ok(());
     }
     Err(errors)
 }
 
-fn policy_error_from_validation(error: jsonschema::ValidationError<'_>) -> PolicyError {
-    let mut instance_path = location_to_pointer(error.instance_path());
-    let code = match error.kind() {
-        ValidationErrorKind::AdditionalProperties { unexpected } => {
-            if instance_path.is_empty() && unexpected.len() == 1 {
-                instance_path = join_pointer_path("", &unexpected[0]);
-            }
-            POLICY_UNKNOWN_FIELD_CODE
-        }
-        _ => POLICY_VALIDATION_CODE,
-    };
-    PolicyError {
-        code: code.to_string(),
-        instance_path,
-        message: error.to_string(),
+fn policy_errors_from_validation(error: jsonschema::ValidationError<'_>) -> Vec<PolicyError> {
+    let parent_path = location_to_pointer(error.instance_path());
+    if matches!(
+        error.kind(),
+        ValidationErrorKind::AdditionalProperties { .. }
+    ) {
+        return Vec::new();
     }
+    vec![PolicyError {
+        code: POLICY_VALIDATION_CODE.to_string(),
+        instance_path: parent_path,
+        message: error.to_string(),
+    }]
+}
+
+fn unknown_field_errors(config: &Value, schema: &Value) -> Vec<PolicyError> {
+    let Some(definitions) = schema.get("definitions").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut errors = BTreeMap::new();
+    collect_unknown_fields(config, schema, definitions, "", &mut errors);
+    errors.into_values().collect()
+}
+
+fn collect_unknown_fields(
+    instance: &Value,
+    schema: &Value,
+    definitions: &Map<String, Value>,
+    instance_path: &str,
+    errors: &mut BTreeMap<String, PolicyError>,
+) {
+    if let Some(instance_array) = instance.as_array() {
+        let item_schemas = array_item_schemas(schema, definitions);
+        for (index, item) in instance_array.iter().enumerate() {
+            let item_path = join_pointer_path(instance_path, &index.to_string());
+            for item_schema in &item_schemas {
+                collect_unknown_fields(item, item_schema, definitions, &item_path, errors);
+            }
+        }
+        return;
+    }
+    let Some(instance_object) = instance.as_object() else {
+        return;
+    };
+    let candidates = object_schema_candidates(schema, definitions);
+    if candidates.is_empty() {
+        return;
+    }
+
+    for (field, child) in instance_object {
+        let child_path = join_pointer_path(instance_path, field);
+        let child_schemas = candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .and_then(|properties| properties.get(field))
+            })
+            .collect::<Vec<_>>();
+        if child_schemas.is_empty()
+            && candidates
+                .iter()
+                .all(|candidate| candidate.get("additionalProperties") == Some(&Value::Bool(false)))
+        {
+            errors.insert(
+                child_path.clone(),
+                PolicyError {
+                    code: POLICY_UNKNOWN_FIELD_CODE.to_string(),
+                    instance_path: child_path,
+                    message: format!("unknown policy field `{field}`"),
+                },
+            );
+            continue;
+        }
+        for child_schema in child_schemas {
+            collect_unknown_fields(child, child_schema, definitions, &child_path, errors);
+        }
+    }
+}
+
+fn object_schema_candidates<'a>(
+    schema: &'a Value,
+    definitions: &'a Map<String, Value>,
+) -> Vec<&'a Value> {
+    if let Some(name) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix("#/definitions/"))
+    {
+        return definitions.get(name).map_or_else(Vec::new, |definition| {
+            object_schema_candidates(definition, definitions)
+        });
+    }
+    if schema.get("properties").is_some() {
+        return vec![schema];
+    }
+    for union_key in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(union_key).and_then(Value::as_array) {
+            return branches
+                .iter()
+                .flat_map(|branch| object_schema_candidates(branch, definitions))
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn array_item_schemas<'a>(
+    schema: &'a Value,
+    definitions: &'a Map<String, Value>,
+) -> Vec<&'a Value> {
+    if let Some(name) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix("#/definitions/"))
+    {
+        return definitions.get(name).map_or_else(Vec::new, |definition| {
+            array_item_schemas(definition, definitions)
+        });
+    }
+    if let Some(items) = schema.get("items") {
+        return vec![items];
+    }
+    for union_key in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(union_key).and_then(Value::as_array) {
+            return branches
+                .iter()
+                .flat_map(|branch| array_item_schemas(branch, definitions))
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 fn normalized_schema_bytes(schema: &Value) -> Result<Vec<u8>, PolicyError> {
@@ -283,8 +402,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_top_level_field_reports_its_instance_path() {
+    fn required_null_config() -> Value {
         let schema_json: Value =
             serde_json::from_slice(super::SCHEMA_BYTES).expect("schema parses");
         let mut config = Value::Object(Map::new());
@@ -297,14 +415,62 @@ mod tests {
             }
         }
         config
+    }
+
+    #[test]
+    fn multiple_unknown_top_level_fields_report_each_instance_path() {
+        let mut config = required_null_config();
+        config
             .as_object_mut()
             .expect("config object")
-            .insert("unexpectedTopLevelField".to_string(), json!(true));
+            .insert("firstUnexpectedField".to_string(), json!(true));
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert("secondUnexpectedField".to_string(), json!(true));
+        let errors = validate_config(&config).expect_err("expected validation failure");
+        let paths = errors
+            .iter()
+            .filter(|error| error.code == super::POLICY_UNKNOWN_FIELD_CODE)
+            .map(|error| error.instance_path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            paths,
+            BTreeSet::from(["/firstUnexpectedField", "/secondUnexpectedField"])
+        );
+    }
+
+    #[test]
+    fn unknown_nested_field_reports_its_instance_path() {
+        let mut config = required_null_config();
+        config.as_object_mut().expect("config object").insert(
+            "runtimeConfig".to_string(),
+            json!({"unexpected/nested~field": true}),
+        );
         let errors = validate_config(&config).expect_err("expected validation failure");
         assert!(
-            errors
-                .iter()
-                .any(|error| error.instance_path == "/unexpectedTopLevelField")
+            errors.iter().any(|error| {
+                error.code == super::POLICY_UNKNOWN_FIELD_CODE
+                    && error.instance_path == "/runtimeConfig/unexpected~1nested~0field"
+            }),
+            "validation errors: {errors:#?}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_in_array_element_reports_its_instance_path() {
+        let mut config = required_null_config();
+        config.as_object_mut().expect("config object").insert(
+            "network".to_string(),
+            json!({"egress": {"allow": [{"to": "example.com", "unexpected": true}]}}),
+        );
+        let errors = validate_config(&config).expect_err("expected validation failure");
+        assert!(
+            errors.iter().any(|error| {
+                error.code == super::POLICY_UNKNOWN_FIELD_CODE
+                    && error.instance_path == "/network/egress/allow/0/unexpected"
+            }),
+            "validation errors: {errors:#?}"
         );
     }
 }
