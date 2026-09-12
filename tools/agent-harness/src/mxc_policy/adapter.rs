@@ -683,6 +683,25 @@ mod tests {
     }
 
     #[test]
+    fn minimal_valid_config_accepts_all_unsupported_sections_absent() {
+        let config = base("provision");
+        let object = config.as_object().expect("base config object");
+        for field in [
+            "experimental",
+            "fallback",
+            "lifecycle",
+            "lxc",
+            "processContainer",
+            "seatbelt",
+            "telemetry",
+            "ui",
+        ] {
+            assert!(!object.contains_key(field), "{field} must be absent");
+        }
+        assert!(adapt(&config).is_ok());
+    }
+
+    #[test]
     fn phase_payloads_are_restricted() {
         let mut provision = base("provision");
         insert(&mut provision, "process", json!({"commandLine": "true"}));
