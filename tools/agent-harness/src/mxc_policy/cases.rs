@@ -19,6 +19,7 @@ const CASES_BYTES: &[u8] = include_bytes!("../../fixtures/mxc-policy/cases.json"
 const SCHEMA_VERSION: &str = "0.9.0-dev";
 const SCHEMA_BYTES: &[u8] = include_bytes!("../../schemas/mxc-config.schema.0.9.0-dev.json");
 static CORPUS_OUTPUT_NONCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
 static CORPUS_SCHEMA_VALIDATOR: OnceLock<Result<jsonschema::Validator, PolicyError>> =
     OnceLock::new();
 static CORPUS_SCHEMA_VALUE: OnceLock<Value> = OnceLock::new();
@@ -1555,6 +1556,7 @@ fn corpus_schema_value() -> &'static Value {
     })
 }
 
+#[cfg(test)]
 fn corpus_schema_validator() -> Result<&'static jsonschema::Validator, PolicyError> {
     CORPUS_SCHEMA_VALIDATOR
         .get_or_init(|| {
@@ -1577,6 +1579,7 @@ fn corpus_schema_validator() -> Result<&'static jsonschema::Validator, PolicyErr
         .map_err(Clone::clone)
 }
 
+#[cfg(test)]
 fn first_direct_schema_error(config: &Value) -> Option<PolicyError> {
     let validator = match corpus_schema_validator() {
         Ok(validator) => validator,
@@ -1591,6 +1594,77 @@ fn first_direct_schema_error(config: &Value) -> Option<PolicyError> {
     })
 }
 
+fn expected_outcome_for_entry(
+    entry: &CatalogEntry,
+) -> (ExpectedDisposition, Option<String>, Option<String>) {
+    let key = entry.key;
+    if key == "cross.version.must_equal_0.9.0-dev"
+        || key == "version#absent"
+        || key == "version#nullable"
+    {
+        return rejected_expectation("invalid_value", "/version");
+    }
+    if key.starts_with("containment#")
+        && entry
+            .expected_instance_behavior()
+            .eq(&ExpectedInstanceBehavior::Rejected)
+    {
+        return rejected_expectation("invalid_value", "/containment");
+    }
+    if matches!(
+        key,
+        "phase#absent" | "phase#nullable" | "phase#anyOf[1]=null"
+    ) {
+        return rejected_expectation("invalid_phase", "/phase");
+    }
+    if matches!(
+        key,
+        "process#absent" | "process#nullable" | "process#anyOf[1]=null"
+    ) {
+        return rejected_expectation("invalid_phase", "/process");
+    }
+    if matches!(
+        key,
+        "process.commandLine#absent" | "process.commandLine#nullable"
+    ) {
+        return rejected_expectation("invalid_value", "/process/commandLine");
+    }
+    if key == "sandboxId" || key == "cross.phase.non_provision_requires_sandbox_id" {
+        return rejected_expectation("invalid_phase", "/sandboxId");
+    }
+    if entry.disposition == PolicyDisposition::Rejected {
+        let (path, _) = parse_key(key);
+        return rejected_expectation("unsupported_field", &unsupported_contract_path(path));
+    }
+    (ExpectedDisposition::Accepted, None, None)
+}
+
+fn rejected_expectation(
+    code: &str,
+    path: &str,
+) -> (ExpectedDisposition, Option<String>, Option<String>) {
+    (
+        ExpectedDisposition::Rejected,
+        Some(code.to_string()),
+        Some(path.to_string()),
+    )
+}
+
+fn unsupported_contract_path(path: &str) -> String {
+    if path.starts_with("filesystem.deniedPaths") {
+        return "/filesystem/deniedPaths".to_string();
+    }
+    if let Some(network_path) = path.strip_prefix("network.") {
+        let field = network_path
+            .split(['.', '['])
+            .next()
+            .unwrap_or(network_path);
+        return format!("/network/{field}");
+    }
+    format!("/{}", path.split(['.', '[']).next().unwrap_or(path))
+}
+
+#[cfg(test)]
 fn expected_outcome_from_contract(
     config: &Value,
 ) -> (ExpectedDisposition, Option<String>, Option<String>) {
@@ -1611,6 +1685,7 @@ fn expected_outcome_from_contract(
     (ExpectedDisposition::Accepted, None, None)
 }
 
+#[cfg(test)]
 fn contract_error(config: &Value) -> Option<PolicyError> {
     let object = config.as_object()?;
     if object.get("version").and_then(Value::as_str) != Some(SCHEMA_VERSION) {
@@ -1802,6 +1877,7 @@ fn contract_error(config: &Value) -> Option<PolicyError> {
     None
 }
 
+#[cfg(test)]
 fn is_valid_loopback_proxy(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
@@ -1819,6 +1895,7 @@ fn is_valid_loopback_proxy(value: &str) -> bool {
         && endpoint_only
 }
 
+#[cfg(test)]
 fn explicit_url_port(value: &str) -> Option<u16> {
     let authority = value.split_once("://")?.1.split(['/', '?', '#']).next()?;
     let port = if authority.starts_with('[') {
@@ -1829,6 +1906,7 @@ fn explicit_url_port(value: &str) -> Option<u16> {
     port.parse().ok()
 }
 
+#[cfg(test)]
 fn is_proxy_environment_key(entry: &str) -> bool {
     entry
         .split_once('=')
@@ -1864,6 +1942,37 @@ mod tests {
             .filter(|result| !result.passed)
             .collect::<Vec<_>>();
         assert!(failures.is_empty(), "static case failures: {failures:#?}");
+    }
+
+    #[test]
+    fn generated_structural_cases_are_schema_valid() {
+        let cases = generated_corpus();
+        for case in cases {
+            assert_eq!(
+                first_direct_schema_error(&case.config),
+                None,
+                "generated structural case {} must satisfy the vendored MXC schema",
+                case.id
+            );
+            assert_ne!(case.expected_code.as_deref(), Some("schema_validation"));
+        }
+    }
+
+    #[test]
+    fn reviewed_expectations_match_independent_contract_oracle() {
+        for case in generated_corpus() {
+            let actual = expected_outcome_from_contract(&case.config);
+            let expected = (
+                case.expected_disposition,
+                case.expected_code.clone(),
+                case.expected_path.clone(),
+            );
+            assert_eq!(
+                expected, actual,
+                "reviewed expectation drifted for generated case {}",
+                case.id
+            );
+        }
     }
 
     #[test]
