@@ -196,7 +196,6 @@ pub fn discover_artifacts(
 ) -> Result<LaunchArtifacts, MissingPrerequisite> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("..")
         .join("..");
     let openvmm_exe = overrides.openvmm_exe.clone().unwrap_or_else(|| {
         repo_root
@@ -1276,10 +1275,44 @@ mod tests {
         let root = std::env::temp_dir().join(format!("launch-discovery-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create temp root");
-        let result = discover_artifacts(&root, &LaunchOverrides::default());
+        let overrides = LaunchOverrides {
+            openvmm_exe: Some(root.join("missing-openvmm.exe")),
+            ..LaunchOverrides::default()
+        };
+        let result = discover_artifacts(&root, &overrides);
         assert!(result.is_err());
         let error = result.expect_err("missing openvmm expected");
-        assert!(!error.field.is_empty());
+        assert_eq!(error.field, "openvmm_exe");
+    }
+
+    #[test]
+    fn artifact_discovery_reports_missing_kernel_with_explicit_overrides() {
+        let root = std::env::temp_dir().join(format!(
+            "launch-discovery-missing-kernel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let openvmm = root.join(if cfg!(windows) {
+            "openvmm.exe"
+        } else {
+            "openvmm"
+        });
+        let initramfs = root.join(DEFAULT_INITRAMFS);
+        std::fs::write(&openvmm, b"openvmm").expect("seed openvmm");
+        std::fs::write(&initramfs, b"initramfs").expect("seed initramfs");
+        let overrides = LaunchOverrides {
+            openvmm_exe: Some(openvmm),
+            kernel: Some(root.join("missing-vmlinux")),
+            mxc_initramfs: Some(initramfs),
+            common_root: Some(root.join("common-root")),
+            portable_network: None,
+        };
+        let result = discover_artifacts(&root, &overrides);
+        assert!(result.is_err());
+        let error = result.expect_err("missing kernel expected");
+        assert_eq!(error.field, "kernel");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

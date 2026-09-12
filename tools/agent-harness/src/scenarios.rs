@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use crate::client::{ClientError, MxcAgentClient};
 use crate::launch::{LaunchedVm, build_launch_plan, discover_artifacts, launch_whp_vm};
+#[cfg(windows)]
+use crate::mxc_policy::{NvxProvisionPolicy, adapt_policy};
 use crate::{
     CANONICAL_SCENARIOS, CheckOutcome, EvidenceCheckStatus, EvidenceSource, HarnessOptions,
     ScenarioDefinition,
@@ -233,7 +235,9 @@ static LIVE_STATE: OnceLock<Mutex<LiveHarnessState>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub(crate) struct PolicyLiveEvidence {
-    pub passed: bool,
+    pub positive_passed: bool,
+    pub negative_passed: bool,
+    pub blocked: bool,
     pub evidence: Vec<String>,
     pub error: Option<String>,
 }
@@ -251,51 +255,95 @@ struct PolicyNetworkReport {
 pub(crate) fn run_live_policy_process_profiles(
     options: &HarnessOptions,
 ) -> BTreeMap<String, PolicyLiveEvidence> {
-    let mut state = fresh_policy_live_state();
     let mut results = BTreeMap::new();
-    if let Err(error) = ensure_live_initialized(&mut state, options) {
-        for id in ["process-shell", "proxy-environment"] {
-            results.insert(
-                id.to_string(),
-                PolicyLiveEvidence {
-                    passed: false,
-                    evidence: Vec::new(),
-                    error: Some(format!("live WHP bootstrap failed: {error}")),
-                },
-            );
-        }
-        return results;
-    }
-    let process = run_policy_shell_contract(&mut state);
-    let proxy = run_policy_proxy_contract(&mut state);
-    results.insert("process-shell".to_string(), process);
-    results.insert("proxy-environment".to_string(), proxy);
-    if let Err(error) = teardown_live_session(&mut state) {
-        for result in results.values_mut() {
-            result.passed = false;
-            result.error = Some(format!(
-                "{}; teardown failed: {error}",
-                result.error.as_deref().unwrap_or("profile checks passed")
-            ));
-        }
-    }
+    results.insert(
+        "filesystem-rw-ro".to_string(),
+        run_policy_profile_with_session(options, run_policy_filesystem_contract),
+    );
+    results.insert(
+        "process-shell".to_string(),
+        run_policy_profile_with_session(options, run_policy_shell_contract),
+    );
+    results.insert(
+        "proxy-environment".to_string(),
+        run_policy_profile_with_session(options, run_policy_proxy_contract),
+    );
+    results.insert(
+        "control-lifecycle".to_string(),
+        run_policy_profile_with_session(options, run_policy_control_lifecycle_contract),
+    );
     results
 }
 
 #[cfg(windows)]
-pub(crate) fn run_live_policy_network_profile(options: &HarnessOptions) -> PolicyLiveEvidence {
-    policy_live_evidence((|| {
-        let mut no_nic_state = fresh_policy_live_state();
-        ensure_live_initialized(&mut no_nic_state, options)?;
-        let no_nic = run_network_probe(&mut no_nic_state, 1_321, Some("192.0.2.1:9"))?;
-        teardown_live_session(&mut no_nic_state)?;
-        if !no_nic.non_loopback_interfaces.is_empty()
-            || no_nic.has_default_route
-            || no_nic.outbound_connect_succeeded != Some(false)
-        {
-            return Err(format!("no-NIC negative probe failed: {no_nic:?}"));
-        }
+fn run_policy_profile_with_session(
+    options: &HarnessOptions,
+    check: fn(&mut LiveHarnessState) -> PolicyLiveEvidence,
+) -> PolicyLiveEvidence {
+    let mut state = fresh_policy_live_state();
+    let init = (|| -> Result<(), String> {
+        ensure_live_initialized(&mut state, options)
+            .map_err(|error| format!("live WHP bootstrap failed: {error}"))?;
+        ensure_policy_probe_capabilities(&mut state)
+    })();
+    let mut result = match init {
+        Ok(()) => check(&mut state),
+        Err(error) => policy_live_result_from_error(error),
+    };
+    if let Err(teardown_error) = teardown_live_session(&mut state) {
+        append_policy_teardown_failure(&mut result, teardown_error);
+    }
+    result
+}
 
+#[cfg(windows)]
+fn run_with_policy_live_session<T>(
+    options: &HarnessOptions,
+    check: impl FnOnce(&mut LiveHarnessState) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut state = fresh_policy_live_state();
+    let run = (|| -> Result<T, String> {
+        ensure_live_initialized(&mut state, options)
+            .map_err(|error| format!("live WHP bootstrap failed: {error}"))?;
+        ensure_policy_probe_capabilities(&mut state)?;
+        check(&mut state)
+    })();
+    let teardown = teardown_live_session(&mut state);
+    merge_with_teardown(run, teardown)
+}
+
+#[cfg(windows)]
+fn merge_with_teardown<T>(
+    run: Result<T, String>,
+    teardown: Result<(), String>,
+) -> Result<T, String> {
+    match (run, teardown) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(teardown_error)) => Err(format!("teardown failed: {teardown_error}")),
+        (Err(error), Err(teardown_error)) => {
+            Err(format!("{error}; teardown failed: {teardown_error}"))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn append_policy_teardown_failure(result: &mut PolicyLiveEvidence, teardown_error: String) {
+    let prefix = result
+        .error
+        .clone()
+        .unwrap_or_else(|| "profile assertions completed".to_string());
+    let teardown_text = format!("teardown failed: {teardown_error}");
+    result.positive_passed = false;
+    result.negative_passed = false;
+    result.blocked = false;
+    result.error = Some(format!("{prefix}; {teardown_text}"));
+}
+
+#[cfg(windows)]
+pub(crate) fn run_live_policy_network_profile(options: &HarnessOptions) -> PolicyLiveEvidence {
+    let mut positive_evidence = Vec::new();
+    let positive = (|| {
         let listener = TcpListener::bind("0.0.0.0:0")
             .map_err(|error| format!("controlled outbound listener bind failed: {error}"))?;
         listener
@@ -318,51 +366,127 @@ pub(crate) fn run_live_policy_network_profile(options: &HarnessOptions) -> Polic
             }
             false
         });
-        let mut portable_options = options.clone();
-        portable_options.output_dir = options.output_dir.join("portable-network-profile");
-        let mut overrides = portable_options
-            .launch_overrides
-            .clone()
-            .unwrap_or_default();
-        overrides.common_root = Some(
-            options
-                .output_dir
-                .join("portable-network-profile")
-                .join("common-root"),
-        );
-        overrides.portable_network = Some("10.0.0.2/24".to_string());
-        portable_options.launch_overrides = Some(overrides);
-        let mut portable_state = fresh_policy_live_state();
-        ensure_live_initialized(&mut portable_state, &portable_options)?;
+        let mut allow_options = options.clone();
+        allow_options.output_dir = options.output_dir.join("network-allow-profile");
+        let mut allow_overrides = allow_options.launch_overrides.clone().unwrap_or_default();
+        let allow_root = allow_options.output_dir.join("common-root");
+        allow_overrides.common_root = Some(allow_root.clone());
+        let allow_provision = adapt_live_provision_policy(
+            "policy-live-network-allow",
+            &allow_root,
+            serde_json::json!({
+                "allowedHosts": ["10.0.0.1"],
+                "defaultPolicy": "allow"
+            }),
+        )?;
+        allow_overrides.portable_network =
+            portable_network_override_from_provision(&allow_provision)?;
+        allow_options.launch_overrides = Some(allow_overrides);
         let endpoint = format!("10.0.0.1:{port}");
-        let portable = run_network_probe(&mut portable_state, 1_322, Some(&endpoint))?;
-        teardown_live_session(&mut portable_state)?;
+        let allow_report = run_with_policy_live_session(&allow_options, |state| {
+            run_network_probe(state, 1_322, Some(&endpoint))
+        })?;
         let accepted = acceptor
             .join()
             .map_err(|_| "controlled outbound listener thread panicked".to_string())?;
-        if portable.non_loopback_interfaces.is_empty()
-            || !portable.has_default_route
-            || portable.dns_servers.is_empty()
-            || portable.outbound_connect_succeeded != Some(true)
+        if allow_report.non_loopback_interfaces.is_empty()
+            || !allow_report.has_default_route
+            || allow_report.dns_servers.is_empty()
+            || allow_report.outbound_connect_succeeded != Some(true)
             || !accepted
         {
             return Err(format!(
-                "portable-network positive probe failed: report={portable:?} hostAccepted={accepted}"
+                "allow/default-allow network probe failed: report={allow_report:?} hostAccepted={accepted}"
             ));
         }
-        Ok(vec![
-            "no-NIC live profile exposed no non-loopback interface/default route and rejected an outbound connect".to_string(),
-            format!(
-                "portable-network live profile exposed interface/route/DNS and reached controlled host endpoint {endpoint}"
-            ),
-        ])
-    })())
+        positive_evidence.push(format!(
+            "defaultPolicy=allow (allowedHosts set) produced portable network and reached controlled host endpoint {endpoint}"
+        ));
+        Ok(())
+    })();
+
+    let mut negative_evidence = Vec::new();
+    let negative = (|| {
+        let mut block_options = options.clone();
+        block_options.output_dir = options.output_dir.join("network-block-profile");
+        let mut block_overrides = block_options.launch_overrides.clone().unwrap_or_default();
+        let block_root = block_options.output_dir.join("common-root");
+        block_overrides.common_root = Some(block_root.clone());
+        let block_provision = adapt_live_provision_policy(
+            "policy-live-network-block",
+            &block_root,
+            serde_json::json!({
+                "blockedHosts": ["10.0.0.1"],
+                "defaultPolicy": "block"
+            }),
+        )?;
+        block_overrides.portable_network =
+            portable_network_override_from_provision(&block_provision)?;
+        block_options.launch_overrides = Some(block_overrides);
+        let block_report = run_with_policy_live_session(&block_options, |state| {
+            run_network_probe(state, 1_321, Some("192.0.2.1:9"))
+        })?;
+        if !block_report.non_loopback_interfaces.is_empty()
+            || block_report.has_default_route
+            || !block_report.dns_servers.is_empty()
+            || block_report.outbound_connect_succeeded != Some(false)
+        {
+            return Err(format!(
+                "defaultPolicy=block negative probe failed: {block_report:?}"
+            ));
+        }
+        negative_evidence.push(
+            "defaultPolicy=block (blockedHosts set) produced no-NIC posture and rejected outbound connect"
+                .to_string(),
+        );
+
+        let mut absent_options = options.clone();
+        absent_options.output_dir = options.output_dir.join("network-default-absent-profile");
+        let mut absent_overrides = absent_options.launch_overrides.clone().unwrap_or_default();
+        let absent_root = absent_options.output_dir.join("common-root");
+        absent_overrides.common_root = Some(absent_root.clone());
+        let absent_provision = adapt_live_provision_policy(
+            "policy-live-network-default-absent",
+            &absent_root,
+            serde_json::json!({
+                "allowedHosts": ["10.0.0.1"]
+            }),
+        )?;
+        absent_overrides.portable_network =
+            portable_network_override_from_provision(&absent_provision)?;
+        absent_options.launch_overrides = Some(absent_overrides);
+        let absent_report = run_with_policy_live_session(&absent_options, |state| {
+            run_network_probe(state, 1_323, Some("192.0.2.1:9"))
+        })?;
+        if !absent_report.non_loopback_interfaces.is_empty()
+            || absent_report.has_default_route
+            || !absent_report.dns_servers.is_empty()
+            || absent_report.outbound_connect_succeeded != Some(false)
+        {
+            return Err(format!(
+                "defaultPolicy absent negative probe failed: {absent_report:?}"
+            ));
+        }
+        negative_evidence.push(
+            "defaultPolicy absent remained non-portable (no-NIC) and rejected outbound connect"
+                .to_string(),
+        );
+        Ok(())
+    })();
+
+    policy_live_assertions(
+        positive,
+        negative,
+        [positive_evidence, negative_evidence].concat(),
+    )
 }
 
 #[cfg(not(windows))]
 pub(crate) fn run_live_policy_network_profile(_options: &HarnessOptions) -> PolicyLiveEvidence {
     PolicyLiveEvidence {
-        passed: false,
+        positive_passed: false,
+        negative_passed: false,
+        blocked: true,
         evidence: Vec::new(),
         error: Some("live WHP policy profiles require Windows".to_string()),
     }
@@ -372,19 +496,26 @@ pub(crate) fn run_live_policy_network_profile(_options: &HarnessOptions) -> Poli
 pub(crate) fn run_live_policy_process_profiles(
     _options: &HarnessOptions,
 ) -> BTreeMap<String, PolicyLiveEvidence> {
-    ["process-shell", "proxy-environment"]
-        .into_iter()
-        .map(|id| {
-            (
-                id.to_string(),
-                PolicyLiveEvidence {
-                    passed: false,
-                    evidence: Vec::new(),
-                    error: Some("live WHP policy profiles require Windows".to_string()),
-                },
-            )
-        })
-        .collect()
+    [
+        "filesystem-rw-ro",
+        "process-shell",
+        "proxy-environment",
+        "control-lifecycle",
+    ]
+    .into_iter()
+    .map(|id| {
+        (
+            id.to_string(),
+            PolicyLiveEvidence {
+                positive_passed: false,
+                negative_passed: false,
+                blocked: true,
+                evidence: Vec::new(),
+                error: Some("live WHP policy profiles require Windows".to_string()),
+            },
+        )
+    })
+    .collect()
 }
 
 #[cfg(windows)]
@@ -631,7 +762,7 @@ fn ensure_live_initialized(
             symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
             reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
         };
-        let req9_mappings = req9_legitimate_mappings()?;
+        let req9_mappings = req9_legitimate_mappings(&common_root)?;
         let vm = launch_whp_vm(plan)?;
         let pid = vm.process_id();
         let expected_image = vm.plan.artifacts.openvmm_exe.to_string_lossy().into_owned();
@@ -762,19 +893,13 @@ fn ensure_live_initialized(
 }
 
 #[cfg(windows)]
-fn req9_legitimate_mappings() -> Result<Vec<ChildMapping>, String> {
-    Ok(vec![
-        ChildMapping {
-            child: RelativeChildPath::parse(RW_CHILD.to_string())
-                .map_err(|error| format!("invalid rw mapping child path: {error}"))?,
-            access: AccessMode::ReadWrite,
-        },
-        ChildMapping {
-            child: RelativeChildPath::parse(RO_CHILD.to_string())
-                .map_err(|error| format!("invalid ro mapping child path: {error}"))?,
-            access: AccessMode::ReadOnly,
-        },
-    ])
+fn req9_legitimate_mappings(common_root: &Path) -> Result<Vec<ChildMapping>, String> {
+    let provision = adapt_live_provision_policy(
+        "policy-live-provision-mappings",
+        common_root,
+        serde_json::Value::Null,
+    )?;
+    Ok(provision.mappings)
 }
 
 #[cfg(windows)]
@@ -2620,7 +2745,7 @@ fn run_req11_shutdown_validation_session(session: &mut LiveWhpSession) -> Result
                     nonce: vm.plan.launch_nonce,
                 },
                 root,
-                mappings: req9_legitimate_mappings()?,
+                mappings: req9_legitimate_mappings(&vm.plan.artifacts.common_root)?,
                 containment: MappingContainmentPolicy {
                     symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
                     reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
@@ -2720,7 +2845,7 @@ fn run_req11_shutdown_validation_session(session: &mut LiveWhpSession) -> Result
             let remaining =
                 remaining_until(shutdown_deadline, "req11 guest shutdown channel close")?;
             match client.poll_agent_control(remaining) {
-                Err(ClientError::Control(_) | ClientError::ControlOperation { .. }) => break true,
+                Err(error) if is_expected_channel_close_error(&error) => break true,
                 Err(error) => {
                     return Err(format!(
                         "req11 shutdown channel observation failed: {error}"
@@ -2950,6 +3075,34 @@ fn remaining_until(deadline: Instant, context: &str) -> Result<Duration, String>
         return Err(format!("deadline exhausted while waiting for {context}"));
     }
     Ok(deadline.saturating_duration_since(now))
+}
+
+#[cfg(windows)]
+fn is_expected_channel_close_error(error: &ClientError) -> bool {
+    match error {
+        ClientError::Control(source) | ClientError::ControlOperation { source, .. } => {
+            is_expected_channel_close_session_error(source)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn is_expected_channel_close_session_error(source: &SessionError) -> bool {
+    match source {
+        SessionError::Closed => true,
+        SessionError::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+        ),
+        SessionError::Protocol(_)
+        | SessionError::DeadlineExceeded(_)
+        | SessionError::SequenceMismatch { .. }
+        | SessionError::SessionIdentityMismatch
+        | SessionError::UnexpectedRecordType(_) => false,
+    }
 }
 
 #[cfg(windows)]
@@ -3298,8 +3451,64 @@ fn start_probe_exec(
 }
 
 #[cfg(windows)]
+const POLICY_SCHEMA_VERSION: &str = "0.9.0-dev";
+#[cfg(windows)]
+const POLICY_PROBE_CAPABILITY_VERSION: &str = "policy-suite-capabilities-v1";
+#[cfg(windows)]
+const POLICY_REQUIRED_PROBE_COMMANDS: &[&str] = &[
+    "capabilities-json",
+    "mapping-check",
+    "network-policy-json",
+    "spawn-tree",
+    "check-pids-gone",
+];
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+struct PolicyProbeCapabilitiesReport {
+    version: String,
+    supported_commands: Vec<String>,
+}
+
+#[cfg(windows)]
+fn run_policy_filesystem_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence {
+    let outcome = run_req9_mapping_containment(state);
+    match outcome.check_status {
+        EvidenceCheckStatus::Pass => PolicyLiveEvidence {
+            positive_passed: true,
+            negative_passed: true,
+            blocked: false,
+            evidence: outcome.evidence,
+            error: None,
+        },
+        EvidenceCheckStatus::NotRun => PolicyLiveEvidence {
+            positive_passed: false,
+            negative_passed: false,
+            blocked: true,
+            evidence: Vec::new(),
+            error: Some(outcome.error.unwrap_or_else(|| {
+                "filesystem-rw-ro profile was not run and returned no detail".to_string()
+            })),
+        },
+        EvidenceCheckStatus::Fail => PolicyLiveEvidence {
+            positive_passed: false,
+            negative_passed: false,
+            blocked: false,
+            evidence: Vec::new(),
+            error: Some(outcome.error.unwrap_or_else(|| {
+                "filesystem-rw-ro profile failed without error detail".to_string()
+            })),
+        },
+    }
+}
+
+#[cfg(windows)]
 fn run_policy_shell_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence {
-    let result = (|| {
+    if state.session.is_none() {
+        return policy_live_blocked("live session unavailable".to_string());
+    }
+    let mut evidence = Vec::new();
+    let positive = (|| {
         let session = state
             .session
             .as_mut()
@@ -3322,6 +3531,10 @@ fn run_policy_shell_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence
                 String::from_utf8_lossy(&observed.stdout)
             ));
         }
+        evidence.push(
+            "live /bin/sh -c preserved quoting, expansion, explicit cwd, and environment"
+                .to_string(),
+        );
         let nonzero = run_policy_command(
             session,
             1_302,
@@ -3337,61 +3550,110 @@ fn run_policy_shell_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence
                 nonzero.disposition
             ));
         }
-        let timeout = run_policy_command(
-            session,
-            1_303,
-            "sleep 30 & echo $! > /mnt/virtiofs/rw/policy-timeout.pid; wait",
-            None,
-            Vec::new(),
-            Some(250),
-            Duration::from_secs(10),
-        )?;
-        if timeout.disposition != Some(ExecDisposition::TimedOut) || timeout.termination.is_none() {
-            return Err(format!(
-                "timeout did not terminate the shell tree: disposition={:?} termination={:?}",
-                timeout.disposition, timeout.termination
-            ));
+        evidence.push("live shell preserved nonzero exit code 23".to_string());
+        if !run_timeout_tree_exec(session, 1_303, true, 250)? {
+            return Err(
+                "timeout workload did not prove child+grandchild cleanup and terminal ordering"
+                    .to_string(),
+            );
         }
-        let descendant = run_policy_command(
-            session,
-            1_304,
-            "pid=$(cat /mnt/virtiofs/rw/policy-timeout.pid) && test ! -d \"/proc/$pid\"",
-            None,
-            Vec::new(),
-            None,
-            Duration::from_secs(10),
-        )?;
-        if descendant.disposition != Some(ExecDisposition::ExitCode(0)) {
-            return Err(format!(
-                "timed-out shell descendant remained visible: {:?}",
-                descendant.disposition
-            ));
-        }
-        Ok(vec![
-            "live /bin/sh -c preserved quoting, expansion, explicit cwd, and environment"
-                .to_string(),
-            "live shell preserved nonzero exit code 23".to_string(),
-            "live timeout terminated the shell process tree before terminal delivery".to_string(),
-        ])
+        evidence.push(
+            "timeout command used child+grandchild probe and confirmed descendants-cleaned before terminal plus post-terminal pid-gone verification".to_string(),
+        );
+        Ok(())
     })();
-    policy_live_evidence(result)
+    let negative = (|| {
+        let session = state
+            .session
+            .as_ref()
+            .ok_or_else(|| "live session unavailable".to_string())?;
+        let empty = adapt_policy(
+            "policy-live-empty-command",
+            &policy_exec_config("", None, Vec::new(), None, None),
+            &session.vm.plan.artifacts.common_root,
+        );
+        let empty = match empty {
+            Ok(_) => {
+                return Err(
+                    "empty command was accepted, expected adapter rejection at /process/commandLine"
+                        .to_string(),
+                );
+            }
+            Err(errors) => errors,
+        };
+        let command_line_rejected = empty.iter().any(|error| {
+            error.instance_path == "/process/commandLine"
+                && (error.code == "invalid_value" || error.code == "schema_validation")
+        });
+        if !command_line_rejected {
+            return Err(format!(
+                "empty command rejection did not point to /process/commandLine: {empty:?}"
+            ));
+        }
+        evidence.push(
+            "empty command was rejected by adapter at /process/commandLine as required".to_string(),
+        );
+        Ok(())
+    })();
+    policy_live_assertions(positive, negative, evidence)
 }
 
 #[cfg(windows)]
 fn run_policy_proxy_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence {
-    let result = (|| {
+    let mut evidence = Vec::new();
+    let positive = (|| {
         let session = state
             .session
             .as_mut()
             .ok_or_else(|| "live session unavailable".to_string())?;
         let command = "printf '%s|%s|%s|%s|%s' \"${HTTP_PROXY-unset}\" \"${HTTPS_PROXY-unset}\" \"${http_proxy-unset}\" \"${https_proxy-unset}\" \"${NO_PROXY-unset}\"";
-        let absent = run_policy_command(
+        let proxy = "http://127.0.0.1:18080";
+        let config = policy_exec_config(command, None, Vec::new(), None, Some(proxy));
+        let adapted = adapt_policy(
+            "policy-live-proxy-env",
+            &config,
+            &session.vm.plan.artifacts.common_root,
+        )
+        .map_err(|errors| format!("policy adapter rejected proxy config: {errors:?}"))?;
+        let exec = adapted.exec.ok_or_else(|| {
+            "policy adapter did not emit exec policy for proxy profile".to_string()
+        })?;
+        let expected_http = exec
+            .env
+            .iter()
+            .find_map(|entry| entry.strip_prefix("HTTP_PROXY="))
+            .ok_or_else(|| "adapted exec env omitted HTTP_PROXY".to_string())?;
+        let expected_https = exec
+            .env
+            .iter()
+            .find_map(|entry| entry.strip_prefix("HTTPS_PROXY="))
+            .ok_or_else(|| "adapted exec env omitted HTTPS_PROXY".to_string())?;
+        let injected =
+            run_policy_exec_from_adapter(session, 1_312, config, Duration::from_secs(10))?;
+        let expected = format!("{expected_http}|{expected_https}|unset|unset|unset");
+        if injected.stdout != expected.as_bytes()
+            || injected.disposition != Some(ExecDisposition::ExitCode(0))
+        {
+            return Err(format!(
+                "proxy variables were not injected exactly from runtimeConfig.networkProxy: {:?}",
+                String::from_utf8_lossy(&injected.stdout)
+            ));
+        }
+        evidence.push(
+            "runtimeConfig.networkProxy explicit-port loopback URL projected exactly into HTTP_PROXY/HTTPS_PROXY for live exec environment".to_string(),
+        );
+        Ok(())
+    })();
+    let negative = (|| {
+        let session = state
+            .session
+            .as_mut()
+            .ok_or_else(|| "live session unavailable".to_string())?;
+        let command = "printf '%s|%s|%s|%s|%s' \"${HTTP_PROXY-unset}\" \"${HTTPS_PROXY-unset}\" \"${http_proxy-unset}\" \"${https_proxy-unset}\" \"${NO_PROXY-unset}\"";
+        let absent = run_policy_exec_from_adapter(
             session,
             1_311,
-            command,
-            None,
-            Vec::new(),
-            None,
+            policy_exec_config(command, None, Vec::new(), None, None),
             Duration::from_secs(10),
         )?;
         if absent.stdout != b"unset|unset|unset|unset|unset"
@@ -3402,34 +3664,453 @@ fn run_policy_proxy_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence
                 String::from_utf8_lossy(&absent.stdout)
             ));
         }
-        let proxy = "http://proxy.example:8080";
-        let injected = run_policy_command(
-            session,
-            1_312,
-            command,
-            None,
-            vec![
-                format!("HTTP_PROXY={proxy}"),
-                format!("HTTPS_PROXY={proxy}"),
-            ],
-            None,
-            Duration::from_secs(10),
+        evidence.push(
+            "when runtimeConfig.networkProxy was absent, proxy variables remained fully scrubbed (HTTP/HTTPS lowercase/uppercase and NO_PROXY unset)".to_string(),
+        );
+        Ok(())
+    })();
+    policy_live_assertions(positive, negative, evidence)
+}
+
+#[cfg(windows)]
+fn run_control_lifecycle_dedicated_session(
+    state: &mut LiveHarnessState,
+) -> Result<Vec<String>, String> {
+    let session = state
+        .session
+        .as_mut()
+        .ok_or_else(|| "live session unavailable".to_string())?;
+    session.auxiliary_launches_started = session.auxiliary_launches_started.saturating_add(1);
+    let validation_dir = session
+        .req9_fixtures
+        .run_dir
+        .join("policy-control-lifecycle-dedicated");
+    fs::create_dir_all(&validation_dir).map_err(|error| {
+        format!(
+            "creating control lifecycle validation directory {} failed: {error}",
+            validation_dir.display()
+        )
+    })?;
+    let mut vm = launch_whp_vm(build_launch_plan(
+        &validation_dir,
+        session.vm.plan.artifacts.clone(),
+    ))?;
+    let checks = (|| -> Result<Vec<String>, String> {
+        let rw = vm.plan.artifacts.common_root.join(RW_CHILD);
+        let ro = vm.plan.artifacts.common_root.join(RO_CHILD);
+        fs::create_dir_all(&rw)
+            .map_err(|error| format!("creating lifecycle rw fixture failed: {error}"))?;
+        fs::create_dir_all(&ro)
+            .map_err(|error| format!("creating lifecycle ro fixture failed: {error}"))?;
+
+        let pid = vm.process_id();
+        let expected_image = vm.plan.artifacts.openvmm_exe.to_string_lossy().into_owned();
+        let control = NamedPipeClient::connect(
+            &vm.plan.control_pipe_name,
+            Duration::from_secs(5),
+            Some(pid),
+            Some(expected_image.as_str()),
+        )
+        .map_err(|error| format!("control lifecycle dedicated pipe connect failed: {error}"))?;
+        let mut client = MxcAgentClient::new(HostControlSession::new(control));
+        let launch = LaunchIdentity {
+            generation: vm.plan.channel_generation.saturating_add(1),
+            nonce: vm.plan.launch_nonce,
+        };
+        client
+            .authenticate_launch(
+                vm.plan.launch_capability,
+                HostControlMessage::HostHello {
+                    service: SERVICE_IDENTITY.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    launch,
+                    capability_proof: launch_capability_proof(vm.plan.launch_nonce)?,
+                },
+                LIVE_TIMEOUT,
+            )
+            .map_err(|error| format!("control lifecycle dedicated launch auth failed: {error}"))?;
+
+        let provision = adapt_live_provision_policy(
+            "policy-live-control-lifecycle-provision",
+            &vm.plan.artifacts.common_root,
+            serde_json::Value::Null,
         )?;
-        let expected = format!("{proxy}|{proxy}|unset|unset|unset");
-        if injected.stdout != expected.as_bytes()
-            || injected.disposition != Some(ExecDisposition::ExitCode(0))
+        client
+            .send_configure(HostControlMessage::Configure {
+                launch,
+                root: CanonicalHostMappingRoot::parse(ROOT_CANONICAL_HOST.to_string())
+                    .map_err(|error| format!("control lifecycle root parse failed: {error}"))?,
+                mappings: provision.mappings,
+                containment: MappingContainmentPolicy {
+                    symlink_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                    reparse_policy: SymlinkContainmentPolicy::DeclaredForHostGuestEnforcement,
+                },
+            })
+            .map_err(|error| format!("control lifecycle provision/configure failed: {error}"))?;
+        adapt_policy(
+            "policy-live-control-lifecycle-start",
+            &serde_json::json!({
+                "version": POLICY_SCHEMA_VERSION,
+                "containment": "vm",
+                "phase": "start",
+                "sandboxId": "policy-live-lifecycle-sandbox",
+            }),
+            &vm.plan.artifacts.common_root,
+        )
+        .map_err(|errors| format!("control lifecycle start adaptation failed: {errors:?}"))?;
+        match client
+            .wait_ready(LIVE_TIMEOUT)
+            .map_err(|error| format!("control lifecycle start/wait_ready failed: {error}"))?
         {
+            AgentControlMessage::Ready {
+                launch: ready_launch,
+                ..
+            } if ready_launch == launch => {}
+            other => {
+                return Err(format!(
+                    "control lifecycle start expected Ready, got {other:?}"
+                ));
+            }
+        }
+        match client
+            .request_health(LIVE_TIMEOUT)
+            .map_err(|error| format!("control lifecycle ready health failed: {error}"))?
+        {
+            AgentControlMessage::Health(status) if status.launch_admitted => {}
+            other => {
+                return Err(format!(
+                    "control lifecycle start health unexpected: {other:?}"
+                ));
+            }
+        }
+
+        let exec = adapt_policy(
+            "policy-live-control-lifecycle-exec",
+            &serde_json::json!({
+                "version": POLICY_SCHEMA_VERSION,
+                "containment": "vm",
+                "phase": "exec",
+                "sandboxId": "policy-live-lifecycle-sandbox",
+                "containerId": "policy-live-lifecycle-container",
+                "process": { "commandLine": "echo lifecycle", "cwd": "/", "env": [], "timeout": 1000 }
+            }),
+            &vm.plan.artifacts.common_root,
+        )
+        .map_err(|errors| format!("control lifecycle exec adaptation failed: {errors:?}"))?
+        .exec
+        .ok_or_else(|| "control lifecycle exec adaptation omitted exec policy".to_string())?;
+        client
+            .send_create_process(HostControlMessage::CreateProcess {
+                exec_id: 1_313,
+                argv: exec.argv,
+                cwd: exec.cwd,
+                env: exec.env,
+                timeout_ms: exec.timeout_ms,
+            })
+            .map_err(|error| format!("control lifecycle exec create failed: {error}"))?;
+        client
+            .send_flow_credits(FlowCreditRequest {
+                exec_id: 1_313,
+                stream: StreamName::Stdout,
+                credits: 1,
+            })
+            .map_err(|error| format!("control lifecycle exec stdout credit failed: {error}"))?;
+        client
+            .send_flow_credits(FlowCreditRequest {
+                exec_id: 1_313,
+                stream: StreamName::Stderr,
+                credits: 1,
+            })
+            .map_err(|error| format!("control lifecycle exec stderr credit failed: {error}"))?;
+        match client
+            .wait_exec_terminal(1_313, Duration::from_secs(10))
+            .map_err(|error| format!("control lifecycle exec terminal wait failed: {error}"))?
+        {
+            AgentControlMessage::ExecTerminal {
+                exec_id: 1_313,
+                disposition: ExecDisposition::ExitCode(0),
+                ..
+            } => {}
+            other => {
+                return Err(format!(
+                    "control lifecycle exec expected exit code 0 terminal, got {other:?}"
+                ));
+            }
+        }
+
+        adapt_policy(
+            "policy-live-control-lifecycle-stop",
+            &serde_json::json!({
+                "version": POLICY_SCHEMA_VERSION,
+                "containment": "vm",
+                "phase": "stop",
+                "sandboxId": "policy-live-lifecycle-sandbox",
+            }),
+            &vm.plan.artifacts.common_root,
+        )
+        .map_err(|errors| format!("control lifecycle stop adaptation failed: {errors:?}"))?;
+        let shutdown = client
+            .request_shutdown(SHUTDOWN_VALIDATION_GRACE_MS, Duration::from_secs(3))
+            .map_err(|error| format!("control lifecycle stop request failed: {error}"))?;
+        if !matches!(shutdown, AgentControlMessage::ShuttingDown) {
             return Err(format!(
-                "proxy variables were not injected exactly: {:?}",
-                String::from_utf8_lossy(&injected.stdout)
+                "control lifecycle stop expected ShuttingDown ack, got {shutdown:?}"
             ));
         }
+        let close_deadline = Instant::now() + Duration::from_secs(3);
+        let channel_closed = loop {
+            let remaining = close_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            match client.poll_agent_control(remaining.min(Duration::from_millis(250))) {
+                Err(error) if is_expected_channel_close_error(&error) => break true,
+                Err(error) => {
+                    return Err(format!(
+                        "control lifecycle stop channel-close observation failed: {error}"
+                    ));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break false,
+            }
+        };
+        if !channel_closed {
+            return Err(
+                "control lifecycle stop did not close guest control channel after shutdown ack"
+                    .to_string(),
+            );
+        }
+        adapt_policy(
+            "policy-live-control-lifecycle-deprovision",
+            &serde_json::json!({
+                "version": POLICY_SCHEMA_VERSION,
+                "containment": "vm",
+                "phase": "deprovision",
+                "sandboxId": "policy-live-lifecycle-sandbox",
+            }),
+            &vm.plan.artifacts.common_root,
+        )
+        .map_err(|errors| format!("control lifecycle deprovision adaptation failed: {errors:?}"))?;
         Ok(vec![
-            "live child environment scrubbed all proxy variables when proxy was absent".to_string(),
-            "live child received exactly HTTP_PROXY and HTTPS_PROXY for URL proxy".to_string(),
+            "phase=provision mapped to authenticated Configure on dedicated lifecycle session".to_string(),
+            "phase=start mapped to Ready + Health on dedicated lifecycle session".to_string(),
+            "phase=exec mapped to authenticated CreateProcess/ExecTerminal on dedicated lifecycle session".to_string(),
+            "phase=stop mapped to graceful Shutdown ack plus channel close on dedicated lifecycle session".to_string(),
+            "phase=deprovision mapped to explicit harness teardown after stop (no Drop-only cleanup)".to_string(),
         ])
     })();
-    policy_live_evidence(result)
+    let teardown = vm
+        .kill()
+        .map_err(|error| format!("control lifecycle dedicated teardown failed: {error}"));
+    session.auxiliary_launches_torn_down = session.auxiliary_launches_torn_down.saturating_add(1);
+    match (checks, teardown) {
+        (Ok(evidence), Ok(())) => Ok(evidence),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(teardown_error)) => Err(teardown_error),
+        (Err(error), Err(teardown_error)) => Err(format!("{error}; {teardown_error}")),
+    }
+}
+
+#[cfg(windows)]
+fn run_policy_control_lifecycle_contract(state: &mut LiveHarnessState) -> PolicyLiveEvidence {
+    let mut evidence = Vec::new();
+    let positive = (|| {
+        let phase_evidence = run_control_lifecycle_dedicated_session(state)?;
+        evidence.extend(phase_evidence);
+        Ok(())
+    })();
+
+    let negative = (|| {
+        let session = state
+            .session
+            .as_ref()
+            .ok_or_else(|| "live session unavailable".to_string())?;
+        let all_rejected = [
+            (
+                "control-lifecycle-sandbox-missing",
+                serde_json::json!({
+                    "version": POLICY_SCHEMA_VERSION,
+                    "containment": "vm",
+                    "phase": "exec",
+                    "process": { "commandLine": "echo missing-sandbox" }
+                }),
+            ),
+            (
+                "control-lifecycle-sandbox-present-provision",
+                serde_json::json!({
+                    "version": POLICY_SCHEMA_VERSION,
+                    "containment": "vm",
+                    "phase": "provision",
+                    "sandboxId": "must-be-absent",
+                }),
+            ),
+            (
+                "control-lifecycle-containment-override",
+                serde_json::json!({
+                    "version": POLICY_SCHEMA_VERSION,
+                    "containment": "process",
+                    "phase": "provision",
+                }),
+            ),
+            (
+                "control-lifecycle-version-override",
+                serde_json::json!({
+                    "version": "0.9.0",
+                    "containment": "vm",
+                    "phase": "provision",
+                }),
+            ),
+            (
+                "control-lifecycle-phase-missing",
+                serde_json::json!({
+                    "version": POLICY_SCHEMA_VERSION,
+                    "containment": "vm",
+                }),
+            ),
+        ]
+        .iter()
+        .all(|(case_id, config)| {
+            adapt_policy(*case_id, config, &session.vm.plan.artifacts.common_root).is_err()
+        });
+        let container_id_variants_ok = adapt_policy(
+            "control-lifecycle-containerid-null",
+            &serde_json::json!({
+                "version": POLICY_SCHEMA_VERSION,
+                "containment": "vm",
+                "phase": "start",
+                "sandboxId": "sandbox-null-container",
+                "containerId": serde_json::Value::Null,
+            }),
+            &session.vm.plan.artifacts.common_root,
+        )
+        .is_ok()
+            && adapt_policy(
+                "control-lifecycle-containerid-absent",
+                &serde_json::json!({
+                    "version": POLICY_SCHEMA_VERSION,
+                    "containment": "vm",
+                    "phase": "start",
+                    "sandboxId": "sandbox-absent-container",
+                }),
+                &session.vm.plan.artifacts.common_root,
+            )
+            .is_ok();
+        if !all_rejected || !container_id_variants_ok {
+            return Err(format!(
+                "negative lifecycle invariants failed: all_rejected={all_rejected} container_id_variants_ok={container_id_variants_ok}"
+            ));
+        }
+        evidence.push(
+            "negative prelaunch adapter checks rejected invalid sandbox/version/containment/phase combinations while allowing containerId null/absent variants".to_string(),
+        );
+        Ok(())
+    })();
+    policy_live_assertions(positive, negative, evidence)
+}
+
+#[cfg(windows)]
+fn adapt_live_provision_policy(
+    case_id: &str,
+    common_root: &Path,
+    network: serde_json::Value,
+) -> Result<NvxProvisionPolicy, String> {
+    let mut config = serde_json::json!({
+        "version": POLICY_SCHEMA_VERSION,
+        "containment": "vm",
+        "phase": "provision",
+        "filesystem": {
+            "readonlyPaths": [common_root.join(RO_CHILD).to_string_lossy().into_owned()],
+            "readwritePaths": [common_root.join(RW_CHILD).to_string_lossy().into_owned()]
+        }
+    });
+    if !network.is_null() {
+        config["network"] = network;
+    }
+    let adapted = adapt_policy(case_id, &config, common_root)
+        .map_err(|errors| format!("policy adapter rejected provision config: {errors:?}"))?;
+    adapted
+        .provision
+        .ok_or_else(|| "policy adapter omitted provision plan for phase=provision".to_string())
+}
+
+#[cfg(windows)]
+fn portable_network_override_from_provision(
+    provision: &NvxProvisionPolicy,
+) -> Result<Option<String>, String> {
+    match provision.default_network_policy.as_deref() {
+        Some("allow") => Ok(Some("10.0.0.2/24".to_string())),
+        Some("block") | None => Ok(None),
+        Some(other) => Err(format!(
+            "runtime gap: unsupported provision defaultPolicy `{other}` (expected allow/block/null)"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn policy_exec_config(
+    command_line: &str,
+    cwd: Option<&str>,
+    env: Vec<String>,
+    timeout_ms: Option<u64>,
+    runtime_proxy: Option<&str>,
+) -> serde_json::Value {
+    let mut config = serde_json::json!({
+        "version": POLICY_SCHEMA_VERSION,
+        "containment": "vm",
+        "phase": "exec",
+        "sandboxId": "policy-live-sandbox",
+        "process": {
+            "commandLine": command_line,
+            "env": env,
+        }
+    });
+    if let Some(cwd) = cwd {
+        config["process"]["cwd"] = serde_json::Value::String(cwd.to_string());
+    }
+    if let Some(timeout_ms) = timeout_ms {
+        config["process"]["timeout"] = serde_json::Value::from(timeout_ms);
+    }
+    if let Some(proxy) = runtime_proxy {
+        config["runtimeConfig"] = serde_json::json!({ "networkProxy": proxy });
+    }
+    config
+}
+
+#[cfg(windows)]
+fn run_policy_exec_from_adapter(
+    session: &mut LiveWhpSession,
+    exec_id: u32,
+    config: serde_json::Value,
+    timeout: Duration,
+) -> Result<ExecObservation, String> {
+    let adapted = adapt_policy(
+        "policy-live-profile",
+        &config,
+        &session.vm.plan.artifacts.common_root,
+    )
+    .map_err(|errors| format!("policy adapter rejected profile config: {errors:?}"))?;
+    let exec = adapted
+        .exec
+        .ok_or_else(|| "policy adapter did not emit exec policy for phase=exec".to_string())?;
+    session
+        .client
+        .send_create_process(HostControlMessage::CreateProcess {
+            exec_id,
+            argv: exec.argv,
+            cwd: exec.cwd,
+            env: exec.env,
+            timeout_ms: exec.timeout_ms,
+        })
+        .map_err(|error| format!("policy create process {exec_id} failed: {error}"))?;
+    grant_stream(session, exec_id, StreamName::Stdout, 1)?;
+    grant_stream(session, exec_id, StreamName::Stderr, 1)?;
+    collect_exec_until_terminal(
+        session,
+        exec_id,
+        timeout,
+        true,
+        ExecCollectionLimits::small_probe(timeout),
+    )
 }
 
 #[cfg(windows)]
@@ -3442,28 +4123,11 @@ fn run_policy_command(
     timeout_ms: Option<u64>,
     timeout: Duration,
 ) -> Result<ExecObservation, String> {
-    session
-        .client
-        .send_create_process(HostControlMessage::CreateProcess {
-            exec_id,
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                command_line.to_string(),
-            ],
-            cwd,
-            env,
-            timeout_ms,
-        })
-        .map_err(|error| format!("policy create process {exec_id} failed: {error}"))?;
-    grant_stream(session, exec_id, StreamName::Stdout, 1)?;
-    grant_stream(session, exec_id, StreamName::Stderr, 1)?;
-    collect_exec_until_terminal(
+    run_policy_exec_from_adapter(
         session,
         exec_id,
+        policy_exec_config(command_line, cwd.as_deref(), env, timeout_ms, None),
         timeout,
-        true,
-        ExecCollectionLimits::small_probe(timeout),
     )
 }
 
@@ -3493,19 +4157,126 @@ fn run_network_probe(
 }
 
 #[cfg(windows)]
-fn policy_live_evidence(result: Result<Vec<String>, String>) -> PolicyLiveEvidence {
-    match result {
-        Ok(evidence) => PolicyLiveEvidence {
-            passed: true,
-            evidence,
-            error: None,
-        },
-        Err(error) => PolicyLiveEvidence {
-            passed: false,
+fn ensure_policy_probe_capabilities(state: &mut LiveHarnessState) -> Result<(), String> {
+    let session = state
+        .session
+        .as_mut()
+        .ok_or_else(|| "live session unavailable".to_string())?;
+    let (disposition, stdout, stderr) =
+        run_simple_probe_exec(session, 1_390, &["capabilities-json"])?;
+    if disposition != ExecDisposition::ExitCode(0) {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        if stderr_text.contains("unknown subcommand") {
+            return Err(format!(
+                "blocked stale-artifact diagnostic: nvx-agent-probe does not support `capabilities-json`; update staged probe artifact at {PROBE_PATH}"
+            ));
+        }
+        return Err(format!(
+            "policy probe capability check failed: disposition={disposition:?} stderr={stderr_text}"
+        ));
+    }
+    let report: PolicyProbeCapabilitiesReport = serde_json::from_slice(&stdout).map_err(|error| {
+        format!("policy probe capability check failed: capabilities payload is invalid JSON ({error})")
+    })?;
+    if report.version != POLICY_PROBE_CAPABILITY_VERSION {
+        return Err(format!(
+            "blocked stale-artifact diagnostic: nvx-agent-probe capability version mismatch (expected={}, actual={})",
+            POLICY_PROBE_CAPABILITY_VERSION, report.version
+        ));
+    }
+    let missing_commands = POLICY_REQUIRED_PROBE_COMMANDS
+        .iter()
+        .copied()
+        .filter(|required| {
+            !report
+                .supported_commands
+                .iter()
+                .any(|seen| seen == required)
+        })
+        .collect::<Vec<_>>();
+    if !missing_commands.is_empty() {
+        return Err(format!(
+            "blocked stale-artifact diagnostic: nvx-agent-probe lacks required policy subcommands [{}]",
+            missing_commands.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn policy_live_result_from_error(error: String) -> PolicyLiveEvidence {
+    if policy_error_is_infrastructure_blocker(&error) {
+        policy_live_blocked(error)
+    } else {
+        PolicyLiveEvidence {
+            positive_passed: false,
+            negative_passed: false,
+            blocked: false,
             evidence: Vec::new(),
             error: Some(error),
-        },
+        }
     }
+}
+
+#[cfg(windows)]
+fn policy_live_assertions(
+    positive: Result<(), String>,
+    negative: Result<(), String>,
+    evidence: Vec<String>,
+) -> PolicyLiveEvidence {
+    let positive_failed_with_blocker = positive
+        .as_ref()
+        .err()
+        .is_some_and(|error| policy_error_is_infrastructure_blocker(error));
+    let negative_failed_with_blocker = negative
+        .as_ref()
+        .err()
+        .is_some_and(|error| policy_error_is_infrastructure_blocker(error));
+    let any_failed = positive.is_err() || negative.is_err();
+    let all_failed_are_blockers = (positive.is_ok() || positive_failed_with_blocker)
+        && (negative.is_ok() || negative_failed_with_blocker);
+
+    let mut errors = Vec::new();
+    if let Err(error) = &positive {
+        errors.push(format!("positive assertion failed: {error}"));
+    }
+    if let Err(error) = &negative {
+        errors.push(format!("negative assertion failed: {error}"));
+    }
+    let combined_error = if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
+    };
+    let blocked = any_failed && all_failed_are_blockers;
+    PolicyLiveEvidence {
+        positive_passed: positive.is_ok(),
+        negative_passed: negative.is_ok(),
+        blocked,
+        evidence,
+        error: combined_error,
+    }
+}
+
+#[cfg(windows)]
+fn policy_live_blocked(error: String) -> PolicyLiveEvidence {
+    PolicyLiveEvidence {
+        positive_passed: false,
+        negative_passed: false,
+        blocked: true,
+        evidence: Vec::new(),
+        error: Some(error),
+    }
+}
+
+#[cfg(windows)]
+fn policy_error_is_infrastructure_blocker(error: &str) -> bool {
+    if error.contains("teardown failed:") {
+        return false;
+    }
+    error.contains("\"kind\":\"missing-prerequisite\"")
+        || error.contains("blocked stale-artifact diagnostic")
+        || error.contains("live WHP policy profiles require Windows")
 }
 
 #[cfg(windows)]
@@ -4247,5 +5018,164 @@ mod tests {
         assert!(source.contains("10 => run_req10_network_status"));
         assert!(source.contains("11 => run_req11_health_quiesce_resume_shutdown"));
         assert!(source.contains("12 => run_req12_channel_loss_generation"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn channel_close_classifier_accepts_only_closed_or_explicit_io_kinds() {
+        let accepted = [
+            ClientError::Control(SessionError::Closed),
+            ClientError::Control(SessionError::Io(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            ))),
+            ClientError::ControlOperation {
+                operation: "poll",
+                source: SessionError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            },
+            ClientError::ControlOperation {
+                operation: "poll",
+                source: SessionError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            },
+        ];
+        for error in accepted {
+            assert!(
+                is_expected_channel_close_error(&error),
+                "expected accepted closure error: {error:?}"
+            );
+        }
+
+        let rejected = [
+            ClientError::Control(SessionError::Io(std::io::Error::from(
+                std::io::ErrorKind::WouldBlock,
+            ))),
+            ClientError::Control(SessionError::Protocol(
+                agent_protocol::control_session::ProtocolError::InvalidMagic,
+            )),
+            ClientError::Control(SessionError::SequenceMismatch {
+                expected: 5,
+                actual: 9,
+            }),
+            ClientError::Control(SessionError::SessionIdentityMismatch),
+            ClientError::Control(SessionError::UnexpectedRecordType(
+                agent_protocol::control_session::RecordType::Data,
+            )),
+            ClientError::Control(SessionError::DeadlineExceeded("control channel close")),
+            ClientError::Protocol("unexpected parse path".to_string()),
+            ClientError::Timeout("poll"),
+        ];
+        for error in rejected {
+            assert!(
+                !is_expected_channel_close_error(&error),
+                "expected non-closure error rejection: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_profile_infrastructure_blockers_map_to_blocked_status() {
+        assert!(policy_error_is_infrastructure_blocker(
+            "{\"kind\":\"missing-prerequisite\",\"field\":\"openvmm_exe\"}"
+        ));
+        assert!(policy_error_is_infrastructure_blocker(
+            "blocked stale-artifact diagnostic: nvx-agent-probe does not support capabilities-json"
+        ));
+        assert!(policy_error_is_infrastructure_blocker(
+            "blocked stale-artifact diagnostic: nvx-agent-probe lacks required policy subcommands [policy-network]"
+        ));
+        assert!(policy_error_is_infrastructure_blocker(
+            "live WHP policy profiles require Windows"
+        ));
+        assert!(!policy_error_is_infrastructure_blocker(
+            "teardown failed: live session VM teardown failed: exit timeout"
+        ));
+        assert!(!policy_error_is_infrastructure_blocker(
+            "blocked stale-artifact diagnostic: nvx-agent-probe capability version mismatch; teardown failed: live session VM teardown failed: exit timeout"
+        ));
+        assert!(!policy_error_is_infrastructure_blocker(
+            "live WHP bootstrap failed: failed to connect control pipe: access denied"
+        ));
+        assert!(!policy_error_is_infrastructure_blocker(
+            "launch authentication failed: protocol mismatch"
+        ));
+        assert!(!policy_error_is_infrastructure_blocker(
+            "configure session failed: InvalidLifecycleTransition"
+        ));
+        assert!(!policy_error_is_infrastructure_blocker(
+            "wait_ready failed: timed out waiting for ready"
+        ));
+        assert!(!policy_error_is_infrastructure_blocker(
+            "health request failed: stale session identity"
+        ));
+        assert!(!policy_error_is_infrastructure_blocker(
+            "portable-network positive probe failed: report mismatch"
+        ));
+        assert!(!policy_error_is_infrastructure_blocker(
+            "policy probe capability check failed: capabilities payload is invalid JSON (expected value at line 1 column 1)"
+        ));
+    }
+
+    #[test]
+    fn policy_live_assertions_status_combination_only_blocks_for_all_blocker_failures() {
+        let semantic_fail =
+            Err("portable-network positive probe failed: report mismatch".to_string());
+        let blocker_fail = Err(
+            "blocked stale-artifact diagnostic: nvx-agent-probe capability version mismatch"
+                .to_string(),
+        );
+
+        let mixed = policy_live_assertions(
+            semantic_fail.clone(),
+            blocker_fail.clone(),
+            vec!["mixed".to_string()],
+        );
+        assert!(!mixed.blocked);
+        assert!(!mixed.positive_passed);
+        assert!(!mixed.negative_passed);
+
+        let single_blocker = policy_live_assertions(Ok(()), blocker_fail.clone(), vec![]);
+        assert!(single_blocker.blocked);
+        assert!(single_blocker.positive_passed);
+        assert!(!single_blocker.negative_passed);
+
+        let both_blocker = policy_live_assertions(blocker_fail.clone(), blocker_fail, vec![]);
+        assert!(both_blocker.blocked);
+        assert!(!both_blocker.positive_passed);
+        assert!(!both_blocker.negative_passed);
+
+        let single_semantic = policy_live_assertions(semantic_fail, Ok(()), vec![]);
+        assert!(!single_semantic.blocked);
+        assert!(!single_semantic.positive_passed);
+        assert!(single_semantic.negative_passed);
+    }
+
+    #[test]
+    fn policy_live_result_from_invalid_capabilities_json_is_non_blocking_failure() {
+        let result = policy_live_result_from_error(
+            "policy probe capability check failed: capabilities payload is invalid JSON (expected value at line 1 column 1)"
+                .to_string(),
+        );
+        assert!(!result.blocked);
+        assert!(!result.positive_passed);
+        assert!(!result.negative_passed);
+        assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn policy_teardown_failure_forces_non_blocked_failure_status() {
+        let mut result = policy_live_blocked(
+            "blocked stale-artifact diagnostic: nvx-agent-probe lacks required policy subcommands [policy-network]"
+                .to_string(),
+        );
+        append_policy_teardown_failure(
+            &mut result,
+            "live session VM teardown failed: exit timeout".to_string(),
+        );
+        assert!(!result.blocked);
+        assert!(!result.positive_passed);
+        assert!(!result.negative_passed);
+        assert!(result.error.as_deref().is_some_and(|error| {
+            error.contains("blocked stale-artifact diagnostic")
+                && error.contains("teardown failed: live session VM teardown failed: exit timeout")
+        }));
     }
 }

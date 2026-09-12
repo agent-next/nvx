@@ -12,6 +12,25 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, String>;
+const POLICY_PROBE_CAPABILITY_VERSION: &str = "policy-suite-capabilities-v1";
+const POLICY_SUPPORTED_COMMANDS: &[&str] = &[
+    "capabilities-json",
+    "seq",
+    "stream-split",
+    "stdin-roundtrip",
+    "flood",
+    "wait-stdin-eof",
+    "signal-self",
+    "spawn-tree",
+    "check-pids-gone",
+    "child-loop",
+    "grandchild-loop",
+    "identity-json",
+    "isolation-json",
+    "mapping-check",
+    "policy-env-json",
+    "network-policy-json",
+];
 
 fn main() {
     if let Err(error) = run() {
@@ -41,8 +60,28 @@ fn run() -> Result<()> {
         "mapping-check" => run_mapping_check(args.collect()),
         "policy-env-json" => run_policy_env_json(args.collect()),
         "network-policy-json" => run_network_policy_json(args.collect()),
+        "capabilities-json" => run_capabilities_json(args.collect()),
         other => Err(format!("unknown subcommand {other:?}")),
     }
+}
+
+#[derive(Serialize)]
+struct ProbeCapabilitiesReport {
+    version: String,
+    supported_commands: Vec<String>,
+}
+
+fn run_capabilities_json(args: Vec<String>) -> Result<()> {
+    if !args.is_empty() {
+        return Err("capabilities-json accepts no arguments".to_string());
+    }
+    write_json(&ProbeCapabilitiesReport {
+        version: POLICY_PROBE_CAPABILITY_VERSION.to_string(),
+        supported_commands: POLICY_SUPPORTED_COMMANDS
+            .iter()
+            .map(|command| (*command).to_string())
+            .collect(),
+    })
 }
 
 #[derive(Serialize)]

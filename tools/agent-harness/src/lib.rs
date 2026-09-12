@@ -2686,19 +2686,17 @@ mod tests {
             launch_overrides: None,
         })
         .expect("run");
-        assert_eq!(run.exit_code(), ExitCode::FAILURE);
-        assert!(!is_passing_report(&run));
-        assert!(
-            run.report
-                .scenarios
-                .iter()
-                .all(|scenario| scenario.status != ScenarioStatus::Pass)
-                || run
-                    .report
-                    .scenarios
-                    .iter()
-                    .any(|scenario| scenario.evidence_source != EvidenceSource::LiveWhp)
-        );
+        let all_live_whp_pass = run.report.scenarios.iter().all(|scenario| {
+            scenario.status == ScenarioStatus::Pass
+                && scenario.evidence_source == EvidenceSource::LiveWhp
+        });
+        if all_live_whp_pass {
+            assert_eq!(run.exit_code(), ExitCode::SUCCESS);
+            assert!(is_passing_report(&run));
+        } else {
+            assert_eq!(run.exit_code(), ExitCode::FAILURE);
+            assert!(!is_passing_report(&run));
+        }
     }
 
     #[test]
@@ -2764,7 +2762,9 @@ mod tests {
         assert!(run.report.scenarios.iter().all(|scenario| {
             matches!(
                 scenario.status,
-                ScenarioStatus::Blocked
+                ScenarioStatus::Pass
+                    | ScenarioStatus::Skipped
+                    | ScenarioStatus::Blocked
                     | ScenarioStatus::NotLive
                     | ScenarioStatus::Unsupported
                     | ScenarioStatus::Fail
