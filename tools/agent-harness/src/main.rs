@@ -105,15 +105,14 @@ fn run_conformance(arguments: Vec<String>) -> ExitCode {
         launch_overrides,
         config,
         execute_config,
-    } =
-        match parse_common(arguments, PathBuf::from("build").join("mxc-agent-harness")) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                eprintln!("error: {error}");
-                print_usage();
-                return ExitCode::FAILURE;
-            }
-        };
+    } = match parse_common(arguments, PathBuf::from("build").join("mxc-agent-harness")) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("error: {error}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
     if config.is_some() {
         eprintln!("error: --config is valid only for mxc-policy");
         return ExitCode::FAILURE;
@@ -170,15 +169,14 @@ fn run_policy(arguments: Vec<String>) -> ExitCode {
         launch_overrides,
         config,
         execute_config,
-    } =
-        match parse_common(arguments, PathBuf::from("build").join("mxc-policy-harness")) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                eprintln!("error: {error}");
-                print_usage();
-                return ExitCode::FAILURE;
-            }
-        };
+    } = match parse_common(arguments, PathBuf::from("build").join("mxc-policy-harness")) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("error: {error}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
     let options = PolicyHarnessOptions {
         backend,
         mode: if static_only {

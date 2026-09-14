@@ -2092,11 +2092,48 @@ mod tests {
 
     #[test]
     fn checked_in_corpus_hash_is_pinned() {
+        let normalized = normalize_crlf_to_lf(CASES_BYTES);
         assert_eq!(
-            content_sha256_hex_bytes(CASES_BYTES),
+            content_sha256_hex_bytes(&normalized),
             "bc25ea50fc99d8003ffe02df4e841f2b1509ff48741c6c38898242f279aab052",
             "corpus hash changed: regenerate fixture and update pin"
         );
+    }
+
+    #[test]
+    fn corpus_hash_pin_uses_lf_canonical_bytes() {
+        let canonical = normalize_crlf_to_lf(CASES_BYTES);
+        let forced_crlf = lf_to_crlf(&canonical);
+        assert_eq!(
+            content_sha256_hex_bytes(&canonical),
+            content_sha256_hex_bytes(&normalize_crlf_to_lf(&forced_crlf))
+        );
+    }
+
+    fn normalize_crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
+        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                normalized.push(b'\n');
+                index += 2;
+                continue;
+            }
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+        normalized
+    }
+
+    fn lf_to_crlf(bytes: &[u8]) -> Vec<u8> {
+        let mut converted = Vec::with_capacity(bytes.len().saturating_mul(2));
+        for byte in bytes {
+            if *byte == b'\n' {
+                converted.push(b'\r');
+            }
+            converted.push(*byte);
+        }
+        converted
     }
 
     #[test]

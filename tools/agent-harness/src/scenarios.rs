@@ -236,7 +236,11 @@ fn execute_policy_exec_on_dedicated_session(
     let teardown = session.vm.kill();
     let merged = match execution {
         Ok(mut result) => {
-            result.cleanup.explicit_teardown_succeeded = teardown.is_ok();
+            let teardown_ok = teardown.is_ok();
+            result.cleanup.explicit_teardown_succeeded = teardown_ok;
+            if teardown_ok {
+                result.cleanup.process_exited = true;
+            }
             result.cleanup.cleanup_error = teardown.err();
             Ok(result)
         }

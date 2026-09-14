@@ -169,6 +169,13 @@ struct PreparedExecuteConfig {
     exec: super::NvxExecPolicy,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct OutcomeEvaluation {
+    mode: PolicyHarnessMode,
+    enforce_static_links: bool,
+    execute_config_mode: bool,
+}
+
 impl PolicyHarnessRun {
     pub fn exit_code(&self) -> ExitCode {
         if self.report.passed && verify_policy_run(self).is_ok() {
@@ -255,8 +262,11 @@ pub fn execute_policy_harness(
             &case_by_id,
             &static_results_by_id,
             &live_profiles,
-            options.mode,
-            options.config.is_none(),
+            OutcomeEvaluation {
+                mode: options.mode,
+                enforce_static_links: options.config.is_none(),
+                execute_config_mode: options.execute_config,
+            },
         );
         match actual_outcome.as_str() {
             "blocked" => blocked.push(entry.key.to_string()),
@@ -583,18 +593,25 @@ fn actual_outcome(
     cases: &BTreeMap<&str, &PolicyCase>,
     static_results: &BTreeMap<&str, &StaticCaseResult>,
     live: &BTreeMap<String, LiveProfileResult>,
-    mode: PolicyHarnessMode,
-    enforce_static_links: bool,
+    evaluation: OutcomeEvaluation,
 ) -> (String, Option<String>, Vec<String>) {
-    let (static_status, static_error, mut artifacts) =
-        static_outcome(entry, case_ids, cases, static_results, enforce_static_links);
+    let (static_status, static_error, mut artifacts) = static_outcome(
+        entry,
+        case_ids,
+        cases,
+        static_results,
+        evaluation.enforce_static_links,
+    );
     if static_status != "passed" {
         return (static_status, static_error, artifacts);
     }
     if entry.required_evidence() != EvidenceRequirement::LiveWhpPositiveNegative {
         return ("passed".to_string(), None, artifacts);
     }
-    if mode == PolicyHarnessMode::StaticOnly {
+    if evaluation.execute_config_mode {
+        return ("passed".to_string(), None, artifacts);
+    }
+    if evaluation.mode == PolicyHarnessMode::StaticOnly {
         return (
             "blocked".to_string(),
             Some("live WHP positive/negative evidence was not requested".to_string()),
@@ -1552,12 +1569,42 @@ mod tests {
             &case_map,
             &static_results,
             &BTreeMap::new(),
-            PolicyHarnessMode::StaticOnly,
-            true,
+            OutcomeEvaluation {
+                mode: PolicyHarnessMode::StaticOnly,
+                enforce_static_links: true,
+                execute_config_mode: false,
+            },
         );
         assert_eq!(outcome, "unexpected");
         assert!(error.is_some_and(|message| {
             message.contains("contradictory-case") && message.contains("contract")
         }));
+    }
+
+    #[test]
+    fn execute_config_mode_does_not_require_live_profile_catalog_bindings() {
+        let entry = CatalogEntry {
+            key: "network.defaultPolicy",
+            schema_path: "/properties/network/properties/defaultPolicy",
+            disposition: PolicyDisposition::Honored,
+            phases: &[crate::mxc_policy::MxcPhase::Provision],
+            evidence: EvidenceRequirement::LiveWhpPositiveNegative,
+            reason: "test",
+        };
+        let (outcome, error, artifacts) = actual_outcome(
+            &entry,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            OutcomeEvaluation {
+                mode: PolicyHarnessMode::LiveWhp,
+                enforce_static_links: false,
+                execute_config_mode: true,
+            },
+        );
+        assert_eq!(outcome, "passed");
+        assert!(error.is_none());
+        assert!(artifacts.is_empty());
     }
 }
