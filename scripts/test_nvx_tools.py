@@ -590,6 +590,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertFalse(mxc_policy_tests.static_only)
         self.assertIsNone(mxc_policy_tests.config)
+        self.assertFalse(mxc_policy_tests.execute_config)
         self.assertIs(mxc_policy_tests.handler, nvx.command_test_mxc_policy)
 
     def test_test_mxc_agent_builds_canonical_command(self):
@@ -722,6 +723,52 @@ class CliTests(unittest.TestCase):
         self.assertIn("--openvmm-exe", command)
         self.assertIn("--kernel", command)
         self.assertIn("--mxc-initramfs", command)
+
+    def test_test_mxc_policy_execute_config_forwards_flag(self):
+        args = nvx.parse_args(
+            [
+                "test-mxc-policy",
+                "--backend",
+                "whp",
+                "--config",
+                "policy.json",
+                "--execute-config",
+                "--output-dir",
+                "artifacts/policy",
+            ]
+        )
+        with (
+            patch.object(nvx, "_run") as run,
+            patch.object(nvx, "_validate_mxc_agent_live_inputs"),
+            patch.object(nvx, "openvmm_binary_path", return_value=Path("openvmm.exe")),
+            patch.object(nvx, "artifact_path", side_effect=lambda name: Path("build") / name),
+        ):
+            nvx.command_test_mxc_policy(args)
+        command = [str(value) for value in run.call_args.args[0]]
+        self.assertIn("--execute-config", command)
+        self.assertIn("--config", command)
+
+    def test_test_mxc_policy_execute_config_requires_config(self):
+        args = nvx.parse_args(["test-mxc-policy", "--backend", "whp", "--execute-config"])
+        with self.assertRaises(common.ScriptError) as context:
+            nvx.command_test_mxc_policy(args)
+        self.assertIn("--execute-config requires --config", str(context.exception))
+
+    def test_test_mxc_policy_execute_config_rejects_static_only(self):
+        args = nvx.parse_args(
+            [
+                "test-mxc-policy",
+                "--backend",
+                "whp",
+                "--config",
+                "policy.json",
+                "--execute-config",
+                "--static-only",
+            ]
+        )
+        with self.assertRaises(common.ScriptError) as context:
+            nvx.command_test_mxc_policy(args)
+        self.assertIn("requires live mode", str(context.exception))
 
     def test_sandbox_command_parses_typed_launch_contract(self):
         args = nvx.parse_args(

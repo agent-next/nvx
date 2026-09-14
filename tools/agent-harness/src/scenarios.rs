@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::client::{ClientError, MxcAgentClient};
 use crate::launch::{LaunchedVm, build_launch_plan, discover_artifacts, launch_whp_vm};
 #[cfg(windows)]
-use crate::mxc_policy::{NvxProvisionPolicy, adapt_policy};
+use crate::mxc_policy::{NvxExecPolicy, NvxProvisionPolicy, adapt_policy};
 use crate::{
     CANONICAL_SCENARIOS, CheckOutcome, EvidenceCheckStatus, EvidenceSource, HarnessOptions,
     ScenarioDefinition,
@@ -39,7 +39,7 @@ use agent_protocol::{
     MAX_SHUTDOWN_GRACE_TIMEOUT_MS, PROTOCOL_SAFE_STREAM_CHUNK_MAX_BYTES, PROTOCOL_VERSION,
 };
 #[cfg(windows)]
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const LIVE_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(windows)]
@@ -81,6 +81,29 @@ struct LiveHarnessState {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PolicyExecCleanupOutcome {
+    pub shutdown_acknowledged: bool,
+    pub channel_closed: bool,
+    pub process_exited: bool,
+    pub explicit_teardown_succeeded: bool,
+    pub cleanup_error: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PolicyExecLiveResult {
+    pub exec_id: u32,
+    pub disposition: ExecDisposition,
+    pub termination: Option<TerminationOutcome>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub cleanup: PolicyExecCleanupOutcome,
+}
+
+#[cfg(windows)]
 struct LiveWhpSession {
     vm: LaunchedVm,
     client: MxcAgentClient<NamedPipeClient>,
@@ -96,6 +119,16 @@ struct LiveWhpSession {
 }
 
 #[cfg(windows)]
+pub(crate) fn run_live_execute_config_policy(
+    options: &HarnessOptions,
+    exec: NvxExecPolicy,
+) -> Result<PolicyExecLiveResult, String> {
+    run_with_policy_live_session(options, move |state| {
+        execute_policy_exec_on_dedicated_session(state, exec)
+    })
+}
+
+#[cfg(windows)]
 #[derive(Clone)]
 struct Req9Fixtures {
     run_dir: PathBuf,
@@ -107,6 +140,113 @@ struct Req9Fixtures {
     undeclared_host_path: PathBuf,
     outside_escape_target: PathBuf,
     reparse_link_path: PathBuf,
+}
+
+#[cfg(windows)]
+fn execute_policy_exec_on_dedicated_session(
+    state: &mut LiveHarnessState,
+    exec: NvxExecPolicy,
+) -> Result<PolicyExecLiveResult, String> {
+    let mut session = state
+        .session
+        .take()
+        .ok_or_else(|| "live session unavailable".to_string())?;
+    let exec_id = 1_501_u32;
+    let execution = (|| -> Result<PolicyExecLiveResult, String> {
+        session
+            .client
+            .send_create_process(HostControlMessage::CreateProcess {
+                exec_id,
+                argv: exec.argv,
+                cwd: exec.cwd,
+                env: exec.env,
+                timeout_ms: exec.timeout_ms,
+            })
+            .map_err(|error| format!("policy execute-config create process failed: {error}"))?;
+        grant_stream(&mut session, exec_id, StreamName::Stdout, 1)?;
+        grant_stream(&mut session, exec_id, StreamName::Stderr, 1)?;
+        let observed = collect_exec_until_terminal(
+            &mut session,
+            exec_id,
+            Duration::from_secs(30),
+            true,
+            ExecCollectionLimits::small_probe(Duration::from_secs(30)),
+        )?;
+        let disposition = observed.disposition.ok_or_else(|| {
+            "policy execute-config did not produce terminal disposition".to_string()
+        })?;
+        if !terminal_order_ok(
+            &observed.messages,
+            exec_id,
+            disposition,
+            observed.termination,
+        ) {
+            return Err(
+                "policy execute-config terminal was not ordered after EOF and descendants-cleaned"
+                    .to_string(),
+            );
+        }
+        let shutdown_acknowledged = matches!(
+            session
+                .client
+                .request_shutdown(SHUTDOWN_VALIDATION_GRACE_MS, Duration::from_secs(3))
+                .map_err(|error| {
+                    format!("policy execute-config shutdown request failed: {error}")
+                })?,
+            AgentControlMessage::ShuttingDown
+        );
+        let shutdown_deadline = Instant::now() + Duration::from_secs(3);
+        let channel_closed = loop {
+            if Instant::now() >= shutdown_deadline {
+                break false;
+            }
+            let remaining = shutdown_deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(250));
+            match session.client.poll_agent_control(remaining) {
+                Err(error) if is_expected_channel_close_error(&error) => break true,
+                Err(error) => {
+                    return Err(format!(
+                        "policy execute-config shutdown channel-close failed: {error:?} ({error})"
+                    ));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break false,
+            }
+        };
+        let process_exited = session
+            .vm
+            .wait_for_exit_with_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("policy execute-config exit wait failed: {error}"))?;
+        Ok(PolicyExecLiveResult {
+            exec_id,
+            disposition,
+            termination: observed.termination,
+            stdout: observed.stdout,
+            stderr: observed.stderr,
+            cleanup: PolicyExecCleanupOutcome {
+                shutdown_acknowledged,
+                channel_closed,
+                process_exited,
+                explicit_teardown_succeeded: false,
+                cleanup_error: None,
+            },
+        })
+    })();
+    let teardown = session.vm.kill();
+    let merged = match execution {
+        Ok(mut result) => {
+            result.cleanup.explicit_teardown_succeeded = teardown.is_ok();
+            result.cleanup.cleanup_error = teardown.err();
+            Ok(result)
+        }
+        Err(error) => match teardown {
+            Ok(()) => Err(error),
+            Err(teardown_error) => Err(format!("{error}; teardown failed: {teardown_error}")),
+        },
+    };
+    state.session = None;
+    merged
 }
 
 #[cfg(windows)]

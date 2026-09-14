@@ -5,15 +5,21 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use super::PolicyError;
+use super::adapter::adapt_policy;
 use super::cases::{
     ExpectedDisposition, PolicyCase, StaticCaseResult, live_profile_for_path, load_corpus,
     load_single_config, run_static_cases, validate_case_disposition_contract, validate_corpus,
 };
 use super::catalog::{CatalogEntry, EvidenceRequirement, PolicyDisposition, catalog, catalog_hash};
-use super::live::{LiveProfileResult, LiveProfileStatus, run_live_profiles};
+use super::live::{
+    LiveExecuteCleanup, LiveExecuteEvidence, LiveProfileResult, LiveProfileStatus,
+    execute_live_config, run_live_profiles,
+};
 use super::schema::{normalized_sha256, provenance, raw_sha256};
 use crate::launch::LaunchOverrides;
 use crate::{HarnessBackend, content_sha256_hex_bytes, write_bytes_atomic, write_json_atomic};
+#[cfg(windows)]
+use agent_protocol::messages::ExecDisposition;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -34,6 +40,7 @@ pub struct PolicyHarnessOptions {
     pub mode: PolicyHarnessMode,
     pub output_dir: PathBuf,
     pub config: Option<PathBuf>,
+    pub execute_config: bool,
     pub launch_overrides: LaunchOverrides,
 }
 
@@ -86,12 +93,48 @@ pub struct PolicyHarnessReport {
     pub catalog_results: Vec<CatalogResult>,
     pub static_cases: Vec<StaticCaseResult>,
     pub live_profiles: BTreeMap<String, LiveProfileResult>,
+    pub execute_config: Option<ExecuteConfigReport>,
     pub uncovered: Vec<String>,
     pub unexpected: Vec<String>,
     pub blocked: Vec<String>,
     pub failed: Vec<String>,
     pub rejection_effects_zero: bool,
     pub passed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecuteConfigArtifact {
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecuteConfigTerminal {
+    #[cfg(windows)]
+    pub disposition: ExecDisposition,
+    #[cfg(not(windows))]
+    pub disposition: String,
+    #[cfg(windows)]
+    pub termination: Option<agent_protocol::messages::TerminationOutcome>,
+    #[cfg(not(windows))]
+    pub termination: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecuteConfigReport {
+    pub tier: String,
+    pub exec_id: u32,
+    pub terminal: ExecuteConfigTerminal,
+    pub stdout: ExecuteConfigArtifact,
+    pub stderr: ExecuteConfigArtifact,
+    pub outcome: ExecuteConfigArtifact,
+    pub cleanup: LiveExecuteCleanup,
+    pub passed: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -120,6 +163,12 @@ pub struct PolicyHarnessRun {
     trusted_artifacts: BTreeMap<String, (String, u64, String)>,
 }
 
+#[derive(Clone, Debug)]
+struct PreparedExecuteConfig {
+    case: PolicyCase,
+    exec: super::NvxExecPolicy,
+}
+
 impl PolicyHarnessRun {
     pub fn exit_code(&self) -> ExitCode {
         if self.report.passed && verify_policy_run(self).is_ok() {
@@ -145,9 +194,11 @@ pub fn execute_policy_harness(
             "vendored schema bytes, normalized form, or Draft do not match provenance",
         ));
     }
-    let cases = match &options.config {
-        Some(path) => vec![load_single_config(path)?],
-        None => load_corpus()?,
+    let execute_config = validate_execute_config_request(&options)?;
+    let cases = match (&options.config, &execute_config) {
+        (_, Some(prepared)) => vec![prepared.case.clone()],
+        (Some(path), None) => vec![load_single_config(path)?],
+        (None, None) => load_corpus()?,
     };
     let coverage = if options.config.is_none() {
         validate_corpus(&cases)?
@@ -166,10 +217,14 @@ pub fn execute_policy_harness(
             || (result.effect_counters.is_zero() && !result.output_directory_created)
     });
 
-    let live_profiles = if options.mode == PolicyHarnessMode::LiveWhp {
+    let live_profiles = if options.mode == PolicyHarnessMode::LiveWhp && !options.execute_config {
         run_live_profiles(&options)
     } else {
         BTreeMap::new()
+    };
+    let execute_config_report = match execute_config {
+        Some(prepared) => Some(run_execute_config_live(&options, prepared.exec)?),
+        None => None,
     };
     let catalog_entries = catalog()?;
     let mut uncovered = Vec::new();
@@ -239,12 +294,20 @@ pub fn execute_policy_harness(
         failed.push("freshness-identities".to_string());
     }
     let live_profiles_complete = live_profiles_complete(options.mode, &live_profiles);
+    if let Some(execute_result) = &execute_config_report
+        && !execute_result.passed
+    {
+        failed.push("execute-config".to_string());
+    }
     let passed = uncovered.is_empty()
         && unexpected.is_empty()
         && failed.is_empty()
         && blocked.is_empty()
         && rejection_effects_zero
-        && live_profiles_complete;
+        && live_profiles_complete
+        && execute_config_report
+            .as_ref()
+            .is_none_or(|result| result.passed);
     let report = PolicyHarnessReport {
         schema: REPORT_SCHEMA.to_string(),
         version: REPORT_VERSION,
@@ -254,6 +317,7 @@ pub fn execute_policy_harness(
         catalog_results,
         static_cases: static_results,
         live_profiles,
+        execute_config: execute_config_report,
         uncovered,
         unexpected,
         blocked,
@@ -306,6 +370,199 @@ pub fn execute_policy_harness(
     };
     verify_policy_run(&run)?;
     Ok(run)
+}
+
+fn validate_execute_config_request(
+    options: &PolicyHarnessOptions,
+) -> Result<Option<PreparedExecuteConfig>, PolicyError> {
+    if !options.execute_config {
+        return Ok(None);
+    }
+    if options.backend != HarnessBackend::Whp {
+        return Err(PolicyError::new(
+            "execute_config_requires_whp",
+            "/backend",
+            "--execute-config requires --backend whp",
+        ));
+    }
+    if options.mode != PolicyHarnessMode::LiveWhp {
+        return Err(PolicyError::new(
+            "execute_config_requires_live_mode",
+            "/mode",
+            "--execute-config cannot be combined with --static-only",
+        ));
+    }
+    let config_path = options.config.as_ref().ok_or_else(|| {
+        PolicyError::new(
+            "execute_config_requires_config",
+            "/config",
+            "--execute-config requires --config <path>",
+        )
+    })?;
+    let case = load_single_config(config_path)?;
+    let static_root = options
+        .launch_overrides
+        .common_root
+        .as_deref()
+        .unwrap_or_else(|| Path::new(r"C:\nvx-policy-common"));
+    let adapted = adapt_policy(case.id.clone(), &case.config, static_root).map_err(|errors| {
+        errors.first().cloned().unwrap_or_else(|| {
+            PolicyError::new(
+                "execute_config_rejected",
+                "$",
+                "policy adaptation rejected execute-config input",
+            )
+        })
+    })?;
+    if adapted.phase != super::MxcPhase::Exec {
+        return Err(PolicyError::new(
+            "execute_config_invalid_phase",
+            "/phase",
+            format!(
+                "--execute-config requires an accepted phase=exec policy, got {}",
+                adapted.phase.as_str()
+            ),
+        ));
+    }
+    let exec = adapted.exec.ok_or_else(|| {
+        PolicyError::new(
+            "execute_config_missing_exec",
+            "/process",
+            "accepted phase=exec policy did not produce an exec plan",
+        )
+    })?;
+    Ok(Some(PreparedExecuteConfig { case, exec }))
+}
+
+fn run_execute_config_live(
+    options: &PolicyHarnessOptions,
+    exec: super::NvxExecPolicy,
+) -> Result<ExecuteConfigReport, PolicyError> {
+    let evidence = execute_live_config(options, exec).map_err(|error| {
+        PolicyError::new(
+            "execute_config_live_failed",
+            "$",
+            format!("live execute-config run failed: {error}"),
+        )
+    })?;
+    fs::create_dir_all(&options.output_dir).map_err(|error| {
+        PolicyError::new(
+            "report_io",
+            "$",
+            format!(
+                "failed to create policy output {}: {error}",
+                options.output_dir.display()
+            ),
+        )
+    })?;
+    let stdout = write_execute_artifact(
+        &options.output_dir,
+        Path::new("execute-config").join("stdout.bin"),
+        &evidence.stdout,
+    )?;
+    let stderr = write_execute_artifact(
+        &options.output_dir,
+        Path::new("execute-config").join("stderr.bin"),
+        &evidence.stderr,
+    )?;
+    let terminal = ExecuteConfigTerminal {
+        #[cfg(windows)]
+        disposition: evidence.disposition,
+        #[cfg(not(windows))]
+        disposition: evidence.disposition,
+        #[cfg(windows)]
+        termination: evidence.termination,
+        #[cfg(not(windows))]
+        termination: evidence.termination,
+    };
+    let outcome_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "tier": &evidence.tier,
+        "execId": evidence.exec_id,
+        "terminal": &terminal,
+        "cleanup": &evidence.cleanup,
+        "stdoutArtifactPath": &stdout.path,
+        "stderrArtifactPath": &stderr.path,
+    }))
+    .map_err(|error| {
+        PolicyError::new(
+            "report_io",
+            "$",
+            format!("serialize execute-config outcome: {error}"),
+        )
+    })?;
+    let outcome = write_execute_artifact(
+        &options.output_dir,
+        Path::new("execute-config").join("outcome.json"),
+        &outcome_bytes,
+    )?;
+    let cleanup_ok = evidence.cleanup.shutdown_acknowledged
+        && evidence.cleanup.channel_closed
+        && evidence.cleanup.process_exited
+        && evidence.cleanup.explicit_teardown_succeeded
+        && evidence.cleanup.cleanup_error.is_none();
+    let exit_zero = execute_disposition_is_success(&evidence);
+    let passed = cleanup_ok && exit_zero;
+    let mut errors = Vec::new();
+    if !exit_zero {
+        errors.push("ExecTerminal disposition was not ExitCode(0)".to_string());
+    }
+    if !cleanup_ok {
+        errors.push("cleanup verification did not complete successfully".to_string());
+    }
+    if let Some(cleanup_error) = &evidence.cleanup.cleanup_error {
+        errors.push(format!("explicit teardown error: {cleanup_error}"));
+    }
+    Ok(ExecuteConfigReport {
+        tier: evidence.tier,
+        exec_id: evidence.exec_id,
+        terminal,
+        stdout,
+        stderr,
+        outcome,
+        cleanup: evidence.cleanup,
+        passed,
+        error: if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        },
+    })
+}
+
+fn write_execute_artifact(
+    output_dir: &Path,
+    relative: PathBuf,
+    bytes: &[u8],
+) -> Result<ExecuteConfigArtifact, PolicyError> {
+    let path = output_dir.join(&relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            PolicyError::new(
+                "report_io",
+                "$",
+                format!(
+                    "failed to create execute-config artifact directory {}: {error}",
+                    parent.display()
+                ),
+            )
+        })?;
+    }
+    write_bytes_atomic(&path, bytes).map_err(|error| PolicyError::new("report_io", "$", error))?;
+    Ok(ExecuteConfigArtifact {
+        path: relative.to_string_lossy().replace('\\', "/"),
+        size_bytes: bytes.len() as u64,
+        sha256: content_sha256_hex_bytes(bytes),
+    })
+}
+
+#[cfg(windows)]
+fn execute_disposition_is_success(evidence: &LiveExecuteEvidence) -> bool {
+    evidence.disposition == ExecDisposition::ExitCode(0)
+}
+
+#[cfg(not(windows))]
+fn execute_disposition_is_success(evidence: &LiveExecuteEvidence) -> bool {
+    evidence.disposition == "ExitCode(0)"
 }
 
 fn live_profiles_complete(
@@ -886,6 +1143,7 @@ mod tests {
             mode: PolicyHarnessMode::StaticOnly,
             output_dir: output.clone(),
             config: None,
+            execute_config: false,
             launch_overrides: LaunchOverrides::default(),
         })
         .expect("static report");
@@ -906,6 +1164,7 @@ mod tests {
             mode: PolicyHarnessMode::StaticOnly,
             output_dir: output.clone(),
             config: None,
+            execute_config: false,
             launch_overrides: LaunchOverrides::default(),
         })
         .expect("static report");
@@ -926,6 +1185,7 @@ mod tests {
             mode: PolicyHarnessMode::StaticOnly,
             output_dir: output.clone(),
             config: None,
+            execute_config: false,
             launch_overrides: LaunchOverrides::default(),
         })
         .expect("static report");
@@ -942,6 +1202,7 @@ mod tests {
             mode: PolicyHarnessMode::StaticOnly,
             output_dir: output.clone(),
             config: None,
+            execute_config: false,
             launch_overrides: LaunchOverrides::default(),
         })
         .expect("static report");
@@ -959,6 +1220,7 @@ mod tests {
             mode: PolicyHarnessMode::StaticOnly,
             output_dir: output.clone(),
             config: None,
+            execute_config: false,
             launch_overrides: LaunchOverrides::default(),
         })
         .expect("static report");
@@ -989,6 +1251,7 @@ mod tests {
             mode: PolicyHarnessMode::StaticOnly,
             output_dir: output.clone(),
             config: None,
+            execute_config: false,
             launch_overrides: LaunchOverrides::default(),
         })
         .expect("static report");
@@ -1007,6 +1270,7 @@ mod tests {
             mode: PolicyHarnessMode::StaticOnly,
             output_dir: output.clone(),
             config: None,
+            execute_config: false,
             launch_overrides: LaunchOverrides::default(),
         })
         .expect("static report");
@@ -1049,6 +1313,7 @@ mod tests {
             mode: PolicyHarnessMode::StaticOnly,
             output_dir: default_static_common_root(),
             config: None,
+            execute_config: false,
             launch_overrides: LaunchOverrides::default(),
         })
         .expect("pins");
@@ -1096,11 +1361,146 @@ mod tests {
             mode: PolicyHarnessMode::StaticOnly,
             output_dir: output.clone(),
             config: None,
+            execute_config: false,
             launch_overrides: LaunchOverrides::default(),
         })
         .expect("static report");
         fs::write(&run.attestation_manifest_path, b"{}").expect("tamper manifest");
         assert!(verify_policy_run(&run).is_err());
+        fs::remove_dir_all(output).expect("cleanup");
+    }
+
+    fn write_test_config(name: &str, value: &serde_json::Value) -> PathBuf {
+        let root = test_output(name);
+        fs::create_dir_all(&root).expect("create config root");
+        let path = root.join("policy.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(value).expect("serialize config"),
+        )
+        .expect("write config");
+        path
+    }
+
+    #[test]
+    fn execute_config_requires_config_before_output_creation() {
+        let output = test_output("policy-execute-config-requires-config");
+        assert!(!output.exists());
+        let error = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::LiveWhp,
+            output_dir: output.clone(),
+            config: None,
+            execute_config: true,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect_err("missing --config must fail");
+        assert_eq!(error.code, "execute_config_requires_config");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn execute_config_rejects_static_only_before_output_creation() {
+        let output = test_output("policy-execute-config-static-only");
+        let config_path = write_test_config(
+            "policy-execute-config-static-only-config",
+            &serde_json::json!({
+                "version": "0.9.0-dev",
+                "containment": "vm",
+                "phase": "exec",
+                "sandboxId": "sandbox",
+                "process": {"commandLine": "echo ok", "env": []}
+            }),
+        );
+        let error = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::StaticOnly,
+            output_dir: output.clone(),
+            config: Some(config_path),
+            execute_config: true,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect_err("static-only execute-config must fail");
+        assert_eq!(error.code, "execute_config_requires_live_mode");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn execute_config_rejects_non_exec_phase_before_output_creation() {
+        let output = test_output("policy-execute-config-non-exec");
+        let config_path = write_test_config(
+            "policy-execute-config-non-exec-config",
+            &serde_json::json!({
+                "version": "0.9.0-dev",
+                "containment": "vm",
+                "phase": "start",
+                "sandboxId": "sandbox-start"
+            }),
+        );
+        let error = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::LiveWhp,
+            output_dir: output.clone(),
+            config: Some(config_path),
+            execute_config: true,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect_err("non-exec phase must fail");
+        assert_eq!(error.code, "execute_config_invalid_phase");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn execute_config_rejected_policy_produces_no_output() {
+        let output = test_output("policy-execute-config-rejected");
+        let config_path = write_test_config(
+            "policy-execute-config-rejected-config",
+            &serde_json::json!({
+                "version": "0.9.0-dev",
+                "containment": "process",
+                "phase": "exec",
+                "sandboxId": "sandbox",
+                "process": {"commandLine": "echo blocked", "env": []}
+            }),
+        );
+        let _ = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::LiveWhp,
+            output_dir: output.clone(),
+            config: Some(config_path),
+            execute_config: true,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect_err("rejected policy must fail");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn manifest_attests_execute_config_stream_artifacts() {
+        let output = test_output("policy-execute-config-artifacts");
+        let execute_dir = output.join("execute-config");
+        fs::create_dir_all(&execute_dir).expect("create execute-config directory");
+        fs::write(execute_dir.join("stdout.bin"), b"hello stdout").expect("write stdout");
+        fs::write(execute_dir.join("stderr.bin"), b"").expect("write stderr");
+        fs::write(execute_dir.join("outcome.json"), b"{\"ok\":true}").expect("write outcome");
+        let run = execute_policy_harness(PolicyHarnessOptions {
+            backend: HarnessBackend::Whp,
+            mode: PolicyHarnessMode::StaticOnly,
+            output_dir: output.clone(),
+            config: None,
+            execute_config: false,
+            launch_overrides: LaunchOverrides::default(),
+        })
+        .expect("static report");
+        let paths = run
+            .trusted_artifacts
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains("execute-config/stdout.bin"));
+        assert!(paths.contains("execute-config/stderr.bin"));
+        assert!(paths.contains("execute-config/outcome.json"));
+        verify_policy_run(&run).expect("manifest remains valid");
         fs::remove_dir_all(output).expect("cleanup");
     }
 

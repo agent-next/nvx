@@ -271,10 +271,19 @@ python scripts\nvx.py test-mxc-policy --backend whp `
 # Static catalog/corpus diagnostics, or one real MXC JSON document
 python scripts\nvx.py test-mxc-policy --backend whp --static-only
 python scripts\nvx.py test-mxc-policy --backend whp --static-only --config policy.json
+
+# Execute one accepted phase=exec MXC config in a dedicated live WHP session
+python scripts\nvx.py test-mxc-policy --backend whp `
+  --config policy.json `
+  --execute-config `
+  --output-dir A:\Temp\nvx-mxc-policy-exec `
+  --common-root A:\Temp\nvx-mxc-policy-exec-common
 ```
 
 The report schema is `nvx.mxc.policy.harness.report.v1`. Freshness pins include
 the source schema and commit, raw/normalized schema hashes, catalog, adapter,
 protocol source/version, case corpus, kernel, initramfs, workload probe,
 OpenVMM, and harness identities. `report.json` and `diagnostics.log` are covered
-by a detached SHA-256 manifest.
+by a detached SHA-256 manifest. In `--execute-config` mode, binary
+`execute-config/stdout.bin`, `execute-config/stderr.bin`, and
+`execute-config/outcome.json` are also recursively attested.

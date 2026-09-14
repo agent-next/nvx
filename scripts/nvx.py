@@ -258,6 +258,10 @@ def command_test_mxc_agent(args: argparse.Namespace) -> None:
 
 
 def command_test_mxc_policy(args: argparse.Namespace) -> None:
+    if args.execute_config and args.config is None:
+        raise ScriptError("--execute-config requires --config")
+    if args.execute_config and args.static_only:
+        raise ScriptError("--execute-config requires live mode (omit --static-only)")
     openvmm_exe = args.openvmm_exe or openvmm_binary_path()
     kernel = args.kernel or artifact_path("vmlinux")
     mxc_initramfs = args.mxc_initramfs or artifact_path(MXC_PROTOTYPE_INITRAMFS_NAME)
@@ -285,6 +289,8 @@ def command_test_mxc_policy(args: argparse.Namespace) -> None:
     ]
     if args.config is not None:
         command.extend(("--config", args.config))
+    if args.execute_config:
+        command.append("--execute-config")
     if args.static_only:
         command.append("--static-only")
     else:
@@ -724,6 +730,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--config",
         type=Path,
         help="run one diagnostic MXC JSON config instead of the checked-in corpus",
+    )
+    mxc_policy_tests.add_argument(
+        "--execute-config",
+        action="store_true",
+        help="execute the supplied --config once in a dedicated live WHP session and require full execution evidence",
     )
     mxc_policy_tests.add_argument(
         "--static-only",

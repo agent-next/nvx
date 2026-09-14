@@ -10,28 +10,29 @@ fn print_usage() {
         "  agent-harness [conformance] --backend whp [--static-only] [--output-dir <path>] [artifact overrides]"
     );
     eprintln!(
-        "  agent-harness mxc-policy --backend whp [--config <json>] [--static-only] [--output-dir <path>] [artifact overrides]"
+        "  agent-harness mxc-policy --backend whp [--config <json>] [--execute-config] [--static-only] [--output-dir <path>] [artifact overrides]"
     );
+}
+
+struct ParsedCommon {
+    backend: HarnessBackend,
+    static_only: bool,
+    output_dir: PathBuf,
+    launch_overrides: agent_harness::launch::LaunchOverrides,
+    config: Option<PathBuf>,
+    execute_config: bool,
 }
 
 fn parse_common(
     arguments: impl IntoIterator<Item = String>,
     default_output: PathBuf,
-) -> Result<
-    (
-        HarnessBackend,
-        bool,
-        PathBuf,
-        agent_harness::launch::LaunchOverrides,
-        Option<PathBuf>,
-    ),
-    String,
-> {
+) -> Result<ParsedCommon, String> {
     let mut backend = None;
     let mut static_only = false;
     let mut output_dir = default_output;
     let mut launch_overrides = agent_harness::launch::LaunchOverrides::default();
     let mut config = None;
+    let mut execute_config = false;
     let mut args = arguments.into_iter();
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -78,6 +79,7 @@ fn parse_common(
                         .ok_or_else(|| "--config requires a value".to_string())?,
                 ));
             }
+            "--execute-config" => execute_config = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -85,17 +87,25 @@ fn parse_common(
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok((
-        backend.ok_or_else(|| "--backend is required".to_string())?,
+    Ok(ParsedCommon {
+        backend: backend.ok_or_else(|| "--backend is required".to_string())?,
         static_only,
         output_dir,
         launch_overrides,
         config,
-    ))
+        execute_config,
+    })
 }
 
 fn run_conformance(arguments: Vec<String>) -> ExitCode {
-    let (backend, static_only, output_dir, launch_overrides, config) =
+    let ParsedCommon {
+        backend,
+        static_only,
+        output_dir,
+        launch_overrides,
+        config,
+        execute_config,
+    } =
         match parse_common(arguments, PathBuf::from("build").join("mxc-agent-harness")) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -106,6 +116,10 @@ fn run_conformance(arguments: Vec<String>) -> ExitCode {
         };
     if config.is_some() {
         eprintln!("error: --config is valid only for mxc-policy");
+        return ExitCode::FAILURE;
+    }
+    if execute_config {
+        eprintln!("error: --execute-config is valid only for mxc-policy");
         return ExitCode::FAILURE;
     }
     let options = HarnessOptions {
@@ -149,7 +163,14 @@ fn run_conformance(arguments: Vec<String>) -> ExitCode {
 }
 
 fn run_policy(arguments: Vec<String>) -> ExitCode {
-    let (backend, static_only, output_dir, launch_overrides, config) =
+    let ParsedCommon {
+        backend,
+        static_only,
+        output_dir,
+        launch_overrides,
+        config,
+        execute_config,
+    } =
         match parse_common(arguments, PathBuf::from("build").join("mxc-policy-harness")) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -167,6 +188,7 @@ fn run_policy(arguments: Vec<String>) -> ExitCode {
         },
         output_dir,
         config,
+        execute_config,
         launch_overrides,
     };
     match execute_policy_harness(options) {
@@ -206,5 +228,43 @@ fn main() -> ExitCode {
             run_conformance(arguments)
         }
         _ => run_conformance(arguments),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::parse_common;
+
+    #[test]
+    fn parse_common_defaults_execute_config_to_false() {
+        let parsed = parse_common(
+            vec!["--backend".to_string(), "whp".to_string()],
+            PathBuf::from("default-output"),
+        )
+        .expect("parsed");
+        assert_eq!(parsed.backend.as_str(), "whp");
+        assert!(!parsed.static_only);
+        assert_eq!(parsed.output_dir, PathBuf::from("default-output"));
+        assert!(parsed.config.is_none());
+        assert!(!parsed.execute_config);
+    }
+
+    #[test]
+    fn parse_common_accepts_execute_config_and_config_together() {
+        let parsed = parse_common(
+            vec![
+                "--backend".to_string(),
+                "whp".to_string(),
+                "--config".to_string(),
+                "policy.json".to_string(),
+                "--execute-config".to_string(),
+            ],
+            PathBuf::from("default-output"),
+        )
+        .expect("parsed");
+        assert_eq!(parsed.config, Some(PathBuf::from("policy.json")));
+        assert!(parsed.execute_config);
     }
 }
