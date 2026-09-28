@@ -23,6 +23,7 @@ from nvx_tools import (  # noqa: E402
     control_session,
     microvm_tests,
     openvmm_process,
+    sandbox,
 )
 from nvx_tools.build_constants import (  # noqa: E402
     BuildConstants,
@@ -1639,6 +1640,7 @@ class MicrovmTests(unittest.TestCase):
         self,
         root: Path,
         outputs: dict[str, tuple[int, bytes]],
+        launcher: tuple[int, int] | None = None,
     ) -> list[list[str]]:
         layer = root / "ubuntu-distro.erofs"
         layer.write_bytes(b"layer")
@@ -1648,14 +1650,12 @@ class MicrovmTests(unittest.TestCase):
         )
         output_dir = root / "logs"
         output_dir.mkdir()
-        identity: tuple[tuple[int, int], str]
-        if sys.platform == "win32":
-            identity = ((65534, 65534), "process")
-        else:
-            identity = ((os.getuid(), os.getgid()), "caller")
+        owned = launcher is not None and launcher[0] != 0
         commands: list[list[str]] = []
 
-        def scratch(scratch_root: Path, _identity: tuple[int, int]) -> Path:
+        def scratch(scratch_root: Path, owner: tuple[int, int] | None) -> Path:
+            if owner != (launcher if owned else None):
+                raise AssertionError("scratch does not define the share owner")
             template = scratch_root / "scratch-template.ext4"
             template.write_bytes(b"scratch")
             return template
@@ -1672,9 +1672,8 @@ class MicrovmTests(unittest.TestCase):
                 self.access = mount[2]
                 probe = (self.export / "probe.sh").read_text(encoding="utf-8")
                 chmod = 'chmod 0600 "$share/guest-file" || fail 50\n'
-                caller_owned = cast(str, identity[1]) == "caller"
-                if (chmod in probe) != caller_owned:
-                    raise AssertionError("probe chmod does not match the owner mode")
+                if (chmod in probe) != owned:
+                    raise AssertionError("probe chmod does not match share ownership")
 
             def __enter__(self) -> "FakeProcess":
                 return self
@@ -1728,11 +1727,8 @@ class MicrovmTests(unittest.TestCase):
 
         with (
             patch.object(microvm_tests, "artifact_path", side_effect=artifact),
-            patch.object(
-                microvm_tests,
-                "_sandbox_filesystem_identity",
-                return_value=identity,
-            ),
+            patch.object(microvm_tests, "launcher_identity", return_value=launcher),
+            patch.object(sandbox, "launcher_identity", return_value=launcher),
             patch.object(microvm_tests, "_assign_sandbox_export_owner"),
             patch.object(
                 microvm_tests,
@@ -1750,7 +1746,10 @@ class MicrovmTests(unittest.TestCase):
                 timeout=60,
                 output_dir=output_dir,
             )
-        self.assertTrue((output_dir / "sandbox-filesystem.json").is_file())
+        root_run = launcher is not None and not owned
+        self.assertEqual(
+            (output_dir / "sandbox-filesystem.json").is_file(), not root_run
+        )
         return commands
 
     def _sandbox_filesystem_outputs(self) -> dict[str, tuple[int, bytes]]:
@@ -1793,14 +1792,14 @@ class MicrovmTests(unittest.TestCase):
             ],
             ["/workspace", "/workspace", "/dev/nvx-share", "/bin/nvx-share"],
         )
-        expected_owner = "process" if sys.platform == "win32" else "caller"
         for command, access in zip(commands[:2], ("rw", "ro"), strict=True):
             self.assertTrue(command[command.index("--mount") + 1].endswith(access))
             self.assertTrue(
                 command[command.index("--mount-deny") + 1].endswith("secrets")
             )
             self.assertEqual(
-                command[command.index("--mount-owner") + 1], expected_owner
+                command[command.index("--microvm-workload-identity") + 1],
+                "65534:65534",
             )
             self.assertEqual(command[command.index("--memory") + 1], "256M")
             self.assertEqual(
@@ -1814,9 +1813,56 @@ class MicrovmTests(unittest.TestCase):
             commands[0][commands[0].index("--cmdline") + 1],
         )
         self.assertIn("--microvm-report", commands[0])
-        for command in commands[2:]:
+        for command in commands:
             self.assertNotIn("--mount-owner", command)
+        for command in commands[2:]:
             self.assertNotIn("--mount-deny", command)
+
+    def test_sandbox_filesystem_runs_the_linux_share_as_the_launcher(self):
+        # The real share contract checks the host owner of the export.
+        launcher = sandbox.launcher_identity()
+        if launcher is None or 0 in launcher or 65534 in launcher:
+            self.skipTest("requires a non-root Linux launcher")
+        with tempfile.TemporaryDirectory() as temporary:
+            commands = self._run_sandbox_filesystem(
+                Path(temporary), self._sandbox_filesystem_outputs(), launcher
+            )
+
+        self.assertEqual(len(commands), 4)
+        for command in commands[:2]:
+            self.assertEqual(
+                command[command.index("--microvm-workload-identity") + 1],
+                f"{launcher[0]}:{launcher[1]}",
+            )
+            self.assertNotIn("--mount-owner", command)
+
+    def test_sandbox_filesystem_expects_a_root_share_rejection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands = self._run_sandbox_filesystem(
+                Path(temporary), self._sandbox_filesystem_outputs(), (0, 0)
+            )
+
+        mounts = [
+            command[command.index("--mount") + 1].split(",") for command in commands
+        ]
+        self.assertEqual(
+            [(mount[0], mount[2]) for mount in mounts],
+            [("/workspace", "ro"), ("/dev/nvx-share", "ro"), ("/bin/nvx-share", "ro")],
+        )
+        self.assertEqual(
+            commands[0][commands[0].index("--microvm-workload-identity") + 1],
+            "65534:65534",
+        )
+
+    def test_sandbox_filesystem_rejects_an_accepted_root_share(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(sandbox, "_require_share_identity"),
+            self.assertRaisesRegex(RuntimeError, "root-launched read-write share"),
+        ):
+            self._run_sandbox_filesystem(
+                Path(temporary), self._sandbox_filesystem_outputs(), (0, 0)
+            )
 
     def test_sandbox_filesystem_rejects_an_accepted_unsafe_target(self):
         outputs = self._sandbox_filesystem_outputs()

@@ -63,7 +63,7 @@ from .sandbox import (
     SandboxLaunch,
     SandboxLayer,
     SandboxMount,
-    default_mount_owner,
+    launcher_identity,
 )
 
 MICROVM_TEST_SCENARIOS = (
@@ -131,8 +131,6 @@ SANDBOX_FILESYSTEM_OK_MARKER = b"NVX-SANDBOX-FILESYSTEM-OK"
 SANDBOX_FILESYSTEM_READ_ONLY_MARKER = b"NVX-SANDBOX-FILESYSTEM-READ-ONLY-OK"
 SANDBOX_FILESYSTEM_EXIT_MARKER = b"NVX-SANDBOX-EXIT: status=0"
 SANDBOX_FILESYSTEM_USER = "nvx-share"
-# A root test run cannot use UID 0 as the workload, so it exports this owner.
-SANDBOX_FILESYSTEM_ROOT_RUN_IDENTITY = (12345, 12345)
 SANDBOX_FILESYSTEM_SCRATCH_TEMPLATE_NAME = "ubuntu-smoke-scratch.ext4"
 SANDBOX_FILESYSTEM_SCRATCH_SIZE = 64 * 1024 * 1024
 SNAPSHOT_CORE_CONTINUED_MARKER = b"NVX-SNAPSHOT-CORE-CONTINUED"
@@ -1982,25 +1980,6 @@ def run_sandbox_blocks(
         )
 
 
-def _sandbox_filesystem_identity() -> tuple[tuple[int, int], str]:
-    """Returns the workload identity and mount owner for the live-share test.
-
-    Linux runs use caller ownership with a workload identity that owns the
-    export, which maps guest-created files to that owner. Windows has no host
-    UID mapping and keeps the default identity and process ownership.
-    """
-    if sys.platform == "win32":
-        return DEFAULT_WORKLOAD_IDENTITY, default_mount_owner()
-    uid, gid = os.getuid(), os.getgid()
-    if uid == 0:
-        return SANDBOX_FILESYSTEM_ROOT_RUN_IDENTITY, "caller"
-    if gid == 0 or 65534 in (uid, gid):
-        raise ScriptError(
-            "sandbox-filesystem requires a host UID and GID other than 0 and 65534"
-        )
-    return (uid, gid), "caller"
-
-
 def _assign_sandbox_export_owner(export: Path, identity: tuple[int, int]) -> None:
     if sys.platform == "win32":
         return
@@ -2010,10 +1989,10 @@ def _assign_sandbox_export_owner(export: Path, identity: tuple[int, int]) -> Non
     os.chmod(export, 0o700)
 
 
-def _sandbox_filesystem_scratch(root: Path, identity: tuple[int, int]) -> Path:
-    """Creates the scratch template whose upper layer defines the identity."""
+def _sandbox_filesystem_scratch(root: Path, owner: tuple[int, int] | None) -> Path:
+    """Creates the scratch template whose upper layer defines the share owner."""
     template = root / "scratch-template.ext4"
-    if sys.platform == "win32":
+    if sys.platform == "win32" or owner is None:
         shutil.copyfile(
             require_file(
                 artifact_path(SANDBOX_FILESYSTEM_SCRATCH_TEMPLATE_NAME),
@@ -2022,7 +2001,7 @@ def _sandbox_filesystem_scratch(root: Path, identity: tuple[int, int]) -> Path:
             template,
         )
         return template
-    uid, gid = identity
+    uid, gid = owner
     staging = root / "scratch-staging"
     upper = staging / "upper"
     etc = upper / "etc"
@@ -2096,7 +2075,9 @@ def _sandbox_filesystem_command(
     return command
 
 
-def _check_sandbox_filesystem_writes(export: Path, identity: tuple[int, int]) -> None:
+def _check_sandbox_filesystem_writes(
+    export: Path, owner: tuple[int, int] | None
+) -> None:
     written = export / "guest-file"
     nested = export / "guest-dir" / "nested"
     if (
@@ -2104,15 +2085,15 @@ def _check_sandbox_filesystem_writes(export: Path, identity: tuple[int, int]) ->
         or nested.read_bytes() != b"NVX-GUEST-NESTED\n"
     ):
         raise RuntimeError("sandbox workload writes were not visible on the host")
-    if sys.platform == "win32":
+    if owner is None:
         return
     for path in (written, nested.parent, nested):
         status = path.stat()
-        if (status.st_uid, status.st_gid) != identity:
+        if (status.st_uid, status.st_gid) != owner:
             raise RuntimeError(
                 f"sandbox workload created {path.name} as "
                 f"{status.st_uid}:{status.st_gid}, not the export owner "
-                f"{identity[0]}:{identity[1]}"
+                f"{owner[0]}:{owner[1]}"
             )
     if stat.S_IMODE(written.stat().st_mode) != 0o600:
         raise RuntimeError("sandbox workload chmod did not reach the host file")
@@ -2149,7 +2130,15 @@ def run_sandbox_filesystem(
         ) from error
     memory_mib = max(memory_mib, 256)
     target = SANDBOX_FILESYSTEM_TARGET
-    identity, owner = _sandbox_filesystem_identity()
+    launcher = launcher_identity()
+    root_run = launcher is not None and launcher[0] == 0
+    # Linux serves the share as the launcher, which must own it and be the workload.
+    owner = None if root_run else launcher
+    if owner is not None and (owner[1] == 0 or 65534 in owner):
+        raise ScriptError(
+            "sandbox-filesystem requires a host UID and GID other than 0 and 65534"
+        )
+    identity = DEFAULT_WORKLOAD_IDENTITY if owner is None else owner
     with tempfile.TemporaryDirectory(prefix="nvx-sandbox-filesystem-") as temporary:
         root = Path(temporary)
         export = root / "export"
@@ -2163,12 +2152,11 @@ def run_sandbox_filesystem(
                 "sandbox-filesystem.sh.in",
                 TARGET=target,
                 IDENTITY=f"{identity[0]}:{identity[1]}",
-                # Only a caller-owned share reports the workload as the owner
-                # that the guest kernel requires for chmod.
+                # The guest kernel allows chmod only when the workload owns the file.
                 OWNER_CHECK=(
-                    'chmod 0600 "$share/guest-file" || fail 50'
-                    if owner == "caller"
-                    else ":"
+                    ":"
+                    if owner is None
+                    else 'chmod 0600 "$share/guest-file" || fail 50'
                 ),
             ).encode()
         )
@@ -2176,7 +2164,7 @@ def run_sandbox_filesystem(
             _render_script("sandbox-filesystem-read-only.sh.in", TARGET=target).encode()
         )
         _assign_sandbox_export_owner(export, identity)
-        template = _sandbox_filesystem_scratch(root, identity)
+        template = _sandbox_filesystem_scratch(root, owner)
 
         def sandbox(name: str, access: str | None, probe: str) -> SandboxLaunch:
             scratch = root / f"{name}-scratch.ext4"
@@ -2195,50 +2183,61 @@ def run_sandbox_filesystem(
                         host_path=export,
                         access=access,
                         denied_paths=(secrets_path,),
-                        owner=owner,
                     )
                 ),
             )
 
         report_path = root / "sandbox-filesystem.json"
-        with OpenvmmProcess(
-            _sandbox_filesystem_command(
-                executable,
-                kernel,
-                initrd,
-                backend,
-                memory_mib,
-                sandbox("read-write", "rw", "probe.sh"),
-                report=report_path,
-            ),
-            output_dir / "sandbox-filesystem.log",
-        ) as process:
-            process.wait_for_line(
-                f"NVX-SANDBOX-VIRTFS: mounted microvm at {target} (rw)".encode(),
-                timeout,
-            )
-            process.wait_for_line(SANDBOX_FILESYSTEM_WRITTEN_MARKER, timeout)
-            # The workload is still running, so these checks observe the live
-            # share rather than a copy-back after exit.
-            _check_sandbox_filesystem_writes(export, identity)
-            staged_edit = export / ".host-edit"
-            staged_edit.write_bytes(b"NVX-HOST-EDIT\n")
-            os.replace(staged_edit, export / "host-edit")
-            process.wait_for_line(SANDBOX_FILESYSTEM_OK_MARKER, timeout)
-            result = process.wait(timeout)
-        if (
-            result.returncode != 0
-            or SANDBOX_FILESYSTEM_EXIT_MARKER not in _output_lines(result.output)
-        ):
-            raise RuntimeError("sandbox live-share workload did not exit cleanly")
-        if secret.read_bytes() != b"NVX-SECRET\n":
-            raise RuntimeError("sandbox workload modified a denied path")
-        report = _read_outcome_report(report_path)
-        _preserve_outcome_report(output_dir / "sandbox-filesystem.json", report)
-        if report["outcome"]["category"] != "success" or not all(
-            report["teardown"].values()
-        ):
-            raise RuntimeError("sandbox live-share outcome reported an unclean exit")
+        read_write = sandbox("read-write", "rw", "probe.sh")
+        if root_run:
+            try:
+                read_write.validated()
+            except ScriptError as error:
+                if "launched as root" not in str(error):
+                    raise
+            else:
+                raise RuntimeError("sandbox accepted a root-launched read-write share")
+        else:
+            with OpenvmmProcess(
+                _sandbox_filesystem_command(
+                    executable,
+                    kernel,
+                    initrd,
+                    backend,
+                    memory_mib,
+                    read_write,
+                    report=report_path,
+                ),
+                output_dir / "sandbox-filesystem.log",
+            ) as process:
+                process.wait_for_line(
+                    f"NVX-SANDBOX-VIRTFS: mounted microvm at {target} (rw)".encode(),
+                    timeout,
+                )
+                process.wait_for_line(SANDBOX_FILESYSTEM_WRITTEN_MARKER, timeout)
+                # The workload is still running, so these checks observe the
+                # live share rather than a copy-back after exit.
+                _check_sandbox_filesystem_writes(export, owner)
+                staged_edit = export / ".host-edit"
+                staged_edit.write_bytes(b"NVX-HOST-EDIT\n")
+                os.replace(staged_edit, export / "host-edit")
+                process.wait_for_line(SANDBOX_FILESYSTEM_OK_MARKER, timeout)
+                result = process.wait(timeout)
+            if (
+                result.returncode != 0
+                or SANDBOX_FILESYSTEM_EXIT_MARKER not in _output_lines(result.output)
+            ):
+                raise RuntimeError("sandbox live-share workload did not exit cleanly")
+            if secret.read_bytes() != b"NVX-SECRET\n":
+                raise RuntimeError("sandbox workload modified a denied path")
+            report = _read_outcome_report(report_path)
+            _preserve_outcome_report(output_dir / "sandbox-filesystem.json", report)
+            if report["outcome"]["category"] != "success" or not all(
+                report["teardown"].values()
+            ):
+                raise RuntimeError(
+                    "sandbox live-share outcome reported an unclean exit"
+                )
 
         with OpenvmmProcess(
             _sandbox_filesystem_command(

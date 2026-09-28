@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import UUID
@@ -25,7 +26,6 @@ SANDBOX_COMMAND_LINE_MAX_SIZE = (
 _HOSTNAME = re.compile(r"(?=^.{1,63}$)(?!-)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 DEFAULT_WORKLOAD_IDENTITY = (65534, 65534)
 MOUNT_ACCESS_MODES = ("ro", "rw")
-MOUNT_OWNERS = ("process", "caller")
 MOUNT_DENIED_PATHS_MAX = 128
 # Targets that the sandbox agent itself mounts or rewrites inside the container.
 _RESERVED_MOUNT_TREES = ("/proc", "/sys", "/dev", "/.nvx-agent")
@@ -33,9 +33,11 @@ _RESERVED_MOUNT_TARGETS = ("/etc", "/etc/machine-id")
 _INVALID_MOUNT_TARGET_CHARACTERS = frozenset("\0\\=,")
 
 
-def default_mount_owner() -> str:
-    """Returns the host identity used for sandbox mounts on this host."""
-    return "process" if os.name == "nt" else "caller"
+def launcher_identity() -> tuple[int, int] | None:
+    """Returns the effective UID:GID that serves Linux shares, or None on Windows."""
+    if sys.platform == "win32":
+        return None
+    return os.geteuid(), os.getegid()
 
 
 def parse_workload_identity(value: str) -> tuple[int, int]:
@@ -86,7 +88,6 @@ class SandboxMount:
     host_path: Path
     access: str = "ro"
     denied_paths: tuple[Path, ...] = ()
-    owner: str = "process"
 
     @classmethod
     def parse(
@@ -94,7 +95,6 @@ class SandboxMount:
         value: str,
         *,
         denied_paths: tuple[Path, ...] = (),
-        owner: str | None = None,
     ) -> SandboxMount:
         fields = value.split(",")
         if len(fields) not in (2, 3):
@@ -107,7 +107,6 @@ class SandboxMount:
             host_path=Path(raw_path),
             access=fields[2] if len(fields) == 3 else "ro",
             denied_paths=denied_paths,
-            owner=default_mount_owner() if owner is None else owner,
         )
 
     def __post_init__(self) -> None:
@@ -133,10 +132,6 @@ class SandboxMount:
             )
         if self.access not in MOUNT_ACCESS_MODES:
             raise ScriptError(f"--mount mode must be ro or rw, not {self.access!r}")
-        if self.owner not in MOUNT_OWNERS:
-            raise ScriptError(f"unsupported --mount-owner {self.owner!r}")
-        if self.owner == "caller" and os.name == "nt":
-            raise ScriptError("--mount-owner caller requires a Linux host")
         if len(self.denied_paths) > MOUNT_DENIED_PATHS_MAX:
             raise ScriptError(
                 f"--mount-deny accepts at most {MOUNT_DENIED_PATHS_MAX} paths"
@@ -169,7 +164,6 @@ class SandboxMount:
         ]
         for denied in self.denied_paths:
             arguments.extend(("--mount-deny", os.fspath(denied)))
-        arguments.extend(("--mount-owner", self.owner))
         return arguments
 
     def command_line_fragment(self) -> str:
@@ -234,6 +228,16 @@ class SandboxLaunch:
         _reject_disk_path(self.scratch)
         if self.mount is not None:
             self.mount.validated()
+            launcher = launcher_identity()
+            if self.mount.access == "rw" and launcher is not None:
+                export = self.mount.host_path.resolve(strict=True)
+                status = export.stat()
+                _require_share_identity(
+                    export,
+                    owner=(status.st_uid, status.st_gid),
+                    launcher=launcher,
+                    workload=self.workload_identity,
+                )
         return self
 
     def ordered_layers(self) -> tuple[SandboxLayer, ...]:
@@ -300,6 +304,40 @@ class SandboxLaunch:
                 "sandbox kernel command line exceeds its 1024-byte x86 budget"
             )
         return command_line
+
+
+def _require_share_identity(
+    export: Path,
+    *,
+    owner: tuple[int, int],
+    launcher: tuple[int, int],
+    workload: tuple[int, int],
+) -> None:
+    """Requires the workload and export owner to be OpenVMM's Linux identity."""
+    uid, gid = launcher
+    if uid == 0:
+        raise ScriptError(
+            "a read-write --mount cannot be launched as root because OpenVMM "
+            "serves the share as its own identity and sandbox workloads are never "
+            "root; run NVX as the non-root export owner or mount the share ro"
+        )
+    if gid == 0:
+        raise ScriptError(
+            f"a read-write --mount cannot be served as {uid}:0 because GID 0 is not "
+            "a supported sandbox workload group; run NVX with a non-root primary "
+            "group or mount the share ro"
+        )
+    if owner != launcher:
+        raise ScriptError(
+            f"read-write --mount export {export} is owned by {owner[0]}:{owner[1]}, "
+            f"but OpenVMM serves it as {uid}:{gid}; NVX never changes export "
+            "ownership, so run NVX as the export owner or mount the share ro"
+        )
+    if workload != launcher:
+        raise ScriptError(
+            f"read-write --mount requires --workload-user {uid}:{gid}, the export "
+            f"owner and OpenVMM's identity, not {workload[0]}:{workload[1]}"
+        )
 
 
 def _reject_disk_path(path: Path) -> None:

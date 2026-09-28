@@ -214,7 +214,6 @@ def _serialize_mount(mount: SandboxMount | None) -> dict[str, Any] | None:
         "host_path": os.fspath(resolved.host_path),
         "access": resolved.access,
         "denied_paths": [os.fspath(path) for path in resolved.denied_paths],
-        "owner": resolved.owner,
     }
 
 
@@ -224,12 +223,20 @@ def _deserialize_mount(value: object) -> SandboxMount | None:
     if not isinstance(value, dict):
         raise ScriptError("sandbox configuration is malformed")
     mount = cast(dict[str, Any], value)
+    # State written with the removed --mount-owner option records an owner.
+    owner = mount.get("owner", "process")
+    if owner == "caller":
+        raise ScriptError(
+            "sandbox configuration uses the removed caller-owned --mount mode; "
+            "deprovision and provision the sandbox again"
+        )
+    if owner != "process":
+        raise ScriptError("sandbox configuration is malformed")
     return SandboxMount(
         guest_target=str(mount["guest_target"]),
         host_path=Path(str(mount["host_path"])),
         access=str(mount["access"]),
         denied_paths=tuple(Path(str(path)) for path in mount["denied_paths"]),
-        owner=str(mount["owner"]),
     )
 
 

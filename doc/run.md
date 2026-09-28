@@ -293,28 +293,12 @@ Files appear exactly as they are on the host, and NVX strips nothing from a live
 share. Hide credentials and other sensitive paths with `--mount-deny`. The
 device adds no network path, so the network and egress policy are unchanged.
 
-By default, OpenVMM performs every guest request as its own host identity, so
-guest-created files are owned by the OpenVMM user. On Linux,
-`--mount-owner caller` performs each request as the guest caller's UID and GID
-instead, and maps guest root to the owner of the export root:
-
-```bash
-python3 scripts/nvx.py run --mount "/mnt/host,/absolute/host/share,rw" \
-  --mount-owner caller
-```
-
-Caller mode rejects an export root owned by UID 0 or GID 0. Each request runs
-without OpenVMM's supplementary groups and effective capabilities, so a
-privileged OpenVMM process cannot lend the guest its privileges. OpenVMM must
-run as the export owner or hold `CAP_SETUID` and `CAP_SETGID`. Without those
-capabilities, only requests from OpenVMM's own identity, including guest root,
-succeed, and they keep OpenVMM's supplementary groups; any other caller gets
-`EPERM`. Supplementary groups of the guest caller are not propagated. Because
-the guest names the caller, guest root can act as any non-root host user inside
-the export. Grant the capabilities only for exports that hold no other users'
-files. Windows rejects `--mount-owner caller`: files are created by the OpenVMM
-user, and the guest sees attributes derived from that user's access. The owner
-mode is host policy rather than snapshot state, so a restore selects it again.
+OpenVMM performs every guest request with its own host identity. On Linux,
+guest-created files are owned by the effective `UID:GID` of the OpenVMM process,
+which it inherits from the user that launches NVX, and the host checks each
+request against that identity rather than the guest caller's. On Windows, files
+are created by the OpenVMM user, and the guest sees attributes derived from that
+user's access.
 
 The microVM has exactly one share, with a single access mode. For example, a
 read-write workspace and a read-only tool cache cannot be exported as two
@@ -385,7 +369,7 @@ Add `--mount GUEST_TARGET,HOST_PATH[,ro|rw]` to `sandbox run` or
 python3 scripts/nvx.py sandbox \
   --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
   --scratch /var/lib/nvx/scratch.ext4 \
-  --workload-user 1001:1001 \
+  --workload-user "$(id -u):$(id -g)" \
   --mount /workspace,/home/runner/work/repo,rw \
   --mount-deny /home/runner/work/repo/.secrets
 ```
@@ -411,20 +395,30 @@ Missing target components are created as root-owned `0755` directories in
 scratch. The marker `NVX-SANDBOX-VIRTFS: mounted microvm at GUEST_TARGET (MODE)`
 reports a successful mount. Without `--mount`, the sandbox is unchanged.
 
-The workload accesses the share as its fixed `--workload-user` identity. The
-guest kernel checks access against the host owners and modes, so choose the
-identity that owns the exported directory, such as the runner user; the image
-must define that user, as for any `--workload-user`. On Linux, the command
-passes `--mount-owner caller` by default. OpenVMM then performs workload
-requests as that identity and agent requests as the export owner, so with an
-identity that owns the export, every file the workload creates on the share is
-owned by that host user. The export root must not be owned by UID 0 or GID 0.
-OpenVMM must run as the export owner or hold `CAP_SETUID` and `CAP_SETGID`;
-otherwise the workload's share requests fail with `EPERM`. Use
-`--mount-owner process` to perform every request as the OpenVMM process
-instead. Windows supports only `process`. A
-read-only share rejects workload writes with `EROFS`. `--mount-deny` paths stay
-hidden inside the container. The policy, caching, and link limits in
+The workload accesses the share as its fixed `--workload-user` identity, and the
+guest kernel checks that access against the host owners and modes. Because
+OpenVMM serves every request as its own identity, a Linux read-write share
+requires one identity for all three parties:
+
+```text
+workload UID:GID == export owner UID:GID == OpenVMM effective UID:GID
+```
+
+Files that the workload creates are then owned by that host user, and the
+workload can `chmod` them. The image must define that user, as for any
+`--workload-user`. Before launch, `sandbox run` and `sandbox provision` compare
+the owner of the canonical export root with the effective identity of the
+launching user and with `--workload-user`, and `sandbox start` repeats the
+check, so an export owner or launching user that changed after provisioning is
+rejected. NVX never changes the export's ownership. A sandbox workload is never
+root, so a read-write share cannot be launched as root, and a launching user
+whose effective GID is 0 is rejected as well; share the directory `ro` instead.
+Read-only shares and Windows hosts need no identity match and keep the
+permission behavior described in
+[virtio-fs host mapping](#virtio-fs-host-mapping).
+
+A read-only share rejects workload writes with `EROFS`. `--mount-deny` paths
+stay hidden inside the container. The policy, caching, and link limits in
 [virtio-fs host mapping](#virtio-fs-host-mapping) apply unchanged. A sandbox
 snapshot restore does not mount a newly attached share for the workload.
 

@@ -76,7 +76,6 @@ from nvx_tools.release import (
     verify_source_tree,
 )
 from nvx_tools.sandbox import (
-    MOUNT_OWNERS,
     SandboxLaunch,
     SandboxLayer,
     SandboxMount,
@@ -340,12 +339,8 @@ def command_run(args: argparse.Namespace) -> None:
         if args.mount.count(",") not in (1, 2):
             raise ScriptError("--mount must be GUEST_TARGET,HOST_PATH[,ro|rw]")
         command.extend(["--mount", args.mount])
-    elif args.mount_owner is not None:
-        raise ScriptError("--mount-owner requires --mount")
     for denied_path in args.mount_deny:
         command.extend(["--mount-deny", str(denied_path)])
-    if args.mount_owner is not None:
-        command.extend(["--mount-owner", args.mount_owner])
     if args.net is not None:
         command.extend(["--net", args.net, "--network-profile", args.network_profile])
     if args.network_egress is not None:
@@ -383,16 +378,13 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError(
             "--outcome-report is only valid for one-shot run or managed exec"
         )
-    mount_requested = (
-        args.mount is not None or bool(args.mount_deny) or args.mount_owner is not None
-    )
+    mount_requested = args.mount is not None or bool(args.mount_deny)
     if mount_requested and operation not in ("run", "provision"):
         raise ScriptError(
-            "--mount, --mount-deny, and --mount-owner are only valid for "
-            "sandbox run or provision"
+            "--mount and --mount-deny are only valid for sandbox run or provision"
         )
     if args.mount is None and mount_requested:
-        raise ScriptError("--mount-deny and --mount-owner require --mount")
+        raise ScriptError("--mount-deny requires --mount")
     if operation in ("run", "provision"):
         if (args.net is None) != (args.network_profile is None):
             raise ScriptError("--net and --network-profile must be specified together")
@@ -401,11 +393,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
         mount = (
             None
             if args.mount is None
-            else SandboxMount.parse(
-                args.mount,
-                denied_paths=tuple(args.mount_deny),
-                owner=args.mount_owner,
-            )
+            else SandboxMount.parse(args.mount, denied_paths=tuple(args.mount_deny))
         )
         launch = SandboxLaunch(
             layers=tuple(args.layer),
@@ -748,11 +736,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--processors", type=int, choices=(1, 2, 4, 8), default=1)
     run.add_argument("--mount", help="GUEST_TARGET,HOST_PATH,ro|rw")
     run.add_argument("--mount-deny", action="append", type=Path, default=[])
-    run.add_argument(
-        "--mount-owner",
-        choices=MOUNT_OWNERS,
-        help="host identity for guest --mount requests (default: OpenVMM's process)",
-    )
     run.add_argument("--net", metavar="IPV4/PREFIX")
     run.add_argument("--network-profile", choices=NETWORK_PROFILES)
     run.add_argument("--network-egress", choices=("allow", "deny"))
@@ -831,14 +814,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         metavar="HOST_PATH",
         help="hide an existing path inside the --mount export; repeatable",
-    )
-    sandbox.add_argument(
-        "--mount-owner",
-        choices=MOUNT_OWNERS,
-        help=(
-            "host identity for workload --mount requests "
-            "(default: caller on Linux, process on Windows)"
-        ),
     )
     sandbox.add_argument("--memory-mib", type=int, default=256)
     sandbox.add_argument(

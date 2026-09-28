@@ -22,10 +22,13 @@ or snapshot-tier metadata alone.
 
 The public `nvx sandbox` command accepts one to three role-bearing EROFS lower
 images, a preformatted ext4 scratch image, an absolute entrypoint, individual
-argument tokens, and an optional live virtio-fs share. It supplies non-secret
-kernel-command-line configuration; environment variables, secrets, arguments
-containing whitespace, and sandbox snapshot orchestration are not supported by
-this command. Lower-level OpenVMM capture and restore do support sandbox blocks.
+argument tokens, and an optional live virtio-fs share. OpenVMM serves every
+share request as its own effective identity, so on Linux the command accepts a
+read-write share only when the workload identity and the export owner match
+that identity. It supplies non-secret kernel-command-line configuration;
+environment variables, secrets, arguments containing whitespace, and sandbox
+snapshot orchestration are not supported by this command. Lower-level OpenVMM
+capture and restore do support sandbox blocks.
 See [Run](../run.md#experimental-single-workload-sandbox).
 
 The required kernel facilities are already enabled in the NVX microVM kernel

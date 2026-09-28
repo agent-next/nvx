@@ -3,6 +3,7 @@
 
 import argparse
 import ast
+import contextlib
 import hashlib
 import http.client
 import http.server
@@ -644,7 +645,6 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.workload_user, (1000, 1001))
         self.assertIsNone(args.mount)
         self.assertEqual(args.mount_deny, [])
-        self.assertIsNone(args.mount_owner)
         self.assertIs(args.handler, nvx.command_sandbox)
 
     def test_sandbox_forwards_a_live_mount_to_openvmm(self):
@@ -656,7 +656,7 @@ class CliTests(unittest.TestCase):
             (share / "secrets").mkdir(parents=True)
             layer.write_bytes(b"distro")
             scratch.write_bytes(b"scratch")
-            base = [
+            arguments = [
                 "sandbox",
                 "--layer",
                 f"distro,{layer},11111111-1111-1111-1111-111111111111",
@@ -674,32 +674,37 @@ class CliTests(unittest.TestCase):
             def require(path: Path, _description: str) -> Path:
                 return path
 
-            for extra, owner in (
-                ([], sandbox.default_mount_owner()),
-                (["--mount-owner", "process"], "process"),
+            with (
+                patch.object(sandbox, "launcher_identity", return_value=None),
+                patch.object(nvx, "require_file", side_effect=require),
+                patch.object(
+                    nvx, "_format_command", return_value="formatted"
+                ) as format_command,
             ):
-                with self.subTest(owner=owner):
-                    with (
-                        patch.object(nvx, "require_file", side_effect=require),
-                        patch.object(
-                            nvx, "_format_command", return_value="formatted"
-                        ) as format_command,
-                    ):
-                        nvx.command_sandbox(nvx.parse_args([*base, *extra]))
-                    command = format_command.call_args.args[0]
-                    self.assertEqual(
-                        command[command.index("--mount") + 1],
-                        f"/workspace,{share},rw",
-                    )
-                    self.assertEqual(
-                        command[command.index("--mount-deny") + 1],
-                        str(share / "secrets"),
-                    )
-                    self.assertEqual(command[command.index("--mount-owner") + 1], owner)
-                    self.assertEqual(
-                        command[command.index("--microvm-workload-identity") + 1],
-                        "1001:1001",
-                    )
+                nvx.command_sandbox(nvx.parse_args(arguments))
+            command = format_command.call_args.args[0]
+            self.assertEqual(
+                command[command.index("--mount") + 1],
+                f"/workspace,{share},rw",
+            )
+            self.assertEqual(
+                command[command.index("--mount-deny") + 1],
+                str(share / "secrets"),
+            )
+            self.assertNotIn("--mount-owner", command)
+            self.assertEqual(
+                command[command.index("--microvm-workload-identity") + 1],
+                "1001:1001",
+            )
+
+            with (
+                patch.object(sandbox, "launcher_identity", return_value=(0, 0)),
+                patch.object(nvx, "require_file", side_effect=require),
+                patch.object(nvx, "_format_command") as format_command,
+                self.assertRaisesRegex(common.ScriptError, "launched as root"),
+            ):
+                nvx.command_sandbox(nvx.parse_args(arguments))
+            format_command.assert_not_called()
 
     def test_sandbox_mount_options_are_validated_before_launch(self):
         layer_arguments = [
@@ -711,11 +716,7 @@ class CliTests(unittest.TestCase):
         for arguments, message in (
             (
                 ["sandbox", *layer_arguments, "--mount-deny", "secrets"],
-                "require --mount",
-            ),
-            (
-                ["sandbox", *layer_arguments, "--mount-owner", "process"],
-                "require --mount",
+                "requires --mount",
             ),
             (
                 [
@@ -737,17 +738,31 @@ class CliTests(unittest.TestCase):
                 with self.assertRaisesRegex(common.ScriptError, message):
                     nvx.command_sandbox(nvx.parse_args(arguments))
 
-    def test_run_forwards_mount_owner_only_with_a_mount(self):
-        args = nvx.parse_args(
+    def test_mount_owner_modes_are_not_accepted(self):
+        for arguments in (
+            ["run", "--mount", "/mnt/share,share,rw", "--mount-owner", "caller"],
             [
+                "sandbox",
                 "run",
+                "--layer",
+                "distro,distro.erofs,11111111-1111-1111-1111-111111111111",
+                "--scratch",
+                "scratch.ext4",
                 "--mount",
-                "/mnt/share,share,rw",
+                "/workspace,share,rw",
                 "--mount-owner",
-                "caller",
-                "--dry-run",
-            ]
-        )
+                "process",
+            ],
+        ):
+            with (
+                self.subTest(command=arguments[0]),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                nvx.parse_args(arguments)
+            self.assertIn("unrecognized arguments: --mount-owner", stderr.getvalue())
+
+        args = nvx.parse_args(["run", "--mount", "/mnt/share,share,rw", "--dry-run"])
         with (
             patch.object(nvx, "require_file", return_value=Path("artifact")),
             patch.object(
@@ -756,14 +771,8 @@ class CliTests(unittest.TestCase):
         ):
             nvx.command_run(args)
         command = format_command.call_args.args[0]
-        self.assertEqual(command[command.index("--mount-owner") + 1], "caller")
-
-        without_mount = nvx.parse_args(["run", "--mount-owner", "caller", "--dry-run"])
-        with (
-            patch.object(nvx, "require_file", return_value=Path("artifact")),
-            self.assertRaisesRegex(common.ScriptError, "requires --mount"),
-        ):
-            nvx.command_run(without_mount)
+        self.assertEqual(command[command.index("--mount") + 1], "/mnt/share,share,rw")
+        self.assertNotIn("--mount-owner", command)
 
     def test_sandbox_command_parses_state_aware_operations(self):
         provision = nvx.parse_args(
@@ -4805,7 +4814,6 @@ class SandboxTests(unittest.TestCase):
         mount = sandbox.SandboxMount.parse(
             "/workspace,share,rw",
             denied_paths=(Path("share/secrets"),),
-            owner="process",
         )
         self.assertEqual(
             mount.openvmm_arguments(),
@@ -4814,24 +4822,19 @@ class SandboxTests(unittest.TestCase):
                 f"/workspace,{Path('share')},rw",
                 "--mount-deny",
                 str(Path("share/secrets")),
-                "--mount-owner",
-                "process",
             ],
         )
         self.assertEqual(sandbox.SandboxMount.parse("/data,share").access, "ro")
-        self.assertEqual(
-            sandbox.SandboxMount.parse("/data,share").owner,
-            sandbox.default_mount_owner(),
-        )
         launch = sandbox.SandboxLaunch(
             layers=(distro,),
             scratch=Path("scratch.ext4"),
             mount=mount,
         )
         self.assertEqual(
-            launch.openvmm_arguments()[-6:],
+            launch.openvmm_arguments()[-4:],
             mount.openvmm_arguments(),
         )
+        self.assertNotIn("--mount-owner", launch.openvmm_arguments())
         # The live-share bootstrap tokens are appended by OpenVMM, but they
         # still consume the x86 command-line budget.
         without_mount = sandbox.SandboxLaunch(
@@ -4846,7 +4849,7 @@ class SandboxTests(unittest.TestCase):
         with self.assertRaisesRegex(common.ScriptError, "1024-byte"):
             launch.kernel_command_line(padding)
 
-    def test_mount_contract_rejects_unsafe_targets_and_owners(self):
+    def test_mount_contract_rejects_unsafe_targets(self):
         for value, message in (
             ("workspace,share,rw", "canonical absolute path"),
             ("/,share,rw", "canonical absolute path"),
@@ -4866,24 +4869,88 @@ class SandboxTests(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(common.ScriptError, message):
-                    sandbox.SandboxMount.parse(value, owner="process")
-        sandbox.SandboxMount.parse("/etc/app,share,rw", owner="process")
-        with self.assertRaisesRegex(common.ScriptError, "--mount-owner"):
-            sandbox.SandboxMount.parse("/workspace,share,rw", owner="root")
+                    sandbox.SandboxMount.parse(value)
+        sandbox.SandboxMount.parse("/etc/app,share,rw")
         with self.assertRaisesRegex(common.ScriptError, "at most 128"):
             sandbox.SandboxMount.parse(
                 "/workspace,share,rw",
                 denied_paths=tuple(Path(f"share/{index}") for index in range(129)),
-                owner="process",
             )
-        share = Path("share")
-        with (
-            patch.object(sandbox.os, "name", "nt"),
-            self.assertRaisesRegex(common.ScriptError, "requires a Linux host"),
+
+    def test_writable_share_requires_one_linux_identity(self):
+        export = Path("export")
+        sandbox._require_share_identity(
+            export, owner=(1000, 1001), launcher=(1000, 1001), workload=(1000, 1001)
+        )
+        for owner, launcher, workload, message in (
+            ((0, 0), (0, 0), (1000, 1001), "launched as root"),
+            ((1000, 1001), (0, 0), (1000, 1001), "launched as root"),
+            ((1000, 0), (1000, 0), (1000, 1001), "served as 1000:0"),
+            ((1002, 1001), (1000, 1001), (1000, 1001), "is owned by 1002:1001"),
+            ((1000, 1002), (1000, 1001), (1000, 1001), "is owned by 1000:1002"),
+            ((0, 0), (1000, 1001), (1000, 1001), "is owned by 0:0"),
+            ((1000, 1001), (1000, 1001), (65534, 65534), "--workload-user 1000:1001"),
+            ((1000, 1001), (1000, 1001), (1000, 1002), "--workload-user 1000:1001"),
         ):
-            sandbox.SandboxMount(
-                guest_target="/workspace", host_path=share, owner="caller"
-            )
+            with self.subTest(owner=owner, launcher=launcher, workload=workload):
+                with self.assertRaisesRegex(common.ScriptError, message):
+                    sandbox._require_share_identity(
+                        export, owner=owner, launcher=launcher, workload=workload
+                    )
+
+    def test_launch_validation_aligns_only_linux_writable_shares(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer_path = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            share = root / "share"
+            share.mkdir()
+            layer_path.write_bytes(b"layer")
+            scratch.write_bytes(b"scratch")
+            status = share.stat()
+            owner = (status.st_uid, status.st_gid)
+
+            def launch(
+                access: str,
+                workload: tuple[int, int] = sandbox.DEFAULT_WORKLOAD_IDENTITY,
+            ) -> sandbox.SandboxLaunch:
+                return sandbox.SandboxLaunch(
+                    layers=(
+                        sandbox.SandboxLayer(
+                            role="distro",
+                            path=layer_path,
+                            uuid="11111111-1111-1111-1111-111111111111",
+                        ),
+                    ),
+                    scratch=scratch,
+                    workload_identity=workload,
+                    mount=sandbox.SandboxMount(
+                        guest_target="/workspace", host_path=share, access=access
+                    ),
+                )
+
+            # Windows keeps its existing permission behavior.
+            with patch.object(sandbox, "launcher_identity", return_value=None):
+                launch("rw").validated()
+            with patch.object(sandbox, "launcher_identity", return_value=(0, 0)):
+                launch("ro").validated()
+                with self.assertRaisesRegex(common.ScriptError, "launched as root"):
+                    launch("rw").validated()
+            other = (owner[0] + 1, owner[1] + 1)
+            with patch.object(sandbox, "launcher_identity", return_value=other):
+                launch("ro").validated()
+                with self.assertRaisesRegex(
+                    common.ScriptError, f"is owned by {owner[0]}:{owner[1]}"
+                ):
+                    launch("rw", other).validated()
+            # Windows reports every file as 0:0, and root cannot match a workload.
+            if 0 not in owner:
+                with patch.object(sandbox, "launcher_identity", return_value=owner):
+                    launch("rw", owner).validated()
+                    with self.assertRaisesRegex(
+                        common.ScriptError, f"--workload-user {owner[0]}:{owner[1]}"
+                    ):
+                        launch("rw").validated()
 
     def test_mount_contract_validates_host_paths_against_the_export(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -5038,23 +5105,21 @@ class SandboxTests(unittest.TestCase):
             )
             session.ping.assert_called_once_with(10)
 
-    def test_managed_lifecycle_retains_the_live_mount(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            layer_path = root / "distro.erofs"
-            scratch_path = root / "scratch.ext4"
-            share = root / "share"
-            (share / "secrets").mkdir(parents=True)
-            layer_path.write_bytes(b"layer")
-            scratch_path.write_bytes(b"scratch")
-            state = root / "state"
-            mount = sandbox.SandboxMount(
-                guest_target="/workspace",
-                host_path=share,
-                access="rw",
-                denied_paths=(Path("secrets"),),
-                owner="process",
-            )
+    def _provision_live_mount(self, root: Path) -> tuple[Path, sandbox.SandboxMount]:
+        layer_path = root / "distro.erofs"
+        scratch_path = root / "scratch.ext4"
+        share = root / "share"
+        (share / "secrets").mkdir(parents=True)
+        layer_path.write_bytes(b"layer")
+        scratch_path.write_bytes(b"scratch")
+        state = root / "state"
+        mount = sandbox.SandboxMount(
+            guest_target="/workspace",
+            host_path=share,
+            access="rw",
+            denied_paths=(Path("secrets"),),
+        )
+        with patch.object(sandbox, "launcher_identity", return_value=None):
             sandbox_lifecycle.provision(
                 state,
                 sandbox.SandboxLaunch(
@@ -5081,6 +5146,43 @@ class SandboxTests(unittest.TestCase):
                 host_loopback_forward=(),
                 cmdline="quiet",
             )
+        return state, mount
+
+    def _start_managed_sandbox(self, state: Path) -> MagicMock:
+        process = MagicMock()
+        process.pid = 123
+        process.stdin = io.BytesIO()
+        context = MagicMock()
+        context.__enter__.return_value = MagicMock()
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            patch.object(
+                sandbox_lifecycle,
+                "require_file",
+                side_effect=require,
+            ),
+            patch.object(
+                sandbox_lifecycle.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+            patch.object(
+                sandbox_lifecycle.ControlSession,
+                "connect",
+                return_value=context,
+            ),
+        ):
+            sandbox_lifecycle.start(state, 10)
+        return popen
+
+    def test_managed_lifecycle_retains_the_live_mount(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state, mount = self._provision_live_mount(root)
+            share = root / "share"
             config = json.loads(
                 (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
             )
@@ -5091,43 +5193,34 @@ class SandboxTests(unittest.TestCase):
                     "host_path": str(share),
                     "access": "rw",
                     "denied_paths": ["secrets"],
-                    "owner": "process",
                 },
             )
-            self.assertEqual(sandbox_lifecycle._deserialize_launch(config).mount, mount)
-            legacy = dict(config)
-            del legacy["mount"]
-            self.assertIsNone(sandbox_lifecycle._deserialize_launch(legacy).mount)
-            with self.assertRaisesRegex(common.ScriptError, "malformed"):
-                sandbox_lifecycle._deserialize_launch({**config, "mount": []})
-
-            process = MagicMock()
-            process.pid = 123
-            process.stdin = io.BytesIO()
-            context = MagicMock()
-            context.__enter__.return_value = MagicMock()
-
-            def require(path: Path, _description: str) -> Path:
-                return path
-
-            with (
-                patch.object(
-                    sandbox_lifecycle,
-                    "require_file",
-                    side_effect=require,
-                ),
-                patch.object(
-                    sandbox_lifecycle.subprocess,
-                    "Popen",
-                    return_value=process,
-                ) as popen,
-                patch.object(
-                    sandbox_lifecycle.ControlSession,
-                    "connect",
-                    return_value=context,
-                ),
-            ):
-                sandbox_lifecycle.start(state, 10)
+            with patch.object(sandbox, "launcher_identity", return_value=None):
+                self.assertEqual(
+                    sandbox_lifecycle._deserialize_launch(config).mount, mount
+                )
+                legacy = dict(config)
+                del legacy["mount"]
+                self.assertIsNone(sandbox_lifecycle._deserialize_launch(legacy).mount)
+                # State written with the removed --mount-owner option records it.
+                process_owned = {**config["mount"], "owner": "process"}
+                self.assertEqual(
+                    sandbox_lifecycle._deserialize_launch(
+                        {**config, "mount": process_owned}
+                    ).mount,
+                    mount,
+                )
+                for owner, message in (
+                    ("caller", "deprovision and provision"),
+                    ("root", "malformed"),
+                ):
+                    with self.assertRaisesRegex(common.ScriptError, message):
+                        sandbox_lifecycle._deserialize_launch(
+                            {**config, "mount": {**config["mount"], "owner": owner}}
+                        )
+                with self.assertRaisesRegex(common.ScriptError, "malformed"):
+                    sandbox_lifecycle._deserialize_launch({**config, "mount": []})
+                popen = self._start_managed_sandbox(state)
 
             command = popen.call_args.args[0]
             self.assertEqual(
@@ -5135,7 +5228,27 @@ class SandboxTests(unittest.TestCase):
                 f"/workspace,{share},rw",
             )
             self.assertEqual(command[command.index("--mount-deny") + 1], "secrets")
-            self.assertEqual(command[command.index("--mount-owner") + 1], "process")
+            self.assertNotIn("--mount-owner", command)
+
+    def test_managed_start_revalidates_the_share_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state, _mount = self._provision_live_mount(root)
+            status = (root / "share").stat()
+            # The launcher user or the export owner may change after provisioning.
+            for launcher, message in (
+                ((0, 0), "launched as root"),
+                ((status.st_uid + 1, status.st_gid + 1), "is owned by"),
+            ):
+                with (
+                    self.subTest(launcher=launcher),
+                    patch.object(sandbox, "launcher_identity", return_value=launcher),
+                    patch.object(sandbox_lifecycle.subprocess, "Popen") as popen,
+                    self.assertRaisesRegex(common.ScriptError, message),
+                ):
+                    sandbox_lifecycle.start(state, 10)
+                popen.assert_not_called()
+                self.assertFalse((state / sandbox_lifecycle.RUNTIME_NAME).exists())
 
     def test_versioned_json_reader_supports_custom_version_field(self):
         with tempfile.TemporaryDirectory() as temporary:

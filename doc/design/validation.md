@@ -45,11 +45,14 @@ direct and parent-relative denial, symlink/junction alias denial, a second
 virtio-fs mount, and pre-boot rejection of unsafe path policies.
 Sandbox live-share coverage boots the real sandbox agent over the Ubuntu EROFS
 layer with a read-write share. While the workload runs, it verifies host-file
-visibility, denied-path hiding, nested workload writes and `chmod` that appear
-on the host immediately, and a host edit that the workload observes. On Linux
-it also verifies that caller-owned requests create those files as the export
-owner. It then verifies a read-only share that rejects writes, and agent
-rejection of reserved and symlinked mount targets before the workload starts.
+visibility, denied-path hiding, nested workload writes that appear on the host
+immediately, and a host edit that the workload observes. On a non-root Linux
+host, the workload runs as the launching user, which also owns the export, and
+the scenario verifies that the workload's files have that ownership and that
+its `chmod` reaches the host. A root run instead verifies that the read-write
+share is rejected before launch. The scenario then verifies a read-only share
+that rejects writes, and agent rejection of reserved and symlinked mount
+targets before the workload starts.
 The native suite targets KVM, MSHV, and WHP; a passing run on one backend is
 not a fresh result for the others.
 Coverage also includes
