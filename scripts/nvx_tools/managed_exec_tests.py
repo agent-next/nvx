@@ -10,16 +10,19 @@ import tempfile
 from pathlib import Path
 from typing import cast
 
-from .build_constants import BuildConstants
+from .build_constants import BuildConstants, UbuntuBuildConstants
 from .common import ScriptError, artifact_path, require_file
 
 
 def run_managed_exec_configuration(
     backend: str, *, timeout: float, output_dir: Path
 ) -> None:
-    distro = require_file(artifact_path("ubuntu-distro.erofs"), "Ubuntu workload layer")
+    distro = require_file(
+        artifact_path(UbuntuBuildConstants.DISTRO_NAME), "Ubuntu workload layer"
+    )
     manifest_path = require_file(
-        distro.with_name("ubuntu-distro.erofs.manifest.json"), "Ubuntu layer manifest"
+        distro.with_name(UbuntuBuildConstants.DISTRO_MANIFEST_NAME),
+        "Ubuntu layer manifest",
     )
     scratch_template = require_file(
         artifact_path("ubuntu-smoke-scratch.ext4"), "sandbox scratch template"
