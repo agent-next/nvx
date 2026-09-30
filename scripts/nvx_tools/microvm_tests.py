@@ -767,16 +767,21 @@ def run_managed_lifecycle(
                         (
                             "/bin/sh",
                             "-c",
-                            "printf managed-state >/tmp/nvx-managed-state; "
-                            "printf first-exec",
+                            "/bin/touch nvx-managed-state; "
+                            'printf \'%s|%s|%s\' "$PWD" "$EMPTY" "$COMPLEX"',
                         ),
                         timeout_ms=5_000,
                         response_timeout=timeout,
+                        cwd="/tmp",
+                        environment=(
+                            "EMPTY=",
+                            "COMPLEX=space = \N{SNOWMAN}",
+                        ),
                     )
                 if (
                     first.returncode != 0
                     or first.category != "exit"
-                    or first.stdout != b"first-exec"
+                    or first.stdout != "/tmp||space = \N{SNOWMAN}".encode()
                     or first.stderr
                 ):
                     raise RuntimeError(
@@ -790,7 +795,10 @@ def run_managed_lifecycle(
                         (
                             "/bin/sh",
                             "-c",
-                            "cat /tmp/nvx-managed-state; printf second-exec",
+                            "pwd; test -f /tmp/nvx-managed-state; "
+                            'test "${COMPLEX-unset}" = unset; '
+                            "test ! -e /run/nvx/workload-machine-id; "
+                            "printf second-exec",
                         ),
                         timeout_ms=5_000,
                         response_timeout=timeout,
@@ -800,11 +808,34 @@ def run_managed_lifecycle(
                         timeout_ms=100,
                         response_timeout=timeout,
                     )
+                    after_timeout = session.exec(
+                        ("/bin/sh", "-c", "printf still-usable"),
+                        timeout_ms=5_000,
+                        response_timeout=timeout,
+                    )
+                    missing_cwd = session.exec(
+                        ("/bin/true",),
+                        timeout_ms=5_000,
+                        response_timeout=timeout,
+                        cwd="/does-not-exist",
+                    )
+                    file_cwd = session.exec(
+                        ("/bin/true",),
+                        timeout_ms=5_000,
+                        response_timeout=timeout,
+                        cwd="/etc/passwd",
+                    )
+                    inaccessible_cwd = session.exec(
+                        ("/bin/true",),
+                        timeout_ms=5_000,
+                        response_timeout=timeout,
+                        cwd="/root",
+                    )
                     session.stop(timeout)
                 if (
                     second.returncode != 0
                     or second.category != "exit"
-                    or second.stdout != b"managed-statesecond-exec"
+                    or second.stdout != b"/\nsecond-exec"
                     or second.stderr
                 ):
                     raise RuntimeError(
@@ -812,6 +843,29 @@ def run_managed_lifecycle(
                     )
                 if timed_out.returncode != 124 or timed_out.category != "timeout":
                     raise RuntimeError("managed workload timeout was not reported")
+                if (
+                    after_timeout.returncode != 0
+                    or after_timeout.category != "exit"
+                    or after_timeout.stdout != b"still-usable"
+                    or after_timeout.stderr
+                ):
+                    raise RuntimeError(
+                        "managed guest was not usable after a workload timeout"
+                    )
+                for description, failed_cwd in (
+                    ("missing", missing_cwd),
+                    ("file", file_cwd),
+                    ("inaccessible", inaccessible_cwd),
+                ):
+                    if (
+                        failed_cwd.returncode != 125
+                        or failed_cwd.category != "exit"
+                        or b"cannot use working directory" not in failed_cwd.stderr
+                    ):
+                        raise RuntimeError(
+                            f"{description} managed working directory did not "
+                            "fail clearly"
+                        )
                 result = process.wait(timeout=timeout)
                 if result != 0:
                     raise RuntimeError(

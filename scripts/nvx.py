@@ -367,6 +367,33 @@ def command_run(args: argparse.Namespace) -> None:
 
 def command_sandbox(args: argparse.Namespace) -> None:
     operation = args.sandbox_operation
+    exec_environment: tuple[str, ...] | None = None
+    if args.environment and args.environment_file is not None:
+        raise ScriptError("--environment and --environment-file are mutually exclusive")
+    if operation != "exec" and (
+        args.cwd is not None or args.environment or args.environment_file is not None
+    ):
+        raise ScriptError(
+            "managed execution options require the sandbox exec operation"
+        )
+    if operation == "exec":
+        if args.environment_file is not None:
+            try:
+                value = json.loads(args.environment_file.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ScriptError(
+                    f"failed to read managed execution environment: "
+                    f"{args.environment_file}"
+                ) from error
+            entries = cast(list[object], value) if isinstance(value, list) else None
+            if entries is None or not all(isinstance(entry, str) for entry in entries):
+                raise ScriptError(
+                    "managed execution environment file must contain a JSON "
+                    "array of KEY=VALUE strings"
+                )
+            exec_environment = tuple(cast(list[str], entries))
+        elif args.environment:
+            exec_environment = tuple(args.environment)
     if operation in ("run", "provision", "exec") and (
         args.entrypoint in SYSTEMD_ENTRYPOINTS
     ):
@@ -432,6 +459,8 @@ def command_sandbox(args: argparse.Namespace) -> None:
             (args.entrypoint, *args.sandbox_arg),
             timeout_ms=args.exec_timeout_ms,
             response_timeout=args.timeout,
+            cwd=args.cwd,
+            environment=exec_environment,
         )
         sys.stdout.buffer.write(result.stdout)
         sys.stdout.buffer.flush()
@@ -785,6 +814,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="guest workload timeout in milliseconds; zero disables it",
+    )
+    sandbox.add_argument(
+        "--cwd",
+        help="absolute guest working directory for managed exec (default: /)",
+    )
+    sandbox.add_argument(
+        "--environment",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="set the exact managed exec environment; repeat for multiple entries",
+    )
+    sandbox.add_argument(
+        "--environment-file",
+        type=Path,
+        metavar="PATH",
+        help="read the exact managed exec environment from a JSON string array",
     )
     sandbox.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
     sandbox.add_argument("--net", metavar="IPV4/PREFIX")

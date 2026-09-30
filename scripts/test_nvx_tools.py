@@ -678,6 +678,26 @@ class CliTests(unittest.TestCase):
         self.assertEqual(execute.sandbox_arg, ["-c", "echo managed"])
         self.assertEqual(execute.exec_timeout_ms, 5000)
 
+        configured = nvx.parse_args(
+            [
+                "sandbox",
+                "exec",
+                "--state-dir",
+                "state",
+                "--cwd",
+                "/work tree",
+                "--environment",
+                "EMPTY=",
+                "--environment",
+                "VALUE=space = value",
+            ]
+        )
+        self.assertEqual(configured.cwd, "/work tree")
+        self.assertEqual(
+            configured.environment,
+            ["EMPTY=", "VALUE=space = value"],
+        )
+
         report = nvx.parse_args(
             [
                 "sandbox",
@@ -689,6 +709,63 @@ class CliTests(unittest.TestCase):
             ]
         )
         self.assertEqual(report.outcome_report, Path("exec-outcome.json"))
+
+    def test_sandbox_exec_forwards_explicit_empty_environment_and_cwd(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment_file = Path(temporary) / "environment.json"
+            environment_file.write_text("[]", encoding="utf-8")
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "exec",
+                    "--state-dir",
+                    "state",
+                    "--cwd",
+                    "/work",
+                    "--environment-file",
+                    str(environment_file),
+                ]
+            )
+            result = sandbox_lifecycle.ManagedExecResult(0, "exit", b"", b"")
+            with (
+                patch.object(
+                    sandbox_lifecycle,
+                    "exec_workload",
+                    return_value=result,
+                ) as execute,
+                self.assertRaises(SystemExit) as exit_context,
+            ):
+                nvx.command_sandbox(args)
+
+        self.assertEqual(exit_context.exception.code, 0)
+        execute.assert_called_once_with(
+            Path("state"),
+            ("/bin/sh",),
+            timeout_ms=0,
+            response_timeout=60.0,
+            cwd="/work",
+            environment=(),
+        )
+
+    def test_sandbox_exec_rejects_ambiguous_or_one_shot_environment(self):
+        both = nvx.parse_args(
+            [
+                "sandbox",
+                "exec",
+                "--state-dir",
+                "state",
+                "--environment",
+                "A=1",
+                "--environment-file",
+                "environment.json",
+            ]
+        )
+        with self.assertRaisesRegex(common.ScriptError, "mutually exclusive"):
+            nvx.command_sandbox(both)
+
+        one_shot = nvx.parse_args(["sandbox", "run", "--environment", "A=1"])
+        with self.assertRaisesRegex(common.ScriptError, "require.*exec"):
+            nvx.command_sandbox(one_shot)
 
     def test_network_requires_explicit_portable_profile(self):
         args = nvx.parse_args(
