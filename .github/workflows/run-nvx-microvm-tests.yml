@@ -197,6 +197,7 @@ jobs:
         with:
           name: nvx-microvm-tests-${{ inputs.backend }}
           path: |
+            build/test-results/public-exec-${{ inputs.backend }}
             build/test-results/microvm-${{ inputs.backend }}
             build/test-results/ubuntu-${{ inputs.backend }}
             build/test-results/ubuntu-kvm-extended

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -764,6 +765,24 @@ static int write_exec_config(int fd, const struct exec_config *config)
     return 0;
 }
 
+static int create_exec_config_fd(const struct exec_config *config)
+{
+    int fd = memfd_create("nvx-exec-config", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+
+    if (fd < 0) {
+        return -1;
+    }
+    /* A sealed, bounded anonymous file avoids depending on pipe capacity. */
+    if (write_exec_config(fd, config) != 0 ||
+        lseek(fd, 0, SEEK_SET) < 0 ||
+        fcntl(fd, F_ADD_SEALS,
+              F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static int launch_workload(int argc, char **argv)
 {
     char *end = NULL;
@@ -832,6 +851,11 @@ static int launch_workload(int argc, char **argv)
         environment[index][length] = '\0';
     }
     close((int)descriptor);
+    if (cwd != NULL &&
+        (cwd[0] != '/' || memchr(cwd, '\0', cwd_len) != NULL)) {
+        dprintf(STDERR_FILENO, "nvx-managed-agent: invalid working directory\n");
+        goto fail;
+    }
     if (unsetenv("NVX_EXEC_CONFIG_FD") != 0) {
         goto fail;
     }
@@ -918,7 +942,7 @@ static int run_exec(
     const char *barrier = "/run/nvx/managed-container-start";
     int stdout_pipe[2] = {-1, -1};
     int stderr_pipe[2] = {-1, -1};
-    int config_pipe[2] = {-1, -1};
+    int exec_config_fd = -1;
     pid_t child;
     uint64_t started;
     size_t output_bytes = 0;
@@ -937,7 +961,7 @@ static int run_exec(
     }
     if (pipe2(stdout_pipe, O_CLOEXEC) != 0 ||
         pipe2(stderr_pipe, O_CLOEXEC) != 0 ||
-        pipe2(config_pipe, O_CLOEXEC) != 0) {
+        (exec_config_fd = create_exec_config_fd(exec_config)) < 0) {
         unlink(barrier);
         if (stdout_pipe[0] >= 0) {
             close(stdout_pipe[0]);
@@ -947,9 +971,8 @@ static int run_exec(
             close(stderr_pipe[0]);
             close(stderr_pipe[1]);
         }
-        if (config_pipe[0] >= 0) {
-            close(config_pipe[0]);
-            close(config_pipe[1]);
+        if (exec_config_fd >= 0) {
+            close(exec_config_fd);
         }
         return send_app_error(session, request_id, 125, "launch-failed");
     }
@@ -960,8 +983,7 @@ static int run_exec(
         close(stdout_pipe[1]);
         close(stderr_pipe[0]);
         close(stderr_pipe[1]);
-        close(config_pipe[0]);
-        close(config_pipe[1]);
+        close(exec_config_fd);
         unlink(barrier);
         return send_app_error(session, request_id, 125, "launch-failed");
     }
@@ -970,10 +992,9 @@ static int run_exec(
         char config_fd[32];
 
         setpgid(0, 0);
-        close(config_pipe[1]);
-        if (fcntl(config_pipe[0], F_SETFD, 0) != 0 ||
+        if (fcntl(exec_config_fd, F_SETFD, 0) != 0 ||
             snprintf(
-                config_fd, sizeof(config_fd), "%d", config_pipe[0]) <= 0) {
+                config_fd, sizeof(config_fd), "%d", exec_config_fd) <= 0) {
             _exit(125);
         }
         close(stdout_pipe[0]);
@@ -994,24 +1015,21 @@ static int run_exec(
     }
 
     setpgid(child, child);
-    close(config_pipe[0]);
+    close(exec_config_fd);
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
     if (make_nonblocking(stdout_pipe[0]) != 0 ||
         make_nonblocking(stderr_pipe[0]) != 0 ||
         (!config->direct &&
          (write_pid_to_cgroup(child) != 0 ||
-          release_container_barrier(barrier) != 0)) ||
-        write_exec_config(config_pipe[1], exec_config) != 0) {
+          release_container_barrier(barrier) != 0))) {
         kill(-child, SIGKILL);
         waitpid(child, NULL, 0);
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
-        close(config_pipe[1]);
         unlink(barrier);
         return send_app_error(session, request_id, 125, "launch-failed");
     }
-    close(config_pipe[1]);
     unlink(barrier);
     started = monotonic_milliseconds();
 
