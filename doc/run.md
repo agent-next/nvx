@@ -368,8 +368,10 @@ workload arguments use the bounded control protocol rather than the kernel
 command line and may contain whitespace. Managed execution can select an
 absolute working directory and either repeated inline `KEY=VALUE` entries or a
 UTF-8 JSON-array environment file. The two environment forms are mutually
-exclusive. Omission preserves guest defaults, while an empty file array requests
-an empty environment. Inline values are visible in the host process arguments
+exclusive. Omission inherits the guest bootstrap environment, not the host
+environment: `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, `TERM=linux`, and `HOME`,
+`USER`, and `LOGNAME` resolved from the fixed workload identity. An empty file
+array requests an empty environment. Inline values are visible in host process arguments
 and should not be used for secrets. These options apply only to managed
 `sandbox exec`; one-shot execution rejects them. The legacy operation-less `sandbox`
 form is `sandbox run`; it remains one-shot and rejects `--state-dir` or any
