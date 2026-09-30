@@ -375,6 +375,17 @@ and should not be used for secrets. These options apply only to managed
 form is `sandbox run`; it remains one-shot and rejects `--state-dir` or any
 request to retain VM state.
 
+The explicit `test-microvm --scenario managed-exec-config --backend BACKEND`
+scenario checks these options through public `sandbox provision`, `start`,
+`exec`, `stop`, and `deprovision` commands with an Alpine control guest and an
+Ubuntu workload layer. It requires `build/ubuntu-distro.erofs`, its manifest,
+and the `build/ubuntu-smoke-scratch.ext4` template produced by the guest-artifact
+build. CI invokes it separately on every backend; it is not included in the
+default scenario set because downloaded packages do not include the scratch
+template. Empty environments are measured with `/usr/bin/env`, not a shell that
+can synthesize its own variables. The scenario retains bounded check statuses
+and OpenVMM logs without recording workload environment values.
+
 `run --outcome-report PATH` and one-shot `sandbox run --outcome-report PATH`
 forward OpenVMM's bounded local JSON report. Managed `sandbox exec` writes only
 the operation, bounded result category, numeric status, and an opaque operation

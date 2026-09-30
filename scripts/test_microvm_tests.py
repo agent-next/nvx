@@ -2541,6 +2541,48 @@ class MicrovmTests(unittest.TestCase):
             [False, False, True, True],
         )
 
+    def test_runner_dispatches_public_managed_exec_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "whp",
+                    "--scenario",
+                    "managed-exec-config",
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_managed_exec_configuration") as run,
+            ):
+                self.assertEqual(microvm_tests.run(args), 0)
+            run.assert_called_once_with(
+                "whp", timeout=args.timeout, output_dir=output_dir
+            )
+
+    def test_managed_container_launch_prepares_identity_and_static_helper(self):
+        root = Path(__file__).resolve().parent.parent
+        bootstrap = (root / "guest" / "common" / "nvx-init-agent").read_text()
+        launcher = (root / "guest" / "alpine" / "nvx-container-enter").read_text()
+        self.assertLess(
+            bootstrap.index('>"$runtime/workload-machine-id"'),
+            bootstrap.index("exec /sbin/nvx-managed-agent"),
+        )
+        self.assertIn(
+            "set -- /.nvx-agent/nvx-managed-agent \\\n"
+            '        --exec-config-fd "$NVX_EXEC_CONFIG_FD" -- "$@"',
+            launcher,
+        )
+
     def test_runner_uses_ubuntu_artifact_and_default_memory(self):
         requested: list[Path] = []
 

@@ -54,6 +54,7 @@ from .common import (
 )
 from .control_session import ControlSession
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
+from .managed_exec_tests import run_managed_exec_configuration
 from .openvmm_process import OpenvmmProcess, TcpConsole
 
 MICROVM_TEST_SCENARIOS = (
@@ -69,6 +70,7 @@ MICROVM_TEST_SCENARIOS = (
     "lifecycle",
     "l3-l4-egress-policy",
     "managed-lifecycle",
+    "managed-exec-config",
     "network-snapshot",
     "restore-memory",
     "restore-processors",
@@ -85,7 +87,13 @@ MICROVM_TEST_SCENARIOS = (
     "workload-identity",
 )
 UBUNTU_UNSUPPORTED_SCENARIOS = frozenset(
-    ("console-snapshot", "sandbox-blocks", "scratch-snapshot", "snapshot-tiers")
+    (
+        "console-snapshot",
+        "managed-exec-config",
+        "sandbox-blocks",
+        "scratch-snapshot",
+        "snapshot-tiers",
+    )
 )
 MICROVM_PROCESSOR_COUNTS = (1, 2, 4, 8)
 MICROVM_TEST_SCRIPTS_DIR = Path(__file__).with_name("microvm_test_scripts")
@@ -3883,8 +3891,11 @@ def run(args: argparse.Namespace) -> int:
         scenarios = tuple(
             scenario
             for scenario in MICROVM_TEST_SCENARIOS
-            if descriptor.name != "ubuntu"
-            or scenario not in UBUNTU_UNSUPPORTED_SCENARIOS
+            if scenario != "managed-exec-config"
+            and (
+                descriptor.name != "ubuntu"
+                or scenario not in UBUNTU_UNSUPPORTED_SCENARIOS
+            )
         )
     else:
         scenarios = tuple(dict.fromkeys(args.scenario))
@@ -4006,6 +4017,13 @@ def run(args: argparse.Namespace) -> int:
             memory_mib=args.memory_mib,
             timeout=args.timeout,
             output_dir=output_dir,
+        )
+    if "managed-exec-config" in scenarios:
+        print(
+            f"Running public managed execution configuration on OpenVMM/{args.backend}"
+        )
+        run_managed_exec_configuration(
+            args.backend, timeout=args.timeout, output_dir=output_dir
         )
     if "managed-lifecycle" in scenarios:
         print(f"Running managed microVM lifecycle on OpenVMM/{args.backend}")
