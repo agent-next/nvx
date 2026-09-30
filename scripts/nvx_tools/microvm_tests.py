@@ -31,7 +31,6 @@ from .benchmark import (
     record_adversarial_openvmm_pid,
     smp_probe_script,
     snapshot_restore_command,
-    stable_clocksource_wait_script,
     workload_boot_command,
 )
 from .benchmark import (
@@ -87,6 +86,7 @@ MICROVM_TEST_SCENARIOS = (
 UBUNTU_UNSUPPORTED_SCENARIOS = frozenset(
     ("console-snapshot", "sandbox-blocks", "scratch-snapshot", "snapshot-tiers")
 )
+TSC_DEADLINE_HIDDEN_BACKENDS = frozenset(("mshv", "whp"))
 MICROVM_PROCESSOR_COUNTS = (1, 2, 4, 8)
 MICROVM_TEST_SCRIPTS_DIR = Path(__file__).with_name("microvm_test_scripts")
 LIFECYCLE_COMPLETION_MARKER = b"NVX-LIFECYCLE-OK"
@@ -323,13 +323,8 @@ def _snapshot_core_script(backend: str) -> str:
             '[ "$(cat /sys/devices/system/clocksource/clocksource0/'
             'current_clocksource)" = kvm-clock ] || fail 46'
         )
-    elif backend == "whp":
-        select_clocksource = stable_clocksource_wait_script()
-        validate_clocksource = (
-            '[ "$(cat /sys/devices/system/clocksource/clocksource0/'
-            'current_clocksource)" != tsc-early ] || fail 46'
-        )
-    elif backend == "mshv":
+    elif backend in ("mshv", "whp"):
+        # nvx-snapshot itself waits until the guest meets the capture clock contract.
         select_clocksource = ":"
         validate_clocksource = ":"
     else:
@@ -3790,8 +3785,12 @@ def run(args: argparse.Namespace) -> int:
         scenarios = tuple(
             scenario
             for scenario in MICROVM_TEST_SCENARIOS
-            if descriptor.name != "ubuntu"
-            or scenario not in UBUNTU_UNSUPPORTED_SCENARIOS
+            if not (
+                descriptor.name == "ubuntu"
+                and scenario in UBUNTU_UNSUPPORTED_SCENARIOS
+                or scenario == "smp-lapic"
+                and args.backend in TSC_DEADLINE_HIDDEN_BACKENDS
+            )
         )
     else:
         scenarios = tuple(dict.fromkeys(args.scenario))

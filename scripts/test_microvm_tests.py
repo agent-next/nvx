@@ -38,6 +38,43 @@ def _posix_shell() -> str | None:
     return shell
 
 
+NVX_SNAPSHOT_PATH = Path(__file__).parents[1] / "guest" / "common" / "nvx-snapshot"
+CURRENT_CLOCKSOURCE_PATH = (
+    "/sys/devices/system/clocksource/clocksource0/current_clocksource"
+)
+
+
+def _shell_function(script: str, name: str) -> str:
+    """Return the top-level shell function ``name`` defined in ``script``."""
+    start = script.index(f"\n{name}() {{\n") + 1
+    return script[start : script.index("\n}\n", start) + 3]
+
+
+def _timer_list(broadcast_mode: int | None, cpu_modes: list[int]) -> str:
+    """Return /proc/timer_list output with the given tick device modes."""
+    lines = ["Timer List Version: v0.10", "now at 1116000000 nsecs", ""]
+    for cpu in range(len(cpu_modes)):
+        lines += [f"cpu: {cpu}", " clock 0:", "active timers:", "jiffies: 1", ""]
+    if broadcast_mode is not None:
+        lines += [
+            f"Tick Device: mode:     {broadcast_mode}",
+            "Broadcast device",
+            "Clock Event Device: <NULL>",
+            "tick_broadcast_mask: 0",
+            "",
+        ]
+    for cpu, mode in enumerate(cpu_modes):
+        handler = "hrtimer_interrupt" if mode == 1 else "tick_handle_periodic"
+        lines += [
+            f"Tick Device: mode:     {mode}",
+            f"Per CPU device: {cpu}",
+            "Clock Event Device: lapic",
+            f" event_handler:  {handler}",
+            "",
+        ]
+    return "\n".join(lines) + "\n"
+
+
 def _vp_binding_profile(vp_indices: list[int]) -> bytes:
     fields = "duration_ns=1 process_elapsed_ns=2 pid=3"
     phases = [
@@ -886,6 +923,267 @@ class MicrovmTests(unittest.TestCase):
                 "nvx-snapshot: synthetic restore failure; terminating the VM\n",
             )
 
+    def test_snapshot_clock_ready_requires_one_shot_ticks_on_stable_clocksource(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        snapshot = NVX_SNAPSHOT_PATH.read_text(encoding="utf-8")
+        functions = _shell_function(snapshot, "current_clocksource") + _shell_function(
+            snapshot, "clock_ready"
+        )
+        functions = functions.replace(
+            CURRENT_CLOCKSOURCE_PATH, "current_clocksource"
+        ).replace("/proc/timer_list", "timer_list")
+
+        for name, clocksource, timer_list, ready in (
+            ("broadcast entry first", "tsc", _timer_list(0, [1, 1]), True),
+            ("all one-shot", "tsc", _timer_list(None, [1, 1, 1, 1]), True),
+            ("kvm-clock", "kvm-clock", _timer_list(1, [1]), True),
+            ("mixed per-CPU modes", "tsc", _timer_list(1, [1, 0, 1]), False),
+            ("periodic tick", "tsc", _timer_list(0, [0]), False),
+            ("tsc-early", "tsc-early", _timer_list(0, [1]), False),
+            ("refined-jiffies", "refined-jiffies", _timer_list(0, [1]), False),
+            ("no per-CPU entries", "tsc", _timer_list(0, []), False),
+            ("no timer list", "tsc", None, False),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "current_clocksource").write_text(
+                    f"{clocksource}\n", encoding="ascii"
+                )
+                if timer_list is not None:
+                    (root / "timer_list").write_text(timer_list, encoding="ascii")
+                result = subprocess.run(
+                    [shell, "-s"],
+                    cwd=root,
+                    input=f"set -eu\n{functions}clock_ready\n",
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+
+                self.assertEqual(
+                    result.returncode == 0, ready, result.stdout + result.stderr
+                )
+
+    def test_snapshot_clock_wait_logs_source_and_times_out_after_five_seconds(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        wait = _shell_function(
+            NVX_SNAPSHOT_PATH.read_text(encoding="utf-8"), "wait_for_capture_clock"
+        )
+
+        # Each fake poll advances the guest uptime by one second.
+        for name, clock_ready, expected_stdout, expected_console, timed_out in (
+            (
+                "ready",
+                '[ "$polls" -ge 0 ]',
+                "ready polls=0\n",
+                "NVX-SNAPSHOT-CLOCK: source=tsc waited_us=0\n",
+                False,
+            ),
+            (
+                "ready after waiting",
+                '[ "$polls" -ge 3 ]',
+                "ready polls=3\n",
+                "NVX-SNAPSHOT-CLOCK: source=tsc waited_us=3000000\n",
+                False,
+            ),
+            ("never ready", "false", "not-ready polls=5\n", "", True),
+            # A failed uptime read in a command substitution must not let
+            # the caller request a capture.
+            (
+                "uptime failure",
+                ": >uptime-fails; false",
+                "not-ready polls=0\n",
+                "",
+                False,
+            ),
+        ):
+            with (
+                self.subTest(name=name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                result = subprocess.run(
+                    [shell, "-s"],
+                    cwd=root,
+                    input=(
+                        "set -eu\n"
+                        "uptime=1000000\n"
+                        "polls=0\n"
+                        "uptime_microseconds() {\n"
+                        "    [ ! -e uptime-fails ] || return 1\n"
+                        '    echo "$uptime"\n'
+                        "}\n"
+                        "sleep() {\n"
+                        "    uptime=$((uptime + 1000000))\n"
+                        "    polls=$((polls + 1))\n"
+                        "}\n"
+                        f"clock_ready() {{ {clock_ready}; }}\n"
+                        "current_clocksource() { echo tsc; }\n"
+                        "console_status() { printf '%s\\n' \"$*\" >>console; }\n"
+                        f"{wait}"
+                        "if wait_for_capture_clock; then\n"
+                        '    echo "ready polls=$polls"\n'
+                        "else\n"
+                        '    echo "not-ready polls=$polls"\n'
+                        "fi\n"
+                    ),
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, expected_stdout)
+                console = root / "console"
+                self.assertEqual(
+                    console.read_text(encoding="ascii") if console.exists() else "",
+                    expected_console,
+                )
+                if timed_out:
+                    self.assertIn("nvx-snapshot: timed out waiting for", result.stderr)
+                    self.assertIn("(clocksource: tsc)", result.stderr)
+                else:
+                    self.assertEqual(result.stderr, "")
+
+    def test_snapshot_waits_for_clock_before_freezing_or_requesting_capture(self):
+        snapshot = NVX_SNAPSHOT_PATH.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "    1:--check-clock) check_clock_only=true ;;\n",
+            snapshot,
+        )
+        check_clock_only = snapshot.index('if [ "$check_clock_only" = true ]; then')
+        self.assertLess(check_clock_only, snapshot.index("configured_snapshot_tier=$("))
+        self.assertLess(
+            check_clock_only,
+            snapshot.index("generation_id=$(/sbin/nvx-port-io read-generation-id"),
+        )
+        wait = snapshot.index("\nwait_for_capture_clock || exit 1\n")
+        self.assertLess(
+            snapshot.index("fresh-scratch capture requires an ABI-v2 scratch device"),
+            wait,
+        )
+        self.assertLess(wait, snapshot.index("    container_frozen=true\n"))
+        self.assertLess(wait, snapshot.index('    if ! fsfreeze -f "$scratch_mount"'))
+        self.assertLess(wait, snapshot.index('write_port_byte 1541 "$capture_request"'))
+
+    def test_snapshot_capture_status_rejection_thaws_barriers_and_fails(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        snapshot = NVX_SNAPSHOT_PATH.read_text(encoding="utf-8")
+        functions = (
+            _shell_function(snapshot, "fail_closed")
+            + _shell_function(snapshot, "cleanup")
+        ).replace("/sbin/nvx-exit", "nvx_exit")
+        capture = snapshot[snapshot.index("# A successful capture terminates") :]
+
+        for name, capture_status, restore_status, returncode, error in (
+            ("not rejected", "0", "0", 0, ""),
+            ("VMM without status", "255", "0", 0, ""),
+            (
+                "periodic LAPIC timer",
+                "1",
+                "0",
+                1,
+                "nvx-snapshot: the VMM rejected the capture because a vCPU has "
+                "an armed periodic LAPIC timer\n",
+            ),
+            (
+                "other rejection",
+                "2",
+                "0",
+                1,
+                "nvx-snapshot: the VMM rejected the capture (status 2)\n",
+            ),
+            (
+                "unreadable status",
+                "",
+                "0",
+                1,
+                "nvx-snapshot: failed to read the snapshot capture status\n",
+            ),
+            ("restored VM", "1", "6", 0, ""),
+            ("restored VM without targets", "1", "2", 0, ""),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "cgroup").mkdir()
+                (root / "cgroup" / "cgroup.freeze").write_text("1\n", encoding="ascii")
+                result = subprocess.run(
+                    [shell, "-s", "--", capture_status, restore_status],
+                    cwd=root,
+                    input=(
+                        "set -eu\n"
+                        "container_cgroup=cgroup\n"
+                        "scratch_mount=scratch\n"
+                        "RESTORE_PACKET_AVAILABLE=2\n"
+                        "RESTORE_PROCESSOR_TARGET_AVAILABLE=4\n"
+                        "RESTORE_MEMORY_TARGET_AVAILABLE=8\n"
+                        "RESTORE_MEMORY_EXPANSION_AVAILABLE=16\n"
+                        "snapshot_tier=legacy\n"
+                        "scratch_policy=paired\n"
+                        "container_frozen=true\n"
+                        "scratch_frozen=true\n"
+                        "post_restore_pending=false\n"
+                        "capture_status_value=$1\n"
+                        "restore_status_value=$2\n"
+                        'nvx_exit() { echo "nvx-exit $1" >>events; }\n'
+                        'fsfreeze() { echo "fsfreeze $*" >>events; }\n'
+                        'write_port_byte() { echo "write $1 $2" >>events; }\n'
+                        "read_port_byte() {\n"
+                        '    echo "read $1" >>events\n'
+                        '    case "$1" in\n'
+                        "        1541) printf '%s\\n' \"$capture_status_value\" ;;\n"
+                        "        234) printf '%s\\n' \"$restore_status_value\" ;;\n"
+                        "    esac\n"
+                        "}\n"
+                        "console_status() { :; }\n"
+                        "post_restore() {\n"
+                        "    echo post-restore >>events\n"
+                        "    post_restore_pending=false\n"
+                        "}\n"
+                        f"{functions}"
+                        "trap cleanup EXIT\n"
+                        f"{capture}"
+                    ),
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+
+                self.assertEqual(
+                    result.returncode, returncode, result.stdout + result.stderr
+                )
+                events = (root / "events").read_text(encoding="ascii").splitlines()
+                self.assertEqual(events[0], "write 1541 1")
+                freeze = (root / "cgroup" / "cgroup.freeze").read_text(encoding="ascii")
+                self.assertEqual(result.stderr, error)
+                self.assertNotIn("nvx-exit 1", events)
+                self.assertIn("fsfreeze -u scratch", events)
+                self.assertEqual(freeze, "0\n")
+                # Restored VMs skip the status read to keep restore latency flat.
+                self.assertEqual(
+                    "read 1541" in events, int(restore_status) & 2 == 0, events
+                )
+                self.assertEqual(
+                    "post-restore" in events, name == "restored VM", events
+                )
+
+    def test_scratch_paired_checks_capture_clock_before_writing_snapshot_port(self):
+        script = microvm_tests._read_script("scratch-paired.sh")
+
+        check = script.index("nvx-snapshot --check-clock || fail 64\n")
+        self.assertLess(check, script.index("dd if=/dev/zero of=/dev/vdb"))
+        self.assertLess(check, script.index("seek=1541"))
+
     def test_console_log_persists_buffered_and_completed_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1102,8 +1400,12 @@ class MicrovmTests(unittest.TestCase):
         mshv = microvm_tests._snapshot_core_script("mshv")
 
         self.assertIn("echo kvm-clock", kvm)
-        self.assertIn('current_clocksource)" != tsc-early', whp)
-        self.assertNotIn("@SELECT_CLOCKSOURCE@", mshv)
+        # nvx-snapshot waits for the capture clock contract on MSHV and WHP.
+        for script in (whp, mshv):
+            self.assertNotIn("@SELECT_CLOCKSOURCE@", script)
+            self.assertNotIn("@VALIDATE_CLOCKSOURCE@", script)
+            self.assertNotIn("clocksource", script)
+            self.assertIn("\nnvx-snapshot\n", script)
         self.assertIn("/sbin/nvx-reseed", mshv)
         self.assertIn("/sbin/nvx-reseed --sample", mshv)
         self.assertIn("NVX-SNAPSHOT-GENERATION-ID-", mshv)
@@ -1171,58 +1473,6 @@ class MicrovmTests(unittest.TestCase):
                         (root / "result").read_text(encoding="ascii").split(),
                         ["1", "101", "1"],
                     )
-
-    def test_snapshot_core_whp_waits_for_stable_clocksource(self):
-        shell = _posix_shell()
-        if shell is None:
-            self.skipTest("POSIX shell is unavailable")
-        clocksource_script = microvm_tests._snapshot_core_script("whp").split(
-            "generation_id_before=", 1
-        )[0]
-        for ready_after, stable_source, expected_returncode, expected_waits in (
-            (0, "tsc", 0, 0),
-            (2, "refined-jiffies", 0, 2),
-            (101, "tsc", 46, 100),
-        ):
-            with self.subTest(
-                ready_after=ready_after,
-                stable_source=stable_source,
-            ):
-                result = subprocess.run(
-                    [shell, "-s"],
-                    input=(
-                        "clock_waits=0\n"
-                        "cat() {\n"
-                        f'    if [ "$clock_waits" -ge {ready_after} ]; then\n'
-                        f"        echo {stable_source}\n"
-                        "    else\n"
-                        "        echo tsc-early\n"
-                        "    fi\n"
-                        "}\n"
-                        "sleep() { clock_waits=$((clock_waits + 1)); }\n"
-                        "nvx_exit() {\n"
-                        '    echo "NVX-CLOCKSOURCE-WAITS-$clock_waits"\n'
-                        '    exit "$1"\n'
-                        "}\n"
-                        + clocksource_script.replace("nvx-exit", "nvx_exit")
-                        + 'echo "NVX-CLOCKSOURCE-WAITS-$clock_waits"\n'
-                    ),
-                    text=True,
-                    capture_output=True,
-                    timeout=5,
-                    check=False,
-                )
-
-                self.assertEqual(
-                    result.returncode,
-                    expected_returncode,
-                    result.stdout + result.stderr,
-                )
-                self.assertIn(
-                    f"NVX-CLOCKSOURCE-WAITS-{expected_waits}\n", result.stdout
-                )
-                if expected_returncode:
-                    self.assertIn("NVX-SNAPSHOT-CORE-FAIL code=46", result.stdout)
 
     def test_snapshot_core_waits_for_no_destination_marker_line_before_exit(self):
         events: list[tuple[str, bytes | str | None]] = []
@@ -2613,6 +2863,52 @@ class MicrovmTests(unittest.TestCase):
 
         guest_boot.assert_called_once()
         console_snapshot.assert_not_called()
+
+    def test_runner_omits_redundant_smp_lapic_from_backend_defaults(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        for backend, expected_forced_modes in (
+            ("kvm", [False, True]),
+            ("mshv", [False]),
+            ("whp", [False]),
+        ):
+            with (
+                self.subTest(backend=backend),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                args = argparse.Namespace(
+                    backend=backend,
+                    guest="alpine",
+                    scenario=None,
+                    processors=[2],
+                    memory_mib=128,
+                    timeout=60.0,
+                    output_dir=Path(temporary),
+                )
+                with (
+                    patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                    patch.object(
+                        microvm_tests,
+                        "MICROVM_TEST_SCENARIOS",
+                        ("smp", "smp-lapic"),
+                    ),
+                    patch.object(
+                        microvm_tests,
+                        "require_file",
+                        side_effect=require,
+                    ),
+                    patch.object(microvm_tests, "run_smp") as run_smp,
+                ):
+                    self.assertEqual(microvm_tests.run(args), 0)
+
+                self.assertEqual(
+                    [
+                        entry.kwargs["force_lapic_timer"]
+                        for entry in run_smp.call_args_list
+                    ],
+                    expected_forced_modes,
+                )
 
     def test_runner_rejects_ubuntu_unsupported_scenarios(self):
         def require(path: Path, _description: str) -> Path:

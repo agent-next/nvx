@@ -315,15 +315,18 @@ to advance and remain at least as large as the worker's observed value.
 The check remains strict even on a one-vCPU guest: falling back to the PIT after a failed
 LAPIC calibration is not success. A counter frozen at 12 can indicate Linux's
 `APIC timer disabled due to verification failure`; increasing the poll budget cannot repair it.
-CI runs `test-microvm --scenario smp-lapic --processors 1 2 4 8` before acceptance.
-This repeats the normal SMP probe with `lapic=notscdeadline`, covering the counting
-LAPIC even on hosts that normally use TSC-deadline timers. The ordinary `smp` scenario
-retains the default timer selection.
-MSHV and WHP captures wait for Linux to replace the transitional `tsc-early` clocksource with
-its stable selected clocksource before starting this SMP validation. Until that switch, Linux
-uses a periodic tick that doesn't recover the jiffies skipped by a restore's downtime. The
-clocksource watchdog can then compare `tsc-early` with jiffies across the restore and mark the
-TSC unstable. KVM guests leave `tsc-early` almost immediately after boot.
+Before KVM acceptance, CI runs
+`test-microvm --scenario smp-lapic --processors 1 2 4 8`. This repeats the normal
+SMP probe with `lapic=notscdeadline`, covering the counting LAPIC on a backend that
+normally exposes TSC-deadline timers. MSHV and WHP CPU contracts hide TSC-deadline,
+so their ordinary `smp` scenario already covers the counting LAPIC and their default
+correctness suites omit the duplicate `smp-lapic` run.
+`nvx-snapshot` requests a capture only after the guest's clocksource is `tsc` or `kvm-clock` and
+every online CPU runs a one-shot tick, for the reasons in the
+[snapshot design](design/snapshot-and-restore.md#time-and-entropy). On MSHV and WHP, a capture
+requested within about 1.1 seconds of boot therefore waits for Linux to register `tsc`; KVM
+guests meet the contract at boot. The wait precedes the snapshot-port write, so it is outside the
+snapshot-generation interval but included in the non-gating `request_to_publication_*` fields.
 The coordinator stages the probe and a capture controller in guest memory. The
 controller runs the first probe, blocks in `read`, and invokes `nvx-snapshot` when the
 host sends the trigger. The controller always emits `NVX-SNAPSHOT-DISPATCHED` immediately before
@@ -455,7 +458,8 @@ OpenVMM-exclusive intervals. `console_input_dispatch` measures the synchronous w
 snapshot command and prequeued restore script to the OpenVMM console and records the payload size.
 All captures emit a guest marker immediately before `nvx-snapshot`;
 `console_command_round_trip` ends when the host observes that marker, and
-`guest_dispatch_to_publication` spans that observation through snapshot publication.
+`guest_dispatch_to_publication` spans that observation through snapshot publication, including
+any wait of `nvx-snapshot` for the capture clock contract.
 Each observed record also includes available process counters. Linux reports RSS, peak RSS,
 minor and major faults, total page faults, and, when `smaps_rollup` is available, private dirty
 and private RSS bytes. Windows reports working set, peak working set, private commit, and page
@@ -583,7 +587,8 @@ The lifecycle benchmark uses the optimized 128 MiB shell-ready guest as one base
 MSHV, and WHP. Host timing starts immediately before `Popen`, so cold-start and restore values
 include OpenVMM process startup and VM construction. Snapshot generation uses OpenVMM's monotonic
 process clock from the beginning of input gating, after the guest requests the snapshot, through
-atomic publication. It does not include delivery of `nvx-snapshot` over the polling console.
+atomic publication. It does not include delivery of `nvx-snapshot` over the polling console or
+its wait for the capture clock contract.
 Host request-to-publication and first publication observation (polled every 1 ms) remain diagnostics.
 
 After a cold-start marker, the host dispatches guest `nvx-exit 0` and measures

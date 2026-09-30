@@ -48,20 +48,36 @@ with a bounded wait, calls `sync`, and freezes the mounted filesystem. Its
 fresh-scratch mode instead requires scratch to be unmounted. A rejected capture
 thaws every guest-owned barrier; failure to thaw terminates the VM.
 
+A snapshot may be captured only when the guest's current clocksource is `tsc`
+or `kvm-clock` and every online CPU runs a one-shot tick, for the reasons in
+[Time and entropy](#time-and-entropy). Before any freeze, `nvx-snapshot` polls
+`current_clocksource` and `/proc/timer_list` every 10 ms for up to 5 seconds and
+logs `NVX-SNAPSHOT-CLOCK: source=<name> waited_us=<n>` to the console. If the
+contract doesn't hold by then, it exits 1 without requesting a capture, and the
+VM keeps running. `nvx-snapshot --check-clock` runs only this check, for callers
+that write PMIO `0x605` directly. OpenVMM enforces the part that it can observe
+and rejects the capture while any vCPU has an armed periodic LAPIC timer. A
+guest that continues after a rejected or rolled-back capture reads the reason
+from PMIO `0x605` (see the [PMIO devices](machine-and-device-abi.md#pmio-devices));
+`nvx-snapshot` then thaws its barriers and exits 1. It reads the status only
+when no restore packet is present, which keeps the read off the restore path.
+
 1. gate host input and defer completion of the snapshot-port write;
 2. stop the vCPU at the I/O boundary while completing the write, so saved state
    starts at the instruction immediately after `out`;
 3. preflight the profile, destination, backend, external attachments, and
    snapshot eligibility; a missing destination or rejected preflight releases
    the boundary and lets the guest continue;
-4. quiesce the remaining device workers and VM time in dependency order,
+4. reject the capture, and likewise release the boundary, while any stopped
+   vCPU's LAPIC timer is unmasked, periodic, and has a nonzero initial count;
+5. quiesce the remaining device workers and VM time in dependency order,
    including bounded virtio-blk queue drain;
-5. save the exact state-unit inventory, processor state, device-private state,
+6. save the exact state-unit inventory, processor state, device-private state,
    and memory;
-6. copy and flush state, memory, and any paired scratch into a unique sibling
+7. copy and flush state, memory, and any paired scratch into a unique sibling
    staging directory;
-7. publish the directory with one no-replace rename; and
-8. terminate the source worker and process after publication.
+8. publish the directory with one no-replace rename; and
+9. terminate the source worker and process after publication.
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"background": "#ffffff"}}}%%
@@ -86,10 +102,10 @@ sequenceDiagram
    Worker-->>Port: Complete OUT
    Worker-->>Controller: Boundary ready
    Controller->>Controller: Preflight destination and contract
-   alt No destination or rejected preflight
+   alt No destination, rejected preflight, or periodic LAPIC timer
       Controller->>Worker: Release boundary
       Worker->>Units: Resume host input
-      Worker-->>Guest: Continue execution
+      Worker-->>Guest: Continue execution and report the outcome on 0x605
    else Capture accepted
       Controller->>Worker: Quiesce for snapshot
       Worker->>Units: Stop and save in dependency order
@@ -533,7 +549,10 @@ platform snapshot's command line must carry exactly the recorded value. Under
 the versioned CPU contract, WHP runs the guest TSC at a fixed 1 GHz when the
 host supports that rate and otherwise keeps the host frequency; MSHV exposes no
 TSC-deadline mode because it does not reliably deliver those events to
-direct-boot guests.
+direct-boot guests. WHP hides TSC-deadline mode under the versioned contract as
+well, so that capture can detect a periodic tick, as described below. Because
+this changes the recorded CPU contract, WHP snapshots captured with
+TSC-deadline mode exposed must be recaptured.
 
 Capture records a coherent processor and clock boundary. Restore advances TSC,
 VM time, RTC, PIT/LAPIC deadlines, and the KVM paravirtual clock by nonnegative
@@ -552,6 +571,32 @@ Versioned MSHV CPU contracts do not expose `IA32_TSC_ADJUST` because snapshot
 state cannot preserve that register independently of `IA32_TSC`; Linux
 therefore does not interpret OpenVMM's host-side TSC correction as per-vCPU
 firmware adjustment skew.
+
+A periodic LAPIC timer that the downtime expires more than once still queues a
+single interrupt. A guest whose periodic tick counts those interrupts would
+therefore advance jiffies by one tick while its TSC advances by the whole
+downtime. While Linux's transitional `tsc-early` clocksource is current, its
+clocksource watchdog compares exactly those two, and it marks the TSC unstable
+when the downtime exceeds the watchdog's margin (#253). Replaying every
+missed tick would add restore latency that grows with the downtime, and not
+advancing the TSC would discard it, so capture instead requires the tickless
+state of the [capture contract](#capture-boundary): a one-shot tick recomputes
+jiffies from the clocksource at its first tick after restore. Linux switches a
+CPU to a one-shot tick only when its clocksource is valid for high-resolution
+mode. While the watchdog verifies `tsc-early` on MSHV and WHP, its only
+reference there is `refined-jiffies`, which can't validate it, so the tick
+stays periodic. Linux doesn't watch the TSC when the guest boots with
+`tsc=reliable`, as benchmark guests do, or sees a constant, nonstop TSC with
+`TSC_ADJUST`, which WHP can expose; `tsc-early` then runs one-shot ticks and
+can't fail this way. With `tsc_early_khz`, Linux registers `tsc` about 1.1
+seconds after boot on those backends, and a capture requested earlier waits
+until then either way. KVM guests register `tsc` or `kvm-clock` at boot. A
+LAPIC in TSC-deadline mode has no periodic mode, and Linux emulates a periodic
+tick with deadline one-shots that OpenVMM cannot tell apart from a one-shot
+tick; with TSC-deadline mode hidden on MSHV and WHP, OpenVMM's periodic-timer
+rejection detects every periodic tick on the backends where the watchdog
+compares the TSC with jiffies. On KVM, `kvm-clock` is the watchdog, and restore
+advances it.
 
 KVM advances each VP's TSC through its TSC offset rather than a counter write,
 because KVM can discard a sub-second counter write as a synchronization

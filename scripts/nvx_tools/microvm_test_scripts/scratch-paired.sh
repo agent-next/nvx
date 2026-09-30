@@ -13,6 +13,9 @@ while { [ ! -b /dev/vda ] || [ ! -b /dev/vdb ]; } && [ "$tries" -lt 600 ]; do
 done
 [ "$(cat /sys/block/vda/ro)" = 1 ] || fail 60
 [ "$(cat /sys/block/vdb/ro)" = 0 ] || fail 61
+# This scenario writes the snapshot port directly, so it runs the capture
+# clock check of nvx-snapshot before starting the in-flight write.
+nvx-snapshot --check-clock || fail 64
 dd if=/dev/zero of=/dev/vdb bs=512 count=1 conv=notrunc 2>/dev/null & writer=$!
 tries=0
 while [ "$tries" -lt 2000 ]; do

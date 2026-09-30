@@ -41,8 +41,8 @@ runs:
         name: guest-artifacts
         path: build
 
-    - name: Check Linux counting-LAPIC timers
-      if: runner.os != 'Windows'
+    - name: Check KVM counting-LAPIC timers
+      if: inputs.backend == 'kvm'
       shell: bash
       run: |
         set -euo pipefail
@@ -52,19 +52,6 @@ runs:
           --processors 1 2 4 8 \
           --timeout "${{ inputs.marker-timeout }}" \
           --output-dir "data/runs/${{ inputs.platform }}/lapic-correctness"
-
-    - name: Check Windows counting-LAPIC timers
-      if: runner.os == 'Windows'
-      shell: powershell
-      run: |
-        $ErrorActionPreference = "Stop"
-        python scripts\nvx.py test-microvm `
-          --backend "${{ inputs.backend }}" `
-          --scenario smp-lapic `
-          --processors 1 2 4 8 `
-          --timeout "${{ inputs.marker-timeout }}" `
-          --output-dir "data/runs/${{ inputs.platform }}/lapic-correctness"
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: Run Linux acceptance test
       if: runner.os != 'Windows'

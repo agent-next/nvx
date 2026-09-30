@@ -30,11 +30,14 @@ runs with OpenVMM lifecycle profiling and must report exactly one
 `startup.vp_thread_bind` record. Its `startup.vp_bind_*` records must show that
 an explicit MSHV target binds exactly VPs `0..N-1`, while untargeted MSHV
 restores and all KVM and WHP restores bind the full capacity.
-On MSHV and WHP, the capture waits until Linux replaces its transitional
-`tsc-early` clocksource. A snapshot taken earlier can fail after restore
-without any cross-CPU skew, because the clocksource watchdog compares
-`tsc-early` with jiffies across the restore downtime, as described in
-[the benchmark guide](benchmarks.md).
+Like every capture, the restore-processor capture runs `nvx-snapshot`, which
+waits until the guest's clocksource is `tsc` or `kvm-clock` and every online
+CPU runs a one-shot tick, and logs the outcome as `NVX-SNAPSHOT-CLOCK`. On MSHV
+and WHP, a snapshot taken earlier, on Linux's transitional `tsc-early`
+clocksource, could fail after restore without any cross-CPU skew when the
+clocksource watchdog compares `tsc-early` with jiffies across the restore
+downtime, as described in
+[the snapshot design](design/snapshot-and-restore.md#time-and-entropy).
 A restore fails as soon as its guest prints `NVX-RESTORE-PROCESSORS-FAIL`,
 rather than waiting for the phase timeout. Restore logs also record OpenVMM's
 `adjusted restored vCPU TSC` event for each VP, which includes the applied

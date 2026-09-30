@@ -5969,7 +5969,6 @@ class BenchmarkTests(unittest.TestCase):
     def test_prepare_snapshot_capture_stages_waiting_controller(self):
         script = benchmark.prepare_snapshot_capture_script(
             4,
-            backend="whp",
             teardown_mode="guest-exit",
             network_gateway="10.0.0.1",
             ioapic_irq=10,
@@ -5988,19 +5987,13 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertIn("IFS= read -r trigger\n", script)
         self.assertIn("echo NVX-SNAPSHOT-DISPATCHED\n", script)
-        self.assertIn('while [ "$(cat "$clock_path")" = tsc-early ]', script)
-        self.assertIn(
-            "SMP-CLOCKSOURCE-FAIL expected=stable actual=$current_clocksource",
-            script,
-        )
         self.assertIn(
             "/sbin/nvx-snapshot\necho OPENVMM-SNAPSHOT-RESTORE-OK\nnvx-exit 0\n",
             script,
         )
         host_terminated = benchmark.prepare_snapshot_capture_script(
-            4, backend="kvm", teardown_mode="host-terminate"
+            4, teardown_mode="host-terminate"
         )
-        self.assertNotIn("clock_tries", host_terminated)
         self.assertNotIn("nvx-exit 0", host_terminated)
         self.assertTrue(
             script.endswith(
@@ -6011,24 +6004,19 @@ class BenchmarkTests(unittest.TestCase):
             )
         )
 
-    def test_mshv_and_whp_capture_after_linux_leaves_tsc_early(self):
-        wait = benchmark.stable_clocksource_wait_script()
-        for backend, waits in (("mshv", True), ("whp", True), ("kvm", False)):
-            with self.subTest(backend=backend):
-                script = benchmark.prepare_snapshot_capture_script(
-                    1, backend=backend, teardown_mode="guest-exit"
-                )
-                probe = script.split("<<'NVX_SMP_PROBE_SCRIPT'\n", 1)[1]
-                probe = probe.split("NVX_SMP_PROBE_SCRIPT\n", 1)[0]
-                self.assertEqual(probe.startswith(wait), waits)
-                self.assertEqual("SMP-CLOCKSOURCE-FAIL expected=stable" in probe, waits)
-                if waits:
-                    # The wait and its check run before the probe completes, so
-                    # the host requests the snapshot only after tsc-early is gone.
-                    self.assertLess(
-                        probe.index("SMP-CLOCKSOURCE-FAIL"),
-                        probe.index("NVX-SMP-PROBE-OK"),
-                    )
+    def test_capture_controller_leaves_the_clock_contract_to_nvx_snapshot(self):
+        # nvx-snapshot waits for the capture clock contract on every capture
+        # path, so the harness doesn't wait for a clocksource itself.
+        script = benchmark.prepare_snapshot_capture_script(
+            1, teardown_mode="guest-exit"
+        )
+        probe = script.split("<<'NVX_SMP_PROBE_SCRIPT'\n", 1)[1]
+        probe = probe.split("NVX_SMP_PROBE_SCRIPT\n", 1)[0]
+
+        self.assertNotIn("clocksource", script)
+        self.assertNotIn("timer_list", script)
+        self.assertIn("NVX-SMP-PROBE-OK", probe)
+        self.assertIn("echo NVX-SNAPSHOT-DISPATCHED\n/sbin/nvx-snapshot\n", script)
 
     def test_output_marker_must_be_a_complete_line(self):
         marker = benchmark.RESTORE_MARKER

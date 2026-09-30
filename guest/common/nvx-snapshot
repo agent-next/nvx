@@ -3,9 +3,11 @@ set -eu
 
 snapshot_tier=legacy
 scratch_policy=paired
+check_clock_only=false
 case "$#:${1:-}" in
     0:) ;;
     1:--fresh-scratch) scratch_policy=fresh ;;
+    1:--check-clock) check_clock_only=true ;;
     2:--tier)
         snapshot_tier=$2
         case "$snapshot_tier" in
@@ -18,7 +20,7 @@ case "$#:${1:-}" in
         esac
         ;;
     *)
-        echo "usage: nvx-snapshot [--fresh-scratch | --tier TIER]" >&2
+        echo "usage: nvx-snapshot [--fresh-scratch | --tier TIER | --check-clock]" >&2
         exit 2
         ;;
 esac
@@ -177,6 +179,43 @@ uptime_microseconds() {
         "$((uptime_seconds * 1000000 + uptime_fraction_value * uptime_scale))"
 }
 
+current_clocksource() {
+    IFS= read -r clocksource \
+        </sys/devices/system/clocksource/clocksource0/current_clocksource ||
+        clocksource=unknown
+    printf '%s\n' "$clocksource"
+}
+
+# Restore advances each vCPU's TSC by the host downtime but coalesces the
+# periods that a periodic LAPIC tick missed into one interrupt, so a periodic
+# tick falls behind the TSC, and Linux's clocksource watchdog can mark the TSC
+# unstable. A one-shot tick recomputes jiffies from the clocksource instead.
+clock_ready() {
+    case "$(current_clocksource)" in
+        tsc | kvm-clock) ;;
+        *) return 1 ;;
+    esac
+    # Each tick device is printed as "Tick Device: mode: N", followed by
+    # "Broadcast device" or "Per CPU device: N". Mode 1 is one-shot.
+    awk '/^Tick Device: mode:/ { mode = $NF; next }
+        /^Per CPU device:/ { cpus++; if (mode != 1) periodic++ }
+        END { exit !(cpus > 0 && periodic == 0) }' /proc/timer_list
+}
+
+wait_for_capture_clock() {
+    clock_started_us=$(uptime_microseconds) || return 1
+    while ! clock_ready 2>/dev/null; do
+        clock_now_us=$(uptime_microseconds) || return 1
+        if [ $((clock_now_us - clock_started_us)) -ge 5000000 ]; then
+            echo "nvx-snapshot: timed out waiting for a tsc or kvm-clock clocksource and one-shot ticks on every online CPU (clocksource: $(current_clocksource))" >&2
+            return 1
+        fi
+        sleep 0.01
+    done
+    clock_now_us=$(uptime_microseconds) || return 1
+    console_status "NVX-SNAPSHOT-CLOCK: source=$(current_clocksource) waited_us=$((clock_now_us - clock_started_us))"
+}
+
 activate_restore_memory() {
     range_count=$1
     shift
@@ -251,6 +290,11 @@ activate_restore_memory() {
         fail_closed "failed to read MemTotal after memory activation"
     echo "NVX-MEMORY-ONLINE-OK: added_bytes=$added_bytes memtotal_kib=$memtotal_kib elapsed_us=$((completed_us - started_us))"
 }
+
+if [ "$check_clock_only" = true ]; then
+    wait_for_capture_clock || exit 1
+    exit 0
+fi
 
 configured_snapshot_tier=$(cmdline_value nvx_snapshot_tier || true)
 if [ -n "$configured_snapshot_tier" ]; then
@@ -441,6 +485,8 @@ elif [ "$scratch_policy" = fresh ]; then
     exit 1
 fi
 
+wait_for_capture_clock || exit 1
+
 if [ "$has_scratch" = true ] && [ "$scratch_policy" = paired ]; then
     if [ ! -w "$container_cgroup/cgroup.freeze" ] ||
         [ ! -r "$container_cgroup/cgroup.events" ]; then
@@ -472,7 +518,7 @@ if [ "$has_scratch" = true ] && [ "$scratch_policy" = paired ]; then
 fi
 
 # A successful capture terminates the source before this write returns. On a
-# rejected capture, the trap thaws every guest-owned barrier before returning.
+# rejected capture, the trap thaws every guest-owned barrier before exiting.
 if [ "$scratch_policy" = fresh ]; then
     capture_request=0
 else
@@ -507,4 +553,26 @@ elif [ $((restore_status & RESTORE_PACKET_AVAILABLE)) -ne 0 ] &&
     post_restore
 else
     post_restore_pending=false
+    # A VM without a restore packet continues in the source. The snapshot port
+    # then reads 0 unless the VMM rejected the capture: 1 for an armed periodic
+    # LAPIC timer and 2 for any other reason. A VMM without this status reads
+    # all ones. Restored VMs have a packet, so the read stays off their path.
+    if [ $((restore_status & RESTORE_PACKET_AVAILABLE)) -eq 0 ]; then
+        capture_status=$(read_port_byte 1541) || capture_status=
+        case "$capture_status" in
+            0 | 255) ;;
+            1)
+                echo "nvx-snapshot: the VMM rejected the capture because a vCPU has an armed periodic LAPIC timer" >&2
+                exit 1
+                ;;
+            '' | *[!0-9]*)
+                echo "nvx-snapshot: failed to read the snapshot capture status" >&2
+                exit 1
+                ;;
+            *)
+                echo "nvx-snapshot: the VMM rejected the capture (status $capture_status)" >&2
+                exit 1
+                ;;
+        esac
+    fi
 fi

@@ -64,7 +64,7 @@ flowchart TB
 | `0xe9` | portb data | Raw byte input and output; reads consume one pending byte and zero-fill the remaining access width. |
 | `0xea` | portb status | Bit 0 reports pending host input, bit 1 reports a fresh restore packet, bit 2 reports a processor target, bit 3 reports a version-3 memory target, bit 4 reports one or more memory-expansion ranges, and bit 5 reports the fixed generation-ID selector. Writing `0xa5` after restore selects the one-time restore packet. Writing `0xa6` selects the current 16-byte generation ID; it may be selected repeatedly and remains stable for the lifetime of one VM process. |
 | `0x604` | shutdown | The first output byte becomes the process status carried with the VM power-off request. Reads return all ones. |
-| `0x605` | snapshot request | Reads return all ones. Writes are coalesced and routed asynchronously to the capture controller. Zero requests fresh scratch and a nonzero first byte requests paired scratch. |
+| `0x605` | snapshot request | Writes are coalesced and routed asynchronously to the capture controller. Zero requests fresh scratch and a nonzero first byte requests paired scratch. Reads return the outcome of the last completed request in the first byte and zero-fill the remaining access width: `0` when it was not rejected, `1` when a vCPU had an armed periodic LAPIC timer, and `2` for any other rejection or a rolled-back capture. A new or restored VM reads `0`. |
 
 The portb receive and transmit buffers are each bounded at one MiB. Output
 overflow drops the newest bytes and emits a rate-limited warning; input applies
@@ -86,12 +86,15 @@ status or failed drain fails the pending wait and ends the server with an
 error.
 
 A snapshot-port write with no configured destination completes normally and
-the guest continues. With a destination, the device permits at most one pending
-transaction and defers completion long enough for the controller to establish
-the exact post-`out` capture boundary. Repeated writes are coalesced. The PMIO
-callback itself never pauses vCPUs, drains devices, hashes RAM, or writes files.
-The scratch policy travels with the deferred boundary request. After a gated
-restore, the same write acknowledges completion of guest repair.
+the guest continues; the port then reads `0`. With a destination, the device
+permits at most one pending transaction and defers completion long enough for
+the controller to establish the exact post-`out` capture boundary. Repeated
+writes are coalesced. The PMIO callback itself never pauses vCPUs, drains
+devices, hashes RAM, or writes files. The scratch policy travels with the
+deferred boundary request. A committed capture terminates the source, so only a
+guest that continues after a rejected or rolled-back capture reads a nonzero
+status. After a gated restore, the same write acknowledges completion of guest
+repair.
 
 ## Fixed virtio-mmio transport
 
