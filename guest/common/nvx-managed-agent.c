@@ -665,6 +665,14 @@ static int decode_exec_payload(
                 if (equals == NULL || equals == payload + offset) {
                     goto fail;
                 }
+                for (uint16_t previous = 0; previous < index; ++previous) {
+                    size_t name_length = (size_t)(equals - (payload + offset));
+                    const char *prior = config->environment[previous];
+                    if (strcspn(prior, "=") == name_length &&
+                        memcmp(prior, payload + offset, name_length) == 0) {
+                        goto fail;
+                    }
+                }
                 config->environment[index] = malloc((size_t)length + 1);
                 if (config->environment[index] == NULL) {
                     goto fail;
