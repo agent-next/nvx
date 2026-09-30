@@ -117,7 +117,12 @@ int main(int argc, char **argv) {
             with self.subTest(timeout=timeout):
                 self.assertEqual(self.decode((), timeout=timeout), 0)
 
-    def launch(self, arguments, environment, cwd=b"/"):
+    def launch(
+        self,
+        arguments: tuple[bytes, ...],
+        environment: tuple[bytes, ...] | None,
+        cwd: bytes = b"/",
+    ) -> subprocess.CompletedProcess[bytes]:
         entries = () if environment is None else environment
         flags = 1 | (2 if environment is not None else 0)
         payload = struct.pack(
