@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from .common import bytes_to_mib
+from .common import bytes_to_mib, positive_int
 
 LEGACY_CSV_FIELDS = ["commit", "metric", "unit", "direction", "p50"]
 CSV_FIELDS = [
@@ -1936,13 +1936,6 @@ def gate_results(
     return 1 if regressions else 0
 
 
-def _positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
-    return parsed
-
-
 def _non_negative_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed < 0:
@@ -1999,10 +1992,10 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             "history file restart baseline warmup"
         ),
     )
-    gate.add_argument("--window", type=_positive_int, default=10)
+    gate.add_argument("--window", type=positive_int, default=10)
     gate.add_argument(
         "--minimum-history",
-        type=_positive_int,
+        type=positive_int,
         default=10,
         help="base-branch points required before gating a metric (default: 10)",
     )

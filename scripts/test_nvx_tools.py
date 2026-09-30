@@ -8526,6 +8526,23 @@ class ReleaseTests(unittest.TestCase):
                 )
 
 
+class PositiveIntTests(unittest.TestCase):
+    def test_accepts_positive_integer(self):
+        self.assertEqual(common.positive_int("1"), 1)
+
+    def test_rejects_zero_and_negative_values(self):
+        for value in ("0", "-1"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    argparse.ArgumentTypeError, "^must be greater than zero$"
+                ):
+                    common.positive_int(value)
+
+    def test_rejects_non_integer_input(self):
+        with self.assertRaises(ValueError):
+            common.positive_int("not-an-int")
+
+
 class SharedFileTests(unittest.TestCase):
     def test_checksum_manifest_detects_modified_file(self):
         with tempfile.TemporaryDirectory() as temporary:

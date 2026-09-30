@@ -51,7 +51,12 @@ from nvx_tools.build_constants import (
     BuildConstants,
     OpenVMMBuildConstants,
 )
-from nvx_tools.common import ScriptError, remaining_timeout, require_tool
+from nvx_tools.common import (
+    ScriptError,
+    positive_int,
+    remaining_timeout,
+    require_tool,
+)
 from nvx_tools.release import verify_source_tree
 
 COPILOT_CREDIT_RESERVATION = 30
@@ -120,13 +125,6 @@ def local_executor_environment() -> dict[str, str]:
     environment = sanitized_environment()
     environment["NVX_ADVERSARIAL_STATE_ROOT"] = str(LOCAL_EXECUTOR_STATE_ROOT.resolve())
     return environment
-
-
-def _positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
-    return parsed
 
 
 def _positive_float(value: str) -> float:
@@ -1925,13 +1923,13 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--budget-actions",
-        type=_positive_int,
+        type=positive_int,
         default=8,
         help="maximum accepted broker actions",
     )
     parser.add_argument(
         "--budget-ai-credits",
-        type=_positive_int,
+        type=positive_int,
         default=300,
         help=(
             "campaign Copilot AI-credit budget "
@@ -1974,7 +1972,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--minimize-attempts",
-        type=_positive_int,
+        type=positive_int,
         default=3,
         help="maximum fresh-target prefix minimization attempts",
     )

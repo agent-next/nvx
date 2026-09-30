@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import re
@@ -26,6 +27,13 @@ from .build_constants import (
 
 class ScriptError(RuntimeError):
     """Raised for an actionable command-line workflow failure."""
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def remaining_timeout(deadline: float) -> float:
