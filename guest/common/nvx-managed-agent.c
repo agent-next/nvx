@@ -848,6 +848,11 @@ static int launch_workload(int argc, char **argv)
             read_exact((int)descriptor, environment[index], length) != 0) {
             goto fail;
         }
+        if (memchr(environment[index], '\0', length) != NULL ||
+            environment[index][0] == '=' ||
+            memchr(environment[index], '=', length) == NULL) {
+            goto fail;
+        }
         environment[index][length] = '\0';
     }
     close((int)descriptor);

@@ -180,6 +180,29 @@ int main(int argc, char **argv) {
             self.assertEqual(result.stdout, b"")
             self.assertIn(b"invalid working directory", result.stderr)
 
+    def test_helper_defensively_rejects_malformed_environment(self):
+        for entry in (b"NO_EQUALS", b"=empty-key", b"KEY=embedded\0nul"):
+            with self.subTest(entry=entry), tempfile.TemporaryFile() as config:
+                config.write(struct.pack("<HHI", 2, 1, 0))
+                config.write(struct.pack("<I", len(entry)) + entry)
+                config.seek(0)
+                fd = config.fileno()
+                result = subprocess.run(
+                    [
+                        str(self.executable),
+                        "--exec-config-fd",
+                        str(fd),
+                        "--",
+                        "/usr/bin/env",
+                    ],
+                    pass_fds=(fd,),
+                    capture_output=True,
+                    timeout=5,
+                    env={"BASE": "inherited"},
+                )
+                self.assertEqual(result.returncode, 125)
+                self.assertEqual(result.stdout, b"")
+
 
 if __name__ == "__main__":
     unittest.main()

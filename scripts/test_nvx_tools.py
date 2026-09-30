@@ -767,6 +767,27 @@ class CliTests(unittest.TestCase):
         with self.assertRaisesRegex(common.ScriptError, "require.*exec"):
             nvx.command_sandbox(one_shot)
 
+    def test_sandbox_environment_file_is_bounded_before_state_access(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "environment.json"
+            path.write_bytes(b" " * (1024 * 1024 + 1))
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "exec",
+                    "--state-dir",
+                    "absent-state",
+                    "--environment-file",
+                    str(path),
+                ]
+            )
+            with (
+                patch.object(sandbox_lifecycle, "exec_workload") as execute,
+                self.assertRaisesRegex(common.ScriptError, "exceeds.*byte limit"),
+            ):
+                nvx.command_sandbox(args)
+            execute.assert_not_called()
+
     def test_network_requires_explicit_portable_profile(self):
         args = nvx.parse_args(
             [

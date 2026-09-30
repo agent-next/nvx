@@ -80,6 +80,7 @@ from nvx_tools.sandbox import SandboxLaunch, SandboxLayer, parse_workload_identi
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
 NETWORK_PROFILES = ("portable",)
+MAX_ENVIRONMENT_FILE_BYTES = 1024 * 1024
 SYSTEMD_ENTRYPOINTS = frozenset(("/usr/lib/systemd/systemd", "/lib/systemd/systemd"))
 
 
@@ -379,7 +380,14 @@ def command_sandbox(args: argparse.Namespace) -> None:
     if operation == "exec":
         if args.environment_file is not None:
             try:
-                value = json.loads(args.environment_file.read_text(encoding="utf-8"))
+                with args.environment_file.open("rb") as stream:
+                    data = stream.read(MAX_ENVIRONMENT_FILE_BYTES + 1)
+                if len(data) > MAX_ENVIRONMENT_FILE_BYTES:
+                    raise ScriptError(
+                        "managed execution environment file exceeds "
+                        f"{MAX_ENVIRONMENT_FILE_BYTES}-byte limit"
+                    )
+                value = json.loads(data.decode("utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ScriptError(
                     f"failed to read managed execution environment: "

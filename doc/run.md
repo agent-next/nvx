@@ -377,6 +377,11 @@ and should not be used for secrets. These options apply only to managed
 form is `sandbox run`; it remains one-shot and rejects `--state-dir` or any
 request to retain VM state.
 
+Environment files are limited to 1 MiB of UTF-8 JSON. Environments contain at
+most 256 unique, nonempty names. Each `KEY=VALUE` entry and working-directory
+path is limited to 4096 UTF-8 bytes; the combined execution request must also
+fit the existing 64 KiB control-payload bound.
+
 The explicit `test-microvm --scenario managed-exec-config --backend BACKEND`
 scenario checks these options through public `sandbox provision`, `start`,
 `exec`, `stop`, and `deprovision` commands with an Alpine control guest and an
