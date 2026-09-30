@@ -824,6 +824,9 @@ static int launch_workload(int argc, char **argv)
         environment[index][length] = '\0';
     }
     close((int)descriptor);
+    if (unsetenv("NVX_EXEC_CONFIG_FD") != 0) {
+        goto fail;
+    }
     if ((flags & EXEC_ENVIRONMENT_PRESENT) != 0) {
         if (clearenv() != 0) {
             goto fail;

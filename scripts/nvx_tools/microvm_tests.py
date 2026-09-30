@@ -791,6 +791,45 @@ def run_managed_lifecycle(
                 with ControlSession.connect(
                     Path(endpoint_value), capability, timeout
                 ) as session:
+                    empty_environment = session.exec(
+                        ("/usr/bin/env",),
+                        timeout_ms=5_000,
+                        response_timeout=timeout,
+                        environment=(),
+                    )
+                    exact_environment = session.exec(
+                        ("/usr/bin/env",),
+                        timeout_ms=5_000,
+                        response_timeout=timeout,
+                        environment=("EMPTY=", "COMPLEX=space = \N{SNOWMAN}"),
+                    )
+                    if (
+                        empty_environment.returncode != 0
+                        or empty_environment.stdout
+                        or empty_environment.stderr
+                        or exact_environment.returncode != 0
+                        or exact_environment.stderr
+                        or exact_environment.stdout
+                        != "EMPTY=\nCOMPLEX=space = \N{SNOWMAN}\n".encode()
+                    ):
+                        raise RuntimeError(
+                            "managed exec did not preserve the exact exec environment"
+                        )
+                    for workload_timeout in (0, 3_600_001, 86_400_000, 0xFFFFFFFF):
+                        boundary = session.exec(
+                            ("/bin/true",),
+                            timeout_ms=workload_timeout,
+                            response_timeout=timeout,
+                        )
+                        if (
+                            boundary.returncode != 0
+                            or boundary.category != "exit"
+                            or boundary.stdout
+                            or boundary.stderr
+                        ):
+                            raise RuntimeError(
+                                "managed exec rejected a valid uint32 timeout"
+                            )
                     second = session.exec(
                         (
                             "/bin/sh",
