@@ -45,11 +45,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate runner
-        uses: ./.github/actions/validate-runner
-        with:
-          backend: ${{ inputs.backend }}
-
       - name: Validate NVX CLI
         uses: ./.github/actions/validate-nvx
 
@@ -90,6 +85,13 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: chmod +x openvmm/target/release/openvmm
+
+      # Qualification verifies the downloaded OpenVMM's time ABI preflight.
+      - name: Validate runner
+        uses: ./.github/actions/validate-runner
+        with:
+          backend: ${{ inputs.backend }}
+          verify-openvmm: "true"
 
       - name: Run NVX microVM tests on Linux
         if: runner.os != 'Windows'

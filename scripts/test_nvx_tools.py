@@ -2252,7 +2252,7 @@ class CiConfigurationTests(unittest.TestCase):
         self.assertEqual(build_workflow.count("retention-days: 1"), 2)
         for consumer_workflow, download_count in (
             (microvm_workflow, 4),
-            (platform_workflow, 2),
+            (platform_workflow, 3),
         ):
             self.assertIn("path: openvmm/target/release", consumer_workflow)
             self.assertIn("path: build", consumer_workflow)
@@ -2707,14 +2707,63 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertIn(command, step)
                 self.assertIn('--backend "${{ inputs.backend }}"', step)
                 self.assertIn("--checks H1 H2 H4\n", step)
-                self.assertIn("--no-openvmm\n", step)
+                fingerprint = (
+                    '"${RUNNER_TEMP}/nvx-cpu-fingerprint.json"'
+                    if shell == "bash"
+                    else '"$env:RUNNER_TEMP\\nvx-cpu-fingerprint.json"'
+                )
+                self.assertIn(
+                    "${{ inputs.verify-openvmm == 'true' && "
+                    f"'H3 --cpu-fingerprint {fingerprint}' || '--no-openvmm' }}}}\n",
+                    step,
+                )
                 self.assertIn("--ci-schedule\n", step)
                 self.assertIn(summary, step)
         args = nvx.parse_args(
-            ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4", "--no-openvmm"]
+            ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4", "H3"]
+            + ["--cpu-fingerprint", "fingerprint.json", "--ci-schedule"]
         )
-        self.assertEqual(args.checks, ["H1", "H2", "H4"])
+        self.assertEqual(args.checks, ["H1", "H2", "H4", "H3"])
+        self.assertEqual(args.cpu_fingerprint, Path("fingerprint.json"))
+        args = nvx.parse_args(
+            ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4"]
+            + ["--no-openvmm", "--ci-schedule"]
+        )
         self.assertTrue(args.no_openvmm)
+        self.assertTrue(args.ci_schedule)
+        self.assertIn("  verify-openvmm:\n", validate_runner)
+        self.assertIn('    default: "false"\n', validate_runner)
+        # A failed CPU profile check keeps OpenVMM's fingerprint.
+        upload = validate_runner.split("    - name: Upload the CPU fingerprint\n")[1]
+        upload = upload.split("\n\n", 1)[0]
+        self.assertIn("if: failure() && inputs.verify-openvmm == 'true'\n", upload)
+        self.assertIn("path: ${{ runner.temp }}/nvx-cpu-fingerprint.json\n", upload)
+        self.assertIn("if-no-files-found: ignore\n", upload)
+        # Jobs that run OpenVMM qualify the runner after downloading it.
+        benchmark = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "run-benchmark"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("download-artifact", benchmark)
+        for workflow_name in ("run-nvx-microvm-tests.yml", "run-platform.yml"):
+            with self.subTest(workflow=workflow_name):
+                workflow = (
+                    BuildConstants.REPO_ROOT / ".github" / "workflows" / workflow_name
+                ).read_text(encoding="utf-8")
+                validate = workflow.index("      - name: Validate runner\n")
+                self.assertEqual(workflow.count("      - name: Validate runner\n"), 1)
+                self.assertIn(
+                    'verify-openvmm: "true"', workflow[validate : validate + 220]
+                )
+                for step in (
+                    "      - name: Download guest artifacts\n",
+                    "      - name: Download OpenVMM executable\n",
+                    "      - name: Make OpenVMM executable\n",
+                ):
+                    self.assertLess(workflow.index(step), validate)
         self.assertLess(
             validate_runner.index("Validate Linux toolchain"),
             validate_runner.index("Qualify host time on Linux"),
