@@ -2915,6 +2915,170 @@ class MicrovmTests(unittest.TestCase):
                     expected == 0,
                 )
 
+    @staticmethod
+    def _exhaustive_report(
+        processors: int,
+        *,
+        exit_status: int = 0,
+        failing: tuple[str, int] | None = None,
+        skip: tuple[str, int] | None = None,
+    ) -> str:
+        lines = [
+            '/sbin/nvx-time exhaustive; echo "NVX-EXHAUSTIVE-EXIT status=$?"; '
+            "echo NVX-EXHAUSTIVE-DONE; nvx-exit 0"
+        ]
+        failures = 0
+        for cpu in range(processors):
+            for check in microvm_tests.TIME_ABI_EXHAUSTIVE_CHECKS:
+                if (check, cpu) == skip:
+                    continue
+                status, detail = "pass", ""
+                if (check, cpu) == failing:
+                    status, detail = "fail", "MSR 0x40000118 accepted 2"
+                    failures += 1
+                lines.append(
+                    f"NVX-TIME-ABI-EXHAUSTIVE: v=1 check={check} cpu={cpu} "
+                    f'status={status} detail="{detail}"'
+                )
+        lines += [
+            f"NVX-TIME-ABI-EXHAUSTIVE: v=1 status={'fail' if failures else 'ok'} "
+            f"cpus={processors} failures={failures}",
+            f"NVX-EXHAUSTIVE-EXIT status={exit_status}",
+            "NVX-EXHAUSTIVE-DONE",
+        ]
+        return "\r\n".join(lines) + "\r\n"
+
+    def test_exhaustive_report_requires_every_check_on_every_cpu(self):
+        report = self._exhaustive_report(4)
+        microvm_tests._check_exhaustive_report(report, processors=4)
+        summary = "NVX-TIME-ABI-EXHAUSTIVE: v=1 status=ok cpus=4 failures=0\r\n"
+        first = "NVX-TIME-ABI-EXHAUSTIVE: v=1 check=X1 cpu=0 status=pass"
+        cases = (
+            (
+                self._exhaustive_report(4, failing=("X4", 2), exit_status=1),
+                4,
+                "X4 cpu=2 failed: MSR 0x40000118 accepted 2; summary reports "
+                "status=fail failures=1 for 4 vCPUs; exit status 1$",
+            ),
+            (
+                self._exhaustive_report(4, skip=("X2", 3)),
+                4,
+                "X2 reported nothing for cpu 3",
+            ),
+            (
+                self._exhaustive_report(2),
+                4,
+                "X1 reported nothing for cpu 2, 3;.*summary reports cpus=2 for 4 vCPUs",
+            ),
+            (self._exhaustive_report(4, exit_status=1), 4, "exit status 1$"),
+            (report.replace(summary, ""), 4, "no summary line"),
+            (
+                report.replace(first, first + "\r\n" + first),
+                4,
+                "X1 reported cpu=0 twice",
+            ),
+            (
+                report.replace("status=pass", "status=fail"),
+                4,
+                "X1 cpu=0 failed: ;.*; 16 more failed checks",
+            ),
+            (
+                report.replace("v=1 check=X3 cpu=1", "v=2 check=X3 cpu=1"),
+                4,
+                "malformed",
+            ),
+            (report.replace("check=X3 cpu=1 ", "check=X3 "), 4, "malformed"),
+            (
+                report.replace("NVX-EXHAUSTIVE-EXIT status=0\r\n", ""),
+                4,
+                "printed no exit status",
+            ),
+            (
+                "nvx-time: unknown command\r\nNVX-EXHAUSTIVE-EXIT status=2\r\n",
+                8,
+                "status 2 and reported nothing; the guest image does not provide",
+            ),
+        )
+        for text, processors, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    microvm_tests._check_exhaustive_report(text, processors=processors)
+
+    def test_conformance_runs_nvx_time_exhaustive_at_the_requested_vcpus(self):
+        with patch.object(
+            microvm_tests,
+            "run_guest_script",
+            return_value={"text": self._exhaustive_report(8)},
+        ) as run:
+            microvm_tests.run_time_abi_conformance(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "mshv",
+                8,
+                memory_mib=128,
+                timeout=60,
+                log_path=Path("time-abi-conformance.log"),
+            )
+        command, script, marker = run.call_args.args
+        self.assertEqual(command[command.index("--processors") + 1], "8")
+        self.assertEqual(
+            script,
+            '/sbin/nvx-time exhaustive; echo "NVX-EXHAUSTIVE-EXIT status=$?"; '
+            "echo NVX-EXHAUSTIVE-DONE; nvx-exit 0\n",
+        )
+        self.assertEqual(marker, b"NVX-EXHAUSTIVE-DONE")
+        # The console echoes the input line, which must not complete the run.
+        self.assertFalse(microvm_tests.contains_output_line(script.encode(), marker))
+
+    def test_conformance_guest_line_reports_the_check_exit_status(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        with patch.object(
+            microvm_tests,
+            "run_guest_script",
+            return_value={"text": self._exhaustive_report(1)},
+        ) as run:
+            microvm_tests.run_time_abi_conformance(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                1,
+                memory_mib=128,
+                timeout=60,
+                log_path=Path("time-abi-conformance.log"),
+            )
+        script = (
+            run.call_args.args[1]
+            .replace("/sbin/nvx-time", "nvx_time")
+            .replace("nvx-exit", "nvx_exit")
+        )
+        for status in (0, 1):
+            with self.subTest(status=status):
+                result = subprocess.run(
+                    [shell],
+                    input=(
+                        f'nvx_time() {{ echo "nvx-time $1"; return {status}; }}\n'
+                        'nvx_exit() { printf "NVX-EXIT %s\\n" "$1"; }\n' + script
+                    ),
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.stdout.splitlines(),
+                    [
+                        "nvx-time exhaustive",
+                        f"NVX-EXHAUSTIVE-EXIT status={status}",
+                        "NVX-EXHAUSTIVE-DONE",
+                        "NVX-EXIT 0",
+                    ],
+                    result.stderr,
+                )
+
     def test_removed_tsc_guards_stay_removed(self):
         # The warp probe replaced the restore-tsc-sync guard, its
         # clearcpuid=tsc_adjust kernel option, and the fresh-boot TSC control.
@@ -3168,6 +3332,8 @@ class MicrovmTests(unittest.TestCase):
                     "smp-snapshot",
                     "--scenario",
                     "restore-processors",
+                    "--scenario",
+                    "time-abi-conformance",
                     "--processors",
                     "2",
                     "4",
@@ -3180,12 +3346,16 @@ class MicrovmTests(unittest.TestCase):
                 patch.object(microvm_tests, "require_file", side_effect=require),
                 patch.object(microvm_tests, "run_smp_snapshot") as smp_snapshot,
                 patch.object(microvm_tests, "run_restore_processors") as processors,
+                patch.object(microvm_tests, "run_time_abi_conformance") as conformance,
             ):
                 self.assertEqual(microvm_tests.run(args), 0)
         for run in (smp_snapshot, processors):
             run.assert_called_once()
             self.assertEqual(run.call_args.args[4], [2, 4])
             self.assertEqual(run.call_args.kwargs["output_dir"], output_dir)
+        # The exhaustive check runs once, on the most CPUs requested.
+        conformance.assert_called_once()
+        self.assertEqual(conformance.call_args.args[4], 4)
         with self.assertRaises(SystemExit), patch("sys.stderr"):
             nvx.parse_args(
                 ["test-microvm", "--backend", "kvm", "--scenario", "restore-tsc-sync"]

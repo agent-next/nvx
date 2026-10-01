@@ -72,6 +72,18 @@ the restore marker, report `/sys/kernel/rcu_stall_count` as 0 two seconds
 later, and show an uptime of at least 30 s, which proves that monotonic time
 advanced by the downtime. The captures share one downtime window, so the
 scenario adds about a minute per backend.
+The `time-abi-conformance` scenario boots the largest requested vCPU count and
+runs the guest's exhaustive CI check, `/sbin/nvx-time exhaustive`, which the
+boot check leaves to CI. On every online CPU it checks every leaf
+`0x40000006..=0x400000ff` and every base `0x40000100..=0x4000ff00` for another
+hypervisor signature, every `C3` MSR, the write rules of
+`HV_X64_MSR_TSC_INVARIANT_CONTROL`, writes to the read-only identity MSRs, and
+reads of `IA32_TSC_ADJUST` and `IA32_TSC_DEADLINE` (checks `X1` to `X6`). The
+harness requires a passing `NVX-TIME-ABI-EXHAUSTIVE` line for every check on
+every CPU, a summary with `status=ok`, the requested CPU count, and no
+failures, and exit status 0; a failure lists each failing check with the
+guest's detail. The guest command fits on one console line, so the console's
+echo of it ends before the check prints.
 
 Every job that uses the `validate-runner` action first qualifies its runner
 for the time ABI with `nvx.py doctor --checks H1 H2 H4 --no-openvmm

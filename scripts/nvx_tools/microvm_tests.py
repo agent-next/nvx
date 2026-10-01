@@ -59,10 +59,12 @@ from .egress_policy import CompiledEgressPolicy, compile_policy_file
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .openvmm_process import OpenvmmProcess, TcpConsole
 from .time_abi import (
+    ABI_VERSION,
     WARP_PROBE_COMPLETION_MARKER,
     WARP_PROBE_FAILURE_MARKER,
     check_warp_probe,
     describe_exit_status,
+    parse_fields,
     warp_probe_script,
     warp_rounds,
 )
@@ -91,6 +93,7 @@ MICROVM_TEST_SCENARIOS = (
     "snapshot-core",
     "snapshot-tiers",
     "structured-outcome",
+    "time-abi-conformance",
     "virtio-net",
     "workload-identity",
 )
@@ -167,6 +170,13 @@ RESTORE_DOWNTIME_PATH = "/tmp/nvx-restore-downtime"
 # Gives the RCU stall detector time to report a stall that the release of
 # the stall suppression exposed.
 RESTORE_DOWNTIME_SETTLE_SECONDS = 2
+# The guest's exhaustive CI check reports each check on each online CPU.
+TIME_ABI_EXHAUSTIVE_COMMAND = "/sbin/nvx-time exhaustive"
+TIME_ABI_EXHAUSTIVE_PREFIX = "NVX-TIME-ABI-EXHAUSTIVE: "
+TIME_ABI_EXHAUSTIVE_CHECKS = ("X1", "X2", "X3", "X4", "X5", "X6")
+TIME_ABI_EXHAUSTIVE_EXIT_PREFIX = "NVX-EXHAUSTIVE-EXIT status="
+TIME_ABI_EXHAUSTIVE_COMPLETION_MARKER = b"NVX-EXHAUSTIVE-DONE"
+TIME_ABI_EXHAUSTIVE_REPORTED_FAILURES = 8
 OUTCOME_TOP_LEVEL_FIELDS = frozenset(
     {
         "schema_version",
@@ -1099,6 +1109,115 @@ def run_smp(
         context=f"{processors}-vCPU boot",
         rounds=warp_rounds(processors),
     )
+
+
+def _check_exhaustive_report(text: str, *, processors: int) -> None:
+    """Check that ``nvx-time exhaustive`` passed every check on every CPU."""
+    results: dict[tuple[str, int], dict[str, str]] = {}
+    summary: dict[str, str] | None = None
+    exit_status: str | None = None
+    problems: list[str] = []
+    for raw in text.splitlines():
+        line = raw.removesuffix("\r")
+        if line.startswith(TIME_ABI_EXHAUSTIVE_EXIT_PREFIX):
+            exit_status = line.removeprefix(TIME_ABI_EXHAUSTIVE_EXIT_PREFIX)
+            continue
+        if not line.startswith(TIME_ABI_EXHAUSTIVE_PREFIX):
+            continue
+        try:
+            fields = parse_fields(line.removeprefix(TIME_ABI_EXHAUSTIVE_PREFIX))
+            if fields.get("v") != ABI_VERSION:
+                raise ValueError(f"version {fields.get('v')!r} is not {ABI_VERSION}")
+            if "check" not in fields:
+                summary = fields
+                continue
+            key = (fields["check"], int(fields["cpu"]))
+        except (KeyError, ValueError) as error:
+            raise RuntimeError(
+                f"time ABI exhaustive check: malformed line {line!r}: {error}"
+            ) from error
+        if key in results:
+            problems.append(f"{key[0]} reported cpu={key[1]} twice")
+        results[key] = fields
+    if exit_status is None:
+        raise RuntimeError(
+            "time ABI exhaustive check: the guest printed no exit status for "
+            f"{TIME_ABI_EXHAUSTIVE_COMMAND}"
+        )
+    if summary is None and not results:
+        raise RuntimeError(
+            f"time ABI exhaustive check: {TIME_ABI_EXHAUSTIVE_COMMAND} exited with "
+            f"status {exit_status} and reported nothing; the guest image does not "
+            "provide the exhaustive check"
+        )
+    failed = [
+        f"{check} cpu={cpu} failed: {fields.get('detail', '')}"
+        for (check, cpu), fields in sorted(results.items())
+        if fields.get("status") != "pass"
+    ]
+    if len(failed) > TIME_ABI_EXHAUSTIVE_REPORTED_FAILURES:
+        hidden = len(failed) - TIME_ABI_EXHAUSTIVE_REPORTED_FAILURES
+        failed = failed[:TIME_ABI_EXHAUSTIVE_REPORTED_FAILURES] + [
+            f"{hidden} more failed checks"
+        ]
+    problems.extend(failed)
+    for check in TIME_ABI_EXHAUSTIVE_CHECKS:
+        missing = [cpu for cpu in range(processors) if (check, cpu) not in results]
+        if missing:
+            problems.append(
+                f"{check} reported nothing for cpu {', '.join(map(str, missing))}"
+            )
+    if summary is None:
+        problems.append("no summary line")
+    else:
+        expected = {"status": "ok", "cpus": str(processors), "failures": "0"}
+        mismatched = [
+            f"{name}={summary.get(name)}"
+            for name, value in expected.items()
+            if summary.get(name) != value
+        ]
+        if mismatched:
+            problems.append(
+                f"summary reports {' '.join(mismatched)} for {processors} vCPUs"
+            )
+    if exit_status != "0":
+        problems.append(f"exit status {exit_status}")
+    if problems:
+        raise RuntimeError("time ABI exhaustive check: " + "; ".join(problems))
+
+
+def run_time_abi_conformance(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    processors: int,
+    *,
+    memory_mib: int,
+    timeout: float,
+    log_path: Path,
+) -> None:
+    """Run the guest's exhaustive CI conformance check on every CPU."""
+    command = workload_boot_command(
+        executable,
+        backend,
+        kernel,
+        initrd,
+        memory_mib,
+        "quiet loglevel=0",
+        processors=processors,
+    )
+    # One input line: the console echoes all of it before the check prints.
+    result = run_guest_script(
+        command,
+        f"{TIME_ABI_EXHAUSTIVE_COMMAND}; "
+        f'echo "{TIME_ABI_EXHAUSTIVE_EXIT_PREFIX}$?"; '
+        f"echo {TIME_ABI_EXHAUSTIVE_COMPLETION_MARKER.decode()}; nvx-exit 0\n",
+        TIME_ABI_EXHAUSTIVE_COMPLETION_MARKER,
+        timeout=timeout,
+        log_path=log_path,
+    )
+    _check_exhaustive_report(result["text"], processors=processors)
 
 
 def run_virtio_net(
@@ -4385,6 +4504,22 @@ def run(args: argparse.Namespace) -> int:
             memory_mib=args.memory_mib,
             timeout=args.timeout,
             output_dir=output_dir,
+        )
+    if "time-abi-conformance" in scenarios:
+        processors = max(args.processors)
+        print(
+            f"Running microVM time ABI conformance ({processors} vCPU) "
+            f"on OpenVMM/{args.backend}"
+        )
+        run_time_abi_conformance(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            processors,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            log_path=output_dir / "time-abi-conformance.log",
         )
     if "virtio-net" in scenarios:
         print(f"Running microVM virtio-net correctness on OpenVMM/{args.backend}")
