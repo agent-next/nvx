@@ -43,6 +43,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/io.h>
+#include <sys/klog.h>
 #include <sys/mount.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
@@ -1172,7 +1173,6 @@ struct boot_log {
     bool hypervisor;
     bool privileges;
     bool lapic;
-    bool overrun;
     char last_switch[48];
     char problem[DETAIL_MAX];
 };
@@ -1219,9 +1219,7 @@ static void boot_log_add(struct boot_log *log, const char *message)
 static bool boot_log_verdict(const struct boot_log *log, char *detail,
                              size_t size)
 {
-    if (log->overrun)
-        snprintf(detail, size, "kernel log records were lost (EPIPE)");
-    else if (log->problem[0] != '\0')
+    if (log->problem[0] != '\0')
         snprintf(detail, size, "%s", log->problem);
     else if (!log->hypervisor)
         snprintf(detail, size, "no 'Hypervisor detected: Microsoft Hyper-V'");
@@ -1271,9 +1269,155 @@ static int kmsg_drain(int fd, kmsg_consumer consume, void *context)
     }
 }
 
-static void boot_log_consume(void *context, const char *message)
+#define SYSLOG_ACTION_READ_ALL 3
+#define SYSLOG_ACTION_SIZE_BUFFER 10
+
+// Returns the message text of one SYSLOG_ACTION_READ_ALL line, without its
+// "<level>" prefix and its printk timestamp ("[    1.234567] ").
+static const char *syslog_message(const char *line)
 {
-    boot_log_add(context, message);
+    const char *cursor = line;
+    const char *end = strchr(line, '>');
+    const char *scan;
+
+    if (*cursor == '<' && end != NULL)
+        cursor = end + 1;
+    if (*cursor != '[')
+        return cursor;
+    scan = cursor + 1;
+    while (*scan == ' ')
+        scan++;
+    while (*scan >= '0' && *scan <= '9')
+        scan++;
+    if (*scan++ != '.')
+        return cursor;
+    while (*scan >= '0' && *scan <= '9')
+        scan++;
+    if (*scan != ']')
+        return cursor;
+    return scan[1] == ' ' ? scan + 2 : scan + 1;
+}
+
+static void boot_log_line(void *context, char *line)
+{
+    boot_log_add(context, syslog_message(line));
+}
+
+struct line_starts {
+    const char **starts;
+    size_t count;
+    size_t capacity;
+};
+
+// Records the start of every line of BUFFER that contains NEEDLE.
+static bool mark_lines(const char *buffer, const char *needle,
+                       struct line_starts *lines)
+{
+    for (const char *hit = strstr(buffer, needle); hit != NULL;
+         hit = strstr(hit + 1, needle)) {
+        const char *start = hit;
+
+        while (start > buffer && start[-1] != '\n')
+            start--;
+        if (lines->count == lines->capacity) {
+            size_t capacity = lines->capacity * 2;
+            const char **grown =
+                realloc(lines->starts, capacity * sizeof(*lines->starts));
+
+            if (grown == NULL)
+                return false;
+            lines->starts = grown;
+            lines->capacity = capacity;
+        }
+        lines->starts[lines->count++] = start;
+    }
+    return true;
+}
+
+static int compare_starts(const void *left, const void *right)
+{
+    const char *a = *(const char *const *)left;
+    const char *b = *(const char *const *)right;
+
+    return a < b ? -1 : a > b;
+}
+
+// C4 over the whole SYSLOG_ACTION_READ_ALL text. Only lines that contain a
+// required record, a forbidden record, or the first substring of a watcher
+// row can change the verdict, so a few whole-buffer searches find them, and
+// boot_log_add() sees just those lines, in log order. Matching every rule
+// against every line cost about a millisecond on a guest's boot log.
+static void boot_log_scan(char *buffer, struct boot_log *log)
+{
+    static const char *const anchors[] = {
+        "Hypervisor detected: Microsoft Hyper-V",
+        "Hyper-V: privilege flags low 0x8860,",
+        "Hyper-V: LAPIC Timer Frequency: ",
+        "Fast TSC calibration",
+        "Refined TSC clocksource calibration",
+        "kvm-clock",
+        "APIC timer: using supplied frequency"};
+    struct line_starts lines = {malloc(256 * sizeof(const char *)), 0, 256};
+    bool ok = lines.starts != NULL;
+
+    for (size_t index = 0; ok && index < ARRAY_SIZE(anchors); index++)
+        ok = mark_lines(buffer, anchors[index], &lines);
+    for (size_t index = 0; ok && index < ARRAY_SIZE(k_watch_rules); index++) {
+        const struct watch_rule *rule = &k_watch_rules[index];
+
+        if (rule->all[0] != NULL) {
+            ok = mark_lines(buffer, rule->all[0], &lines);
+            continue;
+        }
+        for (size_t part = 0;
+             ok && part < ARRAY_SIZE(rule->any) && rule->any[part]; part++)
+            ok = mark_lines(buffer, rule->any[part], &lines);
+    }
+    if (!ok) {
+        free(lines.starts);
+        for_each_text_line(buffer, boot_log_line, log);
+        return;
+    }
+    qsort(lines.starts, lines.count, sizeof(*lines.starts), compare_starts);
+    for (size_t index = 0; index < lines.count; index++) {
+        char *start = (char *)lines.starts[index];
+        char *end = strchr(start, '\n');
+
+        if (index > 0 && lines.starts[index - 1] == start)
+            continue;
+        if (end != NULL)
+            *end = '\0';
+        boot_log_add(log, syslog_message(start));
+        if (end != NULL)
+            *end = '\n';
+    }
+    free(lines.starts);
+}
+
+// Reads the whole kernel log for C4 with one SYSLOG_ACTION_READ_ALL. The
+// caller has already positioned the daemon's /dev/kmsg descriptor at the end
+// of the log, so records logged in between are seen twice, never missed.
+static int read_boot_log(struct boot_log *log)
+{
+    int size = klogctl(SYSLOG_ACTION_SIZE_BUFFER, NULL, 0);
+    char *buffer;
+    int count;
+    int error;
+
+    if (size <= 0)
+        return -1;
+    buffer = malloc((size_t)size + 1);
+    if (buffer == NULL)
+        return -1;
+    count = klogctl(SYSLOG_ACTION_READ_ALL, buffer, size);
+    error = errno;
+    if (count >= 0) {
+        buffer[count] = '\0';
+        boot_log_scan(buffer, log);
+    }
+    free(buffer);
+    errno = error;
+    return count < 0 ? -1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,17 +1504,15 @@ static int pin_to_cpu(int cpu)
     return sched_getcpu() == cpu ? 0 : -1;
 }
 
-static const uint32_t k_kvm_signature[3] = {0x4b4d564b, 0x564b4d56,
-                                            0x0000004d};
-
 static bool all_zero(const uint32_t value[4])
 {
     return (value[0] | value[1] | value[2] | value[3]) == 0;
 }
 
-// C1: the identity leaves, the out-of-range rule, and (on one CPU, because it
-// costs 255 CPUID exits) the absence of a KVM signature at any base.
-static bool check_identity(struct checks *checks, int cpu, bool scan_bases)
+// C1: the identity leaves and the explicit zero leaves. The absence of a
+// hypervisor signature at other bases is a static backend property that the
+// CI exhaustive check covers, so the boot check skips that 255-leaf scan.
+static bool check_identity(struct checks *checks, int cpu)
 {
     const uint32_t capacity = (uint32_t)checks->possible;
     const uint32_t expected[6][4] = {
@@ -1381,9 +1523,9 @@ static bool check_identity(struct checks *checks, int cpu, bool scan_bases)
         {0, 0xffffffff, 0, 0},
         {capacity, capacity, 0, 0},
     };
-    static const uint32_t out_of_range[] = {0x40000006, 0x40000081};
+    static const uint32_t zero_leaves[][2] = {{0x40000006, 0x4000000f},
+                                              {0x40000080, 0x40000082}};
     uint32_t value[4];
-    uint32_t highest[4];
 
     for (uint32_t index = 0; index < 6; index++) {
         cpuid(0x40000000 + index, 0, value);
@@ -1397,26 +1539,17 @@ static bool check_identity(struct checks *checks, int cpu, bool scan_bases)
                 value[3], expected[index][0], expected[index][1],
                 expected[index][2], expected[index][3]);
     }
-    cpuid(0, 0, value);
-    cpuid(value[0], 0, highest);
-    for (size_t index = 0; index < ARRAY_SIZE(out_of_range); index++) {
-        cpuid(out_of_range[index], 0, value);
-        if (!all_zero(value) && memcmp(value, highest, sizeof(value)) != 0)
-            return check_failed(checks, "C1",
-                                "cpu %d leaf 0x%08" PRIx32
-                                " is neither zero nor out of range",
-                                cpu, out_of_range[index]);
-    }
-    if (!scan_bases)
-        return true;
-    for (uint32_t base = 0x40000100; base <= 0x4000ff00; base += 0x100) {
-        cpuid(base, 0, value);
-        if (value[1] == k_kvm_signature[0] && value[2] == k_kvm_signature[1] &&
-            value[3] == k_kvm_signature[2])
-            return check_failed(checks, "C1",
-                                "cpu %d leaf 0x%08" PRIx32
-                                " carries the KVM signature",
-                                cpu, base);
+    for (size_t range = 0; range < ARRAY_SIZE(zero_leaves); range++) {
+        for (uint32_t leaf = zero_leaves[range][0]; leaf <= zero_leaves[range][1];
+             leaf++) {
+            cpuid(leaf, 0, value);
+            if (!all_zero(value))
+                return check_failed(
+                    checks, "C1",
+                    "cpu %d leaf 0x%08" PRIx32 " is %08" PRIx32 ":%08" PRIx32
+                    ":%08" PRIx32 ":%08" PRIx32 ", expected zero",
+                    cpu, leaf, value[0], value[1], value[2], value[3]);
+        }
     }
     return true;
 }
@@ -1504,8 +1637,8 @@ static int msr_read(int fd, uint32_t msr, uint64_t *value)
     return count < 0 ? -errno : -EIO;
 }
 
-// C3: the synthetic MSRs. FULL checks every row; otherwise only the
-// declared TSC rate, as the restore phase requires for CPU 0.
+// C3: the synthetic MSRs. At boot (FULL), the VP index on every CPU and the
+// partition-wide MSRs on CPU 0 only; at restore, CPU 0's declared TSC rate.
 static bool check_msrs(struct checks *checks, int cpu, bool full)
 {
     static const uint32_t faulting[] = {0x40000000, 0x40000001, 0x40000020};
@@ -1526,6 +1659,10 @@ static bool check_msrs(struct checks *checks, int cpu, bool full)
                           "cpu %d: MSR 0x40000002 (VP index) is %" PRIu64
                           " (error %d)",
                           cpu, value, error);
+    if (cpu != 0) {
+        close(fd);
+        return ok;
+    }
     if (ok && (error = msr_read(fd, 0x40000022, &value)) != 0)
         ok = check_failed(checks, "C3", "cpu %d: MSR 0x40000022 read: %s",
                           cpu, strerror(-error));
@@ -1962,10 +2099,9 @@ static bool check_debug_watchdogs(struct checks *checks)
 // three checks are independent, so a report-only run shows each failure;
 // the loop stops at the first CPU that fails.
 static bool check_cpus(struct checks *checks, const bool *selected,
-                       bool identity, bool scan_once, bool msrs)
+                       bool identity, bool msrs)
 {
     cpu_set_t original;
-    bool scanned = !scan_once;
     bool ok = true;
 
     if (sched_getaffinity(0, sizeof(original), &original) != 0)
@@ -1980,11 +2116,10 @@ static bool check_cpus(struct checks *checks, const bool *selected,
             break;
         }
         if (identity) {
-            if (!check_identity(checks, cpu, !scanned))
+            if (!check_identity(checks, cpu))
                 ok = false;
             if (!check_time_bits(checks, cpu))
                 ok = false;
-            scanned = true;
         }
         if (msrs && !check_msrs(checks, cpu, true))
             ok = false;
@@ -2260,12 +2395,15 @@ static void discipline_poll(struct daemon *daemon)
     if (lock >= 0)
         close(lock);
     if (!outcome.accepted) {
+        char epsilon[24] = "none";
         char line[192];
 
+        if (result == 1)
+            snprintf(epsilon, sizeof(epsilon), "%" PRId64, outcome.epsilon);
         snprintf(line, sizeof(line),
                  "%s: v=1 phase=runtime status=uncertain "
-                 "code=G_SAMPLE_UNCERTAIN epsilon_ns=%" PRId64 "\n",
-                 abi_prefix(), result == 1 ? outcome.epsilon : -1);
+                 "code=G_SAMPLE_UNCERTAIN epsilon_ns=%s\n",
+                 abi_prefix(), epsilon);
         console_write(line);
     }
 }
@@ -2340,14 +2478,17 @@ static bool release_with_deadline(int64_t timeout_s)
 static void print_restore_marker(int failures, int cpus, uint64_t tsc_hz,
                                  uint64_t lapic_hz, int64_t elapsed_us)
 {
+    char suffix[32] = "";
     char line[256];
 
+    if (g_report_only)
+        snprintf(suffix, sizeof(suffix), " failures=%d", failures);
     snprintf(line, sizeof(line),
              "%s: v=1 phase=restore status=%s cpus=%d tsc_hz=%" PRIu64
              " lapic_hz=%" PRIu64 " generation=%" PRIu32
-             " elapsed_us=%" PRId64 "\n",
+             " elapsed_us=%" PRId64 "%s\n",
              abi_prefix(), failures == 0 ? "ok" : "fail", cpus, tsc_hz,
-             lapic_hz, g_generation, elapsed_us);
+             lapic_hz, g_generation, elapsed_us, suffix);
     console_write(line);
 }
 
@@ -2581,7 +2722,7 @@ static void print_marker(const struct checks *checks, int64_t start_ns)
     char line[256];
     char failures[32] = "";
 
-    if (checks->failures != 0)
+    if (g_report_only)
         snprintf(failures, sizeof(failures), " failures=%d", checks->failures);
     snprintf(line, sizeof(line),
              "%s: v=1 phase=%s status=%s cpus=%d tsc_hz=%" PRIu64
@@ -2625,15 +2766,19 @@ static int cmd_boot(void)
     check_clocksource(&checks);
     memset(&log, 0, sizeof(log));
     kmsg = open("/dev/kmsg", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (kmsg < 0) {
+    if (kmsg < 0 || lseek(kmsg, 0, SEEK_END) < 0) {
         check_failed(&checks, "C4", "open /dev/kmsg: %s", strerror(errno));
-    } else {
-        log.overrun = kmsg_drain(kmsg, boot_log_consume, &log) == -EPIPE;
-        if (!boot_log_verdict(&log, detail, sizeof(detail)))
-            check_failed(&checks, "C4", "%s", detail);
+        if (kmsg >= 0)
+            close(kmsg);
+        kmsg = -1;
+    } else if (read_boot_log(&log) != 0) {
+        check_failed(&checks, "C4", "read the kernel log: %s",
+                     strerror(errno));
+    } else if (!boot_log_verdict(&log, detail, sizeof(detail))) {
+        check_failed(&checks, "C4", "%s", detail);
     }
     check_cpuinfo(&checks, checks.online, true);
-    check_cpus(&checks, checks.online, true, true, true);
+    check_cpus(&checks, checks.online, true, true);
     check_timer_list(&checks, TIMER_LIST_WAIT_NS);
     check_debug_watchdogs(&checks);
     if (check_initial_sample(&checks, &theta, &epsilon))
@@ -2681,7 +2826,7 @@ static void run_restore_checks(struct checks *checks, const bool *new_cpus,
         checks->lapic_hz = lapic_hz;
     }
     if (new_count > 0) {
-        check_cpus(checks, new_cpus, true, false, false);
+        check_cpus(checks, new_cpus, true, false);
         check_cpuinfo(checks, new_cpus, true);
     }
     check_msrs(checks, 0, false);
@@ -3171,23 +3316,32 @@ static int test_sample(int argc, char **argv)
     return 0;
 }
 
-static int test_lines(int argc, char **argv, bool boot)
+// Watcher rules per line (KMSG), or the C4 verdict over message lines
+// (BOOT_LOG) or SYSLOG_ACTION_READ_ALL text (SYSLOG).
+enum line_test { LINES_KMSG, LINES_BOOT_LOG, LINES_SYSLOG };
+
+static int test_lines(int argc, char **argv, enum line_test mode)
 {
     static char text[TEXT_MAX];
     struct boot_log log;
     char detail[DETAIL_MAX];
+    bool boot = mode != LINES_KMSG;
 
     if (argc != 1 || test_text(argv[0], text, sizeof(text)) != 0)
         return 2;
     memset(&log, 0, sizeof(log));
-    for (char *line = strtok(text, "\n"); line != NULL;
-         line = strtok(NULL, "\n")) {
-        const char *code = match_watch_rule(line);
+    if (mode == LINES_SYSLOG) {
+        boot_log_scan(text, &log);
+    } else {
+        for (char *line = strtok(text, "\n"); line != NULL;
+             line = strtok(NULL, "\n")) {
+            const char *code = match_watch_rule(line);
 
-        if (boot)
-            boot_log_add(&log, line);
-        else
-            printf("%s\n", code != NULL ? code : "none");
+            if (boot)
+                boot_log_add(&log, line);
+            else
+                printf("%s\n", code != NULL ? code : "none");
+        }
     }
     if (boot) {
         if (boot_log_verdict(&log, detail, sizeof(detail)))
@@ -3310,9 +3464,11 @@ static int cmd_test(int argc, char **argv)
         return 0;
     }
     if (strcmp(name, "kmsg") == 0)
-        return test_lines(argc, argv, false);
+        return test_lines(argc, argv, LINES_KMSG);
     if (strcmp(name, "boot-log") == 0)
-        return test_lines(argc, argv, true);
+        return test_lines(argc, argv, LINES_BOOT_LOG);
+    if (strcmp(name, "syslog") == 0)
+        return test_lines(argc, argv, LINES_SYSLOG);
     if (strcmp(name, "timer-list") == 0)
         return test_timer_list(argc, argv);
     if (strcmp(name, "correction") == 0)

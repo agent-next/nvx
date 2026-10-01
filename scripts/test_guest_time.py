@@ -436,6 +436,33 @@ class GuestTimeTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertTrue(self.boot_log(lines).startswith("fail "), name)
 
+    def test_boot_log_reads_syslog_read_all_lines(self):
+        # SYSLOG_ACTION_READ_ALL prefixes every line with "<level>" and, with
+        # printk timestamps, "[seconds.micros] ".
+        lines = [
+            f"<6>[{index:5d}.{index * 7919 % 1000000:06d}] {line}"
+            for index, line in enumerate(self.BOOT_LOG)
+        ]
+        lines.insert(1, "<6>[    0.123456] [drm] a bracketed message is kept")
+        own_event = (
+            "<2>[    3.000000] NVX-TIME-REPORT-VIOLATION: v=1 code=G_CONFORMANCE_C4 "
+            'detail="forbidden record: kvm-clock: Using msrs"'
+        )
+
+        def syslog(text_lines: list[str]) -> str:
+            return self.run_test(
+                "syslog", self.fixture("syslog.txt", "\n".join(text_lines) + "\n")
+            ).strip()
+
+        self.assertEqual(syslog(lines), "ok")
+        self.assertEqual(syslog([*lines, own_event]), "ok")
+        self.assertTrue(
+            syslog([*lines, "<6>[    4.000000] kvm-clock: Using msrs"]).startswith(
+                "fail forbidden record: kvm-clock"
+            )
+        )
+        self.assertTrue(syslog(lines[2:]).startswith("fail no 'Hypervisor"))
+
     def timer_list(
         self,
         sections: list[tuple[int, str, int, str, int]],
