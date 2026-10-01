@@ -2325,6 +2325,35 @@ class CiConfigurationTests(unittest.TestCase):
             self.assertIn(job_name, performance_gate_job)
             self.assertIn(f"needs.{job_name}.result", performance_gate_job)
 
+    def test_benchmarks_rely_on_the_microvm_correctness_jobs(self):
+        # #286: the benchmark action ran a second smp-lapic gate before
+        # acceptance. The microVM correctness jobs already gate the required
+        # status, the development release, and performance persistence.
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "run-benchmark"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("test-microvm", action)
+        self.assertNotIn("lapic-correctness", action)
+        for job_name in ci.REQUIRED_CI_MICROVM_TEST_JOBS:
+            with self.subTest(job=job_name):
+                self.assertIn(job_name, ci.REQUIRED_CI_RESULT_ENVIRONMENTS)
+                for consumer in ("release", "performance-persist"):
+                    job = _workflow_job(workflow, consumer)
+                    self.assertIn(f"      - {job_name}\n", job)
+                    self.assertIn(
+                        f"needs.{job_name}.result == 'success' ||\n"
+                        f"          needs.{job_name}.result == 'skipped'",
+                        job,
+                    )
+
     def test_ci_runs_openvmm_tests_and_unit_tests_on_each_backend(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"

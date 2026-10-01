@@ -79,7 +79,6 @@ MICROVM_TEST_SCENARIOS = (
     "sandbox-blocks",
     "scratch-snapshot",
     "smp",
-    "smp-lapic",
     "smp-snapshot",
     "snapshot-core",
     "snapshot-tiers",
@@ -1055,7 +1054,6 @@ def run_smp(
     memory_mib: int,
     timeout: float,
     log_path: Path,
-    force_lapic_timer: bool = False,
 ) -> None:
     command = workload_boot_command(
         executable,
@@ -1063,7 +1061,7 @@ def run_smp(
         kernel,
         initrd,
         memory_mib,
-        "quiet loglevel=0" + (" lapic=notscdeadline" if force_lapic_timer else ""),
+        "quiet loglevel=0",
         processors=processors,
     )
     run_guest_script(
@@ -4212,12 +4210,10 @@ def run(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             output_dir=output_dir,
         )
-    for scenario, force_lapic_timer in (("smp", False), ("smp-lapic", True)):
-        if scenario not in scenarios:
-            continue
+    if "smp" in scenarios:
         for processors in dict.fromkeys(args.processors):
             print(
-                f"Running microVM {scenario} correctness ({processors} vCPU) "
+                f"Running microVM smp correctness ({processors} vCPU) "
                 f"on OpenVMM/{args.backend}"
             )
             run_smp(
@@ -4228,8 +4224,7 @@ def run(args: argparse.Namespace) -> int:
                 processors,
                 memory_mib=args.memory_mib,
                 timeout=args.timeout,
-                log_path=output_dir / f"{scenario}-{processors}.log",
-                force_lapic_timer=force_lapic_timer,
+                log_path=output_dir / f"smp-{processors}.log",
             )
     if "sandbox-blocks" in scenarios:
         print(f"Running microVM sandbox-block correctness on OpenVMM/{args.backend}")

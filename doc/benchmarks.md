@@ -315,10 +315,10 @@ to advance and remain at least as large as the worker's observed value.
 The check remains strict even on a one-vCPU guest: falling back to the PIT after a failed
 LAPIC calibration is not success. A counter frozen at 12 can indicate Linux's
 `APIC timer disabled due to verification failure`; increasing the poll budget cannot repair it.
-CI runs `test-microvm --scenario smp-lapic --processors 1 2 4 8` before acceptance.
-This repeats the normal SMP probe with `lapic=notscdeadline`, covering the counting
-LAPIC even on hosts that normally use TSC-deadline timers. The ordinary `smp` scenario
-retains the default timer selection.
+The time ABI hides the TSC-deadline timer on every backend, so every guest uses the one-shot
+counting LAPIC, and the `smp` scenario that the microVM correctness jobs run at 1, 2, 4, and 8
+vCPUs covers it. There is no separate `lapic=notscdeadline` scenario or pre-benchmark LAPIC
+gate.
 Captures do not wait for a clocksource: under the time ABI, Linux registers the `tsc`
 clocksource at `device_initcall`, before any guest work, so no capture can observe the
 transitional `tsc-early` window.

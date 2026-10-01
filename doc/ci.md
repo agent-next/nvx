@@ -150,7 +150,15 @@ ready, benchmarks run in parallel with the NVX test layer and use any available
 runner in the matching backend pool. All three use virtual-machine performance
 series and the constrained eight-CPU affinity policy. Development releases and
 performance baseline updates still require every applicable test and benchmark
-lane to pass. The workflow uses the read-only OpenVMM deploy key stored in the
+lane to pass.
+The microVM correctness jobs gate every use of benchmark results, so the
+benchmark action runs no correctness scenario of its own (#286). `Required
+status check` requires each `nvx-microvm-tests-*` job that the change schedules
+to succeed. `Publish development release` and `Persist performance
+baseline` run only on `dev` pushes in which every microVM test job succeeded or
+was skipped. The pull-request `Performance regression gate` reads only the
+platform jobs' results and publishes nothing. The counting LAPIC that the
+benchmarks depend on is covered by the `smp` scenario of those jobs. The workflow uses the read-only OpenVMM deploy key stored in the
 `OPENVMM_DEPLOY_KEY` Actions secret to fetch the private submodule at its pinned
 commit. Shared guest binaries and development release packages move through
 short-lived workflow artifacts alongside the OpenVMM handoff and benchmark

@@ -1773,7 +1773,10 @@ class MicrovmTests(unittest.TestCase):
             log_path=Path("smp-4.log"),
         )
 
-    def test_smp_lapic_exercises_counting_timer_without_weakening_probe(self):
+    def test_smp_exercises_the_counting_lapic_without_a_duplicate_scenario(self):
+        # The time ABI hides TSC-deadline on every backend, so the ordinary
+        # smp scenario already exercises the one-shot counting LAPIC (#286).
+        self.assertNotIn("smp-lapic", microvm_tests.MICROVM_TEST_SCENARIOS)
         with patch.object(microvm_tests, "run_guest_script") as run:
             microvm_tests.run_smp(
                 Path("openvmm"),
@@ -1783,14 +1786,10 @@ class MicrovmTests(unittest.TestCase):
                 4,
                 memory_mib=128,
                 timeout=60,
-                log_path=Path("smp-lapic-4.log"),
-                force_lapic_timer=True,
+                log_path=Path("smp-4.log"),
             )
         command, script, marker = run.call_args.args
-        self.assertEqual(
-            command[command.index("--cmdline") + 1],
-            "quiet loglevel=0 lapic=notscdeadline",
-        )
+        self.assertEqual(command[command.index("--cmdline") + 1], "quiet loglevel=0")
         self.assertEqual(script, benchmark.smp_probe_script(4))
         self.assertEqual(marker, benchmark.SMP_PROBE_COMPLETION_MARKER)
 
@@ -3023,7 +3022,7 @@ class MicrovmTests(unittest.TestCase):
             args = argparse.Namespace(
                 backend="whp",
                 guest="alpine",
-                scenario=["smp", "smp", "smp-lapic", "smp-lapic"],
+                scenario=["smp", "smp"],
                 processors=[2, 2, 8],
                 memory_mib=128,
                 timeout=60.0,
@@ -3048,15 +3047,11 @@ class MicrovmTests(unittest.TestCase):
         run_lifecycle.assert_not_called()
         self.assertEqual(
             [entry.args[4] for entry in run_smp.call_args_list],
-            [2, 8, 2, 8],
+            [2, 8],
         )
         self.assertEqual(
             [entry.kwargs["log_path"].name for entry in run_smp.call_args_list],
-            ["smp-2.log", "smp-8.log", "smp-lapic-2.log", "smp-lapic-8.log"],
-        )
-        self.assertEqual(
-            [entry.kwargs["force_lapic_timer"] for entry in run_smp.call_args_list],
-            [False, False, True, True],
+            ["smp-2.log", "smp-8.log"],
         )
 
     def test_runner_uses_ubuntu_artifact_and_default_memory(self):
