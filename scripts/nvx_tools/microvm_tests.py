@@ -26,6 +26,7 @@ from .benchmark import (
     SNAPSHOT_PROFILE_ENV,
     GuestCommandResult,
     GuestFailureReported,
+    contains_output_line,
     measure_once,
     parse_snapshot_profile_line,
     positive_float,
@@ -57,7 +58,14 @@ from .control_session import ControlSession
 from .egress_policy import CompiledEgressPolicy, compile_policy_file
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .openvmm_process import OpenvmmProcess, TcpConsole
-from .time_abi import describe_exit_status
+from .time_abi import (
+    WARP_PROBE_COMPLETION_MARKER,
+    WARP_PROBE_FAILURE_MARKER,
+    check_warp_probe,
+    describe_exit_status,
+    warp_probe_script,
+    warp_rounds,
+)
 
 MICROVM_TEST_SCENARIOS = (
     "console-exit",
@@ -75,7 +83,6 @@ MICROVM_TEST_SCENARIOS = (
     "network-snapshot",
     "restore-memory",
     "restore-processors",
-    "restore-tsc-sync",
     "sandbox-blocks",
     "scratch-snapshot",
     "smp",
@@ -142,17 +149,11 @@ BOOT_MARKER = b"NVX-GUEST-BOOT-OK:"
 GUEST_BOOT_COMPLETION_MARKER = b"NVX-GUEST-BOOT-CHECK-OK"
 GUEST_IDENTITY_COMPLETION_MARKER = b"NVX-GUEST-IDENTITY-OK"
 RESTORE_PROCESSORS_FAILURE_MARKER = b"NVX-RESTORE-PROCESSORS-FAIL"
-RESTORE_UNSTABLE_TSC_FAILURE = "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc"
-# Records each VP's applied restore downtime and which restored MSHV APs were
-# aligned to the BSP counter.
-RESTORE_TSC_LOG_FILTER = (
-    "off,vmm_core::partition_unit::vp_set::tsc=debug,virt_mshv::x86_64::tsc=info"
-)
-TSC_CONTROL_PROCESSORS = 8
-TSC_CONTROL_ROUNDS = 20
-TSC_CONTROL_COMPLETION_MARKER = b"NVX-TSC-CONTROL-DONE"
-TSC_CONTROL_RESULT_PREFIX = "NVX-TSC-CONTROL-RESULT "
-HOST_CPUINFO = Path("/proc/cpuinfo")
+# Records the time ABI rates and restore clock report of each restore. These
+# records are written before the restored VPs run, so they never split a guest
+# console line; targets that log while the guest runs, such as virt_kvm's
+# hidden-MSR #GPs, could split a marker in the merged console stream.
+TIME_ABI_RESTORE_LOG_FILTER = "off,openvmm_core::worker::dispatch::time_abi=info"
 OUTCOME_TOP_LEVEL_FIELDS = frozenset(
     {
         "schema_version",
@@ -1064,12 +1065,26 @@ def run_smp(
         "quiet loglevel=0",
         processors=processors,
     )
-    run_guest_script(
+    result = run_guest_script(
         command,
-        smp_probe_script(processors),
-        SMP_PROBE_COMPLETION_MARKER,
+        smp_probe_script(processors, exit_guest=False)
+        + warp_probe_script()
+        + "nvx-exit 0\n",
+        WARP_PROBE_COMPLETION_MARKER,
         timeout=timeout,
         log_path=log_path,
+    )
+    output = result["text"].encode("utf-8")
+    if not contains_output_line(output, SMP_PROBE_COMPLETION_MARKER):
+        raise RuntimeError(
+            f"{processors}-vCPU guest finished without the SMP probe marker "
+            f"{SMP_PROBE_COMPLETION_MARKER.decode()!r}"
+        )
+    check_warp_probe(
+        result["text"],
+        cpus=processors,
+        context=f"{processors}-vCPU boot",
+        rounds=warp_rounds(processors),
     )
 
 
@@ -2193,56 +2208,104 @@ def run_sandbox_blocks(
         )
 
 
+def _measure_restore(
+    command: Sequence[str],
+    *,
+    context: str,
+    environment: dict[str, str],
+    timeout: float,
+    log_path: Path,
+    failure_marker: bytes,
+) -> bytes:
+    """Restore a snapshot whose post-restore script ends with the restore
+    marker and a queued guest exit, and return the complete output."""
+    try:
+        measure_once(
+            command,
+            environment=environment,
+            timeout=timeout,
+            marker=RESTORE_MARKER,
+            marker_must_be_line=True,
+            guest_exit_prequeued=True,
+            log_path=log_path,
+            failure_marker=failure_marker,
+        )
+    except GuestFailureReported as error:
+        raise RuntimeError(
+            f"{context}: guest reported {error.line}\n"
+            f"--- OpenVMM output ---\n{error.output_tail}"
+        ) from error
+    return log_path.read_bytes()
+
+
+def _check_restore_warp(output: bytes, *, processors: int, context: str) -> None:
+    """Validate the warp probe that a post-restore script ran."""
+    if not contains_output_line(output, WARP_PROBE_COMPLETION_MARKER):
+        raise RuntimeError(f"{context}: the guest did not finish its warp probe")
+    check_warp_probe(
+        output.decode("utf-8", "replace"),
+        cpus=processors,
+        context=context,
+        rounds=warp_rounds(processors),
+    )
+
+
 def run_smp_snapshot(
     executable: Path,
     kernel: Path,
     initrd: Path,
     backend: str,
+    processor_counts: list[int],
     *,
     memory_mib: int,
     timeout: float,
     output_dir: Path,
 ) -> None:
-    processors = 2
-    with tempfile.TemporaryDirectory(prefix="nvx-smp-snapshot-") as temporary:
-        snapshot_path = Path(temporary) / "snapshot"
-        boot_command = workload_boot_command(
-            executable,
-            backend,
-            kernel,
-            initrd,
-            memory_mib,
-            "quiet loglevel=0",
-            processors=processors,
-        )
-        capture_snapshot(
-            [*boot_command, "--snapshot-destination", str(snapshot_path)],
-            snapshot_path,
-            timeout=timeout,
-            processors=processors,
-            post_restore_script=smp_probe_script(processors, exit_guest=False),
-            log_path=output_dir / "smp-snapshot-capture.log",
-        )
-        fingerprint = _snapshot_fingerprint(snapshot_path)
-        for restore_index in range(2):
-            measure_once(
-                snapshot_restore_command(
-                    executable,
-                    backend,
-                    snapshot_path,
-                    processors=processors,
-                ),
-                environment=_restore_environment(),
-                timeout=timeout,
-                marker=RESTORE_MARKER,
-                marker_must_be_line=True,
-                guest_exit_prequeued=True,
-                log_path=output_dir / f"smp-snapshot-restore-{restore_index}.log",
+    counts = list(dict.fromkeys(processor_counts))
+    for processors in counts:
+        # The first snapshot is restored twice to prove that a restore leaves
+        # it reusable; the warp probe runs after every restore.
+        restores = 2 if processors == counts[0] else 1
+        with tempfile.TemporaryDirectory(prefix="nvx-smp-snapshot-") as temporary:
+            snapshot_path = Path(temporary) / "snapshot"
+            boot_command = workload_boot_command(
+                executable,
+                backend,
+                kernel,
+                initrd,
+                memory_mib,
+                "quiet loglevel=0",
+                processors=processors,
             )
-            if _snapshot_fingerprint(snapshot_path) != fingerprint:
-                raise RuntimeError(
-                    f"SMP restore {restore_index} modified snapshot artifacts"
+            capture_snapshot(
+                [*boot_command, "--snapshot-destination", str(snapshot_path)],
+                snapshot_path,
+                timeout=timeout,
+                processors=processors,
+                post_restore_script=smp_probe_script(processors, exit_guest=False)
+                + warp_probe_script(),
+                log_path=output_dir / f"smp-snapshot-{processors}-capture.log",
+            )
+            fingerprint = _snapshot_fingerprint(snapshot_path)
+            for restore_index in range(restores):
+                context = f"{processors}-vCPU SMP restore {restore_index}"
+                output = _measure_restore(
+                    snapshot_restore_command(
+                        executable,
+                        backend,
+                        snapshot_path,
+                        processors=processors,
+                    ),
+                    context=context,
+                    environment=_restore_environment(),
+                    timeout=timeout,
+                    log_path=output_dir
+                    / f"smp-snapshot-{processors}-restore-{restore_index}.log",
+                    failure_marker=WARP_PROBE_FAILURE_MARKER,
                 )
+                _check_restore_warp(output, processors=processors, context=context)
+                if _snapshot_fingerprint(snapshot_path) != fingerprint:
+                    raise RuntimeError(f"{context} modified snapshot artifacts")
 
 
 def _restore_vp_bindings(output: bytes) -> list[int]:
@@ -2293,94 +2356,6 @@ def _check_restore_vp_bindings(
         )
 
 
-def _tsc_control_verdict(text: str) -> str:
-    """Summarize the fresh-boot TSC control result printed by the guest."""
-    for line in text.splitlines():
-        line = line.removesuffix("\r")
-        if line.startswith(TSC_CONTROL_RESULT_PREFIX):
-            fields = line.removeprefix(TSC_CONTROL_RESULT_PREFIX)
-            state, _, activations = fields.partition(" activations=")
-            if state == "stable" and activations.isdecimal():
-                return (
-                    "fresh-boot TSC control: no TSC instability across "
-                    f"{activations} CPU activations without snapshot restore"
-                )
-            if state == "unstable" and activations.isdecimal():
-                return (
-                    "fresh-boot TSC control: Linux also found TSC instability "
-                    f"without snapshot restore after {activations} CPU activations"
-                )
-            break
-    return "fresh-boot TSC control did not report a result"
-
-
-def _host_invariant_tsc_note(cpuinfo: Path = HOST_CPUINFO) -> str:
-    """Report whether a Linux host CPU exposes an invariant TSC.
-
-    Guests on a host without one intermittently see cross-vCPU TSC warps
-    whether or not they were restored (#211).
-    """
-    try:
-        text = cpuinfo.read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    for line in text.splitlines():
-        name, _, flags = line.partition(":")
-        if name.strip() == "flags":
-            if "nonstop_tsc" in flags.split():
-                return "host CPU exposes an invariant TSC (nonstop_tsc)\n"
-            return (
-                "host CPU does not expose an invariant TSC (nonstop_tsc); guests "
-                "on this host intermittently see cross-vCPU TSC warps\n"
-            )
-    return ""
-
-
-def run_fresh_boot_tsc_control(
-    executable: Path,
-    kernel: Path,
-    initrd: Path,
-    backend: str,
-    *,
-    memory_mib: int,
-    timeout: float,
-    log_path: Path,
-) -> str:
-    """Check whether a never-restored guest reproduces a restore TSC failure.
-
-    The guest boots every processor with Linux's cross-CPU TSC warp check
-    forced, then repeatedly reactivates each AP against CPU 0. The result only
-    classifies the failure that triggered it.
-    """
-    command = workload_boot_command(
-        executable,
-        backend,
-        kernel,
-        initrd,
-        memory_mib,
-        "quiet loglevel=0 clearcpuid=tsc_adjust",
-        processors=TSC_CONTROL_PROCESSORS,
-    )
-    script = _render_script(
-        "tsc-sync-control.sh.in",
-        PROCESSORS=str(TSC_CONTROL_PROCESSORS),
-        ROUNDS=str(TSC_CONTROL_ROUNDS),
-    )
-    try:
-        result = run_guest_script(
-            command,
-            script,
-            TSC_CONTROL_COMPLETION_MARKER,
-            timeout=timeout,
-            log_path=log_path,
-        )
-    except Exception as error:
-        # The control only annotates the restore failure that triggered it.
-        summary = str(error).splitlines()[0] if str(error) else type(error).__name__
-        return f"fresh-boot TSC control did not complete: {summary}"
-    return _tsc_control_verdict(result["text"])
-
-
 def run_restore_processors(
     executable: Path,
     kernel: Path,
@@ -2391,19 +2366,17 @@ def run_restore_processors(
     memory_mib: int,
     timeout: float,
     output_dir: Path,
-    check_tsc_sync: bool = False,
 ) -> None:
     capacity = 8
     boot_online = 1
     cmdline = f"quiet loglevel=0 maxcpus={boot_online}"
-    script = _read_script("restore-processors.sh")
-    if check_tsc_sync:
-        cmdline += " clearcpuid=tsc_adjust"
-        script = _read_script("restore-tsc-sync.sh") + script
+    # The warp probe replaces the guest TSC warp guard: it measures the skew
+    # between every pair of CPUs, including the ones the restore activated.
+    script = _read_script("restore-processors.sh") + warp_probe_script()
     # The VP-binding lifecycle records identify the VPs that each restore
     # instantiates without changing restore behavior.
     environment = _restore_environment()
-    environment["OPENVMM_LOG"] = RESTORE_TSC_LOG_FILTER
+    environment["OPENVMM_LOG"] = TIME_ABI_RESTORE_LOG_FILTER
     environment[SNAPSHOT_PROFILE_ENV] = "1"
     with tempfile.TemporaryDirectory(prefix="nvx-restore-processors-") as temporary:
         snapshot_path = Path(temporary) / "snapshot"
@@ -2430,44 +2403,30 @@ def run_restore_processors(
         for target in targets:
             name = "untargeted" if target is None else str(target)
             online = boot_online if target is None else target
+            output = _measure_restore(
+                snapshot_restore_command(
+                    executable,
+                    backend,
+                    snapshot_path,
+                    processors=capacity,
+                    restore_processors=target,
+                ),
+                context=_restore_label(target),
+                environment=environment,
+                timeout=timeout,
+                log_path=output_dir / f"restore-processors-{name}.log",
+                failure_marker=RESTORE_PROCESSORS_FAILURE_MARKER,
+            )
             marker = f"NVX-RESTORE-PROCESSORS-OK count={online}".encode()
-            log_path = output_dir / f"restore-processors-{name}.log"
-            try:
-                measure_once(
-                    snapshot_restore_command(
-                        executable,
-                        backend,
-                        snapshot_path,
-                        processors=capacity,
-                        restore_processors=target,
-                    ),
-                    environment=environment,
-                    timeout=timeout,
-                    marker=marker,
-                    marker_must_be_line=True,
-                    guest_exit_prequeued=True,
-                    log_path=log_path,
-                    failure_marker=RESTORE_PROCESSORS_FAILURE_MARKER,
-                )
-            except GuestFailureReported as error:
-                verdict = ""
-                if error.line == RESTORE_UNSTABLE_TSC_FAILURE:
-                    verdict = run_fresh_boot_tsc_control(
-                        executable,
-                        kernel,
-                        initrd,
-                        backend,
-                        memory_mib=memory_mib,
-                        timeout=timeout,
-                        log_path=output_dir / "restore-processors-tsc-control.log",
-                    )
-                    verdict += "\n" + _host_invariant_tsc_note()
+            if not contains_output_line(output, marker):
                 raise RuntimeError(
-                    f"{_restore_label(target)}: guest reported {error.line}\n"
-                    f"{verdict}--- OpenVMM output ---\n{error.output_tail}"
-                ) from error
+                    f"{_restore_label(target)} did not report {marker.decode()!r}"
+                )
+            _check_restore_warp(
+                output, processors=online, context=_restore_label(target)
+            )
             _check_restore_vp_bindings(
-                log_path.read_bytes(),
+                output,
                 backend,
                 target=target,
                 capacity=capacity,
@@ -4255,6 +4214,7 @@ def run(args: argparse.Namespace) -> int:
             kernel,
             initrd,
             args.backend,
+            args.processors,
             memory_mib=args.memory_mib,
             timeout=args.timeout,
             output_dir=output_dir,
@@ -4272,21 +4232,6 @@ def run(args: argparse.Namespace) -> int:
             memory_mib=args.memory_mib,
             timeout=args.timeout,
             output_dir=output_dir,
-        )
-    if "restore-tsc-sync" in scenarios:
-        print(f"Running microVM restore TSC synchronization on OpenVMM/{args.backend}")
-        tsc_output_dir = output_dir / "restore-tsc-sync"
-        tsc_output_dir.mkdir(parents=True, exist_ok=True)
-        run_restore_processors(
-            executable,
-            kernel,
-            initrd,
-            args.backend,
-            args.processors,
-            memory_mib=args.memory_mib,
-            timeout=args.timeout,
-            output_dir=tsc_output_dir,
-            check_tsc_sync=True,
         )
     if "restore-memory" in scenarios:
         print(f"Running microVM restore-memory correctness on OpenVMM/{args.backend}")

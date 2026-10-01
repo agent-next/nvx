@@ -23,6 +23,7 @@ from nvx_tools import (  # noqa: E402
     control_session,
     microvm_tests,
     openvmm_process,
+    time_abi,
 )
 from nvx_tools.build_constants import (  # noqa: E402
     BuildConstants,
@@ -62,19 +63,41 @@ def _restore_target(command: list[str]) -> int | None:
     return int(command[command.index("--restore-processors") + 1])
 
 
+def _warp_probe_output(cpus: int, *, offset_ns: int = 40) -> bytes:
+    """Return the console output of the idle-inducing warp schedule."""
+    pairs = cpus * (cpus - 1) // 2
+    probe_round = (
+        f"NVX-TIME-PROBE warp max_backward_cycles=0 max_backward_ns=0 "
+        f"max_abs_offset_ns={offset_ns} pairs={pairs} verdict=PASS bound_ns=1000\r\n"
+        "NVX-TIME-PROBE warp-detail max_abs_offset_cycles=1.0 "
+        "max_uncertainty_ns=30 max_skew_bound_ns=50 total_warps=0 "
+        f"inconsistent_pairs=0 stalled_pairs=0 cpus=0-{cpus - 1} duration_ms=100 "
+        "tsc_hz=2793437000 tsc_hz_source=cpuid conclusive=1\r\n"
+    )
+    return (probe_round * time_abi.warp_rounds(cpus) + "NVX-WARP-PROBE-OK\r\n").encode()
+
+
 def _restore_processors_measure(
     backend: str,
     *,
     mshv_prefix: bool = True,
+    warp_offset_ns: int = 40,
 ) -> MagicMock:
     def measure(command: list[str], **kwargs: object) -> None:
         target = _restore_target(command)
+        online = 1 if target is None else target
         vp_count = 8
         if mshv_prefix and backend == "mshv" and target is not None:
             vp_count = target
         log_path = cast(Path, kwargs["log_path"])
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_bytes(_vp_binding_profile(list(range(vp_count))))
+        log_path.write_bytes(
+            f"NVX-RESTORE-PROCESSORS-OK count={online}\r\n".encode()
+            + _warp_probe_output(online, offset_ns=warp_offset_ns)
+            + benchmark.RESTORE_MARKER
+            + b"\r\n"
+            + _vp_binding_profile(list(range(vp_count)))
+        )
 
     return MagicMock(side_effect=measure)
 
@@ -1731,6 +1754,9 @@ class MicrovmTests(unittest.TestCase):
         )
 
     def test_smp_uses_requested_processor_count(self):
+        text = (
+            b"NVX-SMP-PROBE-OK\r\n" + _warp_probe_output(4) + b"nvx-exit 0\r\n"
+        ).decode()
         with (
             patch.object(
                 microvm_tests,
@@ -1742,7 +1768,9 @@ class MicrovmTests(unittest.TestCase):
                 "smp_probe_script",
                 return_value="probe\n",
             ) as smp_probe_script,
-            patch.object(microvm_tests, "run_guest_script") as run_guest_script,
+            patch.object(
+                microvm_tests, "run_guest_script", return_value={"text": text}
+            ) as run_guest_script,
         ):
             microvm_tests.run_smp(
                 Path("openvmm"),
@@ -1764,20 +1792,52 @@ class MicrovmTests(unittest.TestCase):
             "quiet loglevel=0",
             processors=4,
         )
-        smp_probe_script.assert_called_once_with(4)
+        smp_probe_script.assert_called_once_with(4, exit_guest=False)
         run_guest_script.assert_called_once_with(
             ["openvmm", "boot"],
-            "probe\n",
-            benchmark.SMP_PROBE_COMPLETION_MARKER,
+            "probe\n" + time_abi.warp_probe_script() + "nvx-exit 0\n",
+            time_abi.WARP_PROBE_COMPLETION_MARKER,
             timeout=90,
             log_path=Path("smp-4.log"),
         )
+
+    def test_smp_requires_the_probe_marker_and_a_passing_warp_probe(self):
+        cases = (
+            (_warp_probe_output(4).decode(), "without the SMP probe marker"),
+            (
+                "NVX-SMP-PROBE-OK\n" + _warp_probe_output(2).decode(),
+                "measured 1 CPU pairs instead of 6",
+            ),
+            (
+                "NVX-SMP-PROBE-OK\n" + _warp_probe_output(4, offset_ns=1001).decode(),
+                "max_abs_offset_ns=1001 exceeds 1000",
+            ),
+        )
+        for text, message in cases:
+            with self.subTest(message=message):
+                with patch.object(
+                    microvm_tests, "run_guest_script", return_value={"text": text}
+                ):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        microvm_tests.run_smp(
+                            Path("openvmm"),
+                            Path("vmlinux"),
+                            Path("initrd"),
+                            "kvm",
+                            4,
+                            memory_mib=128,
+                            timeout=60,
+                            log_path=Path("smp-4.log"),
+                        )
 
     def test_smp_exercises_the_counting_lapic_without_a_duplicate_scenario(self):
         # The time ABI hides TSC-deadline on every backend, so the ordinary
         # smp scenario already exercises the one-shot counting LAPIC (#286).
         self.assertNotIn("smp-lapic", microvm_tests.MICROVM_TEST_SCENARIOS)
-        with patch.object(microvm_tests, "run_guest_script") as run:
+        text = (b"NVX-SMP-PROBE-OK\r\n" + _warp_probe_output(4)).decode()
+        with patch.object(
+            microvm_tests, "run_guest_script", return_value={"text": text}
+        ) as run:
             microvm_tests.run_smp(
                 Path("openvmm"),
                 Path("vmlinux"),
@@ -1790,8 +1850,10 @@ class MicrovmTests(unittest.TestCase):
             )
         command, script, marker = run.call_args.args
         self.assertEqual(command[command.index("--cmdline") + 1], "quiet loglevel=0")
-        self.assertEqual(script, benchmark.smp_probe_script(4))
-        self.assertEqual(marker, benchmark.SMP_PROBE_COMPLETION_MARKER)
+        self.assertTrue(
+            script.startswith(benchmark.smp_probe_script(4, exit_guest=False))
+        )
+        self.assertEqual(marker, time_abi.WARP_PROBE_COMPLETION_MARKER)
 
     def test_virtio_net_uses_portable_endpoint_policy(self):
         with (
@@ -2217,7 +2279,13 @@ class MicrovmTests(unittest.TestCase):
             microvm_tests.SANDBOX_BLOCKS_COMPLETION_MARKER,
         )
 
-    def test_smp_snapshot_reruns_probe_and_checks_two_restores(self):
+    def test_smp_snapshot_runs_the_warp_probe_after_each_restore(self):
+        def measure(command: list[str], **kwargs: object) -> None:
+            processors = int(command[command.index("--processors") + 1])
+            log_path = cast(Path, kwargs["log_path"])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_bytes(_warp_probe_output(processors))
+
         with tempfile.TemporaryDirectory() as temporary:
             output_dir = Path(temporary) / "logs"
             with (
@@ -2230,9 +2298,11 @@ class MicrovmTests(unittest.TestCase):
                     microvm_tests,
                     "smp_probe_script",
                     return_value="probe\n",
-                ),
+                ) as smp_probe_script,
                 patch.object(microvm_tests, "capture_snapshot") as capture_snapshot,
-                patch.object(microvm_tests, "measure_once") as measure_once,
+                patch.object(
+                    microvm_tests, "measure_once", side_effect=measure
+                ) as measure_once,
                 patch.object(
                     microvm_tests,
                     "_snapshot_fingerprint",
@@ -2244,29 +2314,91 @@ class MicrovmTests(unittest.TestCase):
                     Path("vmlinux"),
                     Path("initrd"),
                     "whp",
+                    [1, 2, 2, 4, 8],
                     memory_mib=128,
                     timeout=60,
                     output_dir=output_dir,
                 )
+            logs = sorted(path.name for path in output_dir.iterdir())
 
-        self.assertEqual(capture_snapshot.call_args.kwargs["processors"], 2)
         self.assertEqual(
-            capture_snapshot.call_args.kwargs["post_restore_script"],
-            "probe\n",
+            [call.kwargs["processors"] for call in capture_snapshot.call_args_list],
+            [1, 2, 4, 8],
         )
-        self.assertEqual(measure_once.call_count, 2)
-        self.assertTrue(
-            all(
-                entry.kwargs["guest_exit_prequeued"]
-                for entry in measure_once.call_args_list
-            )
+        self.assertEqual(
+            [call.args for call in smp_probe_script.call_args_list],
+            [(1,), (2,), (4,), (8,)],
         )
         self.assertTrue(
             all(
-                entry.kwargs["marker"] == benchmark.RESTORE_MARKER
-                for entry in measure_once.call_args_list
+                call.kwargs["post_restore_script"]
+                == "probe\n" + time_abi.warp_probe_script()
+                for call in capture_snapshot.call_args_list
             )
         )
+        # The first snapshot is restored twice.
+        self.assertEqual(
+            [
+                int(call.args[0][call.args[0].index("--processors") + 1])
+                for call in measure_once.call_args_list
+            ],
+            [1, 1, 2, 4, 8],
+        )
+        for entry in measure_once.call_args_list:
+            self.assertTrue(entry.kwargs["guest_exit_prequeued"])
+            self.assertEqual(entry.kwargs["marker"], benchmark.RESTORE_MARKER)
+            self.assertEqual(
+                entry.kwargs["failure_marker"], time_abi.WARP_PROBE_FAILURE_MARKER
+            )
+        self.assertEqual(
+            logs,
+            [
+                "smp-snapshot-1-restore-0.log",
+                "smp-snapshot-1-restore-1.log",
+                "smp-snapshot-2-restore-0.log",
+                "smp-snapshot-4-restore-0.log",
+                "smp-snapshot-8-restore-0.log",
+            ],
+        )
+
+    def test_smp_snapshot_rejects_a_restore_without_a_passing_warp_probe(self):
+        def writer(output: bytes):
+            def measure(_command: list[str], **kwargs: object) -> None:
+                cast(Path, kwargs["log_path"]).write_bytes(output)
+
+            return measure
+
+        cases = (
+            (b"", "did not finish its warp probe"),
+            (_warp_probe_output(4, offset_ns=5000), "max_abs_offset_ns=5000"),
+        )
+        for output, message in cases:
+            with self.subTest(message=message):
+                with tempfile.TemporaryDirectory() as temporary:
+                    with (
+                        patch.object(microvm_tests, "capture_snapshot"),
+                        patch.object(
+                            microvm_tests, "measure_once", side_effect=writer(output)
+                        ),
+                        patch.object(
+                            microvm_tests,
+                            "_snapshot_fingerprint",
+                            return_value=("manifest", "state", "memory"),
+                        ),
+                        self.assertRaisesRegex(
+                            RuntimeError, rf"4-vCPU SMP restore 0: .*{message}"
+                        ),
+                    ):
+                        microvm_tests.run_smp_snapshot(
+                            Path("openvmm"),
+                            Path("vmlinux"),
+                            Path("initrd"),
+                            "kvm",
+                            [4],
+                            memory_mib=128,
+                            timeout=60,
+                            output_dir=Path(temporary),
+                        )
 
     def test_restore_processors_uses_capacity_eight_and_each_target(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2320,15 +2452,18 @@ class MicrovmTests(unittest.TestCase):
             [_restore_target(entry.args[0]) for entry in measure_once.call_args_list],
             [1, 2, 4, 8, None],
         )
+        # Each restore runs to the end of its post-restore script, so the log
+        # holds the processor check and the warp probe for every CPU.
+        for entry in measure_once.call_args_list:
+            self.assertEqual(entry.kwargs["marker"], benchmark.RESTORE_MARKER)
+            self.assertEqual(
+                entry.kwargs["failure_marker"], b"NVX-RESTORE-PROCESSORS-FAIL"
+            )
+        script = capture_snapshot.call_args.kwargs["post_restore_script"]
         self.assertEqual(
-            [entry.kwargs["marker"] for entry in measure_once.call_args_list],
-            [
-                b"NVX-RESTORE-PROCESSORS-OK count=1",
-                b"NVX-RESTORE-PROCESSORS-OK count=2",
-                b"NVX-RESTORE-PROCESSORS-OK count=4",
-                b"NVX-RESTORE-PROCESSORS-OK count=8",
-                b"NVX-RESTORE-PROCESSORS-OK count=1",
-            ],
+            script,
+            microvm_tests._read_script("restore-processors.sh")
+            + time_abi.warp_probe_script(),
         )
         self.assertEqual(
             logs,
@@ -2379,7 +2514,11 @@ class MicrovmTests(unittest.TestCase):
 
                     def measure(command: list[str], **kwargs: object) -> None:
                         log_path = cast(Path, kwargs["log_path"])
-                        log_path.write_bytes(_vp_binding_profile([0, 1]))
+                        log_path.write_bytes(
+                            b"NVX-RESTORE-PROCESSORS-OK count=2\r\n"
+                            + _warp_probe_output(2)
+                            + _vp_binding_profile([0, 1])
+                        )
 
                     with (
                         patch.object(microvm_tests, "capture_snapshot"),
@@ -2452,107 +2591,24 @@ class MicrovmTests(unittest.TestCase):
                 profile.replace(b"exclusive=0", b"exclusive=2")
             )
 
-    def test_restore_tsc_sync_forces_linux_warp_check_and_keeps_failure_guard(self):
-        for backend in ("kvm", "mshv", "whp"):
-            with self.subTest(backend=backend):
-                measure = _restore_processors_measure(backend)
-                with tempfile.TemporaryDirectory() as temporary:
-                    with (
-                        patch.object(microvm_tests, "capture_snapshot") as capture,
-                        patch.object(microvm_tests, "measure_once", measure),
-                        patch.object(
-                            microvm_tests,
-                            "_snapshot_fingerprint",
-                            return_value=("manifest", "state", "memory"),
-                        ),
-                    ):
-                        microvm_tests.run_restore_processors(
-                            Path("openvmm"),
-                            Path("vmlinux"),
-                            Path("initrd"),
-                            backend,
-                            [1, 2, 4, 8],
-                            memory_mib=128,
-                            timeout=60,
-                            output_dir=Path(temporary),
-                            check_tsc_sync=True,
-                        )
-                command = capture.call_args.args[0]
-                self.assertEqual(
-                    command[command.index("--cmdline") + 1],
-                    "quiet loglevel=0 maxcpus=1 clearcpuid=tsc_adjust",
-                )
-                script = capture.call_args.kwargs["post_restore_script"]
-                self.assertTrue(
-                    script.startswith(microvm_tests._read_script("restore-tsc-sync.sh"))
-                )
-                self.assertTrue(
-                    script.endswith(microvm_tests._read_script("restore-processors.sh"))
-                )
-                self.assertEqual(capture.call_args.kwargs["processors"], 1)
-                self.assertEqual(measure.call_count, 5)
-                self.assertEqual(
-                    [_restore_target(call.args[0]) for call in measure.call_args_list],
-                    [1, 2, 4, 8, None],
-                )
-
-    def test_restore_tsc_sync_rejects_an_ineffective_cpu_feature_mask(self):
-        shell = _posix_shell()
-        if shell is None:
-            self.skipTest("POSIX shell is unavailable")
-        script = microvm_tests._read_script("restore-tsc-sync.sh")
-        for cpuinfo, status, expected in (
-            ("flags : tsc constant_tsc rdtscp", 0, 0),
-            ("flags : tsc tsc_adjust constant_tsc", 0, 96),
-            ("flags : tsc tsc_adjust", 0, 96),
-            ("", 1, 1),
-        ):
-            with self.subTest(cpuinfo=cpuinfo, status=status):
-                result = subprocess.run(
-                    [shell],
-                    input=(
-                        f"cat() {{ printf '%s\\n' '{cpuinfo}'; return {status}; }}\n"
-                        + script
-                    ),
-                    text=True,
-                    capture_output=True,
-                    timeout=5,
-                    check=False,
-                )
-                self.assertEqual(result.returncode, expected, result.stderr)
-                self.assertEqual(
-                    "NVX-RESTORE-TSC-SYNC-CHECK-ENABLED" in result.stdout,
-                    expected == 0,
-                )
-
-    def test_restore_processors_rejects_unstable_tsc_after_cpu_activation(self):
+    def test_restore_processors_script_checks_activation_without_the_kernel_log(self):
         shell = _posix_shell()
         if shell is None:
             self.skipTest("POSIX shell is unavailable")
 
-        script = microvm_tests._read_script("restore-processors.sh")
-        for kernel_log, dmesg_status, expected_status in (
-            ("clocksource: Switched to clocksource tsc", 0, 0),
-            ("Measured 10992 cycles TSC warp between CPUs", 0, 95),
-            ("tsc: Marking TSC unstable due to check_tsc_sync_source failed", 0, 95),
-            ("TSC found unstable after boot", 0, 95),
-            ("", 1, 1),
-        ):
-            with self.subTest(kernel_log=kernel_log, dmesg_status=dmesg_status):
+        script = microvm_tests._read_script("restore-processors.sh").replace(
+            "nvx-exit", "nvx_exit"
+        )
+        self.assertNotIn("dmesg", script)
+        for online, expected_status in (("0-3", 0), ("0-2", 93)):
+            with self.subTest(online=online):
                 result = subprocess.run(
                     [shell],
                     input=(
                         "getconf() { printf '4\\n'; }\n"
-                        "cat() {\n"
-                        '  case "$1" in\n'
-                        "    */cpu/online) printf '0-3\\n' ;;\n"
-                        "    */current_clocksource) printf 'tsc\\n' ;;\n"
-                        "    *) return 99 ;;\n"
-                        "  esac\n"
-                        "}\n"
+                        f"cat() {{ printf '%s\\n' '{online}'; }}\n"
                         'taskset() { printf "%s\\n" "$2"; }\n'
-                        f"dmesg() {{ printf '%s\\n' '{kernel_log}'; "
-                        f"return {dmesg_status}; }}\n" + script
+                        'nvx_exit() { printf "NVX-EXIT %s\\n" "$1"; }\n' + script
                     ),
                     text=True,
                     capture_output=True,
@@ -2561,157 +2617,107 @@ class MicrovmTests(unittest.TestCase):
                 )
 
                 self.assertEqual(result.returncode, expected_status, result.stderr)
-                self.assertIn("NVX-RESTORE-PROCESSOR-OK count=4 cpu=3", result.stdout)
                 if expected_status == 0:
                     self.assertIn(
-                        "NVX-RESTORE-CLOCKSOURCE-OK source=tsc", result.stdout
+                        "NVX-RESTORE-PROCESSOR-OK count=4 cpu=3", result.stdout
                     )
                     self.assertIn("NVX-RESTORE-PROCESSORS-OK count=4", result.stdout)
+                    self.assertNotIn("NVX-EXIT", result.stdout)
                 else:
-                    self.assertNotIn("NVX-RESTORE-PROCESSORS-OK", result.stdout)
-                if expected_status == 95:
-                    self.assertIn(kernel_log, result.stdout)
                     self.assertIn(
-                        "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc", result.stdout
+                        "NVX-RESTORE-PROCESSORS-FAIL expected=0-3 actual=0-2",
+                        result.stdout,
                     )
+                    # A failed check powers the guest off with its status.
+                    self.assertIn("NVX-EXIT 93", result.stdout)
+                    self.assertNotIn("NVX-RESTORE-PROCESSORS-OK", result.stdout)
 
-    def test_restore_processors_fail_fast_and_record_restored_tsc_logs(self):
-        for check_tsc_sync in (False, True):
-            with self.subTest(check_tsc_sync=check_tsc_sync):
-                measure = _restore_processors_measure("mshv")
-                with tempfile.TemporaryDirectory() as temporary:
-                    with (
-                        patch.object(microvm_tests, "capture_snapshot"),
-                        patch.object(microvm_tests, "measure_once", measure),
-                        patch.object(
-                            microvm_tests,
-                            "_snapshot_fingerprint",
-                            return_value=("manifest", "state", "memory"),
-                        ),
-                    ):
-                        microvm_tests.run_restore_processors(
-                            Path("openvmm"),
-                            Path("vmlinux"),
-                            Path("initrd"),
-                            "mshv",
-                            [2, 8],
-                            memory_mib=128,
-                            timeout=60,
-                            output_dir=Path(temporary),
-                            check_tsc_sync=check_tsc_sync,
-                        )
-
-                self.assertEqual(measure.call_count, 3)
-                for entry in measure.call_args_list:
-                    self.assertEqual(
-                        entry.kwargs["failure_marker"],
-                        b"NVX-RESTORE-PROCESSORS-FAIL",
-                    )
-                    environment = entry.kwargs["environment"]
-                    self.assertEqual(
-                        environment["OPENVMM_LOG"],
-                        "off,vmm_core::partition_unit::vp_set::tsc=debug,"
-                        "virt_mshv::x86_64::tsc=info",
-                    )
-                    self.assertEqual(environment[benchmark.SNAPSHOT_PROFILE_ENV], "1")
-
-    def test_restore_processors_classifies_unstable_tsc_with_fresh_boot_control(self):
+    def test_restore_processors_fail_fast_and_record_time_abi_logs(self):
+        measure = _restore_processors_measure("mshv")
         with tempfile.TemporaryDirectory() as temporary:
-            output_dir = Path(temporary)
-            passing = _restore_processors_measure("mshv")
-
-            def measure(command: list[str], **kwargs: object) -> None:
-                if _restore_target(command) == 4:
-                    raise benchmark.GuestFailureReported(
-                        "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc",
-                        "Measured 45 cycles TSC warp between CPUs\r\n",
-                    )
-                passing(command, **kwargs)
-
             with (
-                patch.object(microvm_tests, "capture_snapshot"),
-                patch.object(
-                    microvm_tests, "measure_once", side_effect=measure
-                ) as measure_once,
+                patch.object(microvm_tests, "capture_snapshot") as capture,
+                patch.object(microvm_tests, "measure_once", measure),
                 patch.object(
                     microvm_tests,
                     "_snapshot_fingerprint",
                     return_value=("manifest", "state", "memory"),
                 ),
-                patch.object(
-                    microvm_tests,
-                    "run_fresh_boot_tsc_control",
-                    return_value="fresh-boot TSC control: verdict",
-                ) as control,
-                patch.object(
-                    microvm_tests,
-                    "_host_invariant_tsc_note",
-                    return_value="host clock: note\n",
-                ),
             ):
-                with self.assertRaises(RuntimeError) as raised:
-                    microvm_tests.run_restore_processors(
-                        Path("openvmm"),
-                        Path("vmlinux"),
-                        Path("initrd"),
-                        "mshv",
-                        [1, 2, 4, 8],
-                        memory_mib=192,
-                        timeout=30,
-                        output_dir=output_dir,
-                        check_tsc_sync=True,
-                    )
+                microvm_tests.run_restore_processors(
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initrd"),
+                    "mshv",
+                    [2, 8],
+                    memory_mib=128,
+                    timeout=60,
+                    output_dir=Path(temporary),
+                )
 
+        command = capture.call_args.args[0]
+        # No test-only CPU feature mask and no clock tuning on the command line.
         self.assertEqual(
-            str(raised.exception),
-            "restore target 4: guest reported "
-            "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc\n"
-            "fresh-boot TSC control: verdict\n"
-            "host clock: note\n"
-            "--- OpenVMM output ---\n"
-            "Measured 45 cycles TSC warp between CPUs\r\n",
+            command[command.index("--cmdline") + 1], "quiet loglevel=0 maxcpus=1"
         )
-        self.assertIsInstance(
-            raised.exception.__cause__, benchmark.GuestFailureReported
-        )
-        self.assertEqual(measure_once.call_count, 3)
-        control.assert_called_once_with(
-            Path("openvmm"),
-            Path("vmlinux"),
-            Path("initrd"),
-            "mshv",
-            memory_mib=192,
-            timeout=30,
-            log_path=output_dir / "restore-processors-tsc-control.log",
-        )
-
-    def test_host_invariant_tsc_note_reads_the_cpu_flags(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            cpuinfo = Path(temporary) / "cpuinfo"
-            cases = (
-                (
-                    "processor\t: 0\nflags\t\t: fpu tsc constant_tsc nonstop_tsc\n",
-                    "host CPU exposes an invariant TSC (nonstop_tsc)\n",
-                ),
-                (
-                    "processor\t: 0\nflags\t\t: fpu tsc constant_tsc tsc_known_freq\n",
-                    "host CPU does not expose an invariant TSC (nonstop_tsc); "
-                    "guests on this host intermittently see cross-vCPU TSC warps\n",
-                ),
-                ("processor\t: 0\n", ""),
-            )
-            for text, expected in cases:
-                with self.subTest(text=text):
-                    cpuinfo.write_text(text, encoding="utf-8")
-                    self.assertEqual(
-                        microvm_tests._host_invariant_tsc_note(cpuinfo), expected
-                    )
+        self.assertEqual(measure.call_count, 3)
+        for entry in measure.call_args_list:
             self.assertEqual(
-                microvm_tests._host_invariant_tsc_note(Path(temporary) / "missing"),
-                "",
+                entry.kwargs["failure_marker"],
+                b"NVX-RESTORE-PROCESSORS-FAIL",
+            )
+            environment = entry.kwargs["environment"]
+            self.assertEqual(
+                environment["OPENVMM_LOG"],
+                "off,openvmm_core::worker::dispatch::time_abi=info",
+            )
+            self.assertEqual(environment[benchmark.SNAPSHOT_PROFILE_ENV], "1")
+
+    def test_restore_processors_require_the_count_and_a_passing_warp_probe(self):
+        def wrong_count(command: list[str], **kwargs: object) -> None:
+            _restore_processors_measure("kvm")(command, **kwargs)
+            log_path = cast(Path, kwargs["log_path"])
+            log_path.write_bytes(
+                log_path.read_bytes().replace(
+                    b"PROCESSORS-OK count=4", b"PROCESSORS-OK count=2"
+                )
             )
 
-    def test_restore_processors_reports_other_guest_failures_without_control(self):
+        cases = (
+            (wrong_count, "restore target 4 did not report"),
+            (
+                _restore_processors_measure("kvm", warp_offset_ns=1500),
+                "restore target 4: cross-vCPU TSC skew check failed in round 1: "
+                "max_abs_offset_ns=1500 exceeds 1000",
+            ),
+        )
+        for measure, message in cases:
+            with self.subTest(message=message):
+                with tempfile.TemporaryDirectory() as temporary:
+                    with (
+                        patch.object(microvm_tests, "capture_snapshot"),
+                        patch.object(
+                            microvm_tests, "measure_once", side_effect=measure
+                        ),
+                        patch.object(
+                            microvm_tests,
+                            "_snapshot_fingerprint",
+                            return_value=("manifest", "state", "memory"),
+                        ),
+                        self.assertRaisesRegex(RuntimeError, message),
+                    ):
+                        microvm_tests.run_restore_processors(
+                            Path("openvmm"),
+                            Path("vmlinux"),
+                            Path("initrd"),
+                            "kvm",
+                            [4],
+                            memory_mib=128,
+                            timeout=60,
+                            output_dir=Path(temporary),
+                        )
+
+    def test_restore_processors_report_guest_failures_with_the_target(self):
         failure = benchmark.GuestFailureReported(
             "NVX-RESTORE-PROCESSORS-FAIL expected=0-3 actual=0-2", "tail"
         )
@@ -2724,7 +2730,6 @@ class MicrovmTests(unittest.TestCase):
                     "_snapshot_fingerprint",
                     return_value=("manifest", "state", "memory"),
                 ),
-                patch.object(microvm_tests, "run_fresh_boot_tsc_control") as control,
             ):
                 with self.assertRaises(RuntimeError) as raised:
                     microvm_tests.run_restore_processors(
@@ -2745,201 +2750,19 @@ class MicrovmTests(unittest.TestCase):
             "--- OpenVMM output ---\ntail",
         )
         self.assertIs(raised.exception.__cause__, failure)
-        control.assert_not_called()
 
-    def test_fresh_boot_tsc_control_forces_the_warp_check_on_every_processor(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            log_path = Path(temporary) / "control.log"
-            result: benchmark.GuestCommandResult = {
-                "text": (
-                    '> echo "NVX-TSC-CONTROL-RESULT unstable activations=0"\r\n'
-                    "NVX-TSC-CONTROL-RESULT stable activations=147\r\n"
-                ),
-                "wall_ms": 1.0,
-                "peak_rss_bytes": 1,
-            }
-            with (
-                patch.object(
-                    microvm_tests,
-                    "workload_boot_command",
-                    return_value=["openvmm", "boot"],
-                ) as workload_boot_command,
-                patch.object(
-                    microvm_tests, "run_guest_script", return_value=result
-                ) as run_guest_script,
-            ):
-                verdict = microvm_tests.run_fresh_boot_tsc_control(
-                    Path("openvmm"),
-                    Path("vmlinux"),
-                    Path("initrd"),
-                    "kvm",
-                    memory_mib=128,
-                    timeout=45,
-                    log_path=log_path,
-                )
-
-        self.assertEqual(
-            verdict,
-            "fresh-boot TSC control: no TSC instability across 147 CPU "
-            "activations without snapshot restore",
-        )
-        self.assertEqual(
-            workload_boot_command.call_args.args,
-            (
-                Path("openvmm"),
-                "kvm",
-                Path("vmlinux"),
-                Path("initrd"),
-                128,
-                "quiet loglevel=0 clearcpuid=tsc_adjust",
-            ),
-        )
-        self.assertEqual(workload_boot_command.call_args.kwargs, {"processors": 8})
-        command, script, marker = run_guest_script.call_args.args
-        self.assertEqual(command, ["openvmm", "boot"])
-        self.assertEqual(
-            script,
-            microvm_tests._render_script(
-                "tsc-sync-control.sh.in", PROCESSORS="8", ROUNDS="20"
-            ),
-        )
-        self.assertNotIn("@", script)
-        self.assertEqual(marker, b"NVX-TSC-CONTROL-DONE")
-        self.assertEqual(
-            run_guest_script.call_args.kwargs, {"timeout": 45, "log_path": log_path}
-        )
-
-    def test_fresh_boot_tsc_control_reports_its_own_failure(self):
-        with patch.object(
-            microvm_tests,
-            "run_guest_script",
-            side_effect=TimeoutError("guest workload did not finish within 45s\ntail"),
+    def test_removed_tsc_guards_stay_removed(self):
+        # The warp probe replaced the restore-tsc-sync guard, its
+        # clearcpuid=tsc_adjust kernel option, and the fresh-boot TSC control.
+        self.assertNotIn("restore-tsc-sync", microvm_tests.MICROVM_TEST_SCENARIOS)
+        for name in ("restore-tsc-sync.sh", "tsc-sync-control.sh.in"):
+            self.assertFalse((microvm_tests.MICROVM_TEST_SCRIPTS_DIR / name).exists())
+        for name in (
+            "run_fresh_boot_tsc_control",
+            "_tsc_control_verdict",
+            "_host_invariant_tsc_note",
         ):
-            verdict = microvm_tests.run_fresh_boot_tsc_control(
-                Path("openvmm"),
-                Path("vmlinux"),
-                Path("initrd"),
-                "mshv",
-                memory_mib=128,
-                timeout=45,
-                log_path=Path("control.log"),
-            )
-
-        self.assertEqual(
-            verdict,
-            "fresh-boot TSC control did not complete: "
-            "guest workload did not finish within 45s",
-        )
-
-    def test_tsc_control_verdict_accepts_only_guest_result_lines(self):
-        for text, expected in (
-            (
-                "NVX-TSC-CONTROL-RESULT unstable activations=12\r\n",
-                "fresh-boot TSC control: Linux also found TSC instability without "
-                "snapshot restore after 12 CPU activations",
-            ),
-            (
-                '> echo "NVX-TSC-CONTROL-RESULT stable activations=$activations"\n',
-                "fresh-boot TSC control did not report a result",
-            ),
-            (
-                "NVX-TSC-CONTROL-RESULT stable activations=many\n",
-                "fresh-boot TSC control did not report a result",
-            ),
-            ("", "fresh-boot TSC control did not report a result"),
-        ):
-            with self.subTest(text=text):
-                self.assertEqual(microvm_tests._tsc_control_verdict(text), expected)
-
-    def test_tsc_sync_control_script_reactivates_aps_until_tsc_instability(self):
-        shell = _posix_shell()
-        if shell is None:
-            self.skipTest("POSIX shell is unavailable")
-        for flags, online, unstable, expected_status, expected_output in (
-            ("tsc rdtscp", 4, False, 0, "NVX-TSC-CONTROL-RESULT stable activations=9"),
-            (
-                "tsc rdtscp",
-                4,
-                True,
-                0,
-                "NVX-TSC-CONTROL-RESULT unstable activations=3",
-            ),
-            ("tsc tsc_adjust", 4, False, 61, "NVX-TSC-CONTROL-FAIL code=61"),
-            ("tsc rdtscp", 2, False, 60, "NVX-TSC-CONTROL-FAIL code=60"),
-        ):
-            with self.subTest(flags=flags, online=online, unstable=unstable):
-                with tempfile.TemporaryDirectory() as temporary:
-                    cpu_root = Path(temporary)
-                    for cpu in range(1, 4):
-                        (cpu_root / f"cpu{cpu}").mkdir()
-                    kernel_log = (
-                        "Measured 45 cycles TSC warp between CPUs"
-                        if unstable
-                        else "clocksource: Switched to clocksource tsc"
-                    )
-                    script = (
-                        microvm_tests._render_script(
-                            "tsc-sync-control.sh.in", PROCESSORS="4", ROUNDS="2"
-                        )
-                        .replace("/sys/devices/system/cpu", cpu_root.as_posix())
-                        .replace("nvx-exit", "nvx_exit")
-                    )
-                    result = subprocess.run(
-                        [shell, "-s"],
-                        input=(
-                            f"getconf() {{ printf '{online}\\n'; }}\n"
-                            f"cat() {{ printf 'flags : {flags}\\n'; }}\n"
-                            f"dmesg() {{ printf '%s\\n' '{kernel_log}'; }}\n"
-                            'nvx_exit() { exit "$1"; }\n' + script
-                        ),
-                        text=True,
-                        capture_output=True,
-                        timeout=5,
-                        check=False,
-                    )
-                    reactivated = all(
-                        (cpu_root / f"cpu{cpu}" / "online").is_file()
-                        and (cpu_root / f"cpu{cpu}" / "online").read_text() == "1\n"
-                        for cpu in range(1, 4)
-                    )
-
-                self.assertEqual(
-                    result.returncode, expected_status, result.stdout + result.stderr
-                )
-                self.assertIn(expected_output, result.stdout)
-                self.assertEqual(
-                    "NVX-TSC-CONTROL-DONE" in result.stdout, expected_status == 0
-                )
-                self.assertEqual(reactivated, expected_output.endswith("=9"))
-                if unstable:
-                    self.assertIn(kernel_log, result.stdout)
-
-    def test_tsc_sync_control_script_fails_when_dmesg_fails(self):
-        shell = _posix_shell()
-        if shell is None:
-            self.skipTest("POSIX shell is unavailable")
-        script = microvm_tests._render_script(
-            "tsc-sync-control.sh.in", PROCESSORS="4", ROUNDS="2"
-        ).replace("nvx-exit", "nvx_exit")
-
-        result = subprocess.run(
-            [shell, "-s"],
-            input=(
-                "getconf() { printf '4\\n'; }\n"
-                "cat() { printf 'flags : tsc rdtscp\\n'; }\n"
-                "dmesg() { return 71; }\n"
-                'nvx_exit() { exit "$1"; }\n' + script
-            ),
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-
-        self.assertEqual(result.returncode, 71, result.stdout + result.stderr)
-        self.assertIn("NVX-TSC-CONTROL-FAIL code=71", result.stdout)
-        self.assertNotIn("NVX-TSC-CONTROL-RESULT", result.stdout)
-        self.assertNotIn("NVX-TSC-CONTROL-DONE", result.stdout)
+            self.assertFalse(hasattr(microvm_tests, name), name)
 
     def test_restore_memory_reuses_one_base_snapshot_for_all_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3166,7 +2989,7 @@ class MicrovmTests(unittest.TestCase):
                 ):
                     microvm_tests.run(args)
 
-    def test_runner_keeps_restore_tsc_logs_separate_from_processor_restore(self):
+    def test_runner_passes_processor_counts_to_the_restore_scenarios(self):
         def require(path: Path, _description: str) -> Path:
             return path
 
@@ -3178,11 +3001,12 @@ class MicrovmTests(unittest.TestCase):
                     "--backend",
                     "whp",
                     "--scenario",
+                    "smp-snapshot",
+                    "--scenario",
                     "restore-processors",
-                    "--scenario",
-                    "restore-tsc-sync",
-                    "--scenario",
-                    "restore-tsc-sync",
+                    "--processors",
+                    "2",
+                    "4",
                     "--output-dir",
                     str(output_dir),
                 ]
@@ -3190,18 +3014,18 @@ class MicrovmTests(unittest.TestCase):
             with (
                 patch.object(microvm_tests, "validate_openvmm_test_backend"),
                 patch.object(microvm_tests, "require_file", side_effect=require),
-                patch.object(microvm_tests, "run_restore_processors") as run,
+                patch.object(microvm_tests, "run_smp_snapshot") as smp_snapshot,
+                patch.object(microvm_tests, "run_restore_processors") as processors,
             ):
                 self.assertEqual(microvm_tests.run(args), 0)
-            self.assertTrue((output_dir / "restore-tsc-sync").is_dir())
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[0].kwargs["output_dir"], output_dir)
-        self.assertNotIn("check_tsc_sync", run.call_args_list[0].kwargs)
-        self.assertEqual(
-            run.call_args_list[1].kwargs["output_dir"],
-            output_dir / "restore-tsc-sync",
-        )
-        self.assertTrue(run.call_args_list[1].kwargs["check_tsc_sync"])
+        for run in (smp_snapshot, processors):
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[4], [2, 4])
+            self.assertEqual(run.call_args.kwargs["output_dir"], output_dir)
+        with self.assertRaises(SystemExit), patch("sys.stderr"):
+            nvx.parse_args(
+                ["test-microvm", "--backend", "kvm", "--scenario", "restore-tsc-sync"]
+            )
 
     def test_runner_dispatches_console_exit_for_each_requested_cpu_count(self):
         def require(path: Path, _description: str) -> Path:

@@ -29,11 +29,21 @@ fails the scenario at once with the guest's code and detail. An OpenVMM exit
 status of 193, 194, or 195 is reported as the guest's time ABI conformance,
 runtime-violation, or restore-repair power-off, together with the event that
 preceded it, instead of as a generic exit status.
-The restore-processor scenario also rejects Linux TSC instability diagnostics,
-even if the requested CPUs came online, so clock skew cannot silently pass by
-falling back to a different clocksource. After the 1/2/4/8-CPU restores, it
-restores the same snapshot once without `--restore-processors`. Every restore
-runs with OpenVMM lifecycle profiling and must report exactly one
+The `smp`, `smp-snapshot`, and `restore-processors` scenarios run the guest
+warp probe, `/sbin/nvx-time-probe warp --bound-ns 1000`, over every pair of
+online CPUs after each boot or restore, in two rounds with all vCPUs halted
+for 1 s between them, so that a host without an invariant TSC corrects the
+guest TSC as idle host CPUs wake (#265). Every pair in every round must stay
+within the time ABI's 1 µs
+[cross-vCPU skew bound](design/time-abi.md#cross-vcpu-skew-bound) for both the
+backward TSC step and the ping-pong offset; a stalled pair or an inconclusive
+measurement also fails. `smp` boots each requested processor
+count. `smp-snapshot` captures one snapshot per requested count and restores
+it once, and the first snapshot a second time to prove that a restore leaves it
+reusable. `restore-processors` captures one boot-online CPU with capacity 8 and
+probes the CPUs that each restore target activated. After the 1/2/4/8-CPU
+restores, it restores the same snapshot once without `--restore-processors`.
+Every restore runs with OpenVMM lifecycle profiling and must report exactly one
 `startup.vp_thread_bind` record. Its `startup.vp_bind_*` records must show that
 an explicit MSHV target binds exactly VPs `0..N-1`, while untargeted MSHV
 restores and all KVM and WHP restores bind the full capacity.
@@ -41,18 +51,12 @@ Captures do not wait for a clocksource: the time ABI registers `tsc` at
 `device_initcall` on every backend, so the transitional `tsc-early` window that
 once let the clocksource watchdog compare `tsc-early` with jiffies across a
 restore (#253) never reaches the guest's userspace.
-A restore fails as soon as its guest prints `NVX-RESTORE-PROCESSORS-FAIL`,
-rather than waiting for the phase timeout. Restore logs also record OpenVMM's
-`adjusted restored vCPU TSC` event for each VP, which includes the applied
-snapshot downtime, and its `aligning restored AP TSCs to the BSP` event, which
-reports how many created MSHV APs were aligned. When the guest reports
-`unstable-tsc`, the harness boots a never-restored eight-vCPU guest with the
-same forced warp check and reactivates each AP 20 times. The error then states
-whether this control also found TSC instability, which points to host or
-hypervisor clock skew rather than restore alignment, and whether the host CPU
-exposes an invariant TSC. The control log is kept as
-`restore-processors-tsc-control.log`. The control only classifies the
-failure; the restore still fails.
+A restore fails as soon as its guest prints `NVX-RESTORE-PROCESSORS-FAIL` or
+`NVX-WARP-PROBE-FAIL`, rather than waiting for the phase timeout; a failed
+probe also powers the guest off with status 97. Restore-processor logs record
+OpenVMM's `time ABI rates declared` event, which reports the identity MSR
+route, the TSC synchronization method, the native and declared TSC rates, and
+the rate deviation from the snapshot.
 
 Every job that uses the `validate-runner` action first qualifies its runner
 for the time ABI with `nvx.py doctor --checks H1 H2 H4 --no-openvmm
@@ -73,21 +77,13 @@ is why the probe schedule includes idle gaps. Runner labels do not encode the
 generation; per-PR CI captures and restores on one runner, so generations
 never mix.
 
-The `restore-tsc-sync` scenario repeats the restore-processor sequence with
-the test-only kernel option `clearcpuid=tsc_adjust`. Linux normally skips its
-cross-CPU TSC warp test when `IA32_TSC_ADJUST` is available and consistent
-within a package. This scenario verifies that the feature is masked, forcing
-the live CPU-online check even on those hosts, while retaining the existing
-TSC-instability guard. It does not force a fallback clocksource or retry failed
-restores. Its logs are kept in a separate `restore-tsc-sync` subdirectory.
-Run it alone on Windows with:
-
-```powershell
-python scripts\nvx.py test-microvm --backend whp --scenario restore-tsc-sync
-```
-
-This regression targets the WHP clock instability tracked in #19; a passing
-frozen-counter check is not sufficient to validate a fix.
+The warp probe replaced the `restore-tsc-sync` scenario, its test-only
+`clearcpuid=tsc_adjust` kernel option, the guest's scan of the kernel log for
+TSC warp and instability messages, and the fresh-boot TSC control that
+classified those failures (#211, #265). Under the time ABI the guest's TSC is
+`tsc_reliable`, so Linux skips its CPU-online warp check and never logs the
+messages that guard looked for; the probe measures the 1 µs bound on every CPU
+pair instead.
 
 The `console-exit` scenario delays host console reads for two seconds after
 snapshot restore to exercise output backpressure. For each requested processor
