@@ -7,6 +7,7 @@ the C decoders, so the tests check the guest against the specification.
 
 from __future__ import annotations
 
+import re
 import shutil
 import struct
 import subprocess
@@ -544,6 +545,42 @@ class GuestTimeTests(unittest.TestCase):
         signature = leaf("0x40000100", kvm)
         self.assertIn('(signature "KVMKVMKVM...")', signature)
         self.assertTrue(signature.endswith("or the highest basic leaf"), signature)
+
+    def test_exhaustive_report_lines_follow_the_spec(self):
+        # The spec's exhaustive check prints one line per check and CPU, with
+        # an escaped detail, then a summary.
+        line = re.compile(
+            r"^NVX-TIME-ABI-EXHAUSTIVE: v=1 check=X[1-6] cpu=\d+ "
+            r'status=(pass|fail) detail="(?:[^"\\]|\\.)*"$'
+        )
+        passed = self.run_test(
+            "exhaustive-report", "X3", "2", "pass", "ok"
+        ).splitlines()
+        self.assertEqual(
+            passed,
+            [
+                'NVX-TIME-ABI-EXHAUSTIVE: v=1 check=X3 cpu=2 status=pass detail="ok"',
+                "failures=0",
+            ],
+        )
+        failed = self.run_test(
+            "exhaustive-report",
+            "X2",
+            "7",
+            "fail",
+            'base 0x40000100 "KVMKVMKVM" \\ x\ty',
+        ).splitlines()
+        self.assertRegex(failed[0], line)
+        self.assertIn(r'detail="base 0x40000100 \"KVMKVMKVM\" \\ x\x09y"', failed[0])
+        self.assertEqual(failed[1], "failures=1")
+        self.assertEqual(
+            self.run_test("exhaustive-summary", "4", "0").splitlines(),
+            ["NVX-TIME-ABI-EXHAUSTIVE: v=1 status=ok cpus=4 failures=0", "exit=0"],
+        )
+        self.assertEqual(
+            self.run_test("exhaustive-summary", "8", "3").splitlines(),
+            ["NVX-TIME-ABI-EXHAUSTIVE: v=1 status=fail cpus=8 failures=3", "exit=1"],
+        )
 
     def timer_list(
         self,

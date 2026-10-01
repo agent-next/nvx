@@ -1934,6 +1934,13 @@ static void exhaustive_report(struct exhaustive *state, const char *id, int cpu,
         state->failures++;
 }
 
+static int exhaustive_summary(const struct exhaustive *state, int online)
+{
+    printf("NVX-TIME-ABI-EXHAUSTIVE: v=1 status=%s cpus=%d failures=%d\n",
+           state->failures == 0 ? "ok" : "fail", online, state->failures);
+    return state->failures == 0 ? 0 : 1;
+}
+
 // X1 (every leaf 0x40000006..=0x400000ff) when STEP is 1, or X2 (every base
 // 0x40000100..=0x4000ff00) when STEP is 0x100, on the current CPU.
 static void exhaustive_leaves(struct exhaustive *state, const char *id, int cpu,
@@ -2110,8 +2117,8 @@ static int exhaustive_run(void)
     memset(&state, 0, sizeof(state));
     if (read_text("/sys/devices/system/cpu/online", text, sizeof(text)) < 0 ||
         (online = parse_cpu_list(text, cpus)) <= 0) {
-        printf("NVX-TIME-ABI-EXHAUSTIVE: v=1 status=fail cpus=0 failures=1\n");
-        return 1;
+        state.failures = 1;
+        return exhaustive_summary(&state, 0);
     }
     cpuinfo_init(&parse, &state.cpuinfo, cpus, false);
     (void)for_each_file_line("/proc/cpuinfo", cpuinfo_line, &parse);
@@ -2155,9 +2162,7 @@ static int exhaustive_run(void)
     }
     if (CPU_COUNT(&original) > 0)
         (void)sched_setaffinity(0, sizeof(original), &original);
-    printf("NVX-TIME-ABI-EXHAUSTIVE: v=1 status=%s cpus=%d failures=%d\n",
-           state.failures == 0 ? "ok" : "fail", online, state.failures);
-    return state.failures == 0 ? 0 : 1;
+    return exhaustive_summary(&state, online);
 }
 
 // C6: `tsc` is current, and only tsc, refined-jiffies, or jiffies is
@@ -3824,6 +3829,25 @@ static int cmd_test(int argc, char **argv)
             printf("pass\n");
         else
             printf("fail %s\n", detail);
+        return 0;
+    }
+    if (strcmp(name, "exhaustive-report") == 0 && argc == 4) {
+        struct exhaustive state;
+
+        memset(&state, 0, sizeof(state));
+        exhaustive_report(&state, argv[0], atoi(argv[1]),
+                          strcmp(argv[2], "pass") == 0, argv[3]);
+        printf("failures=%d\n", state.failures);
+        return 0;
+    }
+    if (strcmp(name, "exhaustive-summary") == 0 && argc == 2) {
+        struct exhaustive state;
+        int status;
+
+        memset(&state, 0, sizeof(state));
+        state.failures = atoi(argv[1]);
+        status = exhaustive_summary(&state, atoi(argv[0]));
+        printf("exit=%d\n", status);
         return 0;
     }
     if (strcmp(name, "boot-log") == 0)
