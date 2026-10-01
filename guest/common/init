@@ -15,6 +15,16 @@ if [ -e /proc/sys/kernel/modules_disabled ] &&
         sleep 3600
     done
 fi
+# The time ABI boot check runs next, before any other guest work, in every
+# guest mode. It powers the VM off itself on a violation and leaves its state
+# and daemon under /run/nvx/time, so /run is mounted first and kept.
+mount -t tmpfs -o mode=755,nosuid,nodev tmpfs /run
+if ! /sbin/nvx-time boot; then
+    /sbin/nvx-exit 193
+    while :; do
+        sleep 3600
+    done
+fi
 mount -t tmpfs none /tmp
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=linux
 ifconfig lo 127.0.0.1 up

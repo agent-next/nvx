@@ -437,7 +437,8 @@ The Ubuntu initramfs boot remains identical to Alpine at the machine level:
 3. OpenVMM prepends its xe9/hvc console parameters and fixed virtio-mmio
    discovery.
 4. `/init` mounts procfs, sysfs, and devtmpfs, switches kernel module loading
-   off, and mounts tmpfs.
+   off, mounts `/run`, and runs the time ABI boot check (`nvx-time boot`),
+   which also starts the time daemon, before it mounts tmpfs.
 5. `/init` configures loopback, optional static networking, and optional
    HostFs.
 6. `/init` handles an explicit `nvx_exec` workload or opens a root shell.
@@ -466,7 +467,11 @@ The first supported Ubuntu initramfs must provide:
 - HostFs mounting;
 - clean `/sbin/nvx-exit`;
 - SMP boot with 1, 2, 4, and 8 vCPUs; and
-- snapshot and restore for blockless test scenarios.
+- snapshot and restore for blockless test scenarios, including the time ABI
+  guest obligations that the common `nvx-time` and `nvx-snapshot` implement
+  for every guest: the boot conformance check, the violation watcher and
+  wall-clock discipline, restore packet v4 with CPU activation, and the RCU
+  grace-period release.
 
 Alpine-only benchmark scenarios that depend on extra shell tools may remain
 Alpine-only initially. The test selector must reject unsupported Ubuntu
