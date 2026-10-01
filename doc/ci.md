@@ -55,13 +55,20 @@ exposes an invariant TSC. The control log is kept as
 `restore-processors-tsc-control.log`. The control only classifies the
 failure; the restore still fails.
 
-Linux runners must expose an invariant TSC, reported as `nonstop_tsc` in
-`/proc/cpuinfo`. The `validate-runner` action prints each runner's kernel, CPU
-model, clocksource, and TSC flags, and fails the job when `nonstop_tsc` is
-missing. On an MSHV runner VM whose Azure host hid the invariant TSC,
-never-restored guests also hit cross-vCPU TSC warps during CPU activation, and
-keeping every host CPU out of idle removed them (#211). Redeploy such a VM on a
-host that exposes an invariant TSC instead of retrying its jobs.
+Every job that uses the `validate-runner` action first qualifies its runner
+for the time ABI with `nvx.py doctor --checks H1 H2 H4 H5 H7` (see
+[Host qualification](#host-qualification)), which replaces the earlier
+`nonstop_tsc` check and takes a few seconds. It reports the CPU generation,
+the CPU profile that `auto` selects, the measured TSC rate, and the host
+skew in the log and the job summary, and fails the job with a stable code
+when the runner is not qualified, for example `E_PROFILE_HOST_UNKNOWN` on an
+unknown CPU generation or `E_PROFILE_UNSUPPORTED` on a Linux host without
+`constant_tsc` and `nonstop_tsc`. Runner labels do not encode the generation;
+per-PR CI captures and restores on one runner, so generations never mix. On an
+MSHV runner VM whose Azure host hid the invariant TSC, never-restored guests
+also hit cross-vCPU TSC warps during CPU activation, and keeping every host
+CPU out of idle removed them (#211). Redeploy such a VM on a host that exposes
+an invariant TSC instead of retrying its jobs.
 
 The `restore-tsc-sync` scenario repeats the restore-processor sequence with
 the test-only kernel option `clearcpuid=tsc_adjust`. Linux normally skips its
@@ -168,6 +175,12 @@ doctor builds with `rustc` once per source version into
 `$RUNNER_TOOL_CACHE/nvx-host-time-probe` (or `build/host-time-probe` outside
 CI). H3 and H6 need the OpenVMM binary and the guest artifacts; `--openvmm`,
 `--kernel`, and `--initrd` override their default build paths.
+
+In CI, `validate-runner` runs H1, H2, H4, H5, and H7 before every job,
+because jobs download OpenVMM and the guest artifacts only later. H6's
+property is covered by the `smp` scenario, which runs the same warp probe at
+1, 2, 4, and 8 vCPUs in every microVM job. Without H3, H4 checks the rate
+stability without comparing it against the backend's rate.
 
 ## Adversarial campaigns
 

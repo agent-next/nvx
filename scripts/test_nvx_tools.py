@@ -2253,7 +2253,7 @@ class CiConfigurationTests(unittest.TestCase):
             ):
                 self.assertIn(firmware, configuration)
 
-    def test_linux_runners_require_an_invariant_tsc(self):
+    def test_runners_qualify_their_host_time_before_every_job(self):
         validate_runner = (
             BuildConstants.REPO_ROOT
             / ".github"
@@ -2265,13 +2265,39 @@ class CiConfigurationTests(unittest.TestCase):
             BuildConstants.REPO_ROOT / "scripts" / "setup" / "setup-linux-runner.sh"
         ).read_text(encoding="utf-8")
 
-        step = validate_runner.split("    - name: Validate host TSC\n", 1)[1]
-        step = step.split("\n\n    - name: ", 1)[0]
-        self.assertIn("      if: runner.os != 'Windows'\n", step)
-        check = "\n".join(
-            line.removeprefix("        ")
-            for line in step.split("      run: |\n", 1)[1].splitlines()
+        # The doctor replaces the nonstop_tsc check (doc/design/time-abi.md).
+        self.assertNotIn("Validate host TSC", validate_runner)
+        for name, shell, command, summary in (
+            (
+                "Qualify host time on Linux",
+                "bash",
+                "python3 scripts/nvx.py doctor",
+                '--summary "${GITHUB_STEP_SUMMARY}"',
+            ),
+            (
+                "Qualify host time on Windows",
+                "powershell",
+                "python scripts\\nvx.py doctor",
+                '--summary "$env:GITHUB_STEP_SUMMARY"',
+            ),
+        ):
+            with self.subTest(step=name):
+                step = validate_runner.split(f"    - name: {name}\n", 1)[1]
+                step = step.split("\n\n", 1)[0]
+                self.assertIn(f"      shell: {shell}\n", step)
+                self.assertIn(command, step)
+                self.assertIn('--backend "${{ inputs.backend }}"', step)
+                self.assertIn("--checks H1 H2 H4 H5 H7", step)
+                self.assertIn(summary, step)
+        args = nvx.parse_args(
+            ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4", "H5", "H7"]
         )
+        self.assertEqual(args.checks, ["H1", "H2", "H4", "H5", "H7"])
+        self.assertLess(
+            validate_runner.index("Validate Linux toolchain"),
+            validate_runner.index("Qualify host time on Linux"),
+        )
+
         function = linux_setup.split("require_invariant_tsc() {\n", 1)[1]
         function = "require_invariant_tsc() {\n" + function.split("\n}\n", 1)[0]
         function += "\n}\n"
@@ -2293,21 +2319,6 @@ class CiConfigurationTests(unittest.TestCase):
                     f"model name\t: Test CPU\nflags\t\t: {flags}\n",
                     encoding="utf-8",
                 )
-                with self.subTest(flags=flags, check="validate-runner"):
-                    result = subprocess.run(
-                        ["bash", "-c", check.replace("/proc/cpuinfo", str(cpuinfo))],
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                        check=False,
-                    )
-                    self.assertEqual(result.returncode == 0, invariant, result.stderr)
-                    self.assertIn("CPU: Test CPU", result.stdout)
-                    self.assertEqual(
-                        "::error::Runner host does not expose an invariant TSC"
-                        in result.stderr,
-                        not invariant,
-                    )
                 with self.subTest(flags=flags, check="setup-linux-runner"):
                     result = subprocess.run(
                         [

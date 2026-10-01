@@ -117,31 +117,26 @@ runs:
           throw "Hyper-V SVGA firmware was not found: $svgaFirmware"
         }
 
-    - name: Validate host TSC
+    # Time ABI host qualification (doc/design/time-abi.md, "Host
+    # qualification"); it replaces the nonstop_tsc check. H3 and H6 need the
+    # OpenVMM binary and guest artifacts, which jobs download later.
+    - name: Qualify host time on Linux
       if: runner.os != 'Windows'
       shell: bash
-      run: |
-        set -euo pipefail
-        # Guests on a host without an invariant TSC intermittently see
-        # cross-vCPU TSC warps, which make Linux mark the guest TSC unstable
-        # (#211).
-        echo "Kernel: $(uname -r)"
-        echo "CPU: $(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo)"
-        echo "Clocksource: $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null || echo unknown)"
-        flags=" $(awk -F': ' '/^flags/ { print $2; exit }' /proc/cpuinfo) "
-        for flag in constant_tsc nonstop_tsc tsc_known_freq tsc_reliable; do
-          case "${flags}" in
-            *" ${flag} "*) echo "TSC flag ${flag}: present" ;;
-            *) echo "TSC flag ${flag}: absent" ;;
-          esac
-        done
-        case "${flags}" in
-          *" nonstop_tsc "*) ;;
-          *)
-            echo "::error::Runner host does not expose an invariant TSC (nonstop_tsc); redeploy the VM on a host that does" >&2
-            exit 1
-            ;;
-        esac
+      run: >-
+        python3 scripts/nvx.py doctor
+        --backend "${{ inputs.backend }}"
+        --checks H1 H2 H4 H5 H7
+        --summary "${GITHUB_STEP_SUMMARY}"
+
+    - name: Qualify host time on Windows
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: >-
+        python scripts\nvx.py doctor
+        --backend "${{ inputs.backend }}"
+        --checks H1 H2 H4 H5 H7
+        --summary "$env:GITHUB_STEP_SUMMARY"
 
     - name: Validate KVM
       if: inputs.backend == 'kvm'
