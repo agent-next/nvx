@@ -1402,6 +1402,53 @@ class MicrovmTests(unittest.TestCase):
         self.assertIn("NVX-SNAPSHOT-UUID-", script)
         self.assertIn("NVX-SNAPSHOT-TEMP-ID-", script)
 
+    def test_snapshot_core_reads_the_entropy_that_nvx_time_kept(self):
+        # Restore packet v4 is consumed by nvx-time capture, which leaves the
+        # entropy of an untiered restore in /run/nvx/restore-entropy.
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        script = microvm_tests._read_script("snapshot-core.sh")
+        self.assertNotIn("OPENVMM_ENTROPY_V1", script)
+        self.assertNotIn("/dev/port", script)
+        section = (
+            "generation_id_after="
+            + script.split("generation_id_after=", 1)[1].split("rng=", 1)[0]
+        )
+        generation = bytes(range(16))
+        cases = (
+            (generation + bytes(48), "00" * 16, "reseeded", 0),
+            (generation + bytes(47), "00" * 16, "FAIL 44", 44),
+            (bytes(16) + bytes(48), "00" * 16, "FAIL 52", 52),
+            (generation + bytes(48), generation.hex(), "FAIL 51", 51),
+        )
+        for entropy, before, expected, status in cases:
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "restore-entropy"
+                    path.write_bytes(entropy)
+                    body = (
+                        section.replace("/run/nvx/restore-entropy", path.as_posix())
+                        .replace("/sbin/nvx-time", "nvx_time")
+                        .replace("/sbin/nvx-reseed", "nvx_reseed")
+                    )
+                    result = subprocess.run(
+                        [shell],
+                        input=(
+                            "set -eu\n"
+                            'fail() { echo "FAIL $1"; exit "$1"; }\n'
+                            f"nvx_time() {{ echo {generation.hex()}; }}\n"
+                            'nvx_reseed() { echo "reseeded"; }\n'
+                            f"generation_id_before={before}\n" + body
+                        ),
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                        check=False,
+                    )
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertIn(expected, result.stdout)
+
     def test_smp_worker_requires_bounded_local_timer_progress(self):
         shell = _posix_shell()
         if shell is None:
