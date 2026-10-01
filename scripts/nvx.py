@@ -65,6 +65,7 @@ from nvx_tools.common import (
 from nvx_tools.create_linux_source_archive import (
     configure_parser as configure_linux_source_archive_parser,
 )
+from nvx_tools.doctor import configure_parser as configure_doctor_parser
 from nvx_tools.guests import GUEST_NAMES, guest_descriptor
 from nvx_tools.microvm_tests import configure_parser as configure_microvm_test_parser
 from nvx_tools.performance import configure_parser as configure_performance_parser
@@ -687,6 +688,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="run NVX-owned OpenVMM microVM correctness tests",
     )
     configure_microvm_test_parser(microvm_tests)
+
+    doctor = subparsers.add_parser(
+        "doctor",
+        help="qualify this host for the NVX time ABI",
+    )
+    configure_doctor_parser(doctor)
 
     adversarial_tests = subparsers.add_parser(
         "test-adversarial",

@@ -141,6 +141,34 @@ pull requests run the GitHub-hosted validation jobs but do not execute code on
 the Azure runner fleet. A maintainer must stage an external contribution on a
 trusted repository branch before running the backend matrices.
 
+## Host qualification
+
+`python3 scripts/nvx.py doctor --backend <kvm|mshv|whp>` qualifies a host for
+the [time ABI](design/time-abi.md#host-qualification). It runs checks H1 to H7
+in order, prints one `NVX-DOCTOR: check=<id> status=<pass|fail> detail="..."`
+line per check, and exits with status 1 if any check fails. `--checks` selects
+a subset, and `--summary` appends a Markdown table with the CPU generation,
+profile, rates, and skew metrics to a file such as `$GITHUB_STEP_SUMMARY`. A
+failure that matches a time ABI failure code starts its detail with the code in
+brackets, for example `[E_PROFILE_HOST_UNKNOWN]`.
+
+| Check | Implementation |
+| --- | --- |
+| H1 | `/dev/kvm` or `/dev/mshv` is readable and writable, and a KVM host has no `/dev/mshv`; on Windows, `WHvGetCapability` reports a hypervisor |
+| H2 | Vendor, family, model, stepping, microcode, and OS build from `/proc/cpuinfo` or the Windows registry, and the generation and the profile that `auto` selects from the spec's catalog, which shares one profile per generation across backends: `skylake-sp` (6/85, steppings 0 to 4, `intel.skylake-sp.v1`), `icelake-sp` (6/106, `intel.icelake-sp.v1`), or `emeraldrapids` (6/207, `intel.emeraldrapids.v1`). Any other CPU, including Cascade Lake and Cooper Lake, fails with `E_PROFILE_HOST_UNKNOWN`. A Linux host must report `constant_tsc` and `nonstop_tsc` (`E_PROFILE_UNSUPPORTED`), so `azure-azlinux-2` stays unqualified. A Windows host's invariant-TSC CPUID bit is only reported: Azure WHP hosts cannot see one, and the spec qualifies them on the measured warp and rate stability |
+| H3 | `openvmm --x-time-abi-verify` builds the partition and runs the time ABI preflight without running the guest. Its `NVX-TIME-ABI-VERIFY:` line must report `status=ok` for the backend, plausible declared and native TSC rates, the backend's LAPIC rate, and a revision of the profile H2 names; OpenVMM's interim `interim.host.<backend>.v1` profile is accepted until it selects catalog profiles. A failed preflight reports OpenVMM's code, for example `[E_TSC_SYNC_UNSUPPORTED]`. Before the flip, pass `--openvmm-arg=--x-time-abi-v1` |
+| H4 | Two 1 s measurements of the TSC against host monotonic time agree within 1 ppm, and lie within 100 ppm of the rate H3 reports when H3 runs in the same invocation. A KVM host's clocksource must be `tsc`; an MSHV root's may also be `hyperv_clocksource_tsc_page` |
+| H5 | Pinned-thread ping-pong rounds over every pair of host CPUs; `max_abs_offset_ns` is at most 1,000, the measurement is conclusive, and no pair stalls |
+| H6 | A microVM with the largest supported vCPU count up to 8 prints a valid `NVX-TIME-ABI` boot marker, and `nvx-time-probe warp` stays within 1,000 ns |
+| H7 | `adjtimex` reports no `STA_UNSYNC` on Linux; `w32tm /query /status` names a synchronized source on Windows |
+
+H2, H4, and H5 use a dependency-free host probe,
+[`host_time_probe.rs`](../scripts/nvx_tools/host_time_probe.rs), which the
+doctor builds with `rustc` once per source version into
+`$RUNNER_TOOL_CACHE/nvx-host-time-probe` (or `build/host-time-probe` outside
+CI). H3 and H6 need the OpenVMM binary and the guest artifacts; `--openvmm`,
+`--kernel`, and `--initrd` override their default build paths.
+
 ## Adversarial campaigns
 
 The separate

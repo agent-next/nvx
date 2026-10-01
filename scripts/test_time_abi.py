@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import queue
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from nvx_tools import benchmark, openvmm_process, time_abi  # noqa: E402
+from nvx_tools import benchmark, doctor, openvmm_process, time_abi  # noqa: E402
 from nvx_tools.time_abi import TimeAbiFailure, TimeAbiMonitor  # noqa: E402
 
 BOOT_LINE = (
@@ -96,13 +99,25 @@ class FieldParsingTests(unittest.TestCase):
             self.assertIsNone(time_abi.describe_exit_status(status))
 
     def test_maps_cpu_generations(self):
-        self.assertEqual(time_abi.cpu_generation("GenuineIntel", 6, 85), "skylake-sp")
-        self.assertEqual(time_abi.cpu_generation("GenuineIntel", 6, 106), "icelake-sp")
+        def name(model: int, stepping: int, vendor: str = "GenuineIntel"):
+            generation = time_abi.cpu_generation(vendor, 6, model, stepping)
+            return generation.name if generation else None
+
+        self.assertEqual(name(85, 4), "skylake-sp")
+        self.assertEqual(name(106, 6), "icelake-sp")
+        self.assertEqual(name(207, 2), "emeraldrapids")
+        # Cascade Lake and Cooper Lake share model 85 but have no profile.
+        self.assertIsNone(name(85, 7))
+        self.assertIsNone(name(85, 11))
+        self.assertIsNone(name(143, 8))
+        self.assertIsNone(name(1, 1, "AuthenticAMD"))
+
+    def test_names_the_catalog_profiles(self):
+        # One profile per generation serves every backend.
         self.assertEqual(
-            time_abi.cpu_generation("GenuineIntel", 6, 207), "emeraldrapids"
+            [generation.profile_id for generation in time_abi.CPU_GENERATIONS],
+            ["intel.skylake-sp.v1", "intel.icelake-sp.v1", "intel.emeraldrapids.v1"],
         )
-        self.assertIsNone(time_abi.cpu_generation("GenuineIntel", 6, 143))
-        self.assertIsNone(time_abi.cpu_generation("AuthenticAMD", 25, 1))
 
 
 class MonitorTests(unittest.TestCase):
@@ -457,6 +472,465 @@ class RunnerWiringTests(unittest.TestCase):
             console.wait_for(b"NEVER", 1.0)
         console.close()
         peer.close()
+
+
+def doctor_context(root: Path, backend: str = "kvm") -> doctor.DoctorContext:
+    return doctor.DoctorContext(
+        backend=backend,
+        openvmm=root / "openvmm",
+        kernel=root / "vmlinux",
+        initrd=root / "initramfs.cpio.gz",
+        openvmm_args=(),
+        probe_directory=root / "probe",
+        timeout=30,
+    )
+
+
+def completed(stdout: str, returncode: int = 0, stderr: str = ""):
+    return subprocess.CompletedProcess(["x"], returncode, stdout, stderr)
+
+
+CPU = {
+    "vendor": "GenuineIntel",
+    "family": "6",
+    "model": "106",
+    "stepping": "6",
+    "microcode": "0xffffffff",
+    "brand": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+    "os": "Linux 6.6.150.1-1.azl3",
+    "invariant_tsc": "yes",
+}
+
+
+class DoctorTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_check_lines_escape_details_for_field_parsers(self):
+        line = doctor.CheckResult("H5", False, 'say "x" \\ y').line()
+        self.assertTrue(line.startswith("NVX-DOCTOR: check=H5 status=fail "))
+        fields = time_abi.parse_fields(line.removeprefix(doctor.DOCTOR_PREFIX))
+        self.assertEqual(fields["detail"], 'say "x" \\ y')
+
+    def test_backend_check_requires_a_usable_device(self):
+        context = doctor_context(self.root)
+        existing: set[str] = set()
+
+        def exists(path: Path) -> bool:
+            return path.as_posix() in existing
+
+        with (
+            patch.object(doctor, "host_is_windows", return_value=False),
+            patch.object(doctor.Path, "exists", exists),
+            patch.object(doctor.os, "access", return_value=True) as access,
+        ):
+            self.assertIn("does not exist", doctor.check_backend(context).detail)
+            existing.add("/dev/kvm")
+            self.assertTrue(doctor.check_backend(context).passed)
+            existing.add("/dev/mshv")
+            self.assertIn("select MSHV", doctor.check_backend(context).detail)
+            existing.discard("/dev/mshv")
+            access.return_value = False
+            self.assertIn("not readable", doctor.check_backend(context).detail)
+        with patch.object(doctor, "host_is_windows", return_value=False):
+            whp = doctor.check_backend(doctor_context(self.root, "whp"))
+        self.assertFalse(whp.passed)
+        self.assertIn("requires Windows", whp.detail)
+
+    def test_cpu_check_names_the_generation_and_applies_the_invariant_tsc_rule(self):
+        context = doctor_context(self.root)
+        with patch.object(doctor, "host_cpu", return_value=dict(CPU)):
+            result = doctor.check_cpu(context)
+        self.assertTrue(result.passed)
+        self.assertIn("generation=icelake-sp", result.detail)
+        self.assertIn("profile=intel.icelake-sp.v1", result.detail)
+        self.assertEqual(context.facts["generation"], "icelake-sp")
+        for unknown in (dict(CPU, model="143"), dict(CPU, model="85", stepping="7")):
+            with patch.object(doctor, "host_cpu", return_value=unknown):
+                result = doctor.check_cpu(doctor_context(self.root))
+            self.assertFalse(result.passed)
+            self.assertTrue(result.detail.startswith("[E_PROFILE_HOST_UNKNOWN] "))
+        emerald = dict(CPU, model="207", stepping="2")
+        with patch.object(doctor, "host_cpu", return_value=emerald):
+            for backend in ("kvm", "mshv", "whp"):
+                result = doctor.check_cpu(doctor_context(self.root, backend))
+                self.assertTrue(result.passed, result.detail)
+                self.assertIn("profile=intel.emeraldrapids.v1", result.detail)
+        variant = dict(CPU, invariant_tsc="no (missing nonstop_tsc)")
+        with patch.object(doctor, "host_cpu", return_value=variant):
+            result = doctor.check_cpu(doctor_context(self.root, "mshv"))
+            self.assertTrue(result.detail.startswith("[E_PROFILE_UNSUPPORTED] "))
+            # A WHP host qualifies on measured properties instead.
+            self.assertTrue(doctor.check_cpu(doctor_context(self.root, "whp")).passed)
+
+    def test_reads_the_first_processor_from_cpuinfo(self):
+        path = self.root / "cpuinfo"
+        path.write_text(
+            "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\n"
+            "model\t\t: 85\nstepping\t: 4\nmicrocode\t: 0x2007108\n"
+            "flags\t\t: fpu tsc constant_tsc nonstop_tsc\n\n"
+            "processor\t: 1\nvendor_id\t: Other\n",
+            encoding="utf-8",
+        )
+        fields = doctor._linux_cpuinfo(path)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(fields["vendor_id"], "GenuineIntel")
+        self.assertEqual(fields["model"], "85")
+        self.assertIn("nonstop_tsc", fields["flags"])
+
+    def test_preflight_parses_openvmm_verification(self):
+        # The line format of OpenVMM's openvmm_entry verify.rs.
+        line = (
+            "NVX-TIME-ABI-VERIFY: v=1 status=ok backend=kvm "
+            "cpu_profile=intel.icelake-sp.v1 tsc_hz=2793437000 "
+            "native_tsc_hz=2793437000 lapic_hz=1000000000 msr_route=ExitToVmm "
+            "sync=CommonOffset\n"
+        )
+
+        def context_with_files(backend: str = "kvm") -> doctor.DoctorContext:
+            context = doctor_context(self.root, backend)
+            for path in (context.openvmm, context.kernel, context.initrd):
+                path.write_bytes(b"")
+            return context
+
+        context = context_with_files()
+        with patch.object(
+            doctor.subprocess, "run", return_value=completed(line)
+        ) as run:
+            result = doctor.check_openvmm_preflight(context)
+        self.assertTrue(result.passed, result.detail)
+        self.assertEqual(context.facts["native_tsc_hz"], "2793437000")
+        self.assertEqual(context.facts["profile"], "intel.icelake-sp.v1")
+        command = run.call_args.args[0]
+        self.assertEqual(command[-1], "--x-time-abi-verify")
+        self.assertNotIn("--x-time-abi-v1", command)
+        self.assertEqual(command[command.index("--kernel") + 1], str(context.kernel))
+        switched = context_with_files()
+        switched.openvmm_args = ("--x-time-abi-v1",)
+        with patch.object(
+            doctor.subprocess, "run", return_value=completed(line)
+        ) as run:
+            self.assertTrue(doctor.check_openvmm_preflight(switched).passed)
+        self.assertEqual(
+            run.call_args.args[0][-2:], ["--x-time-abi-v1", "--x-time-abi-verify"]
+        )
+        failure = (
+            "NVX-TIME-ABI-VERIFY: v=1 status=fail backend=kvm "
+            'code=E_TSC_SYNC_UNSUPPORTED detail="failed: \\"sync\\" unsupported"\n'
+        )
+        cases = (
+            (
+                completed(failure, 1),
+                '[E_TSC_SYNC_UNSUPPORTED] OpenVMM verification failed (exit 1): failed: "sync" unsupported',
+            ),
+            (
+                completed("", 2, "error: unexpected argument '--x-time-abi-v1' found"),
+                "predates the time ABI",
+            ),
+            (completed(line.replace("1000000000", "200000000")), "[E_LAPIC_RATE_"),
+            (
+                completed(line.replace("tsc_hz=2793437000", "tsc_hz=4000", 1)),
+                "[E_TSC_RATE_",
+            ),
+            (
+                completed(line.replace("backend=kvm", "backend=mshv")),
+                "verified backend mshv",
+            ),
+        )
+        for result_value, message in cases:
+            with self.subTest(message=message):
+                with patch.object(doctor.subprocess, "run", return_value=result_value):
+                    result = doctor.check_openvmm_preflight(context_with_files())
+                self.assertFalse(result.passed)
+                self.assertIn(message, result.detail)
+        for selected, passed in (
+            ("intel.icelake-sp.v2", True),
+            ("intel.skylake-sp.v1", False),
+            # OpenVMM's interim host profile until it selects catalog profiles.
+            ("interim.host.kvm.v1", True),
+            ("interim.host.mshv.v1", False),
+        ):
+            with self.subTest(selected=selected):
+                context = context_with_files()
+                context.facts["profile"] = "intel.icelake-sp.v1"
+                output = line.replace("intel.icelake-sp.v1", selected)
+                with patch.object(
+                    doctor.subprocess, "run", return_value=completed(output)
+                ):
+                    result = doctor.check_openvmm_preflight(context)
+                self.assertEqual(result.passed, passed, result.detail)
+                self.assertEqual(context.facts["profile"], selected)
+        missing = doctor.check_openvmm_preflight(doctor_context(self.root / "none"))
+        self.assertFalse(missing.passed)
+        self.assertIn("was not found", missing.detail)
+
+    def test_rate_check_requires_stability_the_backend_rate_and_a_tsc_clocksource(self):
+        def records(first: float, second: float):
+            return [
+                ("rate", {"tsc_hz": f"{first:.3f}"}),
+                ("rate", {"tsc_hz": f"{second:.3f}"}),
+            ]
+
+        context = doctor_context(self.root)
+        context.facts["tsc_hz"] = "2793437000"
+        with (
+            patch.object(
+                doctor, "run_probe", return_value=records(2793437500, 2793437800)
+            ),
+            patch.object(doctor, "host_clocksource", return_value="tsc"),
+        ):
+            result = doctor.check_rate(context)
+        self.assertTrue(result.passed, result.detail)
+        cases = (
+            (records(2793437000, 2793440000), "tsc", "unstable"),
+            (records(2794000000, 2794000001), "tsc", "ppm from the measured"),
+            (records(2793437000, 2793437000), "hpet", "clocksource is hpet"),
+        )
+        for probe_records, clocksource, message in cases:
+            with self.subTest(message=message):
+                context = doctor_context(self.root)
+                context.facts["tsc_hz"] = "2793437000"
+                with (
+                    patch.object(doctor, "run_probe", return_value=probe_records),
+                    patch.object(doctor, "host_clocksource", return_value=clocksource),
+                ):
+                    result = doctor.check_rate(context)
+                self.assertFalse(result.passed)
+                self.assertIn(message, result.detail)
+        mshv = doctor_context(self.root, "mshv")
+        mshv.facts["tsc_hz"] = "2300000000"
+        with (
+            patch.object(
+                doctor, "run_probe", return_value=records(2300000100, 2300000200)
+            ),
+            patch.object(
+                doctor, "host_clocksource", return_value="hyperv_clocksource_tsc_page"
+            ),
+        ):
+            self.assertTrue(doctor.check_rate(mshv).passed)
+        with (
+            patch.object(
+                doctor, "run_probe", return_value=records(2300000100, 2300000200)
+            ),
+            patch.object(doctor, "host_clocksource", return_value="tsc"),
+        ):
+            standalone = doctor.check_rate(doctor_context(self.root))
+        # Without H3 (validate-runner), H4 still checks stability.
+        self.assertTrue(standalone.passed, standalone.detail)
+        self.assertIn("not compared with the backend's rate", standalone.detail)
+        with (
+            patch.object(
+                doctor, "run_probe", return_value=records(2300000100, 2300009100)
+            ),
+            patch.object(doctor, "host_clocksource", return_value="tsc"),
+        ):
+            unstable = doctor.check_rate(doctor_context(self.root))
+        self.assertFalse(unstable.passed)
+        self.assertIn("unstable", unstable.detail)
+
+    def test_host_skew_check_applies_the_bound(self):
+        summary = {
+            "pairs": "28",
+            "cpus": "0-7",
+            "max_abs_offset_ns": "40",
+            "max_uncertainty_ns": "120",
+            "stalled_pairs": "0",
+            "conclusive": "1",
+        }
+        context = doctor_context(self.root)
+        context.facts["measured_tsc_hz"] = "2793437000"
+        with patch.object(doctor, "run_probe", return_value=[("skew", summary)]) as run:
+            self.assertTrue(doctor.check_host_skew(context).passed)
+        self.assertIn("--tsc-hz", run.call_args.args)
+        for changes, message in (
+            ({"max_abs_offset_ns": "1500"}, "exceeds 1000"),
+            ({"stalled_pairs": "2", "conclusive": "0"}, "2 CPU pair(s) stalled"),
+            ({"conclusive": "0"}, "inconclusive"),
+        ):
+            with (
+                self.subTest(message=message),
+                patch.object(
+                    doctor, "run_probe", return_value=[("skew", summary | changes)]
+                ),
+            ):
+                result = doctor.check_host_skew(doctor_context(self.root))
+                self.assertFalse(result.passed)
+                self.assertIn(message, result.detail)
+
+    def test_guest_warp_check_requires_the_boot_marker_and_the_skew_bound(self):
+        context = doctor_context(self.root)
+        for path in (context.openvmm, context.kernel, context.initrd):
+            path.write_bytes(b"")
+        text = (
+            BOOT_LINE.replace("cpus=4", "cpus=8")
+            + " ALPINE-MICROVM-BOOT-OK: 3.22.1\n"
+            + warp_output(pairs=28)
+        )
+        with (
+            patch.object(doctor.os, "cpu_count", return_value=8),
+            patch.object(
+                doctor, "run_guest_script", return_value={"text": text}
+            ) as run,
+        ):
+            result = doctor.check_guest_warp(context)
+        self.assertTrue(result.passed, result.detail)
+        self.assertEqual(context.facts["guest_warp_ns"], "15")
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--processors") + 1], "8")
+        with (
+            patch.object(doctor.os, "cpu_count", return_value=6),
+            patch.object(
+                doctor,
+                "run_guest_script",
+                return_value={"text": warp_output(pairs=6)},
+            ),
+        ):
+            result = doctor.check_guest_warp(doctor_context(self.root))
+        self.assertFalse(result.passed)
+        self.assertIn("vcpus=4", result.detail)
+        self.assertIn("NVX-TIME-ABI boot marker", result.detail)
+        missing = doctor.check_guest_warp(doctor_context(self.root / "missing"))
+        self.assertIn("OpenVMM was not found", missing.detail)
+
+    def test_utc_check_reads_the_host_clock_discipline(self):
+        context = doctor_context(self.root)
+        with patch.object(doctor, "host_is_windows", return_value=False):
+            with patch.object(doctor, "_linux_clock_state", return_value=(0, 0x2001)):
+                self.assertTrue(doctor.check_utc(context).passed)
+            with patch.object(doctor, "_linux_clock_state", return_value=(5, 0x0041)):
+                self.assertIn("STA_UNSYNC", doctor.check_utc(context).detail)
+        status = (
+            "Leap Indicator: 0(no warning)\nStratum: 2\n"
+            "Source: VM IC Time Synchronization Provider\n"
+        )
+        with (
+            patch.object(doctor, "host_is_windows", return_value=True),
+            patch.object(doctor.subprocess, "run", return_value=completed(status)),
+        ):
+            result = doctor.check_utc(context)
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn("VM IC Time Synchronization Provider", result.detail)
+        for unsynchronized in (
+            status.replace("0(no warning)", "3(not synchronized)"),
+            "Leap Indicator: 0\nSource: Local CMOS Clock\n",
+        ):
+            with (
+                patch.object(doctor, "host_is_windows", return_value=True),
+                patch.object(
+                    doctor.subprocess, "run", return_value=completed(unsynchronized)
+                ),
+            ):
+                self.assertFalse(doctor.check_utc(context).passed)
+
+    def test_run_prints_lines_writes_the_summary_and_fails_closed(self):
+        def passing(check: str):
+            def run_check(context: doctor.DoctorContext) -> doctor.CheckResult:
+                context.facts["generation"] = "emeraldrapids"
+                return doctor.CheckResult(check, True, f"{check} ok")
+
+            return run_check
+
+        def broken(context: doctor.DoctorContext) -> doctor.CheckResult:
+            del context
+            raise doctor.ScriptError("rustc is required to build the host time probe")
+
+        summary = self.root / "summary.md"
+        arguments = doctor_parser().parse_args(
+            [
+                "--backend",
+                "mshv",
+                "--checks",
+                "H5",
+                "H2",
+                "--summary",
+                str(summary),
+                "--probe-dir",
+                str(self.root),
+            ]
+        )
+        stdout = io.StringIO()
+        with (
+            patch.dict(doctor.CHECKS, {"H2": passing("H2"), "H5": passing("H5")}),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(doctor.run(arguments), 0)
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(
+            [line.split()[1] for line in lines if line.startswith("NVX-DOCTOR")],
+            ["check=H2", "check=H5"],
+        )
+        self.assertIn("passed; generation emeraldrapids", lines[-1])
+        self.assertIn("(mshv): passed", summary.read_text(encoding="utf-8"))
+        with (
+            patch.dict(doctor.CHECKS, {"H2": passing("H2"), "H5": broken}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(doctor.run(arguments), 1)
+        text = summary.read_text(encoding="utf-8")
+        self.assertIn("**fail** | rustc is required", text)
+        self.assertIn("Generation: `emeraldrapids`", text)
+
+    def test_builds_the_host_probe_once_per_source_version(self):
+        target = doctor.probe_path(self.root)
+        self.assertRegex(target.name, r"^nvx-host-time-probe-[0-9a-f]{16}(\.exe)?$")
+
+        def rustc(command: list[str], **_kwargs: object):
+            Path(command[command.index("-o") + 1]).write_bytes(b"probe")
+            return completed("")
+
+        with patch.object(doctor.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(doctor.ScriptError, "rustc is required"):
+                doctor.build_probe(self.root)
+        with (
+            patch.object(doctor.shutil, "which", return_value="rustc"),
+            patch.object(doctor.subprocess, "run", side_effect=rustc) as run,
+        ):
+            self.assertEqual(doctor.build_probe(self.root), target)
+            self.assertEqual(doctor.build_probe(self.root), target)
+        run.assert_called_once()
+        self.assertEqual(target.read_bytes(), b"probe")
+        target.unlink()
+        with (
+            patch.object(doctor.shutil, "which", return_value="rustc"),
+            patch.object(
+                doctor.subprocess, "run", return_value=completed("", 1, "error[E0425]")
+            ),
+        ):
+            with self.assertRaisesRegex(doctor.ScriptError, "E0425"):
+                doctor.build_probe(self.root)
+
+    def test_parses_probe_records(self):
+        context = doctor_context(self.root)
+        context.probe = self.root / "probe.exe"
+        output = (
+            "noise\nNVX-HOST-TIME-PROBE rate index=1 tsc_hz=1.5\n"
+            "NVX-HOST-TIME-PROBE skew pairs=1 cpus=0-1\n"
+        )
+        with patch.object(doctor.subprocess, "run", return_value=completed(output)):
+            records = doctor.run_probe(context, "skew")
+        self.assertEqual(
+            records,
+            [
+                ("rate", {"index": "1", "tsc_hz": "1.5"}),
+                ("skew", {"pairs": "1", "cpus": "0-1"}),
+            ],
+        )
+        with patch.object(
+            doctor.subprocess, "run", return_value=completed("", 3, "no CPU")
+        ):
+            with self.assertRaisesRegex(doctor.ScriptError, "skew failed: no CPU"):
+                doctor.run_probe(context, "skew")
+
+
+def doctor_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    doctor.configure_parser(parser)
+    return parser
 
 
 if __name__ == "__main__":

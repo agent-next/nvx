@@ -19,6 +19,7 @@ runs:
         python3 scripts/nvx.py test-microvm --help
         python3 scripts/nvx.py test-adversarial --help
         python3 scripts/nvx.py benchmark --help
+        python3 scripts/nvx.py doctor --help
 
     - name: Validate NVX CLI on Windows
       if: runner.os == 'Windows'
@@ -44,4 +45,6 @@ runs:
         python scripts\nvx.py test-adversarial --help
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         python scripts\nvx.py benchmark --help
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        python scripts\nvx.py doctor --help
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

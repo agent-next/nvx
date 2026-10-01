@@ -10,6 +10,7 @@ probe's 1 us skew bound and the CPU generation names used in reports.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 MARKER_PREFIX = "NVX-TIME-ABI: "
 VIOLATION_PREFIX = "NVX-TIME-ABI-VIOLATION: "
@@ -31,11 +32,32 @@ WARP_BOUND_NS = 1000
 WARP_PROBE_PATH = "/sbin/nvx-time-probe"
 WARP_SUMMARY_PREFIX = "NVX-TIME-PROBE warp "
 WARP_DETAIL_PREFIX = "NVX-TIME-PROBE warp-detail "
-CPU_GENERATIONS: Mapping[tuple[str, int, int], str] = {
-    ("GenuineIntel", 6, 85): "skylake-sp",
-    ("GenuineIntel", 6, 106): "icelake-sp",
-    ("GenuineIntel", 6, 207): "emeraldrapids",
-}
+PROFILE_VENDORS: Mapping[str, str] = {"GenuineIntel": "intel"}
+
+
+@dataclass(frozen=True)
+class CpuGeneration:
+    """One CPU generation of the spec's CPU profile catalog."""
+
+    name: str
+    vendor: str
+    family: int
+    model: int
+    steppings: range
+
+    @property
+    def profile_id(self) -> str:
+        """The catalog's v1 profile, which every backend shares."""
+        return f"{PROFILE_VENDORS[self.vendor]}.{self.name}.v1"
+
+
+# Model 85 also covers Cascade Lake (steppings 5-7) and Cooper Lake (10-11),
+# which have no profile.
+CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
+    CpuGeneration("skylake-sp", "GenuineIntel", 6, 85, range(5)),
+    CpuGeneration("icelake-sp", "GenuineIntel", 6, 106, range(16)),
+    CpuGeneration("emeraldrapids", "GenuineIntel", 6, 207, range(16)),
+)
 # Guest boot markers that init prints after the time ABI boot check.
 GUEST_BOOT_MARKERS = ("ALPINE-MICROVM-BOOT-OK", "NVX-GUEST-BOOT-OK:")
 _MAX_PENDING_LINE = 64 * 1024
@@ -45,9 +67,19 @@ class TimeAbiFailure(RuntimeError):
     """Raised when a guest or its console output violates the time ABI."""
 
 
-def cpu_generation(vendor: str, family: int, model: int) -> str | None:
-    """Return the time ABI generation name of a CPU, or None if unknown."""
-    return CPU_GENERATIONS.get((vendor, family, model))
+def cpu_generation(
+    vendor: str, family: int, model: int, stepping: int
+) -> CpuGeneration | None:
+    """Return the time ABI generation of a CPU, or None if it has none."""
+    for generation in CPU_GENERATIONS:
+        if (
+            generation.vendor == vendor
+            and generation.family == family
+            and generation.model == model
+            and stepping in generation.steppings
+        ):
+            return generation
+    return None
 
 
 def parse_fields(text: str) -> dict[str, str]:
