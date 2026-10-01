@@ -670,7 +670,7 @@ CPUID and MSRs are read on every online CPU through `/dev/cpu/<n>/cpuid` and
 | `C7` | `/proc/timer_list`: every online CPU's tick device is `lapic` with `hrtimer_interrupt` in one-shot mode; no `pit` or `hpet` device; no broadcast device | boot, capture, restore (deferred) |
 | `C8` | `/sys/bus/vmbus` and `/sys/devices/system/cpu/cpufreq/policy0` are absent; `rcu_cpu_stall_suppress` is 0 and `rcu_cpu_stall_timeout` is 21 | boot |
 | `C9` | `/proc/cmdline` contains none of `tsc_early_khz=`, `lapic_timer_hz=`, `notsc`, `nolapic`, `nolapic_timer`, `tsc=unstable`, `hpet=force`, or `clocksource=` with a value other than `tsc` | boot |
-| `C10` | The time daemon is running and has recorded no violation | capture, restore |
+| `C10` | The time daemon is running and has recorded no violation; `/sys/kernel/rcu_stall_count` is 0 | capture, restore |
 | `C11` | Debug kernel only: `/proc/sys/kernel/soft_watchdog` is 1 and `/proc/sys/kernel/hung_task_timeout_secs` is nonzero | boot |
 
 Capture and restore checks never wait. The boot `C7` check and the deferred
@@ -716,7 +716,9 @@ contains every substring of a row:
 
 Before the boot check passes, a match is reported by `C4`. Afterwards it is
 a runtime violation: the daemon emits the event and powers off with status
-194.
+194. The daemon also reads `/sys/kernel/rcu_stall_count` at every discipline
+poll and reports `G_RCU_STALL` if it is nonzero, so a stall is caught even if
+its log record is lost.
 
 A violation event is one line of at most 512 bytes:
 
@@ -769,15 +771,36 @@ in steps 2 and 3. Otherwise, in the restored process:
 11. Run the restore checks (`C1`, `C2`, and `C5` on newly onlined CPUs; `C3`
     for CPU 0; `C6`; `C10`). They do not wait.
 12. If `ACK_REQUIRED` is set, write the acknowledgement (2) to `0x605`.
-13. Signal the daemon to finish the restore off the latency path:
-    `membarrier(MEMBARRIER_CMD_GLOBAL, 0, 0)` (which waits for an RCU grace
-    period, so the grace period captured in flight has ended); restore the
+13. Signal the daemon to finish the restore off the latency path: wait for
+    the [grace period release](#rcu-grace-period-release); restore the
     values saved in steps 2 and 3 (`G_REPAIR_SUPPRESSION`); run the deferred
     `C7` check; print `NVX-TIME-ABI: v=1 phase=restore status=ok`; and restart
     the discipline at the fast cadence.
 
 Steps 6, 7, and 8 run in one helper process. Repair failures emit a violation
 event and power off with status 195.
+
+### RCU grace period release
+
+Stall suppression may be released only after the grace period that was in
+flight at capture has ended, or the restored guest reports a false stall.
+`membarrier(MEMBARRIER_CMD_GLOBAL)` does not guarantee this: Linux 6.18 skips
+`synchronize_rcu()` when one CPU is online, and with `rcupdate.rcu_expedited=1`
+it runs an expedited grace period, which does not end the in-flight normal
+one. The daemon therefore:
+
+1. saves `/sys/kernel/rcu_normal` and writes 1, so every synchronous grace
+   period, expedited or not, waits for a normal grace period;
+2. mounts a private `tmpfs` at `/run/nvx/rcu-sync` and unmounts it (on every
+   unmount, Linux 6.18 `namespace_unlock()` waits in
+   `synchronize_rcu_expedited()`, which now waits for a full normal grace
+   period started after the call, on any number of CPUs);
+3. restores `/sys/kernel/rcu_normal`; and
+4. releases the suppression.
+
+If step 2 has not returned after `rcu_cpu_stall_timeout` seconds, the daemon
+releases the suppression anyway: the grace period is genuinely stuck, and the
+kernel then reports the real stall.
 
 ### Wall-clock discipline
 
@@ -953,7 +976,7 @@ fail with the listed code.
 | Case | Hosts | Expected |
 | --- | --- | --- |
 | Same host, immediate | All | Restored; `DOWNTIME_UTC` clear |
-| Same host, downtime of 30 s (over the 21 s RCU stall timeout) | All | Restored; no RCU stall |
+| Same host, downtime of 30 s (over the 21 s RCU stall timeout), at 1 and 8 vCPUs, with and without `rcupdate.rcu_expedited=1` | All | Restored; no RCU stall; `rcu_stall_count` stays 0 |
 | Same host under DVFS load | prometheus32 | Restored |
 | Simulated host reboot: hooks `force-utc-downtime`, `boot-id-mismatch`, and `dest-rate-offset-ppm=+200`, then `-200` | One host per backend | Restored; `DOWNTIME_UTC` and `TEST_HOOKS` set; rate deviation reported |
 | Simulated rate beyond tolerance: `dest-rate-offset-ppm=+251` | One host per backend | `E_TSC_RATE_TOLERANCE` |
@@ -1015,9 +1038,13 @@ Removed from OpenVMM:
 
 Removed from NVX:
 
-- Kernel: patch 0004 (`lapic_timer_hz`), `CONFIG_CPU_FREQ`, and
-  `CONFIG_X86_INTEL_PSTATE`. `CONFIG_HYPERVISOR_GUEST` stays on and
-  `CONFIG_HYPERV` stays off.
+- Kernel: patch 0004 (`lapic_timer_hz`); `CONFIG_CPU_FREQ`,
+  `CONFIG_X86_INTEL_PSTATE`, and `CONFIG_SCHED_MC_PRIO` (which selects both
+  and needs ACPI CPPC data the microVM lacks); and `CONFIG_KVM_GUEST` with
+  `CONFIG_PARAVIRT_CLOCK` and `CONFIG_HALTPOLL_CPUIDLE`, which are dormant
+  without a KVM signature. `CONFIG_HYPERVISOR_GUEST` and `CONFIG_PARAVIRT`
+  stay on and `CONFIG_HYPERV` stays off. The CI debug kernel adds
+  `CONFIG_DEBUG_KERNEL` with the soft-lockup and hung-task detectors only.
 - Guest: RTC polling in `nvx-reseed`, and the restore packet v1 to v3 parser
   in `nvx-port-io`.
 - Harness: `tsc=reliable` and `no_timer_check` in `BASE_TUNING`; per-backend
