@@ -287,7 +287,7 @@ esac
 export NVX_VM_GENERATION_ID="$generation_id"
 entropy=$runtime/restore-entropy
 
-# Restore steps 9 to 13 of the time ABI (doc/design/time-abi.md). nvx-time
+# Restore steps 9 to 12 of the time ABI (doc/design/time-abi.md). nvx-time
 # capture has already read restore packet v4, checked its generation, set
 # the wall clock, and written the entropy. Its metadata is FLAGS,
 # ONLINE_VP_COUNT, RANGE_COUNT, and the new generation ID, followed by START
@@ -391,7 +391,7 @@ post_restore() {
     finish_restore "$packet_flags"
 }
 
-# Restore steps 12 and 13: the acknowledgement when the host gated its input,
+# Restore steps 11 and 12: the acknowledgement when the host gated its input,
 # then the daemon's restore checks and grace-period release, which run off
 # the restore latency path. A second argument of "quiet" omits the stage and
 # completion lines of a plain untiered restore.
@@ -441,7 +441,8 @@ elif [ "$scratch_policy" = fresh ]; then
 fi
 
 # Capture steps 1 to 3: the capture checks and the stall-detector
-# suppression. They never wait.
+# suppression. They never wait, though nvx-time first lets pending boot
+# checks finish: they start the daemon that the capture checks require.
 /sbin/nvx-time pre-capture || exit 1
 stall_detectors_suppressed=true
 

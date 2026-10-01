@@ -5,19 +5,25 @@
 //
 // doc/design/time-abi.md ("Guest obligations") is the contract this helper
 // enforces. It runs the conformance checks, the violation watcher and the
-// wall-clock discipline (one daemon), and the snapshot agent's time steps:
+// wall-clock discipline (one daemon), and the snapshot agent's time steps. It
+// prints nothing on success: checks record their result in the state file,
+// and only violation events reach the console.
 //
-//   boot                       boot checks, initial clock step, daemon start
+//   boot                       initial clock step (C12), then the other boot
+//                              checks asynchronously, which start the daemon
 //   check --phase PHASE [--new-cpus LIST]
 //                              capture or restore checks, for diagnosis
 //   pre-capture                capture checks and watchdog suppression
-//   capture REQUEST GENERATION_ID ENTROPY_FILE
+//   capture REQUEST GENERATION_ID ENTROPY_FILE [--finish]
 //                              capture request, then restore repair
 //   cancel-capture             undo pre-capture after a rejected capture
 //   restore-finish [--ack] [--new-cpus LIST]
-//                              restore checks, acknowledgement, release
+//                              acknowledgement, then the daemon's restore
+//                              checks and release
+//   status                     print the last check and the runtime state
 //   sample                     print one host time sample
 //   generation-id              print the VM generation ID
+//   exhaustive                 the CI-only exhaustive check
 //   test NAME ARGUMENTS...     pure decoders and checks, for unit tests
 //
 // --report-only, or nvx_time_abi=report-only on the kernel command line,
@@ -116,6 +122,9 @@
 #define SLOW_TIME_CONSTANT 6
 #define TIMER_LIST_WAIT_NS (200 * NSEC_PER_MSEC)
 #define DEFAULT_STALL_TIMEOUT_S 21
+// nvx-time status and pre-capture wait at most 30 s for pending checks.
+#define STATUS_WAIT_NS (30 * NSEC_PER_SEC)
+#define STATUS_POLL_NS (10 * NSEC_PER_MSEC)
 #define EVENT_MAX 512
 #define DETAIL_MAX 384
 #define TEXT_MAX 65536
@@ -125,9 +134,10 @@
 #define STATE_PATH TIME_DIR "/state"
 #define STATE_TEMP_PATH TIME_DIR "/.state"
 #define STATE_LOCK_PATH TIME_DIR "/state.lock"
-#define RATES_PATH TIME_DIR "/rates"
+#define REPORT_PATH TIME_DIR "/report"
 #define DAEMON_PID_PATH TIME_DIR "/daemon.pid"
 #define SUPPRESSION_PATH TIME_DIR "/suppression"
+#define SUPPRESSION_LOCK_PATH TIME_DIR "/suppression.lock"
 #define RESTORE_PATH TIME_DIR "/restore"
 #define PORTB_LOCK_PATH RUN_DIR "/portb.lock"
 #define RCU_SYNC_PATH RUN_DIR "/rcu-sync"
@@ -639,6 +649,12 @@ static void fail_fatal(int status, const char *code, const char *source,
 
 struct time_state {
     uint64_t generation;
+    char check_phase[16];
+    char check_status[16];
+    uint64_t check_cpus;
+    int64_t check_elapsed_us;
+    uint64_t tsc_hz;
+    uint64_t lapic_hz;
     uint64_t discontinuities;
     char last_discontinuity[16];
     int64_t last_step_ns;
@@ -655,9 +671,13 @@ struct time_state {
     uint64_t violations;
 };
 
+// A fresh state is published at the start of the boot checks, which are then
+// pending.
 static void state_init(struct time_state *state)
 {
     memset(state, 0, sizeof(*state));
+    snprintf(state->check_phase, sizeof(state->check_phase), "boot");
+    snprintf(state->check_status, sizeof(state->check_status), "pending");
     snprintf(state->last_discontinuity, sizeof(state->last_discontinuity),
              "none");
     snprintf(state->last_downtime_source, sizeof(state->last_downtime_source),
@@ -681,6 +701,10 @@ static int state_parse(char *text, struct time_state *state)
         int64_t *signed_value;
     } const numbers[] = {
         {"generation", &state->generation, NULL},
+        {"check_cpus", &state->check_cpus, NULL},
+        {"check_elapsed_us", NULL, &state->check_elapsed_us},
+        {"tsc_hz", &state->tsc_hz, NULL},
+        {"lapic_hz", &state->lapic_hz, NULL},
         {"discontinuities", &state->discontinuities, NULL},
         {"last_step_ns", NULL, &state->last_step_ns},
         {"last_step_realtime_ns", NULL, &state->last_step_realtime_ns},
@@ -698,6 +722,8 @@ static int state_parse(char *text, struct time_state *state)
         char *value;
         size_t size;
     } const words[] = {
+        {"check_phase", state->check_phase, sizeof(state->check_phase)},
+        {"check_status", state->check_status, sizeof(state->check_status)},
         {"last_discontinuity", state->last_discontinuity,
          sizeof(state->last_discontinuity)},
         {"last_downtime_source", state->last_downtime_source,
@@ -743,6 +769,12 @@ static void state_format(const struct time_state *state, char *text,
     snprintf(text, size,
              "version=1\n"
              "generation=%" PRIu64 "\n"
+             "check_phase=%s\n"
+             "check_status=%s\n"
+             "check_cpus=%" PRIu64 "\n"
+             "check_elapsed_us=%" PRId64 "\n"
+             "tsc_hz=%" PRIu64 "\n"
+             "lapic_hz=%" PRIu64 "\n"
              "discontinuities=%" PRIu64 "\n"
              "last_discontinuity=%s\n"
              "last_step_ns=%" PRId64 "\n"
@@ -757,7 +789,9 @@ static void state_format(const struct time_state *state, char *text,
              "rejected_samples=%" PRIu64 "\n"
              "last_sample_error=%s\n"
              "violations=%" PRIu64 "\n",
-             state->generation, state->discontinuities,
+             state->generation, state->check_phase, state->check_status,
+             state->check_cpus, state->check_elapsed_us, state->tsc_hz,
+             state->lapic_hz, state->discontinuities,
              state->last_discontinuity, state->last_step_ns,
              state->last_step_realtime_ns, state->last_downtime_ns,
              state->last_downtime_source, state->synchronized,
@@ -822,27 +856,61 @@ static int64_t frequency_to_ppb(int64_t frequency)
     return (scaled + (scaled >= 0 ? 32768 : -32768)) / 65536;
 }
 
+// F and L are published in the state file by the boot check.
 static int rates_load(uint64_t *tsc_hz, uint64_t *lapic_hz)
 {
-    char text[256];
-    unsigned long long tsc;
-    unsigned long long lapic;
+    struct time_state state;
 
-    if (read_text(RATES_PATH, text, sizeof(text)) < 0 ||
-        sscanf(text, "tsc_hz=%llu lapic_hz=%llu", &tsc, &lapic) != 2)
+    if (state_load(&state) != 0 || state.tsc_hz == 0 || state.lapic_hz == 0)
         return -1;
-    *tsc_hz = tsc;
-    *lapic_hz = lapic;
+    *tsc_hz = state.tsc_hz;
+    *lapic_hz = state.lapic_hz;
     return 0;
 }
 
-static int rates_store(uint64_t tsc_hz, uint64_t lapic_hz)
-{
-    char text[128];
+struct check_record {
+    enum phase phase;
+    const char *status;
+    int cpus;
+    int64_t elapsed_us;
+    uint64_t tsc_hz;
+    uint64_t lapic_hz;
+};
 
-    snprintf(text, sizeof(text), "tsc_hz=%" PRIu64 "\nlapic_hz=%" PRIu64 "\n",
-             tsc_hz, lapic_hz);
-    return replace_file(RATES_PATH, RATES_PATH ".tmp", text);
+static void apply_check(struct time_state *state, const void *context)
+{
+    const struct check_record *record = context;
+
+    snprintf(state->check_phase, sizeof(state->check_phase), "%s",
+             k_phase_names[record->phase]);
+    snprintf(state->check_status, sizeof(state->check_status), "%s",
+             record->status);
+    state->check_cpus = (uint64_t)record->cpus;
+    state->check_elapsed_us = record->elapsed_us;
+    if (record->tsc_hz != 0)
+        state->tsc_hz = record->tsc_hz;
+    if (record->lapic_hz != 0)
+        state->lapic_hz = record->lapic_hz;
+}
+
+// Records a conformance check in the state file: "pending" while it runs,
+// then "ok" (a failed check powers the guest off instead). Rates of 0 keep
+// the published ones. In report-only mode the failure count goes beside the
+// state, for nvx-time status.
+static int record_check(enum phase phase, const char *status, int cpus,
+                        int64_t elapsed_us, uint64_t tsc_hz, uint64_t lapic_hz,
+                        int failures)
+{
+    struct check_record record = {phase,      status, cpus,
+                                  elapsed_us, tsc_hz, lapic_hz};
+
+    if (g_report_only) {
+        char text[32];
+
+        snprintf(text, sizeof(text), "failures=%d\n", failures);
+        (void)replace_file(REPORT_PATH, REPORT_PATH ".tmp", text);
+    }
+    return state_apply(apply_check, &record);
 }
 
 // The watchdog settings saved before a capture, in the order they are
@@ -888,16 +956,29 @@ static int suppression_save(void)
     return 0;
 }
 
-// Writes back every value saved by suppression_save, then forgets them.
-static int suppression_restore(char *detail, size_t size)
+// Writes back every value saved by suppression_save, then forgets them. A
+// lock serializes the daemon's release at the stall timeout with the restore
+// worker's; with MISSING_OK, values already written back count as restored.
+static int suppression_restore(char *detail, size_t size, bool missing_ok)
 {
     char text[512];
     char *line = text;
+    int lock = lock_file(SUPPRESSION_LOCK_PATH);
+    int result = -1;
 
-    if (read_text(SUPPRESSION_PATH, text, sizeof(text)) < 0) {
-        snprintf(detail, size, "read %s: %s", SUPPRESSION_PATH,
+    if (lock < 0) {
+        snprintf(detail, size, "lock %s: %s", SUPPRESSION_LOCK_PATH,
                  strerror(errno));
         return -1;
+    }
+    if (read_text(SUPPRESSION_PATH, text, sizeof(text)) < 0) {
+        if (missing_ok && errno == ENOENT)
+            result = 0;
+        else
+            snprintf(detail, size, "read %s: %s", SUPPRESSION_PATH,
+                     strerror(errno));
+        close(lock);
+        return result;
     }
     while (*line != '\0') {
         char *next = strchr(line, '\n');
@@ -911,16 +992,18 @@ static int suppression_restore(char *detail, size_t size)
         if (write_text(line, value) != 0) {
             snprintf(detail, size, "restore %.200s: %s", line,
                      strerror(errno));
+            close(lock);
             return -1;
         }
         line = next != NULL ? next : line + strlen(line);
     }
-    if (unlink(SUPPRESSION_PATH) != 0) {
+    if (unlink(SUPPRESSION_PATH) != 0)
         snprintf(detail, size, "remove %s: %s", SUPPRESSION_PATH,
                  strerror(errno));
-        return -1;
-    }
-    return 0;
+    else
+        result = 0;
+    close(lock);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1450,33 +1533,26 @@ struct checks {
     uint64_t lapic_hz;
 };
 
-static bool check_failed_code(struct checks *checks, const char *id,
-                              const char *code, const char *format, ...)
-    __attribute__((format(printf, 4, 5)));
+static bool check_failed_code(struct checks *checks, const char *code,
+                              const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
 
 // Serializes failure reports from the boot check's per-CPU threads, which
 // share the console and the violation count.
 static pthread_mutex_t g_report_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// Prints the failure line, emits CODE, and powers off with status 193. In
-// report-only mode it returns false and the run continues.
-static bool check_failed_code(struct checks *checks, const char *id,
-                              const char *code, const char *format, ...)
+// Emits CODE and powers off with status 193; a failed check prints no
+// marker. In report-only mode it returns false and the run continues.
+static bool check_failed_code(struct checks *checks, const char *code,
+                              const char *format, ...)
 {
     char detail[DETAIL_MAX];
-    char escaped[DETAIL_MAX];
-    char line[EVENT_MAX + 64];
     va_list arguments;
 
     va_start(arguments, format);
     vsnprintf(detail, sizeof(detail), format, arguments);
     va_end(arguments);
-    escape_text(detail, escaped, sizeof(escaped) - 1);
-    snprintf(line, sizeof(line),
-             "%s: v=1 phase=%s status=fail check=%s detail=\"%s\"\n",
-             abi_prefix(), k_phase_names[checks->phase], id, escaped);
     pthread_mutex_lock(&g_report_lock);
-    console_write(line);
     checks->failures++;
     emit_event(code, "conformance", checks->phase, detail);
     if (!g_report_only)
@@ -1501,7 +1577,7 @@ static bool check_failed(struct checks *checks, const char *id,
     vsnprintf(detail, sizeof(detail), format, arguments);
     va_end(arguments);
     snprintf(code, sizeof(code), "G_CONFORMANCE_%s", id);
-    return check_failed_code(checks, id, code, "%s", detail);
+    return check_failed_code(checks, code, "%s", detail);
 }
 
 static int checks_init(struct checks *checks, enum phase phase)
@@ -2395,10 +2471,11 @@ static pid_t daemon_pid(void)
     return (pid_t)pid;
 }
 
-// The daemon finishes a restore (restore step 13 and the deferred step 11)
-// at idle priority, so that on few vCPUs it never takes the CPU from the
-// restored workload. musl does not implement sched_setscheduler(), and the
-// daemon is single-threaded, so the per-thread system call applies to it.
+// The asynchronous boot checks and restore step 12 run at idle priority, so
+// that on few vCPUs they never take a CPU from the workload; the watcher and
+// the discipline keep normal priority. musl does not implement
+// sched_setscheduler(), so this uses the per-thread system call: PID 0 is
+// the calling thread.
 static void set_idle_priority(pid_t pid, bool idle)
 {
     struct sched_param param = {0};
@@ -2407,17 +2484,16 @@ static void set_idle_priority(pid_t pid, bool idle)
                   &param);
 }
 
-// Restore steps 12 and 13 on the readiness path: the acknowledgement when the
-// host gated its input, then hand the rest of the restore to DAEMON. Returns
-// -1, without acknowledging, when no daemon runs; 1 when the daemon vanished
-// after the acknowledgement. The caller has enabled the ports when ACK is set.
+// Restore steps 11 and 12 on the readiness path: the acknowledgement when the
+// host gated its input, then hand step 12 to DAEMON. Returns -1, without
+// acknowledging, when no daemon runs; 1 when the daemon vanished after the
+// acknowledgement. The caller has enabled the ports when ACK is set.
 static int signal_restore(pid_t daemon, bool ack)
 {
     if (daemon <= 0 || kill(daemon, 0) != 0)
         return -1;
     if (ack)
         outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
-    set_idle_priority(daemon, true);
     return kill(daemon, SIGUSR1) == 0 ? 0 : 1;
 }
 
@@ -2785,14 +2861,9 @@ struct daemon {
     int timer;
     int polls;
     int64_t last_accepted_ns;
-    uint64_t tsc_hz;
-    uint64_t lapic_hz;
-    pid_t release_pid;
-    bool release_done;
-    int release_status;
-    int64_t release_deadline_ns;
-    int64_t restore_elapsed_us;
-    int restore_failures;
+    pid_t worker_pid;
+    int64_t worker_deadline_ns;
+    bool suppression_released;
 };
 
 static void watcher_consume(void *context, const char *message)
@@ -2908,24 +2979,14 @@ static void discipline_poll(struct daemon *daemon)
     (void)state_apply(apply_poll, &outcome);
     if (lock >= 0)
         close(lock);
-    if (!outcome.accepted) {
-        char epsilon[24] = "none";
-        char line[192];
-
-        if (result == 1)
-            snprintf(epsilon, sizeof(epsilon), "%" PRId64, outcome.epsilon);
-        snprintf(line, sizeof(line),
-                 "%s: v=1 phase=runtime status=uncertain "
-                 "code=G_SAMPLE_UNCERTAIN epsilon_ns=%s\n",
-                 abi_prefix(), epsilon);
-        console_write(line);
-    }
 }
 
 // Waits for a full normal RCU grace period: with rcu_normal set, the
 // synchronize_rcu_expedited() in every unmount waits for one that starts
-// after the call, on any number of CPUs. Runs in a child of the daemon.
-static void release_child(void)
+// after the call, on any number of CPUs. The private mount namespace makes the
+// caller a process of its own: the restore worker, or a child. Returns 0 when
+// the release completed.
+static int grace_period_release(void)
 {
     int64_t normal = 0;
     bool saved = read_int64(RCU_NORMAL, &normal) == 0 &&
@@ -2943,7 +3004,7 @@ static void release_child(void)
     }
     if (saved && write_int64(RCU_NORMAL, normal) != 0)
         status = 1;
-    _exit(status);
+    return status;
 }
 
 // Runs the grace-period release in a child and waits at most TIMEOUT_S
@@ -2964,7 +3025,7 @@ static bool release_with_deadline(int64_t timeout_s)
     pid = fork();
     if (pid == 0) {
         sigprocmask(SIG_SETMASK, &previous, NULL);
-        release_child();
+        _exit(grace_period_release());
     }
     while (pid > 0) {
         int status;
@@ -2989,23 +3050,6 @@ static bool release_with_deadline(int64_t timeout_s)
     return released;
 }
 
-static void print_restore_marker(int failures, int cpus, uint64_t tsc_hz,
-                                 uint64_t lapic_hz, int64_t elapsed_us)
-{
-    char suffix[32] = "";
-    char line[256];
-
-    if (g_report_only)
-        snprintf(suffix, sizeof(suffix), " failures=%d", failures);
-    snprintf(line, sizeof(line),
-             "%s: v=1 phase=restore status=%s cpus=%d tsc_hz=%" PRIu64
-             " lapic_hz=%" PRIu64 " generation=%" PRIu32
-             " elapsed_us=%" PRId64 "%s\n",
-             abi_prefix(), failures == 0 ? "ok" : "fail", cpus, tsc_hz,
-             lapic_hz, g_generation, elapsed_us, suffix);
-    console_write(line);
-}
-
 static void run_restore_checks(struct checks *checks, const bool *new_cpus,
                                int new_count);
 
@@ -3018,89 +3062,125 @@ static int parse_new_cpus(const char *text, bool *cpus)
     return parse_cpu_list(text, cpus);
 }
 
-// Parses the restore record: the generation and the repair time that the
-// capture helper wrote, and the CPUs that restore-finish onlined, when it ran.
+// Parses the restore record that restore-finish writes for the daemon: the
+// generation it finished and the CPUs that activation brought online.
 // Returns the number of those CPUs, or -1 when the record is malformed.
 static int parse_restore_record(const char *text, unsigned long long *generation,
-                                long long *elapsed_us, bool *new_cpus)
+                                bool *new_cpus)
 {
     char cpus[128] = "none";
 
-    if (sscanf(text, "generation=%llu elapsed_us=%lld new_cpus=%127s",
-               generation, elapsed_us, cpus) < 2)
+    if (sscanf(text, "generation=%llu new_cpus=%127s", generation, cpus) < 1)
         return -1;
     return parse_new_cpus(cpus, new_cpus);
 }
 
-// Step 13 after the grace period ended (or the stall timeout passed): put
-// the watchdog settings back, run the deferred C7, print the restore marker,
-// and restart the discipline at the fast cadence.
-static void complete_restore(bool released, uint64_t tsc_hz, uint64_t lapic_hz,
-                             int64_t elapsed_us, int failures)
-{
-    struct checks checks;
-    char detail[DETAIL_MAX];
-
-    if (!released)
-        fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
-                   PHASE_RESTORE, "the RCU grace-period release failed");
-    if (suppression_restore(detail, sizeof(detail)) != 0)
-        fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
-                   PHASE_RESTORE, "%s", detail);
-    if (checks_init(&checks, PHASE_RESTORE) != 0)
-        check_failed(&checks, "C7", "cannot read the online CPU set");
-    else
-        check_timer_list(&checks, TIMER_LIST_WAIT_NS);
-    print_restore_marker(failures + checks.failures, checks.online_count,
-                         tsc_hz, lapic_hz, elapsed_us);
-    set_idle_priority(0, false);
-}
-
-// Restore step 13, and step 11 after the acknowledgement: the restore checks
-// fail fast as before, then the grace-period release runs in a child.
-static void start_restore(struct daemon *daemon)
+// Restore step 12, fail-fast: the restore checks, the grace-period release,
+// the saved watchdog settings, the deferred C7, and the restore check's
+// record. A child of the daemon runs it at SCHED_IDLE, and the daemon
+// releases the suppression itself at the stall timeout; restore-finish runs it
+// inline, with its own deadline (WITH_DEADLINE), in report-only mode when no
+// daemon runs. Returns 0, or 1 when a report-only release failed.
+static int restore_work(const bool *new_cpus, int new_count, bool with_deadline)
 {
     int64_t start = clock_ns(CLOCK_MONOTONIC);
-    bool new_cpus[MAX_CPUS];
-    struct checks checks;
-    char text[256];
-    unsigned long long generation;
-    long long elapsed;
     int64_t timeout_s = DEFAULT_STALL_TIMEOUT_S;
-    int new_count;
-    pid_t pid;
+    char detail[DETAIL_MAX];
+    struct checks checks;
+    int64_t elapsed;
+    bool released;
 
-    if (daemon->release_pid > 0)
-        return;
-    set_idle_priority(0, true);
-    if (read_text(RESTORE_PATH, text, sizeof(text)) < 0 ||
-        (new_count = parse_restore_record(text, &generation, &elapsed,
-                                          new_cpus)) < 0) {
-        fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
-                   PHASE_RESTORE, "the restore record is unreadable");
-        return;
-    }
-    g_generation = (uint32_t)generation;
     if (checks_init(&checks, PHASE_RESTORE) != 0)
         check_failed(&checks, "C6", "cannot read the CPU sets");
     else
         run_restore_checks(&checks, new_cpus, new_count);
-    daemon->restore_failures = checks.failures;
-    daemon->restore_elapsed_us =
-        elapsed + (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC;
-    (void)read_int64(RCU_STALL_TIMEOUT, &timeout_s);
-    pid = fork();
-    if (pid == 0)
-        release_child();
-    if (pid < 0) {
-        complete_restore(false, daemon->tsc_hz, daemon->lapic_hz,
-                         daemon->restore_elapsed_us, daemon->restore_failures);
+    elapsed = clock_ns(CLOCK_MONOTONIC) - start;
+    if (with_deadline) {
+        (void)read_int64(RCU_STALL_TIMEOUT, &timeout_s);
+        released = release_with_deadline(timeout_s);
+    } else {
+        released = grace_period_release() == 0;
+    }
+    if (!released)
+        fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
+                   PHASE_RESTORE, "the RCU grace-period release failed");
+    if (suppression_restore(detail, sizeof(detail), true) != 0)
+        fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
+                   PHASE_RESTORE, "%s", detail);
+    start = clock_ns(CLOCK_MONOTONIC);
+    check_timer_list(&checks, TIMER_LIST_WAIT_NS);
+    elapsed += clock_ns(CLOCK_MONOTONIC) - start;
+    if (record_check(PHASE_RESTORE, "ok", checks.online_count,
+                     elapsed / NSEC_PER_USEC, 0, 0, checks.failures) != 0)
+        check_failed(&checks, "C10", "cannot record the restore check: %s",
+                     strerror(errno));
+    return released ? 0 : 1;
+}
+
+// Starts restore step 12 after the acknowledgement, in a child at
+// SCHED_IDLE, so the watcher and the discipline keep normal priority; the
+// fork itself also runs at SCHED_IDLE.
+static void start_restore(struct daemon *daemon)
+{
+    bool new_cpus[MAX_CPUS] = {false};
+    struct time_state state;
+    unsigned long long generation;
+    int64_t timeout_s = DEFAULT_STALL_TIMEOUT_S;
+    char text[256];
+    int new_count = 0;
+    pid_t pid;
+
+    if (daemon->worker_pid > 0)
+        return;
+    if (state_load(&state) != 0) {
+        fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
+                   PHASE_RESTORE, "the time state is unreadable");
         return;
     }
-    daemon->release_pid = pid;
-    daemon->release_done = false;
-    daemon->release_deadline_ns =
+    g_generation = (uint32_t)state.generation;
+    if (read_text(RESTORE_PATH, text, sizeof(text)) >= 0) {
+        new_count = parse_restore_record(text, &generation, new_cpus);
+        if (new_count < 0) {
+            fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
+                       PHASE_RESTORE, "the restore record is malformed");
+            return;
+        }
+        if (generation != state.generation) {
+            memset(new_cpus, 0, sizeof(new_cpus));
+            new_count = 0;
+        }
+    }
+    (void)read_int64(RCU_STALL_TIMEOUT, &timeout_s);
+    // The repair paired the clock with the packet's UTC.
+    daemon->last_accepted_ns = clock_ns(CLOCK_MONOTONIC);
+    set_idle_priority(0, true);
+    pid = fork();
+    if (pid == 0)
+        _exit(restore_work(new_cpus, new_count, false));
+    set_idle_priority(0, false);
+    if (pid < 0) {
+        fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
+                   PHASE_RESTORE, "cannot start the restore work: %s",
+                   strerror(errno));
+        return;
+    }
+    daemon->worker_pid = pid;
+    daemon->worker_deadline_ns =
         clock_ns(CLOCK_MONOTONIC) + timeout_s * NSEC_PER_SEC;
+    daemon->suppression_released = false;
+}
+
+// Releases the stall suppression for a worker whose grace period is still
+// pending at the stall timeout: the grace period is stuck, and the kernel
+// then reports the real stall.
+static void release_suppression(struct daemon *daemon)
+{
+    char detail[DETAIL_MAX];
+
+    daemon->suppression_released = true;
+    if (suppression_restore(detail, sizeof(detail), true) != 0)
+        fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
+                   PHASE_RESTORE, "%s", detail);
 }
 
 static void reap_children(struct daemon *daemon)
@@ -3109,10 +3189,20 @@ static void reap_children(struct daemon *daemon)
     pid_t pid;
 
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        if (pid == daemon->release_pid) {
-            daemon->release_done = true;
-            daemon->release_status = status;
+        if (pid != daemon->worker_pid)
+            continue;
+        daemon->worker_pid = 0;
+        // A failing worker powered the guest off itself, or reported in
+        // report-only mode; a crash leaves the suppression to the daemon.
+        if (!WIFEXITED(status)) {
+            release_suppression(daemon);
+            fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
+                       PHASE_RESTORE, "the restore work ended with signal %d",
+                       WTERMSIG(status));
         }
+        // Step 12 ends by restarting the discipline at the fast cadence.
+        daemon->polls = 0;
+        (void)arm_timer(daemon);
     }
 }
 
@@ -3162,11 +3252,12 @@ static void daemon_loop(struct daemon *daemon)
         struct pollfd fds[3] = {{daemon->kmsg, POLLIN, 0},
                                 {daemon->signals, POLLIN, 0},
                                 {daemon->timer, POLLIN, 0}};
+        bool waiting = daemon->worker_pid > 0 && !daemon->suppression_released;
         int timeout = -1;
 
-        if (daemon->release_pid > 0 && !daemon->release_done) {
+        if (waiting) {
             int64_t remaining =
-                daemon->release_deadline_ns - clock_ns(CLOCK_MONOTONIC);
+                daemon->worker_deadline_ns - clock_ns(CLOCK_MONOTONIC);
 
             timeout = remaining <= 0 ? 0
                                      : (int)((remaining + NSEC_PER_MSEC - 1) /
@@ -3189,108 +3280,37 @@ static void daemon_loop(struct daemon *daemon)
             discipline_poll(daemon);
             arm_timer(daemon);
         }
-        if (daemon->release_pid > 0 &&
-            (daemon->release_done ||
-             clock_ns(CLOCK_MONOTONIC) >= daemon->release_deadline_ns)) {
-            bool released = !daemon->release_done ||
-                            (WIFEXITED(daemon->release_status) &&
-                             WEXITSTATUS(daemon->release_status) == 0);
-
-            daemon->release_pid = 0;
-            complete_restore(released, daemon->tsc_hz, daemon->lapic_hz,
-                             daemon->restore_elapsed_us,
-                             daemon->restore_failures);
-            daemon->polls = 0;
-            daemon->last_accepted_ns = clock_ns(CLOCK_MONOTONIC);
-            arm_timer(daemon);
-        }
+        if (daemon->worker_pid > 0 && !daemon->suppression_released &&
+            clock_ns(CLOCK_MONOTONIC) >= daemon->worker_deadline_ns)
+            release_suppression(daemon);
     }
 }
 
-// Forks the daemon, which keeps reading the kernel log from where the boot
-// check stopped, waits until the daemon reports its descriptors ready, and
-// publishes its PID.
-static int start_daemon(int kmsg, uint64_t tsc_hz, uint64_t lapic_hz,
-                        int64_t last_accepted_ns)
+// Turns the boot checker into the time daemon, at normal priority. It keeps
+// reading the kernel log from where the boot check positioned KMSG and
+// publishes its PID once its descriptors are ready. Returns 0 or -1.
+static int become_daemon(struct daemon *daemon, int kmsg,
+                         int64_t last_accepted_ns)
 {
     char text[32];
-    int ready[2];
-    int error = 0;
-    ssize_t count;
-    pid_t pid;
+    int error;
 
-    if (pipe2(ready, O_CLOEXEC) != 0)
-        return -1;
-    pid = fork();
-    if (pid < 0) {
-        error = errno;
-        close(ready[0]);
-        close(ready[1]);
+    memset(daemon, 0, sizeof(*daemon));
+    daemon->kmsg = kmsg;
+    daemon->last_accepted_ns = last_accepted_ns;
+    set_idle_priority(0, false);
+    error = daemon_setup(daemon);
+    if (error != 0) {
         errno = error;
         return -1;
     }
-    if (pid == 0) {
-        struct daemon daemon;
-        int null = open("/dev/null", O_RDWR | O_CLOEXEC);
-
-        close(ready[0]);
-        memset(&daemon, 0, sizeof(daemon));
-        daemon.kmsg = kmsg;
-        daemon.tsc_hz = tsc_hz;
-        daemon.lapic_hz = lapic_hz;
-        daemon.last_accepted_ns = last_accepted_ns;
-        g_async_output = true;
-        (void)setsid();
-        if (null >= 0) {
-            (void)dup2(null, STDIN_FILENO);
-            (void)dup2(null, STDOUT_FILENO);
-            (void)dup2(null, STDERR_FILENO);
-            close(null);
-        }
-        error = chdir("/") != 0 ? errno : daemon_setup(&daemon);
-        (void)write_all(ready[1], &error, sizeof(error));
-        close(ready[1]);
-        if (error != 0)
-            _exit(1);
-        daemon_loop(&daemon);
-        _exit(0);
-    }
-    close(ready[1]);
-    do
-        count = read(ready[0], &error, sizeof(error));
-    while (count < 0 && errno == EINTR);
-    close(ready[0]);
-    if (count != (ssize_t)sizeof(error) || error != 0) {
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
-        errno = count == (ssize_t)sizeof(error) ? error : EIO;
-        return -1;
-    }
-    snprintf(text, sizeof(text), "%d\n", (int)pid);
+    snprintf(text, sizeof(text), "%d\n", (int)getpid());
     return replace_file(DAEMON_PID_PATH, DAEMON_PID_PATH ".tmp", text);
 }
 
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
-
-static void print_marker(const struct checks *checks, int64_t start_ns)
-{
-    char line[256];
-    char failures[32] = "";
-
-    if (g_report_only)
-        snprintf(failures, sizeof(failures), " failures=%d", checks->failures);
-    snprintf(line, sizeof(line),
-             "%s: v=1 phase=%s status=%s cpus=%d tsc_hz=%" PRIu64
-             " lapic_hz=%" PRIu64 " generation=%" PRIu32
-             " elapsed_us=%" PRId64 "%s\n",
-             abi_prefix(), k_phase_names[checks->phase],
-             checks->failures == 0 ? "ok" : "fail", checks->online_count,
-             checks->tsc_hz, checks->lapic_hz, g_generation,
-             (clock_ns(CLOCK_MONOTONIC) - start_ns) / NSEC_PER_USEC, failures);
-    console_write(line);
-}
 
 static void load_generation(void)
 {
@@ -3332,7 +3352,7 @@ static void boot_kernel_log(struct checks *checks, void *context)
     // K1 is kernel hardening, not time: a writable and executable kernel
     // mapping, such as unprotected ITS thunk pages.
     if (job->log->wx[0] != '\0')
-        check_failed_code(checks, "K1", "G_KERNEL_WX", "%s", job->log->wx);
+        check_failed_code(checks, "G_KERNEL_WX", "%s", job->log->wx);
 }
 
 // C7 beside the per-CPU checks.
@@ -3355,37 +3375,50 @@ struct boot_sample {
     int64_t accepted_ns;
 };
 
-// The boot checks that need no CPU of their own, C12 included, run in the
-// caller while the parallel jobs run.
+// The boot checks that need no CPU of their own run in the caller while the
+// parallel jobs run.
 static void boot_foreground(struct checks *checks, void *context)
 {
-    struct boot_sample *sample = context;
-
+    (void)context;
     check_cmdline(checks);
     check_platform(checks);
     check_clocksource(checks);
     check_debug_watchdogs(checks);
-    if (check_initial_sample(checks, &sample->theta, &sample->epsilon))
-        sample->accepted_ns = clock_ns(CLOCK_MONOTONIC);
 }
 
-static int cmd_boot(void)
+// The asynchronous boot checks: every boot check but C12, at SCHED_IDLE
+// after shell-ready, and fail-fast. When they pass, the checker becomes the
+// daemon and records the boot check, whose duration adds C12's (C12_NS).
+// It never returns.
+static void boot_checker(const struct boot_sample *sample, int64_t c12_ns,
+                         int c12_failures)
 {
     int64_t start = clock_ns(CLOCK_MONOTONIC);
+    int null = open("/dev/null", O_RDWR | O_CLOEXEC);
     struct boot_log_job log_job;
     struct side_job sides[3];
+    struct daemon daemon;
     struct checks checks;
     struct boot_log log;
-    struct time_state state;
-    struct boot_sample sample = {0, 0, 0};
+    bool started = false;
     int kmsg;
 
-    g_generation = 0;
-    make_runtime_directories();
+    g_async_output = true;
+    (void)setsid();
+    if (null >= 0) {
+        (void)dup2(null, STDIN_FILENO);
+        (void)dup2(null, STDOUT_FILENO);
+        (void)dup2(null, STDERR_FILENO);
+        close(null);
+    }
+    if (chdir("/") != 0)
+        _exit(1);
+    set_idle_priority(0, true);
     if (checks_init(&checks, PHASE_BOOT) != 0) {
         check_failed(&checks, "C1", "cannot read the CPU sets");
-        return 1;
+        _exit(1);
     }
+    checks.failures = c12_failures;
     memset(&log, 0, sizeof(log));
     log_job.log = &log;
     log_job.read_log = false;
@@ -3406,7 +3439,7 @@ static int cmd_boot(void)
     sides[1] = (struct side_job){.run = boot_timer_list};
     sides[2] = (struct side_job){.run = boot_cpuinfo};
     check_cpus_parallel(&checks, checks.online, true, true, sides,
-                        ARRAY_SIZE(sides), boot_foreground, &sample);
+                        ARRAY_SIZE(sides), boot_foreground, NULL);
     free(log_job.buffer);
     memcpy(checks.cpu_khz, sides[2].checks.cpu_khz, sizeof(checks.cpu_khz));
     memcpy(checks.cpu_khz_known, sides[2].checks.cpu_khz_known,
@@ -3418,21 +3451,62 @@ static int cmd_boot(void)
                      "cpu 0: floor(F / 1000) is %" PRIu64
                      " kHz but cpu MHz is %" PRIu64 " kHz",
                      checks.tsc_hz / 1000, checks.cpu_khz[0]);
+    if (kmsg >= 0) {
+        started = become_daemon(&daemon, kmsg, sample->accepted_ns) == 0;
+        if (!started)
+            check_failed(&checks, "C10", "cannot start the time daemon: %s",
+                         strerror(errno));
+    }
+    if (record_check(PHASE_BOOT, "ok", checks.online_count,
+                     (c12_ns + clock_ns(CLOCK_MONOTONIC) - start) /
+                         NSEC_PER_USEC,
+                     checks.tsc_hz, checks.lapic_hz, checks.failures) != 0)
+        check_failed(&checks, "C10", "cannot publish the time state: %s",
+                     strerror(errno));
+    if (!started)
+        _exit(1);
+    daemon_loop(&daemon);
+    _exit(0);
+}
+
+// Before shell-ready, only C12: the initial time sample and clock step, then
+// the published state. Every other boot check runs asynchronously in a child,
+// which becomes the daemon.
+static int cmd_boot(void)
+{
+    int64_t start = clock_ns(CLOCK_MONOTONIC);
+    struct boot_sample sample = {0, 0, 0};
+    struct time_state state;
+    struct checks checks;
+    pid_t pid;
+
+    g_generation = 0;
+    make_runtime_directories();
+    memset(&checks, 0, sizeof(checks));
+    checks.phase = PHASE_BOOT;
+    if (check_initial_sample(&checks, &sample.theta, &sample.epsilon))
+        sample.accepted_ns = clock_ns(CLOCK_MONOTONIC);
     state_init(&state);
     state.synchronized = sample.accepted_ns != 0;
     state.samples = sample.accepted_ns != 0;
     state.offset_ns = sample.accepted_ns != 0 ? sample.theta : 0;
     state.uncertainty_ns = sample.accepted_ns != 0 ? sample.epsilon : 0;
     state.frequency_ppb = frequency_to_ppb(current_frequency());
-    if (rates_store(checks.tsc_hz, checks.lapic_hz) != 0 ||
-        state_store(&state) != 0)
+    if (state_store(&state) != 0) {
         check_failed(&checks, "C10", "cannot publish the time state: %s",
                      strerror(errno));
-    else if (kmsg >= 0 && start_daemon(kmsg, checks.tsc_hz, checks.lapic_hz,
-                                       sample.accepted_ns) != 0)
-        check_failed(&checks, "C10", "cannot start the time daemon: %s",
+        return 1;
+    }
+    fflush(NULL);
+    pid = fork();
+    if (pid == 0)
+        boot_checker(&sample, clock_ns(CLOCK_MONOTONIC) - start,
+                     checks.failures);
+    if (pid < 0) {
+        check_failed(&checks, "C10", "cannot start the boot checks: %s",
                      strerror(errno));
-    print_marker(&checks, start);
+        return 1;
+    }
     return 0;
 }
 
@@ -3503,16 +3577,49 @@ static int cmd_check(int argc, char **argv)
         run_capture_checks(&checks);
     else
         run_restore_checks(&checks, new_cpus, new_count);
-    print_marker(&checks, start);
+    (void)record_check(phase, "ok", checks.online_count,
+                       (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC, 0,
+                       0, checks.failures);
     return checks.failures == 0 ? 0 : 1;
+}
+
+// Waits until no conformance check is pending, for at most STATUS_WAIT_NS,
+// and loads the state into STATE. Returns 0, 1 when a check is still
+// pending, or -1 when the state is unreadable.
+static int wait_for_checks(struct time_state *state)
+{
+    int64_t deadline = clock_ns(CLOCK_MONOTONIC) + STATUS_WAIT_NS;
+
+    for (;;) {
+        if (state_load(state) != 0)
+            return -1;
+        if (strcmp(state->check_status, "pending") != 0)
+            return 0;
+        if (clock_ns(CLOCK_MONOTONIC) >= deadline)
+            return 1;
+        (void)nanosleep(&(struct timespec){0, STATUS_POLL_NS}, NULL);
+    }
 }
 
 static int cmd_pre_capture(void)
 {
-    int64_t start = clock_ns(CLOCK_MONOTONIC);
+    struct time_state state;
     struct checks checks;
+    int64_t start;
+    int waited;
 
-    load_generation();
+    // The asynchronous boot checks start the daemon that C10 requires.
+    waited = wait_for_checks(&state);
+    if (waited != 0) {
+        memset(&checks, 0, sizeof(checks));
+        checks.phase = PHASE_CAPTURE;
+        check_failed(&checks, "C10", "%s",
+                     waited > 0 ? "the boot checks are still pending"
+                                : "the time state is unreadable");
+        return 1;
+    }
+    start = clock_ns(CLOCK_MONOTONIC);
+    g_generation = (uint32_t)state.generation;
     if (checks_init(&checks, PHASE_CAPTURE) != 0) {
         check_failed(&checks, "C6", "cannot read the CPU sets");
         return 1;
@@ -3523,13 +3630,17 @@ static int cmd_pre_capture(void)
         int error = errno;
 
         if (error != EEXIST)
-            (void)suppression_restore(detail, sizeof(detail));
+            (void)suppression_restore(detail, sizeof(detail), false);
         fprintf(stderr, "nvx-time: cannot suppress the stall detectors: %s\n",
                 error == EEXIST ? "a capture is already pending"
                                 : strerror(error));
         return 1;
     }
-    print_marker(&checks, start);
+    if (record_check(PHASE_CAPTURE, "ok", checks.online_count,
+                     (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC, 0, 0,
+                     checks.failures) != 0)
+        check_failed(&checks, "C10", "cannot record the capture check: %s",
+                     strerror(errno));
     return 0;
 }
 
@@ -3537,7 +3648,7 @@ static int cmd_cancel_capture(void)
 {
     char detail[DETAIL_MAX];
 
-    if (suppression_restore(detail, sizeof(detail)) != 0) {
+    if (suppression_restore(detail, sizeof(detail), false) != 0) {
         fprintf(stderr, "nvx-time: %s\n", detail);
         return 1;
     }
@@ -3574,6 +3685,11 @@ static void apply_repair(struct time_state *state, const void *context)
     state->samples++;
     snprintf(state->last_sample_error, sizeof(state->last_sample_error),
              "none");
+    // The daemon's step 12 runs the restore check after the acknowledgement.
+    snprintf(state->check_phase, sizeof(state->check_phase), "restore");
+    snprintf(state->check_status, sizeof(state->check_status), "pending");
+    state->check_cpus = 0;
+    state->check_elapsed_us = 0;
 }
 
 static int repair_failed(const char *code, const char *detail)
@@ -3583,13 +3699,14 @@ static int repair_failed(const char *code, const char *detail)
 }
 
 // Restore steps 6 to 8: read the packet with four-byte reads, validate it,
-// and set the wall clock from its bracketed UTC. The caller holds the portb
-// lock. With DAEMON set, an untiered restore with no processors or memory to
-// activate needs no shell work before the acknowledgement, so steps 12 and 13
-// run here too and no second helper process starts; the metadata then begins
-// with 2 instead of 1.
+// and set the wall clock from its bracketed UTC, then write the entropy to
+// ENTROPY_FD, the caller's file at ENTROPY_PATH. The caller holds the portb
+// lock. With FINISH (untiered) and a DAEMON, a restore with no processors or
+// memory to activate needs no shell work before the acknowledgement, so
+// steps 11 and 12 start here too and no second helper process starts; the
+// metadata then begins with 2 instead of 1.
 static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
-                          int64_t start_ns, pid_t daemon)
+                          int entropy_fd, bool finish, pid_t daemon)
 {
     static uint8_t body[PACKET_MAX_SIZE];
     static struct restore_packet packet;
@@ -3598,13 +3715,11 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
     struct time_sample sample;
     char detail[DETAIL_MAX];
     char id[GENERATION_ID_SIZE * 2 + 1];
-    char text[128];
     int64_t t0;
     int64_t t1;
     int64_t sample_theta;
     int64_t sample_epsilon;
     int finished = -1;
-    int fd;
 
     t0 = clock_ns(CLOCK_REALTIME);
     outb(SELECT_PACKET, PORTB_STATUS);
@@ -3613,6 +3728,8 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
     if (parse_packet_header(header, &packet, detail, sizeof(detail)) != 0)
         return repair_failed("G_REPAIR_PACKET", detail);
     if (packet.generation == g_generation) {
+        close(entropy_fd);
+        unlink(entropy_path);
         puts("0");
         return 0;
     }
@@ -3656,26 +3773,25 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
     }
     repair.step_realtime_ns = clock_ns(CLOCK_REALTIME);
     repair.packet = &packet;
-    fd = open(entropy_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
-              0600);
-    if (fd < 0 || write_all(fd, packet.entropy, PACKET_ENTROPY_SIZE) != 0 ||
-        close(fd) != 0) {
+    // The entropy goes to the caller in every case, an untiered restore's
+    // too; the file already exists, empty, so only its bytes are written.
+    if (pwrite(entropy_fd, packet.entropy, PACKET_ENTROPY_SIZE, 0) !=
+            PACKET_ENTROPY_SIZE ||
+        close(entropy_fd) != 0) {
         snprintf(detail, sizeof(detail), "write %.200s: %s", entropy_path,
                  strerror(errno));
         return repair_failed("G_REPAIR_PACKET", detail);
     }
-    snprintf(text, sizeof(text), "generation=%" PRIu32 "\nelapsed_us=%" PRId64 "\n",
-             packet.generation,
-             (clock_ns(CLOCK_MONOTONIC) - start_ns) / NSEC_PER_USEC);
-    if (state_apply(apply_repair, &repair) != 0 ||
-        replace_file(RESTORE_PATH, RESTORE_PATH ".tmp", text) != 0) {
+    if (state_apply(apply_repair, &repair) != 0) {
         snprintf(detail, sizeof(detail), "record the restore: %s",
                  strerror(errno));
         return repair_failed("G_REPAIR_CLOCK", detail);
     }
     format_hex(packet.entropy, GENERATION_ID_SIZE, id);
-    if (daemon > 0 && packet.online_vp_count == 0 && packet.range_count == 0 &&
-        (packet.flags & PACKET_MEMORY_TARGET) == 0) {
+    // A plain untiered restore needs no shell work: this helper also
+    // acknowledges and hands step 12 to the daemon.
+    if (finish && daemon > 0 && packet.online_vp_count == 0 &&
+        packet.range_count == 0 && (packet.flags & PACKET_MEMORY_TARGET) == 0) {
         finished = signal_restore(daemon,
                                   (packet.flags & PACKET_ACK_REQUIRED) != 0);
         if (finished > 0)
@@ -3703,9 +3819,9 @@ static int cmd_capture(int argc, char **argv)
     char detail[DETAIL_MAX];
     char *end;
     long request;
-    int64_t start;
     unsigned status;
     pid_t daemon = -1;
+    int entropy_fd;
     int result;
     int lock;
 
@@ -3730,38 +3846,48 @@ static int cmd_capture(int argc, char **argv)
     // the file reads off the restore path.
     if (argc == 4)
         daemon = daemon_pid();
+    // The entropy file is created before the capture, empty, so that a
+    // restored helper only writes its bytes: creating a file right after a
+    // restore faults in the filesystem's metadata, 4 to 9 ms on WHP.
+    entropy_fd = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW |
+                                   O_CLOEXEC,
+                      0600);
+    if (entropy_fd < 0) {
+        fprintf(stderr, "nvx-time: open %s: %s\n", argv[2], strerror(errno));
+        return 1;
+    }
     lock = lock_portb(detail, sizeof(detail));
     if (lock < 0) {
         fprintf(stderr, "nvx-time: %s\n", detail);
+        close(entropy_fd);
+        unlink(argv[2]);
         return 1;
     }
     outb((unsigned char)request, PORT_SNAPSHOT);
-    start = clock_ns(CLOCK_MONOTONIC);
     status = inb(PORTB_STATUS);
     if ((status & PORTB_PACKET_AVAILABLE) == 0) {
         close(lock);
+        close(entropy_fd);
+        unlink(argv[2]);
         puts("0");
         return 0;
     }
-    result = repair_restore(previous_id, argv[2], start, daemon);
+    result = repair_restore(previous_id, argv[2], entropy_fd, argc == 4,
+                            daemon);
     close(lock);
     return result;
 }
 
-// Restore steps 12 and 13 after the shell's activation and identity work: the
-// acknowledgement when the packet asked for one, then the daemon runs the
-// restore checks (step 11, after the acknowledgement) and finishes the
-// restore off the latency path.
+// Restore steps 11 and 12 after the shell's activation and identity work: the
+// acknowledgement when the packet asked for one, then the daemon runs step 12
+// asynchronously. The record tells it which CPUs activation onlined.
 static int cmd_restore_finish(int argc, char **argv)
 {
-    int64_t start = clock_ns(CLOCK_MONOTONIC);
     bool new_cpus[MAX_CPUS] = {false};
     const char *new_list = "none";
-    unsigned long long generation;
-    long long elapsed;
+    struct time_state state;
     struct checks checks;
     char text[256];
-    int64_t timeout_s = DEFAULT_STALL_TIMEOUT_S;
     bool ack = false;
     int new_count = 0;
     int signaled;
@@ -3781,15 +3907,16 @@ static int cmd_restore_finish(int argc, char **argv)
                         "[--new-cpus LIST]\n");
         return 2;
     }
-    load_generation();
-    if (read_text(RESTORE_PATH, text, sizeof(text)) < 0 ||
-        sscanf(text, "generation=%llu elapsed_us=%lld", &generation,
-               &elapsed) != 2)
-        return repair_failed("G_REPAIR_PACKET", "no restore record");
-    elapsed += (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC;
-    snprintf(text, sizeof(text), "generation=%llu\nelapsed_us=%lld\nnew_cpus=%s\n",
-             generation, elapsed, new_count > 0 ? new_list : "none");
-    (void)replace_file(RESTORE_PATH, RESTORE_PATH ".tmp", text);
+    if (state_load(&state) != 0)
+        return repair_failed("G_REPAIR_CLOCK", "the time state is unreadable");
+    g_generation = (uint32_t)state.generation;
+    snprintf(text, sizeof(text), "generation=%" PRIu64 "\nnew_cpus=%s\n",
+             state.generation, new_count > 0 ? new_list : "none");
+    if (replace_file(RESTORE_PATH, RESTORE_PATH ".tmp", text) != 0) {
+        snprintf(text, sizeof(text), "record the restore: %s",
+                 strerror(errno));
+        return repair_failed("G_REPAIR_CLOCK", text);
+    }
     if (ack && enable_ports() != 0) {
         fprintf(stderr, "nvx-time: ioperm: %s\n", strerror(errno));
         return 1;
@@ -3797,22 +3924,75 @@ static int cmd_restore_finish(int argc, char **argv)
     signaled = signal_restore(daemon_pid(), ack);
     if (signaled == 0)
         return 0;
-    if (checks_init(&checks, PHASE_RESTORE) != 0) {
-        check_failed(&checks, "C6", "cannot read the CPU sets");
-        return 1;
-    }
     if (signaled > 0 || !g_report_only) {
+        memset(&checks, 0, sizeof(checks));
+        checks.phase = PHASE_RESTORE;
         check_failed(&checks, "C10", "the time daemon is not running");
         return 1;
     }
     // Report-only runs may lack the daemon; finish the restore here.
     if (ack)
         outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
-    run_restore_checks(&checks, new_cpus, new_count);
-    (void)read_int64(RCU_STALL_TIMEOUT, &timeout_s);
-    complete_restore(release_with_deadline(timeout_s), checks.tsc_hz,
-                     checks.lapic_hz, elapsed, checks.failures);
+    (void)restore_work(new_cpus, new_count, true);
     return 0;
+}
+
+// Formats nvx-time status's lines from STATE: the marker of the last
+// conformance check, with status=pending and no elapsed_us while it runs,
+// and the runtime line. Report-only mode adds the check's FAILURES.
+static void format_status(const struct time_state *state, int failures,
+                          char *text, size_t size)
+{
+    bool pending = strcmp(state->check_status, "pending") == 0;
+    char elapsed[40] = "";
+    char suffix[32] = "";
+    int length;
+
+    if (!pending)
+        snprintf(elapsed, sizeof(elapsed), " elapsed_us=%" PRId64,
+                 state->check_elapsed_us);
+    if (g_report_only)
+        snprintf(suffix, sizeof(suffix), " failures=%d", failures);
+    length = snprintf(text, size,
+                      "%s: v=1 phase=%s status=%s cpus=%" PRIu64
+                      " tsc_hz=%" PRIu64 " lapic_hz=%" PRIu64
+                      " generation=%" PRIu64 "%s%s\n",
+                      abi_prefix(), state->check_phase, state->check_status,
+                      state->check_cpus, state->tsc_hz, state->lapic_hz,
+                      state->generation, elapsed, suffix);
+    if (length < 0 || (size_t)length >= size)
+        return;
+    snprintf(text + length, size - (size_t)length,
+             "%s: v=1 phase=runtime status=%s generation=%" PRIu64
+             " discontinuities=%" PRIu64 " offset_ns=%" PRId64
+             " uncertainty_ns=%" PRId64 " rejected_samples=%" PRIu64
+             " last_sample_error=%s\n",
+             abi_prefix(),
+             state->synchronized != 0 ? "synchronized" : "unsynchronized",
+             state->generation, state->discontinuities, state->offset_ns,
+             state->uncertainty_ns, state->rejected_samples,
+             state->last_sample_error);
+}
+
+// Prints the time state on demand, after waiting for pending checks: CI and
+// the matrix driver run it over the console; production paths never do.
+static int cmd_status(void)
+{
+    struct time_state state;
+    char text[768];
+    int failures = 0;
+    int waited = wait_for_checks(&state);
+
+    if (waited < 0) {
+        fprintf(stderr, "nvx-time: the time state is unavailable\n");
+        return 1;
+    }
+    if (g_report_only && read_text(REPORT_PATH, text, sizeof(text)) >= 0)
+        (void)sscanf(text, "failures=%d", &failures);
+    format_status(&state, failures, text, sizeof(text));
+    fputs(text, stdout);
+    fflush(stdout);
+    return waited == 0 ? 0 : 1;
 }
 
 static int cmd_sample(void)
@@ -4096,19 +4276,18 @@ static int test_restore_record(int argc, char **argv)
 {
     static char text[4096];
     unsigned long long generation;
-    long long elapsed_us;
     bool cpus[MAX_CPUS];
     const char *separator = "";
     int count;
 
     if (argc != 1 || test_text(argv[0], text, sizeof(text)) != 0)
         return 2;
-    count = parse_restore_record(text, &generation, &elapsed_us, cpus);
+    count = parse_restore_record(text, &generation, cpus);
     if (count < 0) {
         printf("error\n");
         return 0;
     }
-    printf("generation=%llu elapsed_us=%lld new_cpus=", generation, elapsed_us);
+    printf("generation=%llu new_cpus=", generation);
     for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
         if (cpus[cpu]) {
             printf("%s%d", separator, cpu);
@@ -4250,6 +4429,19 @@ static int cmd_test(int argc, char **argv)
     }
     if (strcmp(name, "state") == 0)
         return test_state(argc, argv);
+    if (strcmp(name, "status") == 0 && argc == 3) {
+        static char text[4096];
+        struct time_state state;
+        char out[768];
+
+        if (test_text(argv[0], text, sizeof(text)) != 0 ||
+            state_parse(text, &state) != 0)
+            return 2;
+        g_report_only = strcmp(argv[1], "report-only") == 0;
+        format_status(&state, atoi(argv[2]), out, sizeof(out));
+        fputs(out, stdout);
+        return 0;
+    }
     if (strcmp(name, "restore-record") == 0)
         return test_restore_record(argc, argv);
     if (strcmp(name, "parallel") == 0)
@@ -4292,9 +4484,10 @@ static int usage(void)
             "  boot\n"
             "  check --phase capture|restore [--new-cpus LIST]\n"
             "  pre-capture\n"
-            "  capture 0|1 GENERATION_ID ENTROPY_FILE\n"
+            "  capture 0|1 GENERATION_ID ENTROPY_FILE [--finish]\n"
             "  cancel-capture\n"
             "  restore-finish [--ack] [--new-cpus LIST]\n"
+            "  status\n"
             "  sample\n"
             "  generation-id\n"
             "  exhaustive\n"
@@ -4338,6 +4531,8 @@ int main(int argc, char **argv)
         return cmd_cancel_capture();
     if (strcmp(command, "restore-finish") == 0)
         return cmd_restore_finish(count - 1, arguments + 1);
+    if (strcmp(command, "status") == 0 && count == 1)
+        return cmd_status();
     if (strcmp(command, "sample") == 0 && count == 1)
         return cmd_sample();
     if (strcmp(command, "generation-id") == 0 && count == 1)
