@@ -245,8 +245,9 @@ settled cell on the registered hosts.
 **WHP decision gate: met.** Suspending partition time, writing the target,
 verifying the frozen values, and resuming kept every pair of vCPUs within
 70 ns over 60 s on bare metal and on both Azure runner generations, so WHP
-never traps RDTSC. The emulated clock it replaces cost 45 to 75 µs per guest
-timestamp read.
+never traps RDTSC. The emulated clock it replaces cost about 45 µs per guest
+timestamp read on bare metal and 66 to 70 µs on Azure (p50), on every vCPU of
+an SMP-restored VM for its lifetime.
 
 ## CPU profiles
 
@@ -1099,16 +1100,28 @@ Expected effects:
 
 | Change | Expected effect |
 | --- | --- |
-| WHP restored SMP without RDTSC emulation (if the WHP spike meets 1 µs) | Removes the 1-to-2 vCPU restore jump (120.7 ms to 165.9 ms p50) |
+| WHP restored SMP without RDTSC emulation | Removes the 1-to-2 vCPU restore jump (120.7 ms to 165.9 ms p50) and the 45 to 70 µs cost of every guest timestamp read after an SMP restore |
 | Packet v4 with four-byte reads instead of 83 or more byte reads | Fewer restore exits, most visible on WHP |
 | Wall clock from the packet instead of RTC polling | Removes at least 32 CMOS port exits and the update wait per tiered restore |
-| No capture-time clocksource waits | Removes up to 5 s of capture latency on MSHV and WHP; outside the restore metrics |
-| No LAPIC calibration and no `tsc-early` window at cold boot | Unchanged or faster cold boot |
+| No capture-time clocksource waits | Removes the harness's wait for `tsc-early` to become `tsc`: 0.73 to 0.92 s per capture on MSHV and 0.47 to 0.67 s on WHP; outside the gated metrics |
+| `no_timer_check` from the Hyper-V identity, no LAPIC calibration, and no `tsc-early` window at cold boot | About 43 to 52 ms (9 to 15%) faster `cold_start_base` and other quiet cold boots on MSHV and WHP; KVM unchanged |
+| MSHV VP creation | Serialized at about 14 ms per application processor on bare metal (27 and 85 ms at 4 and 8 vCPUs); the frozen synchronized TSC set adds 40 to 170 µs for 1 to 4 VPs and no per-VP serialized work |
 | Boot check and daemon start | Added cold-boot cost, reported as the first run's `elapsed_us`; budget 2.5 ms at one vCPU plus 0.3 ms per additional vCPU on KVM and MSHV, and 5 ms plus 0.6 ms per additional vCPU on WHP; the gate is authoritative |
 | Counting LAPIC instead of TSC-deadline on KVM | Different timer-programming exits; covered by the gate |
 | Restore repair and checks before the acknowledgement | Run in one helper process; the RCU release and deferred checks run after the acknowledgement |
 
 Expected wins are tracked separately and do not relax the gate.
+
+**Attribution.** With `OPENVMM_STARTUP_PROFILE` set, OpenVMM's lifecycle
+profile records three exclusive time ABI restore phases:
+`restore.time_abi_clock` (restore steps 11 to 16), `restore.guest_resume`
+(from the VP release to the guest's first selection of the restore packet),
+and, for a restore with `ACK_REQUIRED`, `restore.guest_repair` (from that
+selection to the arrival of the `0x605` acknowledgement). The
+`restore.guest_repair_gate` milestone still spans from the VP release to the
+release of the acknowledgement boundary. The guest reports its own repair
+checks as the restore marker's `elapsed_us`, which covers ungated restores
+too.
 
 ## Test matrix
 
