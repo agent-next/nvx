@@ -86,7 +86,7 @@ MICROVM_TEST_SCENARIOS = (
 UBUNTU_UNSUPPORTED_SCENARIOS = frozenset(
     ("console-snapshot", "sandbox-blocks", "scratch-snapshot", "snapshot-tiers")
 )
-TSC_DEADLINE_HIDDEN_BACKENDS = frozenset(("mshv", "whp"))
+TSC_DEADLINE_HIDDEN_BACKENDS = frozenset(("mshv",))
 MICROVM_PROCESSOR_COUNTS = (1, 2, 4, 8)
 MICROVM_TEST_SCRIPTS_DIR = Path(__file__).with_name("microvm_test_scripts")
 LIFECYCLE_COMPLETION_MARKER = b"NVX-LIFECYCLE-OK"

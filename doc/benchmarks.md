@@ -318,9 +318,10 @@ LAPIC calibration is not success. A counter frozen at 12 can indicate Linux's
 Before KVM acceptance, CI runs
 `test-microvm --scenario smp-lapic --processors 1 2 4 8`. This repeats the normal
 SMP probe with `lapic=notscdeadline`, covering the counting LAPIC on a backend that
-normally exposes TSC-deadline timers. MSHV and WHP CPU contracts hide TSC-deadline,
-so their ordinary `smp` scenario already covers the counting LAPIC and their default
-correctness suites omit the duplicate `smp-lapic` run.
+normally exposes TSC-deadline timers. WHP also exposes TSC-deadline and retains
+`smp-lapic` in its default correctness suite. MSHV hides TSC-deadline, so its
+ordinary `smp` scenario already covers the counting LAPIC and its default suite
+omits the duplicate `smp-lapic` run.
 `nvx-snapshot` requests a capture only after the guest's clocksource is `tsc` or `kvm-clock` and
 every online CPU runs a one-shot tick, for the reasons in the
 [snapshot design](design/snapshot-and-restore.md#time-and-entropy). On MSHV and WHP, a capture

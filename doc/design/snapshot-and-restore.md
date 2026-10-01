@@ -549,10 +549,10 @@ platform snapshot's command line must carry exactly the recorded value. Under
 the versioned CPU contract, WHP runs the guest TSC at a fixed 1 GHz when the
 host supports that rate and otherwise keeps the host frequency; MSHV exposes no
 TSC-deadline mode because it does not reliably deliver those events to
-direct-boot guests. WHP hides TSC-deadline mode under the versioned contract as
-well, so that capture can detect a periodic tick, as described below. Because
-this changes the recorded CPU contract, WHP snapshots captured with
-TSC-deadline mode exposed must be recaptured.
+direct-boot guests. WHP retains TSC-deadline mode. Forcing WHP onto its
+counting LAPIC timer can lose periodic ticks during ordinary host descheduling
+and make Linux reject `tsc-early` before the guest can reach the capture
+contract.
 
 Capture records a coherent processor and clock boundary. Restore advances TSC,
 VM time, RTC, PIT/LAPIC deadlines, and the KVM paravirtual clock by nonnegative
@@ -593,10 +593,12 @@ seconds after boot on those backends, and a capture requested earlier waits
 until then either way. KVM guests register `tsc` or `kvm-clock` at boot. A
 LAPIC in TSC-deadline mode has no periodic mode, and Linux emulates a periodic
 tick with deadline one-shots that OpenVMM cannot tell apart from a one-shot
-tick; with TSC-deadline mode hidden on MSHV and WHP, OpenVMM's periodic-timer
-rejection detects every periodic tick on the backends where the watchdog
-compares the TSC with jiffies. On KVM, `kvm-clock` is the watchdog, and restore
-advances it.
+tick. MSHV hides TSC-deadline mode, so OpenVMM's periodic-timer rejection
+detects every periodic tick there. WHP retains TSC-deadline mode to avoid
+cold-boot clock instability, so the guest-side check is authoritative for a
+periodic software tick programmed as deadline one-shots; OpenVMM still rejects
+an observable counting-LAPIC periodic tick. On KVM, `kvm-clock` is the
+watchdog, and restore advances it.
 
 KVM advances each VP's TSC through its TSC offset rather than a counter write,
 because KVM can discard a sub-second counter write as a synchronization

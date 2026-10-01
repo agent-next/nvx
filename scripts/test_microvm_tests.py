@@ -2871,7 +2871,7 @@ class MicrovmTests(unittest.TestCase):
         for backend, expected_forced_modes in (
             ("kvm", [False, True]),
             ("mshv", [False]),
-            ("whp", [False]),
+            ("whp", [False, True]),
         ):
             with (
                 self.subTest(backend=backend),
