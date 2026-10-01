@@ -142,7 +142,9 @@ hypervisor identity, and runs the cross-vCPU warp test that the
 skew bound. `nvx-time` implements the time ABI's
 [guest obligations](design/time-abi.md#guest-obligations): the conformance
 checks, the violation watcher, the restore packet v4 and time-sample parsers,
-the snapshot agent's time steps, and the wall-clock discipline. Its
+the snapshot agent's time steps, and the wall-clock discipline. Its boot check
+also fails when the kernel's boot-time W+X audit reports a writable and
+executable mapping. The
 `--report-only` flag (or the `nvx_time_abi=report-only` kernel command-line
 token) reports violations without powering off, for runs against VMMs that
 predate the ABI. Both time tools are linked statically against musl

@@ -1175,7 +1175,12 @@ struct boot_log {
     bool lapic;
     char last_switch[48];
     char problem[DETAIL_MAX];
+    char wx[DETAIL_MAX];
 };
+
+// CONFIG_DEBUG_WX audits the kernel page tables before init runs and logs
+// this for a mapping that is both writable and executable.
+static const char k_wx_record[] = "Found insecure W+X mapping";
 
 static void boot_log_add(struct boot_log *log, const char *message)
 {
@@ -1186,6 +1191,9 @@ static void boot_log_add(struct boot_log *log, const char *message)
     const char *name = strstr(message, switched);
     const char *code;
 
+    if (log->wx[0] == '\0' && strncmp(message, "NVX-TIME-", 9) != 0 &&
+        strstr(message, k_wx_record) != NULL)
+        snprintf(log->wx, sizeof(log->wx), "%.300s", message);
     if (strstr(message, "Hypervisor detected: Microsoft Hyper-V") != NULL)
         log->hypervisor = true;
     if (strstr(message, "Hyper-V: privilege flags low 0x8860,") != NULL)
@@ -1342,11 +1350,12 @@ static int compare_starts(const void *left, const void *right)
     return a < b ? -1 : a > b;
 }
 
-// C4 over the whole SYSLOG_ACTION_READ_ALL text. Only lines that contain a
-// required record, a forbidden record, or the first substring of a watcher
-// row can change the verdict, so a few whole-buffer searches find them, and
-// boot_log_add() sees just those lines, in log order. Matching every rule
-// against every line cost about a millisecond on a guest's boot log.
+// C4 and K1 over the whole SYSLOG_ACTION_READ_ALL text. Only lines that
+// contain a required record, a forbidden record, the W+X record, or the first
+// substring of a watcher row can change the verdict, so a few whole-buffer
+// searches find them, and boot_log_add() sees just those lines, in log order.
+// Matching every rule against every line cost about a millisecond on a
+// guest's boot log.
 static void boot_log_scan(char *buffer, struct boot_log *log)
 {
     static const char *const anchors[] = {
@@ -1356,7 +1365,8 @@ static void boot_log_scan(char *buffer, struct boot_log *log)
         "Fast TSC calibration",
         "Refined TSC clocksource calibration",
         "kvm-clock",
-        "APIC timer: using supplied frequency"};
+        "APIC timer: using supplied frequency",
+        k_wx_record};
     struct line_starts lines = {malloc(256 * sizeof(const char *)), 0, 256};
     bool ok = lines.starts != NULL;
 
@@ -1436,19 +1446,18 @@ struct checks {
     uint64_t lapic_hz;
 };
 
-static bool check_failed(struct checks *checks, const char *id,
-                         const char *format, ...)
-    __attribute__((format(printf, 3, 4)));
+static bool check_failed_code(struct checks *checks, const char *id,
+                              const char *code, const char *format, ...)
+    __attribute__((format(printf, 4, 5)));
 
-// Prints the failure line, emits G_CONFORMANCE_<ID>, and powers off with
-// status 193. In report-only mode it returns false and the run continues.
-static bool check_failed(struct checks *checks, const char *id,
-                         const char *format, ...)
+// Prints the failure line, emits CODE, and powers off with status 193. In
+// report-only mode it returns false and the run continues.
+static bool check_failed_code(struct checks *checks, const char *id,
+                              const char *code, const char *format, ...)
 {
     char detail[DETAIL_MAX];
     char escaped[DETAIL_MAX];
     char line[EVENT_MAX + 64];
-    char code[32];
     va_list arguments;
 
     va_start(arguments, format);
@@ -1459,12 +1468,30 @@ static bool check_failed(struct checks *checks, const char *id,
              "%s: v=1 phase=%s status=fail check=%s detail=\"%s\"\n",
              abi_prefix(), k_phase_names[checks->phase], id, escaped);
     console_write(line);
-    snprintf(code, sizeof(code), "G_CONFORMANCE_%s", id);
     checks->failures++;
     emit_event(code, "conformance", checks->phase, detail);
     if (!g_report_only)
         power_off(STATUS_CONFORMANCE);
     return false;
+}
+
+static bool check_failed(struct checks *checks, const char *id,
+                         const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
+
+// check_failed_code() with the conformance code G_CONFORMANCE_<ID>.
+static bool check_failed(struct checks *checks, const char *id,
+                         const char *format, ...)
+{
+    char detail[DETAIL_MAX];
+    char code[32];
+    va_list arguments;
+
+    va_start(arguments, format);
+    vsnprintf(detail, sizeof(detail), format, arguments);
+    va_end(arguments);
+    snprintf(code, sizeof(code), "G_CONFORMANCE_%s", id);
+    return check_failed_code(checks, id, code, "%s", detail);
 }
 
 static int checks_init(struct checks *checks, enum phase phase)
@@ -2774,8 +2801,13 @@ static int cmd_boot(void)
     } else if (read_boot_log(&log) != 0) {
         check_failed(&checks, "C4", "read the kernel log: %s",
                      strerror(errno));
-    } else if (!boot_log_verdict(&log, detail, sizeof(detail))) {
-        check_failed(&checks, "C4", "%s", detail);
+    } else {
+        if (!boot_log_verdict(&log, detail, sizeof(detail)))
+            check_failed(&checks, "C4", "%s", detail);
+        // K1 is kernel hardening, not time: a writable and executable kernel
+        // mapping, such as unprotected ITS thunk pages.
+        if (log.wx[0] != '\0')
+            check_failed_code(&checks, "K1", "G_KERNEL_WX", "%s", log.wx);
     }
     check_cpuinfo(&checks, checks.online, true);
     check_cpus(&checks, checks.online, true, true);
@@ -3348,6 +3380,8 @@ static int test_lines(int argc, char **argv, enum line_test mode)
             printf("ok\n");
         else
             printf("fail %s\n", detail);
+        if (log.wx[0] != '\0')
+            printf("wx %s\n", log.wx);
     }
     return 0;
 }

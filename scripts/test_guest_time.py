@@ -463,6 +463,57 @@ class GuestTimeTests(unittest.TestCase):
         )
         self.assertTrue(syslog(lines[2:]).startswith("fail no 'Hypervisor"))
 
+    def test_boot_log_reports_a_kernel_wx_mapping_apart_from_c4(self):
+        # Linux 6.18's CONFIG_DEBUG_WX audit, as logged when the ITS
+        # mitigation's thunk pages are left writable and executable.
+        warning = [
+            "<4>[    0.412345] ------------[ cut here ]------------",
+            "<4>[    0.412346] x86/mm: Found insecure W+X mapping at address "
+            "0xffffffffc0000000",
+            "<4>[    0.412400] WARNING: CPU: 0 PID: 1 at "
+            "arch/x86/mm/dump_pagetables.c:246 note_wx+0x5a/0x70",
+            "<6>[    0.412500] x86/mm: Checked W+X mappings: FAILED, 4 W+X pages "
+            "found.",
+        ]
+        lines = [f"<6>[    0.100000] {line}" for line in self.BOOT_LOG]
+
+        def syslog(text_lines: list[str]) -> list[str]:
+            return (
+                self.run_test(
+                    "syslog",
+                    self.fixture("syslog.txt", "\n".join(text_lines) + "\n"),
+                )
+                .strip()
+                .splitlines()
+            )
+
+        self.assertEqual(
+            syslog([*lines[:2], *warning, *lines[2:]]),
+            [
+                "ok",
+                "wx x86/mm: Found insecure W+X mapping at address 0xffffffffc0000000",
+            ],
+        )
+        self.assertEqual(
+            syslog(
+                [
+                    *lines,
+                    "<6>[    0.412500] x86/mm: Checked W+X mappings: passed, "
+                    "no W+X pages found.",
+                ]
+            ),
+            ["ok"],
+        )
+        failed = syslog([*warning, *lines[1:]])
+        self.assertEqual(len(failed), 2)
+        self.assertTrue(failed[0].startswith("fail no 'Hypervisor"))
+        self.assertTrue(failed[1].startswith("wx x86/mm: Found insecure W+X"))
+        own_event = (
+            "<2>[    3.000000] NVX-TIME-REPORT-VIOLATION: v=1 code=G_KERNEL_WX "
+            'detail="x86/mm: Found insecure W+X mapping at address 0x0"'
+        )
+        self.assertEqual(syslog([*lines, own_event]), ["ok"])
+
     def timer_list(
         self,
         sections: list[tuple[int, str, int, str, int]],
