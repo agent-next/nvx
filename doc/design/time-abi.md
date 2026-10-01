@@ -973,8 +973,10 @@ mounting `/proc`, `/sys`, and `/dev`, it takes a time sample within the
 [uncertainty bound](#uncertainty-bounds) and steps the clock to host UTC
 (`C12`), so the workload starts on host time; this step is not counted as a
 discontinuity. Init then reports shell-ready (or starts the workload, in
-modes without a shell) and runs every other boot check asynchronously, at
-`SCHED_IDLE`. The checks start the daemon when they pass. Every check stays
+modes without a shell) and runs every other boot check asynchronously: at
+`SCHED_IDLE` for the first 100 ms after shell-ready, and at normal priority
+after that (see [Snapshot agent](#snapshot-agent)). The checks start the
+daemon when they pass. Every check stays
 fail-fast: a failure powers the guest off with status 193, even if the
 workload is running. A guest that powers off before its checks finish skips them, which
 is why CI takes its evidence from `nvx-time status`, which waits for them.
@@ -1043,7 +1045,9 @@ NVX-TIME-ABI: v=1 phase=runtime status=<synchronized|unsynchronized> generation=
 
 It exits with status 0. If a check is still pending after 30 s, the first
 line reports `status=pending`, without `elapsed_us`, and the exit status is
-1. `elapsed_us` covers the checks and, at boot, the daemon start. A failed
+1. At boot, `elapsed_us` covers the checks and the daemon start. At restore,
+it covers steps 6 to 12 of the [snapshot agent](#snapshot-agent) and the
+step 11 checks, but not the grace period wait or the deferred `C7`. A failed
 check prints no marker: it emits the violation event with code
 `G_CONFORMANCE_<ID>` (`G_KERNEL_WX` for `K1`) and powers off with status 193.
 
@@ -1119,8 +1123,9 @@ Before the capture request:
 
 If the write returns without a restore (no destination or a rejected
 capture), the agent removes the barriers and then restores the values saved
-in steps 2 and 3. Otherwise, in the restored process, only these steps run
-before the acknowledgement:
+in steps 2 and 3. Otherwise, the restored process runs these steps. Steps 6
+to 10 and 12 are the readiness path: nothing else runs before the
+acknowledgement.
 
 6. Read the status from `0xea`. Bit 1 is always set after a restore.
 7. Read `CLOCK_REALTIME` as `t0`, write `0xa5` to `0xea`, read it as `t1`,
@@ -1141,11 +1146,13 @@ before the acknowledgement:
 10. Run the existing entropy and identity repair for the tier. The RTC-based
     wall-clock refresh is removed; `instance-checkpoint` restores also get
     step 8.
-11. If `ACK_REQUIRED` is set, write the acknowledgement (2) to `0x605`.
-12. After the acknowledgement, or after step 10 when none is required, the
-    daemon finishes the restore asynchronously, and fail-fast:
-    - it runs the restore checks (`C1`, `C2`, and `C5` on newly onlined
-      CPUs; `C3` for CPU 0; `C6`; `C10`);
+11. Defer the restore checks to step 13: `C1`, `C2`, and `C5` on newly
+    onlined CPUs; `C3` for CPU 0; `C6`; and `C10`. They do not wait, and a
+    failure still emits its violation event and powers off with status 193.
+12. If `ACK_REQUIRED` is set, write the acknowledgement (2) to `0x605`.
+13. After the acknowledgement, or after step 10 when none is required, signal
+    the daemon, which finishes the restore asynchronously:
+    - it runs the step 11 checks;
     - it waits for the [grace period release](#rcu-grace-period-release);
     - it restores the values saved in steps 2 and 3
       (`G_REPAIR_SUPPRESSION`);
@@ -1156,16 +1163,25 @@ before the acknowledgement:
     It prints nothing unless a check fails.
 
 No restore check runs before the acknowledgement. The post-acknowledgement
-checks are `C1`, `C2`, `C3`, `C5`, `C6`, `C7`, and `C10`. Steps 6, 7, and 8
-run in one helper process, which may also run every other step before the
-acknowledgement and signal the daemon, so that a restore without shell work
-(for example, untiered with no processor or memory target) needs no second
-helper. Step 12 and the asynchronous boot checks run at `SCHED_IDLE`, so on
-few vCPUs they never take a CPU from the restored or starting workload; the
-watcher and the discipline run at normal priority. Under a CPU-bound
-workload they still progress, more slowly, and stall suppression stays set
-until the release. Repair failures emit a violation
-event and power off with status 195.
+checks are `C1`, `C2`, `C3`, `C5`, `C6`, `C7`, and `C10`.
+
+Steps 6, 7, and 8 run in one helper process. For an untiered restore with no
+processor or memory to activate, that helper runs every step through 12 and
+signals the daemon, so no other process starts on the readiness path. Each
+extra process costs 2 to 4 ms after a restore (fork and exec under demand
+faulting, measured on KVM).
+
+Step 13 and the asynchronous boot checks start at `SCHED_IDLE`, so on few
+vCPUs they never take a CPU from the restored or starting workload. Work
+that has not finished 100 ms after the acknowledgement (or after step 10,
+when none is required) or after shell-ready continues at normal priority.
+This bounds how long a CPU-bound workload runs before a failing check powers
+the guest off: about 100 ms plus the checks' own run time, where
+`SCHED_IDLE` alone would allow about 0.5 s or more. On an idle KVM guest, a
+failing restore check powers off within 1 to 3 ms. The watcher and the
+discipline always run at normal priority, and stall suppression stays set
+until the release. Repair failures emit a violation event and power off with
+status 195.
 
 ### RCU grace period release
 
@@ -1233,7 +1249,7 @@ every change, and `nvx-time status` reads it. The sandbox agent bind-mounts
 | `check_phase` | `boot`, `capture`, or `restore`: the last conformance check |
 | `check_status` | `pending` while it runs, then `ok`; a failed check powers the guest off |
 | `check_cpus` | Online CPUs the check covered |
-| `check_elapsed_us` | Its duration, with the daemon start at boot |
+| `check_elapsed_us` | Its duration, as `elapsed_us` in the [status command](#conformance-checks-and-the-nvx-time-abi-marker) |
 | `tsc_hz`, `lapic_hz` | `F` and `L` |
 | `discontinuities` | Wall-clock discontinuities since cold boot: restores plus discipline steps |
 | `last_discontinuity` | `none`, `restore`, or `step` |
@@ -1461,8 +1477,8 @@ and, for a restore with `ACK_REQUIRED`, `restore.guest_repair` (from that
 selection to the arrival of the `0x605` acknowledgement). The
 `restore.guest_repair_gate` milestone still spans from the VP release to the
 release of the acknowledgement boundary. The guest's restore checks run
-after the acknowledgement, outside these phases; `nvx-time status` reports
-their duration as `elapsed_us`.
+after the acknowledgement, outside these phases. `nvx-time status` reports
+`elapsed_us`, which covers the guest's readiness path and those checks.
 
 ## Test matrix
 
