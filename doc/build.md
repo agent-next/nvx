@@ -186,9 +186,12 @@ matching base assignment before `olddefconfig`. It enables `DEBUG_KERNEL`, the
 soft-lockup and hung-task detectors, and extra RCU stall diagnostics. It pins
 the production RCU stall timeouts and turns off the debug options that
 `DEBUG_KERNEL` would otherwise enable by default. The build fails if the
-detectors are missing from the generated config. CI can shorten the thresholds
-for one boot with `watchdog_thresh=`, `rcupdate.rcu_cpu_stall_timeout=`, and
-`sysctl.kernel.hung_task_timeout_secs=`.
+detectors are missing from the generated config. CI can shorten the soft-lockup
+and hung-task thresholds for one boot with `watchdog_thresh=` and
+`sysctl.kernel.hung_task_timeout_secs=`. The RCU stall timeout stays at the
+production value because the time ABI's
+[conformance check C8](design/time-abi.md#conformance-checks-and-the-nvx-time-abi-marker)
+requires it.
 
 The variant builds in `build/linux-debug`, so it never invalidates the
 production object cache, and it produces:
