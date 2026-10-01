@@ -908,8 +908,8 @@ otherwise, and then fails with a stable code:
 | Use | Bound | Attempts | When every attempt exceeds the bound |
 | --- | --- | --- | --- |
 | Restore repair (packet bracket, then time samples) | 1 ms | 3 | `G_REPAIR_SAMPLE`: event and power-off with status 195 |
-| Initial synchronization at boot (time samples) | 1 ms | 3 | `G_CONFORMANCE_C12`: event and power-off with status 193 |
-| Discipline poll (time samples) | 50 µs | 3 | `G_SAMPLE_UNCERTAIN`: the poll is skipped and the code is recorded in the state file and on the console; never fatal |
+| Initial synchronization at boot, before shell-ready (time samples) | 1 ms | 3 | `G_CONFORMANCE_C12`: event and power-off with status 193 |
+| Discipline poll (time samples) | 50 µs | 3 | `G_SAMPLE_UNCERTAIN`: the poll is skipped and the code is recorded in the state file; never fatal |
 
 `epsilon` is half the round trip of one PMIO write exit plus two
 `CLOCK_REALTIME` reads, so it stays far below both bounds on every backend.
@@ -953,14 +953,31 @@ retries, and a poll whose three attempts all fail is skipped without harm
 
 The guest's time component (`nvx-time` in `guest/common`) performs the
 conformance checks, runs the violation watcher and the wall-clock discipline
-as one daemon, and executes the snapshot agent's time steps. Every guest mode
-starts it: init's interactive and test paths, `nvx_exec`, the sandbox agent,
-and the managed agent.
+as one daemon, executes the snapshot agent's time steps, and reports status
+on demand. Every guest mode starts it: init's interactive and test paths,
+`nvx_exec`, the sandbox agent, and the managed agent.
+
+Production paths keep the console quiet: the time component prints no
+marker or status line, and only a [violation event](#violation-watcher)
+reaches the console. Each console byte costs one or two port exits, about 10
+to 12 µs on bare-metal KVM and an estimated 20 to 45 µs nested on Azure, so a
+110-byte boot marker and a 117-byte restore marker would cost 1 to 5 ms on
+the measured paths. State goes to the [state file](#wall-clock-discipline),
+and `nvx-time status` prints it on demand.
 
 ### Conformance checks and the `NVX-TIME-ABI` marker
 
-Init runs the boot check immediately after mounting `/proc`, `/sys`, and
-`/dev`, before any other guest work, and starts the daemon only if it passes.
+Before shell-ready, init does only what boot correctness needs. Right after
+mounting `/proc`, `/sys`, and `/dev`, it takes a time sample within the
+[uncertainty bound](#uncertainty-bounds) and steps the clock to host UTC
+(`C12`), so the workload starts on host time; this step is not counted as a
+discontinuity. Init then reports shell-ready (or starts the workload, in
+modes without a shell) and runs every other boot check asynchronously. The
+checks start the daemon when they pass. Every check stays fail-fast: a
+failure powers the guest off with status 193, even if the workload is
+running. A guest that powers off before its checks finish skips them, which
+is why CI takes its evidence from `nvx-time status`, which waits for them.
+
 CPUID is executed on every online CPU (the checker pins itself to each CPU in
 turn, or runs one thread pinned to each CPU), and MSRs are read through
 `/dev/cpu/<n>/msr`. A CPU's VP index is its Linux CPU number, because CPUs
@@ -981,7 +998,7 @@ partition-wide on every backend, so `C3` reads them on CPU 0 only.
 | `C9` | `/proc/cmdline` contains none of `tsc_early_khz=`, `lapic_timer_hz=`, `notsc`, `nolapic`, `nolapic_timer`, `tsc=unstable`, `hpet=force`, or `clocksource=` with a value other than `tsc` | boot |
 | `C10` | The time daemon is running and has recorded no violation; `/sys/kernel/rcu_stall_count` is 0; at boot, the state file is published and the daemon started | boot, capture, restore |
 | `C11` | Debug kernel only: `/proc/sys/kernel/soft_watchdog` is 1 and `/proc/sys/kernel/hung_task_timeout_secs` is nonzero | boot |
-| `C12` | A time sample within the [uncertainty bound](#uncertainty-bounds) is obtained, and the clock is stepped to host UTC | boot |
+| `C12` | Before shell-ready: a time sample within the [uncertainty bound](#uncertainty-bounds) is obtained, and the clock is stepped to host UTC | boot |
 | `K1` | Kernel integrity, not a clock property: the kernel's boot-time W+X audit logged no `Found insecure W+X mapping` record | boot |
 
 Capture and restore checks never wait. The boot `C7` check and the deferred
@@ -1010,33 +1027,33 @@ NVX-TIME-ABI-EXHAUSTIVE: v=1 check=<ID> cpu=<n> status=<pass|fail> detail="<esca
 NVX-TIME-ABI-EXHAUSTIVE: v=1 status=<ok|fail> cpus=<online> failures=<n>
 ```
 
-On success the check prints one line to the console:
+**Status command.** Checks print nothing on success; they record their
+result in the [state file](#wall-clock-discipline). `/sbin/nvx-time status`
+prints it on demand: CI scenarios and the matrix driver run it over the
+console when they need evidence, and production paths never do. It waits
+until no check is pending (the asynchronous boot checks, or a restore's
+deferred work), for at most 30 s. It then prints the marker of the last
+completed check and the runtime line:
 
 ```text
 NVX-TIME-ABI: v=1 phase=<boot|capture|restore> status=ok cpus=<online> tsc_hz=<F> lapic_hz=<L> generation=<g> elapsed_us=<duration>
+NVX-TIME-ABI: v=1 phase=runtime status=<synchronized|unsynchronized> generation=<g> discontinuities=<n> offset_ns=<theta> uncertainty_ns=<epsilon> rejected_samples=<n> last_sample_error=<none|G_SAMPLE_UNCERTAIN>
 ```
 
-`elapsed_us` covers the checks and, at boot, the daemon start. The line is
-printed after it is taken, synchronously and before any workload starts, so
-a harness sees the marker before workload output and an early power-off
-cannot lose it; its console cost (one port exit per byte) is part of the
-cold-boot cost the performance gate measures.
-
-On failure it prints `status=fail check=<ID> detail="<text>"` in the same
-format, emits a violation event with code `G_CONFORMANCE_<ID>` (`G_KERNEL_WX`
-for `K1`), and powers
-off with status 193. The boot step of `C12` steps the clock before any
-workload starts and is not counted as a discontinuity. The only other line
-with this prefix is the non-fatal `phase=runtime status=uncertain` line of
-the [wall-clock discipline](#wall-clock-discipline).
+It exits with status 0. If a check is still pending after 30 s, the first
+line reports `status=pending`, without `elapsed_us`, and the exit status is
+1. `elapsed_us` covers the checks and, at boot, the daemon start. A failed
+check prints no marker: it emits the violation event with code
+`G_CONFORMANCE_<ID>` (`G_KERNEL_WX` for `K1`) and powers off with status 193.
 
 **Report-only mode (test only).** The kernel token `nvx_time_abi=report-only`
 makes the checks and the watcher report instead of powering off, so the guest
-can be evaluated under an OpenVMM that does not implement the time ABI. It
-prints `NVX-TIME-REPORT` and `NVX-TIME-REPORT-VIOLATION` lines with the same
-fields, and its marker ends with ` failures=<n>`. These prefixes are reserved
-for this mode; production images never set the token, and harnesses never
-accept a report-only boot as conformant.
+can be evaluated under an OpenVMM that does not implement the time ABI.
+Violations print `NVX-TIME-REPORT-VIOLATION` lines with the event's fields,
+and `nvx-time status` prints its marker with the `NVX-TIME-REPORT` prefix and
+` failures=<n>` appended. These prefixes are reserved for this mode;
+production images never set the token, and harnesses never accept a
+report-only boot as conformant.
 
 ### Violation watcher
 
@@ -1077,10 +1094,11 @@ NVX-TIME-ABI-VIOLATION: v=1 code=<code> source=<conformance|watcher|repair> phas
 ```
 
 The guest writes it to `/dev/kmsg` at priority 2, to the portb data port
-`0xe9` (through `/dev/port` or `outb`), and to the console. Consumers treat
-identical lines as one event. The guest then writes the status to the
-shutdown port `0x604` (directly, or through `nvx-exit`); its first byte
-becomes the OpenVMM process exit status.
+`0xe9` (through `/dev/port` or `outb`), and to the console, on every path:
+violations are rare, and a diagnosable failure is worth the console bytes.
+Consumers treat identical lines as one event. The guest then writes the
+status to the shutdown port `0x604` (directly, or through `nvx-exit`); its
+first byte becomes the OpenVMM process exit status.
 
 ### Snapshot agent
 
@@ -1090,7 +1108,8 @@ builds the soft-lockup and hung-task detectors.
 
 Before the capture request:
 
-1. Run the capture checks (`C6`, `C7`, `C10`). They do not wait.
+1. Run the capture checks (`C6`, `C7`, `C10`). They do not wait and print
+   nothing.
 2. Save `/sys/module/rcupdate/parameters/rcu_cpu_stall_suppress` and write 1.
 3. Debug: save and zero `/proc/sys/kernel/soft_watchdog` and
    `/proc/sys/kernel/hung_task_timeout_secs`.
@@ -1099,7 +1118,8 @@ Before the capture request:
 
 If the write returns without a restore (no destination or a rejected
 capture), the agent removes the barriers and then restores the values saved
-in steps 2 and 3. Otherwise, in the restored process:
+in steps 2 and 3. Otherwise, in the restored process, only these steps run
+before the acknowledgement:
 
 6. Read the status from `0xea`. Bit 1 is always set after a restore.
 7. Read `CLOCK_REALTIME` as `t0`, write `0xa5` to `0xea`, read it as `t1`,
@@ -1118,14 +1138,19 @@ in steps 2 and 3. Otherwise, in the restored process:
 10. Run the existing entropy and identity repair for the tier. The RTC-based
     wall-clock refresh is removed; `instance-checkpoint` restores also get
     step 8.
-11. Run the restore checks (`C1`, `C2`, and `C5` on newly onlined CPUs; `C3`
-    for CPU 0; `C6`; `C10`). They do not wait.
-12. If `ACK_REQUIRED` is set, write the acknowledgement (2) to `0x605`.
-13. Signal the daemon to finish the restore off the latency path: wait for
-    the [grace period release](#rcu-grace-period-release); restore the
-    values saved in steps 2 and 3 (`G_REPAIR_SUPPRESSION`); run the deferred
-    `C7` check; print `NVX-TIME-ABI: v=1 phase=restore status=ok`; and restart
-    the discipline at the fast cadence.
+11. If `ACK_REQUIRED` is set, write the acknowledgement (2) to `0x605`.
+12. After the acknowledgement, or after step 10 when none is required, the
+    daemon finishes the restore asynchronously, and fail-fast:
+    - it runs the restore checks (`C1`, `C2`, and `C5` on newly onlined
+      CPUs; `C3` for CPU 0; `C6`; `C10`);
+    - it waits for the [grace period release](#rcu-grace-period-release);
+    - it restores the values saved in steps 2 and 3
+      (`G_REPAIR_SUPPRESSION`);
+    - it runs the deferred `C7` check and records the restore check in the
+      state file;
+    - it restarts the discipline at the fast cadence.
+
+    It prints nothing unless a check fails.
 
 Steps 6, 7, and 8 run in one helper process. Repair failures emit a violation
 event and power off with status 195.
@@ -1163,12 +1188,9 @@ The daemon keeps `CLOCK_REALTIME` on host UTC through the kernel's PLL:
 - **Cadence.** A poll every 16 s for the first four polls after the boot
   check or a restore, then every 64 s.
 - **Sample.** Up to three time samples per poll; keep the first with
-  `epsilon <= 50 µs`. Otherwise skip the poll, count a rejected sample, set
-  `last_sample_error=G_SAMPLE_UNCERTAIN`, and print
-  `NVX-TIME-ABI: v=1 phase=runtime status=uncertain code=G_SAMPLE_UNCERTAIN
-  epsilon_ns=<smallest>` on the console, with `epsilon_ns=none` when no
-  attempt produced a valid sample. The next accepted sample resets
-  `last_sample_error` to `none`.
+  `epsilon <= 50 µs`. Otherwise skip the poll, count a rejected sample, and
+  set `last_sample_error=G_SAMPLE_UNCERTAIN` in the state file; nothing is
+  printed. The next accepted sample resets `last_sample_error` to `none`.
   A sample whose `g` differs from the recorded `g` is discarded: a restore
   happened, and restore repair resets the discipline.
 - **Step.** If `|theta| >= 128 ms`, apply `ADJ_SETOFFSET | ADJ_NANO` with
@@ -1186,8 +1208,9 @@ The daemon keeps `CLOCK_REALTIME` on host UTC through the kernel's PLL:
 The discipline never powers off the guest: a host wall-clock step is
 followed, not reported as a violation.
 
-**Discontinuity state.** The daemon publishes `/run/nvx/time/state`, replaced
-atomically with `rename(2)` after every change. The sandbox agent bind-mounts
+**State file.** The time component publishes `/run/nvx/time/state`
+from the start of the boot checks, replaced atomically with `rename(2)` after
+every change, and `nvx-time status` reads it. The sandbox agent bind-mounts
 `/run/nvx/time` read-only into the container at the same path. The file holds
 `key=value` lines:
 
@@ -1195,6 +1218,11 @@ atomically with `rename(2)` after every change. The sandbox agent bind-mounts
 | --- | --- |
 | `version` | 1 |
 | `generation` | `g` |
+| `check_phase` | `boot`, `capture`, or `restore`: the last conformance check |
+| `check_status` | `pending` while it runs, then `ok`; a failed check powers the guest off |
+| `check_cpus` | Online CPUs the check covered |
+| `check_elapsed_us` | Its duration, with the daemon start at boot |
+| `tsc_hz`, `lapic_hz` | `F` and `L` |
 | `discontinuities` | Wall-clock discontinuities since cold boot: restores plus discipline steps |
 | `last_discontinuity` | `none`, `restore`, or `step` |
 | `last_step_ns` | Signed size of the last step |
@@ -1269,7 +1297,12 @@ signals, and 255):
 | 195 | Restore repair | `G_REPAIR_PACKET`, `G_REPAIR_GENERATION`, `G_REPAIR_SAMPLE`, `G_REPAIR_CLOCK`, `G_REPAIR_SUPPRESSION` |
 
 `G_SAMPLE_UNCERTAIN` is the only non-fatal guest code: the discipline records
-it and continues (see [Uncertainty bounds](#uncertainty-bounds)).
+it and continues (see [Uncertainty bounds](#uncertainty-bounds)). Every fatal
+guest code prints its violation event before the power-off, on production
+paths too. No other time ABI line reaches the console unless a test runs
+`nvx-time status` or `nvx-time exhaustive`. A boot or restore check that
+fails after shell-ready or after the acknowledgement still powers off with
+193, while the workload may be running.
 
 A workload can exit with any 8-bit status, so a harness classifies a time
 failure by the status together with its `NVX-TIME-ABI-VIOLATION` event.
@@ -1399,9 +1432,10 @@ Expected effects:
 | Invariant TSC from the profile where the backend cannot offer it to guests (Azure MSHV and WHP) | Removes each AP's delay calibration of about 150 ms: an 8-vCPU cold boot takes 299 ms instead of 1,385 ms on Azure MSHV, and cold boots are 0.2 to 1.1 s faster at 2 to 8 vCPUs on Azure WHP |
 | Fixed restore work: the restore clock (0.7 to 1.1 ms), restore verification, and the backend preflight | A one-vCPU WHP restore is at parity on Azure 8370C runners (p50 −0.6 ms) and about 2 ms slower on bare metal, where no emulation cost is recovered; the counting LAPIC accounts for at most 0.75 ms of it |
 | MSHV VP creation | Serialized at about 14 ms per application processor on bare metal (27 and 85 ms at 4 and 8 vCPUs); the frozen synchronized TSC set adds 40 to 170 µs for 1 to 4 VPs and no per-VP serialized work |
-| Boot check and daemon start | Added cold-boot cost, reported as the first run's `elapsed_us`; budget 2.5 ms at one vCPU plus 0.3 ms per additional vCPU on KVM and MSHV, and 5 ms plus 0.6 ms per additional vCPU on WHP; the gate is authoritative |
+| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their `elapsed_us`, budgeted at 2.5 ms at one vCPU plus 0.3 ms per additional vCPU on KVM and MSHV, and 5 ms plus 0.6 ms per additional vCPU on WHP |
 | Counting LAPIC instead of TSC-deadline on KVM | Different timer-programming exits; covered by the gate |
-| Restore repair and checks before the acknowledgement | Run in one helper process; the RCU release and deferred checks run after the acknowledgement |
+| Restore work before the acknowledgement | Only the packet read, the clock set, CPU and memory activation, and entropy and identity repair, in one helper process. The restore checks, the RCU release, and the deferred `C7` run asynchronously after the acknowledgement |
+| No time ABI console lines in production | Each console byte costs one or two port exits, about 10 to 12 µs on bare-metal KVM and an estimated 20 to 45 µs nested on Azure. Without the boot marker (about 110 bytes) and the restore marker (about 117 bytes), boots and restores save 1 to 5 ms, enough to fail the gate on `azure-kvm-5`; violation events still print |
 
 Expected wins are tracked separately and do not relax the gate.
 
@@ -1412,9 +1446,9 @@ profile records three exclusive time ABI restore phases:
 and, for a restore with `ACK_REQUIRED`, `restore.guest_repair` (from that
 selection to the arrival of the `0x605` acknowledgement). The
 `restore.guest_repair_gate` milestone still spans from the VP release to the
-release of the acknowledgement boundary. The guest reports its own repair
-checks as the restore marker's `elapsed_us`, which covers ungated restores
-too.
+release of the acknowledgement boundary. The guest's restore checks run
+after the acknowledgement, outside these phases; `nvx-time status` reports
+their duration as `elapsed_us`.
 
 ## Test matrix
 
@@ -1430,7 +1464,11 @@ parser; four-byte portb reads; and the generation counter.
 
 **Conformance.** The boot and restore checks pass at 1, 2, 4, and 8 vCPUs on
 all 18 registered hosts, plus the exhaustive CI check and the warp probe on
-every backend. The fleet runs them on the hosts our SSH account can use,
+every backend. Production paths print no marker, so CI scenarios and the
+matrix driver run `/sbin/nvx-time status` over the console after shell-ready
+and after every restore, and require its `phase=boot` or `phase=restore`
+marker with `status=ok` and the expected `generation`. The fleet runs them on
+the hosts our SSH account can use,
 which for KVM are prometheus32 and `azure-kvm-5` and for MSHV prometheus30
 and `azure-azlinux-5`: the account cannot open `/dev/kvm` or `/dev/mshv` on
 the other KVM and MSHV runners, which only CI jobs exercise. On the Azure WHP
@@ -1439,7 +1477,9 @@ keeps `tsc` as its clocksource (#292: 6 of 6 runs with the time ABI, against
 0 of 6 before it, which fell back from `tsc-early` to `refined-jiffies`).
 
 **Restore matrix.** Every case runs with zero violations; rejected cases must
-fail with the listed code. Per-PR CI runs the same-host cases on one runner;
+fail with the listed code. A restored case's evidence is the
+`nvx-time status` output after the restore, which waits for the deferred
+checks. Per-PR CI runs the same-host cases on one runner;
 the full matrix, including the cross-VM cases, runs on the hosts our account
 can use as the fleet restore matrix.
 
@@ -1451,7 +1491,7 @@ can use as the fleet restore matrix.
 | Simulated host reboot: hooks `force-utc-downtime`, `boot-id-mismatch`, and `dest-rate-offset-ppm=+200`, then `-200` | One host per backend | Restored; `DOWNTIME_UTC` and `TEST_HOOKS` set; rate deviation reported |
 | Simulated rate beyond tolerance: `dest-rate-offset-ppm=+251` | One host per backend | `E_TSC_RATE_TOLERANCE` |
 | Downtime bounds: `downtime-add-s=2592001`; `force-utc-downtime` with `utc-offset-ms=-<n>`, `n` above the elapsed time | One host per backend | `E_DOWNTIME_EXCESSIVE`; `E_DOWNTIME_NEGATIVE` |
-| Sample uncertainty: `sample-delay-us=200`; then `sample-delay-us=3000` on restore and on cold boot | One host per backend | Restored, with `G_SAMPLE_UNCERTAIN` recorded and the guest running; `G_REPAIR_SAMPLE` (195); `G_CONFORMANCE_C12` (193) |
+| Sample uncertainty: `sample-delay-us=200`; then `sample-delay-us=3000` on restore and on cold boot | One host per backend | Restored and running, with `last_sample_error=G_SAMPLE_UNCERTAIN` in `nvx-time status`; `G_REPAIR_SAMPLE` (195); `G_CONFORMANCE_C12` (193) |
 | Across VMs of one generation | `azure-windows-1` to `-2`; `azure-windows-3` to `-4`. KVM and MSHV have no usable pair of one generation, so the simulated host reboot covers their cross-host path | Restored |
 | Across generations | `azure-windows-1` (8370C) to `-3` (8573C); prometheus32 to `azure-kvm-5` (KVM); prometheus30 to `azure-azlinux-5` (MSHV) | `E_CPU_GENERATION` |
 | Backend that cannot offer invariant TSC to its guests, on a host OS that sees it | `azure-windows-1` to `-4`, `azure-azlinux-5` | Restored; the guest has `constant_tsc` and `nonstop_tsc`; `H4` and `H6` pass |
