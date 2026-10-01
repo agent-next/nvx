@@ -33,6 +33,7 @@ from .time_abi import (
     WARP_BOUND_NS,
     WARP_PROBE_COMPLETION_MARKER,
     WARP_PROBE_IDLE_SECONDS,
+    CpuGeneration,
     TimeAbiFailure,
     TimeAbiMonitor,
     check_warp_probe,
@@ -45,17 +46,21 @@ from .time_abi import (
 CHECK_IDS = ("H1", "H2", "H3", "H4", "H5", "H6", "H7")
 CHECK_TITLES: Mapping[str, str] = {
     "H1": "backend device or API",
-    "H2": "CPU fingerprint and generation",
+    "H2": "CPU fingerprint, generation, and profile",
     "H3": "OpenVMM time ABI preflight",
     "H4": "host TSC rate stability",
     "H5": "host cross-CPU TSC skew",
     "H6": "guest warp probe",
     "H7": "host UTC synchronization",
 }
+# Checks that boot OpenVMM; H2 also runs it unless qualification has none.
+OPENVMM_CHECKS = ("H3", "H6")
 DOCTOR_PREFIX = "NVX-DOCTOR: "
 PROBE_SOURCE = Path(__file__).with_name("host_time_probe.rs")
 PROBE_PREFIX = "NVX-HOST-TIME-PROBE "
 VERIFY_PREFIX = "NVX-TIME-ABI-VERIFY:"
+CPU_PROFILE_PREFIX = "NVX-CPU-PROFILE:"
+RUST_ESCAPE = re.compile(r"\\(u\{[0-9a-fA-F]{1,6}\}|.)")
 RATE_MEASURE_MS = 1000
 RATE_AGREEMENT_PPM = 1.0
 RATE_TOLERANCE_PPM = 100.0
@@ -101,6 +106,9 @@ class DoctorContext:
     timeout: float
     facts: dict[str, str] = field(default_factory=dict[str, str])
     probe: Path | None = None
+    # Where H2 writes OpenVMM's CPU fingerprint; None skips the profile check
+    # when qualification runs without OpenVMM.
+    fingerprint: Path | None = None
 
 
 def host_is_windows() -> bool:
@@ -347,15 +355,127 @@ def check_cpu(context: DoctorContext) -> CheckResult:
         f"microcode={info.get('microcode', 'unknown')} os={info['os']} "
         f"invariant_tsc={info['invariant_tsc']} brand={info['brand']}"
     )
+    problems: list[str] = []
     if generation is None:
-        return CheckResult(
-            "H2",
-            False,
+        problems.append(
             f"[E_PROFILE_HOST_UNKNOWN] {signature} is not a time ABI generation "
-            "(skylake-sp 6/85 steppings 0-4, icelake-sp 6/106, emeraldrapids "
-            f"6/207); {detail}",
+            "(skylake-sp 6/85 steppings 0-4, icelake-sp 6/106, emeraldrapids 6/207)"
         )
+    if context.fingerprint is None:
+        detail += "; CPU profile not checked: qualification runs without OpenVMM"
+    else:
+        profile_detail, profile_problems = _check_cpu_profile(context, generation)
+        detail += f"; {profile_detail}"
+        problems.extend(profile_problems)
+    if problems:
+        return CheckResult("H2", False, "; ".join(problems) + f"; {detail}")
     return CheckResult("H2", True, detail)
+
+
+def parse_cpu_profile_line(line: str) -> dict[str, str]:
+    """Parse OpenVMM's ``NVX-CPU-PROFILE:`` line; ``detail`` is a Rust string."""
+    text = line.strip().removeprefix(CPU_PROFILE_PREFIX)
+    head, quoted, detail = text.partition(' detail="')
+    fields = parse_fields(head)
+    if quoted:
+        fields["detail"] = RUST_ESCAPE.sub(_rust_unescape, detail.removesuffix('"'))
+    return fields
+
+
+def _rust_unescape(match: re.Match[str]) -> str:
+    escape = match.group(1)
+    if escape.startswith("u{"):
+        return chr(int(escape[2:-1], 16))
+    return {"n": "\n", "r": "\r", "t": "\t", "0": "\0"}.get(escape, escape)
+
+
+def _same_profile_lineage(selected: str, expected: str) -> bool:
+    """Whether ``selected`` is a revision of the profile ``expected`` names."""
+    return selected.startswith(expected.rpartition(".v")[0] + ".v")
+
+
+def _check_cpu_profile(
+    context: DoctorContext, generation: CpuGeneration | None
+) -> tuple[str, list[str]]:
+    """Fingerprint the host with OpenVMM and check its generation's profile."""
+    assert context.fingerprint is not None
+    if not context.openvmm.is_file():
+        return "CPU profile not checked", [
+            f"OpenVMM was not found at {context.openvmm}; H2 checks the CPU "
+            "profile with its --cpu-fingerprint tool (or pass --no-openvmm)"
+        ]
+    context.fingerprint.parent.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment["OPENVMM_LOG"] = "off"
+    completed = subprocess.run(
+        [
+            os.fspath(context.openvmm),
+            "--hypervisor",
+            context.backend,
+            "--cpu-fingerprint",
+            os.fspath(context.fingerprint),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=context.timeout,
+        env=environment,
+        check=False,
+    )
+    output = f"{completed.stdout}\n{completed.stderr}"
+    line = next(
+        (
+            line.strip()
+            for line in output.splitlines()
+            if line.strip().startswith(CPU_PROFILE_PREFIX)
+        ),
+        None,
+    )
+    if line is None:
+        last = next(
+            (line.strip() for line in reversed(output.splitlines()) if line.strip()),
+            "no output",
+        )
+        if "--cpu-fingerprint" in output and "unexpected argument" in output:
+            last = "this OpenVMM predates the --cpu-fingerprint tool"
+        return "CPU profile not checked", [
+            f"OpenVMM's CPU fingerprint exited {completed.returncode} without "
+            f"an {CPU_PROFILE_PREFIX} line: {last}"
+        ]
+    fields = parse_cpu_profile_line(line)
+    for name in ("profile", "profile_digest", "surface_digest"):
+        if fields.get(name, "none") != "none":
+            context.facts[name] = fields[name]
+    context.facts["cpu_fingerprint"] = os.fspath(context.fingerprint)
+    detail = (
+        f"CPU profile check status={fields.get('status')} "
+        f"profile={fields.get('profile')} "
+        f"profile_digest={fields.get('profile_digest', 'none')} "
+        f"surface_digest={fields.get('surface_digest')} "
+        f"fingerprint={context.fingerprint}"
+    )
+    problems: list[str] = []
+    if completed.returncode != 0 or fields.get("status") != "pass":
+        code = fields.get("code", "")
+        prefix = f"[{code}] " if code.startswith("E_") else ""
+        problems.append(
+            f"{prefix}OpenVMM's CPU profile check failed (exit "
+            f"{completed.returncode}): {fields.get('detail', line)}"
+        )
+        return detail, problems
+    if fields.get("backend") != context.backend:
+        problems.append(f"OpenVMM fingerprinted the {fields.get('backend')} backend")
+    if generation is not None:
+        if fields.get("generation") != generation.name:
+            problems.append(
+                f"OpenVMM maps the host to generation {fields.get('generation')}, "
+                f"not {generation.name}"
+            )
+        if not _same_profile_lineage(fields.get("profile", ""), generation.profile_id):
+            problems.append(
+                f"OpenVMM selected CPU profile {fields.get('profile')}, not a "
+                f"revision of {generation.profile_id}"
+            )
+    return detail, problems
 
 
 def _guest_vcpus() -> int:
@@ -447,20 +567,14 @@ def check_openvmm_preflight(context: DoctorContext) -> CheckResult:
         )
     expected_profile = context.facts.get("profile", "none")
     selected_profile = fields.get("cpu_profile", "")
-    interim = f"interim.host.{context.backend}.v1"
-    if expected_profile != "none" and selected_profile != interim:
-        # Later revisions of the same generation are fine.
-        lineage = expected_profile.rpartition(".v")[0] + ".v"
-        if not selected_profile.startswith(lineage):
-            problems.append(
-                f"OpenVMM selected CPU profile {selected_profile}, but H2 maps the "
-                f"host to {expected_profile}"
-            )
+    if expected_profile != "none" and not _same_profile_lineage(
+        selected_profile, expected_profile
+    ):
+        problems.append(
+            f"OpenVMM selected CPU profile {selected_profile}, but H2 maps the "
+            f"host to {expected_profile}"
+        )
     detail = " ".join(f"{name}={value}" for name, value in fields.items())
-    if selected_profile == interim:
-        # OpenVMM uses an interim host profile until it selects catalog
-        # profiles; core-design, "Changes".
-        detail += f"; interim CPU profile, expected {expected_profile} later"
     context.facts.update(
         {
             "tsc_hz": fields.get("tsc_hz", ""),
@@ -716,6 +830,8 @@ def summary_markdown(
         ("microcode", "Microcode"),
         ("os", "Host OS"),
         ("profile", "Profile"),
+        ("profile_digest", "Profile digest"),
+        ("surface_digest", "CPU surface digest"),
         ("tsc_hz", "Declared TSC rate (Hz)"),
         ("lapic_hz", "LAPIC rate (Hz)"),
         ("measured_tsc_hz", "Measured TSC rate (Hz)"),
@@ -736,14 +852,27 @@ def run(args: argparse.Namespace) -> int:
     if args.backend not in OPENVMM_TEST_BACKENDS:
         raise ScriptError(f"unsupported backend {args.backend!r}")
     checks = tuple(dict.fromkeys(args.checks or CHECK_IDS))
+    if args.no_openvmm:
+        booting = [check for check in checks if check in OPENVMM_CHECKS]
+        if booting:
+            raise ScriptError(
+                f"--no-openvmm cannot run {' and '.join(booting)}, which boot OpenVMM"
+            )
+    probe_directory = args.probe_dir or default_probe_directory()
+    fingerprint: Path | None = None
+    if not args.no_openvmm:
+        fingerprint = args.cpu_fingerprint or (
+            probe_directory / f"nvx-cpu-fingerprint-{args.backend}.json"
+        )
     context = DoctorContext(
         backend=args.backend,
         openvmm=args.openvmm or openvmm_binary_path(),
         kernel=args.kernel or artifact_path(KernelBuildConstants.BINARY_NAME),
         initrd=args.initrd or artifact_path(AlpineBuildConstants.INITRAMFS_NAME),
         openvmm_args=tuple(args.openvmm_arg),
-        probe_directory=args.probe_dir or default_probe_directory(),
+        probe_directory=probe_directory,
         timeout=args.timeout,
+        fingerprint=fingerprint,
     )
     results = run_checks(context, checks)
     failed = [result.check for result in results if not result.passed]
@@ -782,9 +911,24 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         metavar="ID",
         help="checks to run, in spec order (default: H1 to H7)",
     )
-    parser.add_argument("--openvmm", type=Path, help="OpenVMM binary for H3 and H6")
+    parser.add_argument(
+        "--openvmm", type=Path, help="OpenVMM binary for H2, H3, and H6"
+    )
     parser.add_argument("--kernel", type=Path, help="guest kernel for H6")
     parser.add_argument("--initrd", type=Path, help="guest initramfs for H6")
+    openvmm = parser.add_mutually_exclusive_group()
+    openvmm.add_argument(
+        "--cpu-fingerprint",
+        type=Path,
+        help="where H2 writes OpenVMM's CPU fingerprint "
+        "(default: nvx-cpu-fingerprint-<backend>.json in the probe directory)",
+    )
+    openvmm.add_argument(
+        "--no-openvmm",
+        action="store_true",
+        help="qualify without an OpenVMM binary: H2 checks the CPU identity and "
+        "generation but not the CPU profile, and H3 and H6 cannot run",
+    )
     parser.add_argument(
         "--probe-dir",
         type=Path,

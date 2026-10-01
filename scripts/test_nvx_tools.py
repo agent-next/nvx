@@ -2266,7 +2266,8 @@ class CiConfigurationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         # The doctor replaces the nonstop_tsc check: the backend, the CPU
-        # fingerprint and generation, and the TSC rate stability.
+        # fingerprint and generation, and the TSC rate stability. Jobs have no
+        # OpenVMM binary yet, so H2 skips OpenVMM's CPU profile check.
         self.assertNotIn("Validate host TSC", validate_runner)
         for name, shell, command, summary in (
             (
@@ -2289,11 +2290,13 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertIn(command, step)
                 self.assertIn('--backend "${{ inputs.backend }}"', step)
                 self.assertIn("--checks H1 H2 H4\n", step)
+                self.assertIn("--no-openvmm\n", step)
                 self.assertIn(summary, step)
         args = nvx.parse_args(
-            ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4"]
+            ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4", "--no-openvmm"]
         )
         self.assertEqual(args.checks, ["H1", "H2", "H4"])
+        self.assertTrue(args.no_openvmm)
         self.assertLess(
             validate_runner.index("Validate Linux toolchain"),
             validate_runner.index("Qualify host time on Linux"),

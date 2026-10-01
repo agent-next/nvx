@@ -643,6 +643,12 @@ CPU = {
     "os": "Linux 6.6.150.1-1.azl3",
     "invariant_tsc": "yes",
 }
+# OpenVMM's cpu_profile FingerprintCheck::summary_line, printed on stderr.
+PROFILE_PASS = (
+    "NVX-CPU-PROFILE: status=pass backend=kvm generation=icelake-sp "
+    f"profile=intel.icelake-sp.v1 profile_digest=sha256:{'a3' * 32} "
+    "surface_digest=sha256:6286956acbef host_invariant_tsc=yes\n"
+)
 
 
 class DoctorTests(unittest.TestCase):
@@ -716,6 +722,130 @@ class DoctorTests(unittest.TestCase):
                 self.assertEqual(
                     context.facts["invariant_tsc"], "no (missing nonstop_tsc)"
                 )
+
+    def test_cpu_check_verifies_the_profile_with_openvmm_fingerprint(self):
+        fingerprint = self.root / "out" / "fingerprint.json"
+
+        def context_with_openvmm(backend: str = "kvm") -> doctor.DoctorContext:
+            context = doctor_context(self.root, backend)
+            context.openvmm.write_bytes(b"")
+            context.fingerprint = fingerprint
+            return context
+
+        def check(
+            result: subprocess.CompletedProcess[str],
+            cpu: dict[str, str] = CPU,
+            backend: str = "kvm",
+        ) -> tuple[doctor.CheckResult, doctor.DoctorContext]:
+            context = context_with_openvmm(backend)
+            with (
+                patch.object(doctor, "host_cpu", return_value=dict(cpu)),
+                patch.object(doctor.subprocess, "run", return_value=result),
+            ):
+                return doctor.check_cpu(context), context
+
+        context = context_with_openvmm()
+        with (
+            patch.object(doctor, "host_cpu", return_value=dict(CPU)),
+            patch.object(
+                doctor.subprocess, "run", return_value=completed("", 0, PROFILE_PASS)
+            ) as run,
+        ):
+            result = doctor.check_cpu(context)
+        self.assertTrue(result.passed, result.detail)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                str(context.openvmm),
+                "--hypervisor",
+                "kvm",
+                "--cpu-fingerprint",
+                str(fingerprint),
+            ],
+        )
+        self.assertEqual(run.call_args.kwargs["env"]["OPENVMM_LOG"], "off")
+        self.assertTrue(fingerprint.parent.is_dir())
+        self.assertIn("surface_digest=sha256:6286956acbef", result.detail)
+        self.assertEqual(context.facts["profile"], "intel.icelake-sp.v1")
+        self.assertEqual(context.facts["profile_digest"], f"sha256:{'a3' * 32}")
+        self.assertEqual(context.facts["surface_digest"], "sha256:6286956acbef")
+        # A later revision of the generation's profile is fine.
+        revised = PROFILE_PASS.replace("icelake-sp.v1", "icelake-sp.v2")
+        self.assertTrue(check(completed("", 0, revised))[0].passed)
+
+        unsupported = (
+            "NVX-CPU-PROFILE: status=fail backend=whp generation=icelake-sp "
+            "profile=intel.icelake-sp.v1 profile_digest=sha256:a3 "
+            "surface_digest=sha256:d67f host_invariant_tsc=no "
+            'code=E_PROFILE_UNSUPPORTED detail="CPUID 0x7.0 EDX bits 26, 27 are '
+            'not supported; leaf \\"7\\"\\u{a0}subleaf"\n'
+        )
+        result, context = check(completed("", 1, unsupported), backend="whp")
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            result.detail.startswith(
+                "[E_PROFILE_UNSUPPORTED] OpenVMM's CPU profile check failed (exit 1): "
+                'CPUID 0x7.0 EDX bits 26, 27 are not supported; leaf "7"\xa0subleaf;'
+            ),
+            result.detail,
+        )
+        unknown = (
+            "NVX-CPU-PROFILE: status=fail backend=kvm generation=none profile=none "
+            "surface_digest=sha256:1 host_invariant_tsc=yes "
+            'code=E_PROFILE_HOST_UNKNOWN detail="GenuineIntel family 6 model 143"\n'
+        )
+        result, context = check(completed("", 1, unknown), dict(CPU, model="143"))
+        self.assertFalse(result.passed)
+        self.assertTrue(result.detail.startswith("[E_PROFILE_HOST_UNKNOWN] "))
+        self.assertIn("[E_PROFILE_HOST_UNKNOWN] OpenVMM's CPU profile", result.detail)
+        self.assertEqual(context.facts["profile"], "none")
+        for output, message in (
+            (
+                completed("", 2, "error: unexpected argument '--cpu-fingerprint'"),
+                "predates the --cpu-fingerprint tool",
+            ),
+            (completed("", 1, "fatal error: no backend"), "fatal error: no backend"),
+            (
+                completed("", 0, PROFILE_PASS.replace("=kvm", "=mshv")),
+                "fingerprinted the mshv backend",
+            ),
+            (
+                completed(
+                    "",
+                    0,
+                    PROFILE_PASS.replace(
+                        "generation=icelake-sp", "generation=emeraldrapids"
+                    ),
+                ),
+                "generation emeraldrapids, not icelake-sp",
+            ),
+            (
+                completed(
+                    "", 0, PROFILE_PASS.replace("intel.icelake", "intel.skylake")
+                ),
+                "profile intel.skylake-sp.v1, not a revision",
+            ),
+        ):
+            with self.subTest(message=message):
+                result = check(output)[0]
+                self.assertFalse(result.passed)
+                self.assertIn(message, result.detail)
+        missing = doctor_context(self.root / "none")
+        missing.fingerprint = fingerprint
+        with patch.object(doctor, "host_cpu", return_value=dict(CPU)):
+            result = doctor.check_cpu(missing)
+        self.assertFalse(result.passed)
+        self.assertIn("was not found", result.detail)
+        self.assertIn("--no-openvmm", result.detail)
+        # Without OpenVMM, H2 checks the identity and generation only.
+        with (
+            patch.object(doctor, "host_cpu", return_value=dict(CPU)),
+            patch.object(doctor.subprocess, "run") as run,
+        ):
+            result = doctor.check_cpu(doctor_context(self.root))
+        self.assertTrue(result.passed)
+        self.assertIn("CPU profile not checked", result.detail)
+        run.assert_not_called()
 
     def test_reads_the_first_processor_from_cpuinfo(self):
         path = self.root / "cpuinfo"
@@ -799,9 +929,8 @@ class DoctorTests(unittest.TestCase):
         for selected, passed in (
             ("intel.icelake-sp.v2", True),
             ("intel.skylake-sp.v1", False),
-            # OpenVMM's interim host profile until it selects catalog profiles.
-            ("interim.host.kvm.v1", True),
-            ("interim.host.mshv.v1", False),
+            # OpenVMM selects catalog profiles, so an interim one is a regression.
+            ("interim.host.kvm.v1", False),
         ):
             with self.subTest(selected=selected):
                 context = context_with_files()
@@ -1030,6 +1159,45 @@ class DoctorTests(unittest.TestCase):
         text = summary.read_text(encoding="utf-8")
         self.assertIn("**fail** | rustc is required", text)
         self.assertIn("Generation: `emeraldrapids`", text)
+
+    def test_run_selects_the_cpu_fingerprint_or_runs_without_openvmm(self):
+        seen: list[Path | None] = []
+
+        def cpu(context: doctor.DoctorContext) -> doctor.CheckResult:
+            seen.append(context.fingerprint)
+            context.facts["surface_digest"] = "sha256:62"
+            return doctor.CheckResult("H2", True, "ok")
+
+        summary = self.root / "summary.md"
+        common = ["--backend", "kvm", "--checks", "H2", "--summary", str(summary)]
+        common += ["--probe-dir", str(self.root)]
+        with (
+            patch.dict(doctor.CHECKS, {"H2": cpu}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            for extra in (
+                [],
+                ["--cpu-fingerprint", str(self.root / "fingerprint.json")],
+                ["--no-openvmm"],
+            ):
+                arguments = doctor_parser().parse_args([*common, *extra])
+                self.assertEqual(doctor.run(arguments), 0)
+        self.assertEqual(
+            seen,
+            [
+                self.root / "nvx-cpu-fingerprint-kvm.json",
+                self.root / "fingerprint.json",
+                None,
+            ],
+        )
+        self.assertIn("CPU surface digest: `sha256:62`", summary.read_text("utf-8"))
+        arguments = doctor_parser().parse_args(["--backend", "kvm", "--no-openvmm"])
+        with self.assertRaisesRegex(doctor.ScriptError, "cannot run H3 and H6"):
+            doctor.run(arguments)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            doctor_parser().parse_args(
+                ["--backend", "kvm", "--no-openvmm", "--cpu-fingerprint", "x"]
+            )
 
     def test_builds_the_host_probe_once_per_source_version(self):
         target = doctor.probe_path(self.root)

@@ -56,9 +56,10 @@ exposes an invariant TSC. The control log is kept as
 failure; the restore still fails.
 
 Every job that uses the `validate-runner` action first qualifies its runner
-for the time ABI with `nvx.py doctor --checks H1 H2 H4` (see
+for the time ABI with `nvx.py doctor --checks H1 H2 H4 --no-openvmm` (see
 [Host qualification](#host-qualification)): the backend, the CPU fingerprint
-and generation, and the TSC rate stability. This replaces the earlier
+and generation, and the TSC rate stability. The job has no OpenVMM binary yet,
+so H2 skips OpenVMM's CPU profile check. This replaces the earlier
 `nonstop_tsc` check and takes a few seconds. It reports the CPU generation,
 the CPU profile that `auto` selects, and the measured TSC rate in the log and
 the job summary, and fails the job with a stable code when the runner is not
@@ -164,8 +165,8 @@ brackets, for example `[E_PROFILE_HOST_UNKNOWN]`.
 | Check | Implementation |
 | --- | --- |
 | H1 | `/dev/kvm` or `/dev/mshv` is readable and writable, and a KVM host has no `/dev/mshv`; on Windows, `WHvGetCapability` reports a hypervisor |
-| H2 | Vendor, family, model, stepping, microcode, and OS build from `/proc/cpuinfo` or the Windows registry, and the generation and the profile that `auto` selects from the spec's catalog, which shares one profile per generation across backends: `skylake-sp` (6/85, steppings 0 to 4, `intel.skylake-sp.v1`), `icelake-sp` (6/106, `intel.icelake-sp.v1`), or `emeraldrapids` (6/207, `intel.emeraldrapids.v1`). Any other CPU, including Cascade Lake and Cooper Lake, fails with `E_PROFILE_HOST_UNKNOWN`. The host OS's invariant-TSC flags (`constant_tsc nonstop_tsc`, or the CPUID bit on Windows) are recorded as evidence and never fail the check, because they don't decide what a guest observes: Azure WHP hosts show the CPUID bit but cannot offer invariant TSC to partitions, and their guests measure tens of nanoseconds of skew |
-| H3 | `openvmm --x-time-abi-verify` builds the partition and runs the time ABI preflight without running the guest. Its `NVX-TIME-ABI-VERIFY:` line must report `status=ok` for the backend, plausible declared and native TSC rates, the backend's LAPIC rate, and a revision of the profile H2 names; OpenVMM's interim `interim.host.<backend>.v1` profile is accepted until it selects catalog profiles. A failed preflight reports OpenVMM's code, for example `[E_TSC_SYNC_UNSUPPORTED]`. Before the flip, pass `--openvmm-arg=--x-time-abi-v1` |
+| H2 | Vendor, family, model, stepping, microcode, and OS build from `/proc/cpuinfo` or the Windows registry, and the generation and the profile that `auto` selects from the spec's catalog, which shares one profile per generation across backends: `skylake-sp` (6/85, steppings 0 to 4, `intel.skylake-sp.v1`), `icelake-sp` (6/106, `intel.icelake-sp.v1`), or `emeraldrapids` (6/207, `intel.emeraldrapids.v1`). Any other CPU, including Cascade Lake and Cooper Lake, fails with `E_PROFILE_HOST_UNKNOWN`. Then `openvmm --hypervisor <backend> --cpu-fingerprint <path>` writes the host's CPU fingerprint (by default `nvx-cpu-fingerprint-<backend>.json` in the probe directory; `--cpu-fingerprint` overrides it), checks it against the generation's profile, and prints one `NVX-CPU-PROFILE:` line. H2 requires exit status 0, `status=pass`, the same backend and generation, and a revision of the generation's profile, reports the profile and surface digests, and otherwise fails with OpenVMM's code, for example `[E_PROFILE_UNSUPPORTED]` naming every unsupported CPUID bit. The host OS's invariant-TSC flags (`constant_tsc nonstop_tsc`, or the CPUID bit on Windows) are recorded as evidence and never fail the check, because they don't decide what a guest observes: Azure WHP hosts show the CPUID bit but cannot offer invariant TSC to partitions, and their guests measure tens of nanoseconds of skew |
+| H3 | `openvmm --x-time-abi-verify` builds the partition and runs the time ABI preflight without running the guest. Its `NVX-TIME-ABI-VERIFY:` line must report `status=ok` for the backend, plausible declared and native TSC rates, the backend's LAPIC rate, and a revision of the profile H2 names. A failed preflight reports OpenVMM's code, for example `[E_TSC_SYNC_UNSUPPORTED]`. Before the flip, pass `--openvmm-arg=--x-time-abi-v1` |
 | H4 | Two 1 s measurements of the TSC against host monotonic time agree within 1 ppm, and lie within 100 ppm of the rate H3 reports when H3 runs in the same invocation. A Linux host's clocksource is recorded as evidence |
 | H5 | Pinned-thread ping-pong rounds over every pair of host CPUs; `max_abs_offset_ns` is at most 1,000, the measurement is conclusive, and no pair stalls |
 | H6 | A microVM with the largest supported vCPU count up to 8 prints a valid `NVX-TIME-ABI` boot marker, and the idle-inducing warp schedule stays within 1,000 ns: two rounds of `nvx-time-probe warp` over every CPU pair with all vCPUs halted for 1 s between them, so that a host without an invariant TSC corrects the guest TSC as idle host CPUs wake (#265) |
@@ -175,19 +176,22 @@ H2, H4, and H5 use a dependency-free host probe,
 [`host_time_probe.rs`](../scripts/nvx_tools/host_time_probe.rs), which the
 doctor builds with `rustc` once per source version into
 `$RUNNER_TOOL_CACHE/nvx-host-time-probe` (or `build/host-time-probe` outside
-CI). H3 and H6 need the OpenVMM binary and the guest artifacts; `--openvmm`,
-`--kernel`, and `--initrd` override their default build paths.
+CI). H2's profile check, H3, and H6 need the OpenVMM binary, and H3 and H6
+also need the guest artifacts; `--openvmm`, `--kernel`, and `--initrd`
+override their default build paths. `--no-openvmm` qualifies a host without
+OpenVMM: H2 then checks the CPU identity and generation only, and H3 and H6
+cannot run.
 
 Qualification gates on measured properties, alike on every backend: the guest
 warp probe at 1 µs with its idle gaps (H6), the TSC rate stability (H4), and
 the CPU profile (H2 and H3). The host OS's invariant-TSC flags and clocksource
 are evidence only. In CI, `validate-runner` runs the cheap host-level checks
-H1, H2, and H4 before every job; jobs download OpenVMM and the guest artifacts
-only later. The guest warp probe needs a time ABI boot, so it belongs in the
-microVM boot and restore scenarios, which assert its verdict once OpenVMM
-boots the time ABI by default. Without H3, H4 checks the rate stability
-without comparing it against the backend's rate. H5 and H7 remain available
-for interactive qualification.
+H1, H2, and H4 before every job, with `--no-openvmm`, because jobs download
+OpenVMM and the guest artifacts only later. The guest warp probe needs a time
+ABI boot, so it belongs in the microVM boot and restore scenarios, which
+assert its verdict once OpenVMM boots the time ABI by default. Without H3, H4
+checks the rate stability without comparing it against the backend's rate. H5
+and H7 remain available for interactive qualification.
 
 ## Adversarial campaigns
 
