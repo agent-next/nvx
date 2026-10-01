@@ -35,11 +35,16 @@ class KernelBuildConstants:
     BUILD_STAMP_NAME: Final = ".nvx-build.json"
     BUILD_CONFIG_NAME: Final = ".config"
     INPUT_CONFIG: Final = Path("kernel") / "config-microvm"
+    DEBUG_CONFIG_FRAGMENT: Final = Path("kernel") / "config-microvm-debug"
     PATCH_DIRECTORY: Final = Path("kernel") / "patches"
     BINARY_NAME: Final = "vmlinux"
     CONFIG_NAME: Final = f"{BINARY_NAME}.config"
     PROVENANCE_NAME: Final = "vmlinux.provenance.json"
     PROVENANCE_FORMAT: Final = 1
+    DEBUG_WORK_DIRECTORY_NAME: Final = "linux-debug"
+    DEBUG_BINARY_NAME: Final = "vmlinux-debug"
+    DEBUG_CONFIG_NAME: Final = f"{DEBUG_BINARY_NAME}.config"
+    DEBUG_PROVENANCE_NAME: Final = f"{DEBUG_BINARY_NAME}.provenance.json"
     REQUIRED_VIRTIO_CONSOLE_CONFIG: Final = (
         "CONFIG_HVC_DRIVER=y",
         "CONFIG_VIRTIO=y",
@@ -76,6 +81,15 @@ class KernelBuildConstants:
         "CONFIG_PARAVIRT=y",
         "# CONFIG_HYPERV is not set",
         "# CONFIG_CPU_FREQ is not set",
+    )
+    DEBUG_WATCHDOG_CONFIG: Final = (
+        "CONFIG_SOFTLOCKUP_DETECTOR=y",
+        "CONFIG_DETECT_HUNG_TASK=y",
+    )
+    REQUIRED_DEBUG_CONFIG: Final = (
+        "CONFIG_DEBUG_KERNEL=y",
+        *DEBUG_WATCHDOG_CONFIG,
+        "CONFIG_RCU_CPU_STALL_CPUTIME=y",
     )
 
 
@@ -276,8 +290,14 @@ class DockerBuildConstants:
     ALPINE_TARGET: Final = "artifacts"
     UBUNTU_TARGET: Final = "ubuntu-guest-artifacts"
     ALL_GUESTS_TARGET: Final = "all-guest-artifacts"
+    DEBUG_KERNEL_TARGET: Final = "kernel-debug-artifacts"
     LINUX_SOURCE_TARGET: Final = "linux-source-artifacts"
     OUTPUT_TYPE: Final = "local"
+    DEBUG_KERNEL_ARTIFACT_NAMES: Final = (
+        KernelBuildConstants.DEBUG_BINARY_NAME,
+        KernelBuildConstants.DEBUG_CONFIG_NAME,
+        KernelBuildConstants.DEBUG_PROVENANCE_NAME,
+    )
     ALL_GUEST_ARTIFACT_NAMES: Final = (
         KernelBuildConstants.BINARY_NAME,
         KernelBuildConstants.CONFIG_NAME,

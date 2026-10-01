@@ -475,6 +475,15 @@ class CliTests(unittest.TestCase):
     def test_guest_selection_cli_contract(self):
         default_build = nvx.parse_args(["build-guest"])
         self.assertEqual(default_build.guest, "alpine")
+        self.assertFalse(default_build.debug_kernel)
+
+        debug_guest = nvx.parse_args(["build-guest", "--debug-kernel"])
+        self.assertTrue(debug_guest.debug_kernel)
+        self.assertTrue(nvx._build_config(debug_guest).debug_kernel)
+        self.assertTrue(nvx.parse_args(["build", "--debug-kernel"]).debug_kernel)
+
+        self.assertFalse(nvx.parse_args(["build-kernel"]).debug)
+        self.assertTrue(nvx.parse_args(["build-kernel", "--debug"]).debug)
 
         all_guests = nvx.parse_args(["build-guest", "--guest", "all"])
         self.assertEqual(all_guests.guest, "all")
@@ -991,6 +1000,13 @@ class CliTests(unittest.TestCase):
         self.assertIsInstance(
             build_kernel.call_args.args[0],
             build_config.KernelBuildConfig,
+        )
+        self.assertFalse(build_kernel.call_args.args[0].debug)
+        with patch.object(nvx, "build_kernel") as build_debug_kernel:
+            nvx.command_build_kernel(argparse.Namespace(debug=True))
+        self.assertEqual(
+            build_debug_kernel.call_args.args[0],
+            build_config.KernelBuildConfig.debug_variant(),
         )
         self.assertIsInstance(
             build_initramfs.call_args.args[0],
@@ -2926,6 +2942,9 @@ class BuildConstantsTests(unittest.TestCase):
             KernelBuildConstants.BINARY_NAME,
             KernelBuildConstants.CONFIG_NAME,
             KernelBuildConstants.PROVENANCE_NAME,
+            KernelBuildConstants.DEBUG_BINARY_NAME,
+            KernelBuildConstants.DEBUG_CONFIG_NAME,
+            KernelBuildConstants.DEBUG_PROVENANCE_NAME,
             OpenVMMBuildConstants.GNU_RUST_TARGET,
             OpenVMMBuildConstants.MUSL_RUST_TARGET,
             OpenVMMBuildConstants.WINDOWS_RUST_TARGET,
@@ -4526,10 +4545,58 @@ class BuildTests(unittest.TestCase):
         attributes = (BuildConstants.REPO_ROOT / ".gitattributes").read_text(
             encoding="utf-8"
         )
-        self.assertIn(
-            "kernel/config-microvm text eol=lf",
-            attributes.splitlines(),
+        for path in (
+            KernelBuildConstants.INPUT_CONFIG,
+            KernelBuildConstants.DEBUG_CONFIG_FRAGMENT,
+        ):
+            with self.subTest(path=path):
+                self.assertIn(
+                    f"{path.as_posix()} text eol=lf",
+                    attributes.splitlines(),
+                )
+
+    def test_ci_debug_kernel_is_opt_in_and_keyed_by_its_fragment(self):
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        cache_input = next(
+            line
+            for line in action.splitlines()
+            if line.strip().startswith("DEBUG_KERNEL_INPUT_HASH:")
         )
+        for path in (
+            "kernel/config-microvm",
+            "kernel/config-microvm-debug",
+            "kernel/patches/**",
+            "scripts/nvx_tools/build.py",
+            "scripts/nvx_tools/build_constants.py",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f"'{path}'", cache_input)
+        kernel_input = next(
+            line
+            for line in action.splitlines()
+            if line.strip().startswith("KERNEL_INPUT_HASH:")
+        )
+        self.assertNotIn("config-microvm-debug", kernel_input)
+        build_step = _composite_action_step(action, "Build Linux debug kernel (Docker)")
+        self.assertIn("inputs.debug-kernel == 'true'", build_step)
+        self.assertIn(
+            f"--target {DockerBuildConstants.DEBUG_KERNEL_TARGET}", build_step
+        )
+        self.assertIn('default: "false"', action)
+        for name in DockerBuildConstants.DEBUG_KERNEL_ARTIFACT_NAMES:
+            with self.subTest(artifact=name):
+                self.assertEqual(
+                    [line.strip() for line in action.splitlines()].count(
+                        f"build/{name}"
+                    ),
+                    2,
+                )
 
     def test_ci_guest_cache_keys_include_shared_build_modules(self):
         action = (
@@ -4723,6 +4790,7 @@ class BuildTests(unittest.TestCase):
     def test_checked_in_config_meets_time_abi_kernel_contract(self):
         config = BuildConstants.REPO_ROOT / KernelBuildConstants.INPUT_CONFIG
         build._assert_time_abi_kernel_config(config)
+        build._assert_watchdog_kernel_config(config, debug=False)
         configured = config.read_text(encoding="utf-8").splitlines()
         for removed in (
             "CONFIG_CPU_FREQ=y",
@@ -4752,6 +4820,283 @@ class BuildTests(unittest.TestCase):
                     )
                     with self.assertRaisesRegex(common.ScriptError, missing):
                         build._assert_time_abi_kernel_config(config)
+
+    def test_watchdog_kernel_config_separates_production_and_debug(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / ".config"
+            config.write_text(
+                "\n".join(KernelBuildConstants.REQUIRED_DEBUG_CONFIG) + "\n",
+                encoding="utf-8",
+            )
+            build._assert_watchdog_kernel_config(config, debug=True)
+            with self.assertRaisesRegex(common.ScriptError, "debug-only watchdogs"):
+                build._assert_watchdog_kernel_config(config, debug=False)
+
+            config.write_text("CONFIG_DEBUG_KERNEL=y\n", encoding="utf-8")
+            build._assert_watchdog_kernel_config(config, debug=False)
+            with self.assertRaisesRegex(
+                common.ScriptError, "CONFIG_SOFTLOCKUP_DETECTOR=y"
+            ):
+                build._assert_watchdog_kernel_config(config, debug=True)
+
+    def test_kernel_config_fragment_replaces_base_assignments(self):
+        base = "\n".join(
+            (
+                "#",
+                "# Kernel hacking",
+                "#",
+                "# CONFIG_DEBUG_KERNEL is not set",
+                "CONFIG_RCU_CPU_STALL_TIMEOUT=21",
+                "CONFIG_UNRELATED=y",
+            )
+        )
+        fragment = "\n".join(
+            (
+                "# Comment lines and blank lines are ignored.",
+                "",
+                "CONFIG_DEBUG_KERNEL=y",
+                "# CONFIG_DEBUG_MISC is not set",
+                "CONFIG_RCU_CPU_STALL_TIMEOUT=21",
+            )
+        )
+        self.assertEqual(
+            build.merge_kernel_config_fragment(base, fragment).splitlines(),
+            [
+                "#",
+                "# Kernel hacking",
+                "#",
+                "CONFIG_UNRELATED=y",
+                "CONFIG_DEBUG_KERNEL=y",
+                "# CONFIG_DEBUG_MISC is not set",
+                "CONFIG_RCU_CPU_STALL_TIMEOUT=21",
+            ],
+        )
+        for invalid, message in (
+            ("DEBUG_KERNEL=y\n", "line 1 is invalid"),
+            ("# only a comment\n", "assigns no symbols"),
+            (
+                "CONFIG_DEBUG_KERNEL=y\n# CONFIG_DEBUG_KERNEL is not set\n",
+                "more than once",
+            ),
+        ):
+            with self.subTest(fragment=invalid):
+                with self.assertRaisesRegex(common.ScriptError, message):
+                    build.merge_kernel_config_fragment(base, invalid)
+
+    def test_checked_in_debug_fragment_only_adds_watchdogs(self):
+        base = (BuildConstants.REPO_ROOT / KernelBuildConstants.INPUT_CONFIG).read_text(
+            encoding="utf-8"
+        )
+        fragment = (
+            BuildConstants.REPO_ROOT / KernelBuildConstants.DEBUG_CONFIG_FRAGMENT
+        ).read_text(encoding="utf-8")
+        merged = build.merge_kernel_config_fragment(base, fragment).splitlines()
+        for setting in KernelBuildConstants.REQUIRED_DEBUG_CONFIG:
+            with self.subTest(setting=setting):
+                self.assertIn(setting, merged)
+        for setting in (
+            "# CONFIG_DEBUG_MISC is not set",
+            "# CONFIG_RCU_TRACE is not set",
+            "# CONFIG_X86_DEBUG_FPU is not set",
+            "CONFIG_RCU_CPU_STALL_TIMEOUT=21",
+        ):
+            with self.subTest(setting=setting):
+                self.assertIn(setting, merged)
+        self.assertNotIn("# CONFIG_DEBUG_KERNEL is not set", merged)
+        for setting in KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG:
+            with self.subTest(time_abi=setting):
+                self.assertIn(setting, merged)
+
+    def test_debug_kernel_build_applies_fragment_and_records_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_config = root / KernelBuildConstants.INPUT_CONFIG
+            input_config.parent.mkdir(parents=True)
+            input_config.write_text(
+                "\n".join(
+                    (
+                        *KernelBuildConstants.REQUIRED_DIRECT_BOOT_CONFIG,
+                        *KernelBuildConstants.REQUIRED_VIRTIO_CONSOLE_CONFIG,
+                        *KernelBuildConstants.REQUIRED_SHARED_STATUS_CONFIG,
+                        *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
+                        *KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
+                        "# CONFIG_DEBUG_KERNEL is not set",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fragment = root / KernelBuildConstants.DEBUG_CONFIG_FRAGMENT
+            fragment.write_text(
+                "# debug fixture\n"
+                + "\n".join(KernelBuildConstants.REQUIRED_DEBUG_CONFIG)
+                + "\n",
+                encoding="utf-8",
+            )
+            patch_path = root / KernelBuildConstants.PATCH_DIRECTORY / "example.patch"
+            patch_path.parent.mkdir()
+            patch_path.write_text("patch", encoding="utf-8")
+            source = root / "source"
+            source.mkdir()
+            output_directory = root / "output"
+            output_directory.mkdir()
+            production_provenance = (
+                output_directory / KernelBuildConstants.PROVENANCE_NAME
+            )
+            production_provenance.write_text("production", encoding="utf-8")
+            config = build_config.KernelBuildConfig(
+                work=root / "work-debug",
+                output=output_directory / KernelBuildConstants.DEBUG_BINARY_NAME,
+                debug=True,
+            )
+
+            with patch.object(BuildConstants, "REPO_ROOT", root):
+                source_fingerprint = build._kernel_source_fingerprint()
+
+            def run_build(command: object, **_kwargs: object) -> None:
+                if isinstance(command, list) and command[-1] == "vmlinux":
+                    (config.work / "vmlinux").write_bytes(b"debug kernel")
+
+            with (
+                patch.object(BuildConstants, "REPO_ROOT", root),
+                patch.object(build, "_require_linux"),
+                patch.object(build, "require_tool", return_value="tool"),
+                patch.object(
+                    build,
+                    "prepare_kernel_source",
+                    return_value=(source, source_fingerprint),
+                ),
+                patch.object(build, "run_checked", side_effect=run_build),
+            ):
+                build.build_kernel(config)
+
+            generated = (
+                output_directory / KernelBuildConstants.DEBUG_CONFIG_NAME
+            ).read_text(encoding="utf-8")
+            self.assertIn("CONFIG_DEBUG_KERNEL=y", generated.splitlines())
+            self.assertNotIn("# CONFIG_DEBUG_KERNEL is not set", generated)
+            provenance = json.loads(
+                (
+                    output_directory / KernelBuildConstants.DEBUG_PROVENANCE_NAME
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                provenance["debug_config_fragment"],
+                {
+                    "path": KernelBuildConstants.DEBUG_CONFIG_FRAGMENT.as_posix(),
+                    "sha256": common.sha256_file(fragment),
+                },
+            )
+            self.assertEqual(
+                provenance["input_config"]["sha256"], common.sha256_file(input_config)
+            )
+            self.assertEqual(
+                provenance["kernel_sha256"],
+                hashlib.sha256(b"debug kernel").hexdigest(),
+            )
+            self.assertEqual(
+                production_provenance.read_text(encoding="utf-8"), "production"
+            )
+            self.assertIn(
+                "debug_config_fragment_sha256",
+                (config.work / KernelBuildConstants.BUILD_STAMP_NAME).read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertEqual(
+                config.provenance_name, KernelBuildConstants.DEBUG_PROVENANCE_NAME
+            )
+            self.assertEqual(
+                build_config.KernelBuildConfig().provenance_name,
+                KernelBuildConstants.PROVENANCE_NAME,
+            )
+            self.assertNotIn("debug_config_fragment", build.kernel_provenance_inputs())
+
+    def test_guest_build_adds_debug_kernel_only_when_requested(self):
+        with (
+            patch.object(build, "build_kernel") as kernel,
+            patch.object(build, "build_initramfs"),
+            patch.object(build, "build_docker_debug_kernel") as docker_debug,
+        ):
+            native = build_config.BuildConfig(native_guest=True, debug_kernel=True)
+            build.build_guest(native)
+            self.assertEqual(
+                kernel.call_args_list,
+                [
+                    call(native.kernel),
+                    call(build_config.KernelBuildConfig.debug_variant()),
+                ],
+            )
+            docker_debug.assert_not_called()
+
+        with (
+            patch.object(build, "build_docker_artifacts") as docker,
+            patch.object(build, "build_docker_debug_kernel") as docker_debug,
+        ):
+            portable = build_config.BuildConfig(debug_kernel=True)
+            build.build_guest(portable)
+            docker.assert_called_once_with(portable.docker, "alpine")
+            docker_debug.assert_called_once_with(portable.docker)
+
+        with (
+            patch.object(build, "build_docker_artifacts"),
+            patch.object(build, "build_docker_debug_kernel") as docker_debug,
+        ):
+            build.build_guest(build_config.BuildConfig())
+            docker_debug.assert_not_called()
+
+        debug = build_config.KernelBuildConfig.debug_variant()
+        self.assertTrue(debug.debug)
+        self.assertEqual(debug.output.name, KernelBuildConstants.DEBUG_BINARY_NAME)
+        self.assertEqual(
+            debug.work.name, KernelBuildConstants.DEBUG_WORK_DIRECTORY_NAME
+        )
+
+    def test_docker_debug_kernel_target_exports_debug_artifacts(self):
+        dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "FROM base AS kernel-debug\n"
+            "RUN python3 scripts/nvx.py build-kernel --debug\n",
+            dockerfile,
+        )
+        self.assertIn(
+            f"FROM scratch AS {DockerBuildConstants.DEBUG_KERNEL_TARGET}", dockerfile
+        )
+        for name in DockerBuildConstants.DEBUG_KERNEL_ARTIFACT_NAMES:
+            with self.subTest(artifact=name):
+                self.assertIn(
+                    f"COPY --from=kernel-debug /repo/build/{name} /{name}", dockerfile
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary)
+
+            def export(_command: object, **_kwargs: object) -> None:
+                for name in DockerBuildConstants.DEBUG_KERNEL_ARTIFACT_NAMES:
+                    (destination / name).write_bytes(b"artifact")
+
+            config = build_config.DockerBuildConfig(artifact_destination=destination)
+            with (
+                patch.object(build, "require_tool", return_value="docker"),
+                patch.object(build, "run_checked", side_effect=export) as run,
+            ):
+                build.build_docker_debug_kernel(config)
+            command = run.call_args.args[0]
+            self.assertEqual(
+                command[command.index("--target") + 1],
+                DockerBuildConstants.DEBUG_KERNEL_TARGET,
+            )
+
+            for name in DockerBuildConstants.DEBUG_KERNEL_ARTIFACT_NAMES:
+                (destination / name).unlink()
+            with (
+                patch.object(build, "require_tool", return_value="docker"),
+                patch.object(build, "run_checked"),
+                self.assertRaisesRegex(common.ScriptError, "did not produce"),
+            ):
+                build.build_docker_debug_kernel(config)
 
 
 class SandboxTests(unittest.TestCase):

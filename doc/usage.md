@@ -87,19 +87,23 @@ See [Setup](setup.md) for host prerequisites.
 python3 scripts/nvx.py build-guest
     [--guest {alpine,ubuntu,all}]
     [--native]
+    [--debug-kernel]
 ```
 
 By default, builds the guest kernel and initramfs with Docker. `--native`
 builds the selected artifacts directly on Linux instead. Alpine is the
 default. `--guest all` also builds the Ubuntu EROFS distro layer.
+`--debug-kernel` also builds the CI debug kernel, `build/vmlinux-debug`; see
+[Build](build.md#ci-debug-kernel).
 
 ### `build-kernel`
 
 ```console
-python3 scripts/nvx.py build-kernel
+python3 scripts/nvx.py build-kernel [--debug]
 ```
 
 Fetches, verifies, patches, and builds the pinned kernel directly on Linux.
+`--debug` builds the CI debug variant instead of the production kernel.
 
 ### `build-initramfs`
 

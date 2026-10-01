@@ -60,7 +60,8 @@ nvx/
 |-- kernel/                      Linux configuration and NVX patch set
 |   |-- patches/                 Ordered patches applied to Linux
 |   |-- COPYING-LINUX            Linux copyright and license notice
-|   `-- config-microvm           MicroVM kernel configuration
+|   |-- config-microvm           MicroVM kernel configuration
+|   `-- config-microvm-debug     CI debug-kernel fragment (watchdogs on)
 |-- openvmm/                     Private OpenVMM Git submodule
 |-- scripts/                     Build, run, benchmark, and release tooling
 |   |-- nvx_tools/               Python implementation behind the NVX CLI
@@ -141,7 +142,8 @@ environment.
 ### `kernel/`
 
 Inputs owned by NVX for producing the guest kernel. `config-microvm` defines the
-kernel build. Files in `patches/` are applied in name order to the pinned Linux
+kernel build. `config-microvm-debug` is a fragment applied on top of it for the
+CI debug kernel. Files in `patches/` are applied in name order to the pinned Linux
 source. `COPYING-LINUX` records the upstream Linux copyright and license
 notice. See the [build guide](build.md#building-the-packaged-linux-source) for
 kernel-specific details.

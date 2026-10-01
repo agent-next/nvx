@@ -160,9 +160,45 @@ virtio-mmio requirements are missing. It also enforces the time-ABI settings:
 and `CONFIG_CPU_FREQ` stay off. Without cpufreq, `intel_pstate` cannot probe
 MSRs the microVM does not implement, so no `#GP` traces are printed with
 interrupts disabled during boot. `CONFIG_SCHED_MC_PRIO` is off as well because
-it selects both cpufreq and `intel_pstate`. Changing an archive hash or patch
+it selects both cpufreq and `intel_pstate`. Production kernels must not enable
+the soft-lockup or hung-task detectors. Changing an archive hash or patch
 invalidates both source and object caches; changing the input configuration
 invalidates the object cache.
+
+## CI debug kernel
+
+CI proves that snapshot restores never trip the kernel watchdogs with a debug
+variant of the same kernel:
+
+```bash
+python3 scripts/nvx.py build-guest --debug-kernel
+python3 scripts/nvx.py build-kernel --debug   # native, Linux only
+```
+
+The variant applies the
+[`kernel/config-microvm-debug`](../kernel/config-microvm-debug) fragment on top
+of `kernel/config-microvm`. Each assignment in the fragment replaces the
+matching base assignment before `olddefconfig`. It enables `DEBUG_KERNEL`, the
+soft-lockup and hung-task detectors, and extra RCU stall diagnostics. It pins
+the production RCU stall timeouts and turns off the debug options that
+`DEBUG_KERNEL` would otherwise enable by default. The build fails if the
+detectors are missing from the generated config. CI can shorten the thresholds
+for one boot with `watchdog_thresh=`, `rcupdate.rcu_cpu_stall_timeout=`, and
+`sysctl.kernel.hung_task_timeout_secs=`.
+
+The variant builds in `build/linux-debug`, so it never invalidates the
+production object cache, and it produces:
+
+```text
+build/vmlinux-debug
+build/vmlinux-debug.config
+build/vmlinux-debug.provenance.json
+```
+
+Its provenance has the production fields plus a `debug_config_fragment` path
+and SHA-256. The debug kernel is a CI artifact and is never packaged. The
+`build-guest-artifacts` action caches and builds it only when its
+`debug-kernel` input is `true`.
 
 Release packaging stages and verifies a complete output before replacing an
 existing `dist/` version. Its `SOURCE-MANIFEST.json` records the package

@@ -152,6 +152,7 @@ def _build_config(args: argparse.Namespace) -> BuildConfig:
     return BuildConfig(
         guest=getattr(args, "guest", InitramfsBuildConstants.DEFAULT_GUEST),
         native_guest=getattr(args, "native", False),
+        debug_kernel=getattr(args, "debug_kernel", False),
         openvmm=_openvmm_build_config(args),
     )
 
@@ -160,8 +161,12 @@ def command_build_guest(args: argparse.Namespace) -> None:
     build_guest(_build_config(args))
 
 
-def command_build_kernel(_: argparse.Namespace) -> None:
-    build_kernel(KernelBuildConfig())
+def command_build_kernel(args: argparse.Namespace) -> None:
+    build_kernel(
+        KernelBuildConfig.debug_variant()
+        if getattr(args, "debug", False)
+        else KernelBuildConfig()
+    )
 
 
 def command_build_initramfs(args: argparse.Namespace) -> None:
@@ -530,6 +535,14 @@ def _add_guest_options(
         action="store_true",
         help="build directly on Linux instead of using Docker",
     )
+    parser.add_argument(
+        "--debug-kernel",
+        action="store_true",
+        help=(
+            "also build the CI debug kernel (build/vmlinux-debug), which adds "
+            "the soft-lockup, hung-task, and RCU stall diagnostics"
+        ),
+    )
 
 
 def _add_openvmm_options(parser: argparse.ArgumentParser) -> None:
@@ -558,6 +571,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     kernel = subparsers.add_parser(
         "build-kernel",
         help="fetch, patch, and build the pinned kernel natively on Linux",
+    )
+    kernel.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "build the CI debug variant (build/vmlinux-debug) by applying "
+            "kernel/config-microvm-debug"
+        ),
     )
     kernel.set_defaults(handler=command_build_kernel)
 

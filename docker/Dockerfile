@@ -36,6 +36,9 @@ COPY LICENSE README.md SOURCE-MANIFEST.json THIRD_PARTY_NOTICES.md /repo/
 FROM base AS kernel
 RUN python3 scripts/nvx.py build-kernel
 
+FROM base AS kernel-debug
+RUN python3 scripts/nvx.py build-kernel --debug
+
 FROM base AS initramfs
 RUN python3 scripts/nvx.py build-initramfs --guest alpine
 
@@ -56,6 +59,11 @@ FROM scratch AS kernel-artifacts
 COPY --from=kernel /repo/build/vmlinux /vmlinux
 COPY --from=kernel /repo/build/vmlinux.config /vmlinux.config
 COPY --from=kernel /repo/build/vmlinux.provenance.json /vmlinux.provenance.json
+
+FROM scratch AS kernel-debug-artifacts
+COPY --from=kernel-debug /repo/build/vmlinux-debug /vmlinux-debug
+COPY --from=kernel-debug /repo/build/vmlinux-debug.config /vmlinux-debug.config
+COPY --from=kernel-debug /repo/build/vmlinux-debug.provenance.json /vmlinux-debug.provenance.json
 
 FROM scratch AS initramfs-artifacts
 COPY --from=initramfs /repo/build/initramfs.cpio.gz /initramfs.cpio.gz
