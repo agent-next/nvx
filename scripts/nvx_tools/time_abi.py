@@ -9,6 +9,7 @@ probe's 1 us skew bound and the CPU generation names used in reports.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -42,6 +43,12 @@ WARP_PROBE_FAILURE_STATUS = 97
 # The idle-inducing warp schedule: probe rounds separated by halted vCPUs.
 WARP_PROBE_ROUNDS = 2
 WARP_PROBE_IDLE_SECONDS = 1
+# Idle gaps between probe rounds, in seconds (doc/design/time-abi.md, "Warp
+# schedules"): CI's schedule after boot and every restore, and H6's.
+CI_WARP_GAPS: tuple[str, ...] = (str(WARP_PROBE_IDLE_SECONDS),) * (
+    WARP_PROBE_ROUNDS - 1
+)
+QUALIFICATION_WARP_GAPS: tuple[str, ...] = ("0.1", "1", "5", "1")
 PROFILE_VENDORS: Mapping[str, str] = {"GenuineIntel": "intel"}
 
 
@@ -371,33 +378,39 @@ def warp_probe_command(*, cpus: str | None = None) -> str:
     return command if cpus is None else f"{command} --cpus {cpus}"
 
 
-def warp_rounds(cpus: int) -> int:
-    """Return how many probe rounds the warp schedule runs on ``cpus`` CPUs."""
-    return 1 if cpus < 2 else WARP_PROBE_ROUNDS
+def warp_rounds(cpus: int, gaps: Sequence[str] = CI_WARP_GAPS) -> int:
+    """Return how many probe rounds a warp schedule runs on ``cpus`` CPUs."""
+    return 1 if cpus < 2 else len(gaps) + 1
 
 
-def warp_probe_script() -> str:
-    """Return a guest shell fragment that runs the idle-inducing warp schedule.
+def warp_probe_script(gaps: Sequence[str] = CI_WARP_GAPS) -> str:
+    """Return a guest shell fragment that runs an idle-inducing warp schedule.
 
-    The probe runs over every online CPU in WARP_PROBE_ROUNDS rounds with all
-    vCPUs halted for WARP_PROBE_IDLE_SECONDS between rounds: a host without an
-    invariant TSC corrects guest TSC timing when an idle host CPU wakes, which
-    busy probe rounds alone never trigger (#265). The CPU list is read when
-    the fragment runs, so one post-restore script serves every restore target.
-    A failed round prints WARP_PROBE_FAILURE_MARKER and powers the guest off
-    with WARP_PROBE_FAILURE_STATUS; otherwise the fragment prints
+    The probe runs over every online CPU, and again after each idle gap in
+    ``gaps`` (seconds), during which every vCPU halts: a host without an
+    invariant TSC corrects guest TSC timing when an idle host CPU wakes,
+    which busy probe rounds alone never trigger (#265). A single-CPU guest
+    runs it once, because it has no CPU pair to compare across a gap. The
+    CPU list is read when the fragment runs, so one post-restore script
+    serves every restore target. A failed round prints
+    WARP_PROBE_FAILURE_MARKER and powers the guest off with
+    WARP_PROBE_FAILURE_STATUS; otherwise the fragment prints
     WARP_PROBE_COMPLETION_MARKER.
     """
+    if any(not re.fullmatch(r"[0-9]+(\.[0-9]+)?", gap) for gap in gaps):
+        raise ValueError(f"invalid warp probe idle gaps: {gaps!r}")
     probe = warp_probe_command(cpus='"$warp_cpus"')
     return (
         'warp_cpus="$(cat /sys/devices/system/cpu/online)"\n'
-        f"warp_rounds={WARP_PROBE_ROUNDS}\n"
+        f'warp_gaps="{" ".join(gaps)}"\n'
         'case "$warp_cpus" in\n'
         "    *[-,]*) ;;\n"
-        "    *) warp_rounds=1 ;;\n"
+        "    *) warp_gaps= ;;\n"
         "esac\n"
-        "warp_round=1\n"
-        "while :; do\n"
+        "warp_round=0\n"
+        "for warp_gap in 0 $warp_gaps; do\n"
+        '    [ "$warp_round" -eq 0 ] || sleep "$warp_gap"\n'
+        "    warp_round=$((warp_round + 1))\n"
         "    warp_status=0\n"
         f"    {probe} || warp_status=$?\n"
         '    if [ "$warp_status" -ne 0 ]; then\n'
@@ -406,9 +419,6 @@ def warp_probe_script() -> str:
         f"        nvx-exit {WARP_PROBE_FAILURE_STATUS}\n"
         f"        exit {WARP_PROBE_FAILURE_STATUS}\n"
         "    fi\n"
-        '    [ "$warp_round" -lt "$warp_rounds" ] || break\n'
-        f"    sleep {WARP_PROBE_IDLE_SECONDS}\n"
-        "    warp_round=$((warp_round + 1))\n"
         "done\n"
         f"echo {WARP_PROBE_COMPLETION_MARKER.decode()}\n"
     )

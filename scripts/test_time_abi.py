@@ -304,6 +304,16 @@ class WarpProbeTests(unittest.TestCase):
             [time_abi.warp_rounds(cpus) for cpus in (1, 2, 8)],
             [1, time_abi.WARP_PROBE_ROUNDS, time_abi.WARP_PROBE_ROUNDS],
         )
+        self.assertEqual(time_abi.CI_WARP_GAPS, ("1",))
+        self.assertEqual(
+            [
+                time_abi.warp_rounds(cpus, time_abi.QUALIFICATION_WARP_GAPS)
+                for cpus in (1, 8)
+            ],
+            [1, 5],
+        )
+        with self.assertRaisesRegex(ValueError, "invalid warp probe idle gaps"):
+            time_abi.warp_probe_script(("1; reboot",))
         two = warp_output() + warp_output(offset=30)
         results = time_abi.check_warp_probe(two, cpus=4, context="boot", rounds=2)
         self.assertEqual(
@@ -332,6 +342,32 @@ class WarpProbeTests(unittest.TestCase):
             .replace(time_abi.WARP_PROBE_PATH, "probe")
             .replace("nvx-exit", "nvx_exit")
         )
+
+        def run_fragment(
+            fragment: str, online: str, failing_round: int = 0
+        ) -> subprocess.CompletedProcess[str]:
+            assert shell is not None
+            return subprocess.run(
+                [shell],
+                input=(
+                    f"cat() {{ printf '%s\\n' '{online}'; }}\n"
+                    "calls=0\n"
+                    "probe() {\n"
+                    "    calls=$((calls + 1))\n"
+                    '    printf "probe %s\\n" "$*"\n'
+                    f'    [ "$calls" -ne {failing_round} ]\n'
+                    "}\n"
+                    'sleep() { printf "SLEEP %s\\n" "$1"; }\n'
+                    'nvx_exit() { printf "NVX-EXIT %s\\n" "$1"; }\n'
+                    + fragment
+                    + "echo after\n"
+                ),
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+
         for online, failing_round, calls, sleeps in (
             ("0-3", 0, 2, 1),
             ("0-3", 2, 2, 1),
@@ -339,26 +375,7 @@ class WarpProbeTests(unittest.TestCase):
             ("0", 0, 1, 0),
         ):
             with self.subTest(online=online, failing_round=failing_round):
-                result = subprocess.run(
-                    [shell],
-                    input=(
-                        f"cat() {{ printf '%s\\n' '{online}'; }}\n"
-                        "calls=0\n"
-                        "probe() {\n"
-                        "    calls=$((calls + 1))\n"
-                        '    printf "probe %s\\n" "$*"\n'
-                        f'    [ "$calls" -ne {failing_round} ]\n'
-                        "}\n"
-                        'sleep() { printf "SLEEP %s\\n" "$1"; }\n'
-                        'nvx_exit() { printf "NVX-EXIT %s\\n" "$1"; }\n'
-                        + fragment
-                        + "echo after\n"
-                    ),
-                    text=True,
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
+                result = run_fragment(fragment, online, failing_round)
                 lines = result.stdout.splitlines()
                 self.assertEqual(
                     lines.count(f"probe warp --bound-ns 1000 --cpus {online}"),
@@ -380,6 +397,36 @@ class WarpProbeTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("NVX-WARP-PROBE-OK", lines)
                     self.assertIn("after", lines)
+        # H6's qualification schedule idles for each gap in order.
+        qualification = fragment.replace(
+            'warp_gaps="1"',
+            f'warp_gaps="{" ".join(time_abi.QUALIFICATION_WARP_GAPS)}"',
+        )
+        self.assertEqual(
+            qualification,
+            time_abi.warp_probe_script(time_abi.QUALIFICATION_WARP_GAPS)
+            .replace(time_abi.WARP_PROBE_PATH, "probe")
+            .replace("nvx-exit", "nvx_exit"),
+        )
+        result = run_fragment(qualification, "0-7")
+        probe = "probe warp --bound-ns 1000 --cpus 0-7"
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                probe,
+                "SLEEP 0.1",
+                probe,
+                "SLEEP 1",
+                probe,
+                "SLEEP 5",
+                probe,
+                "SLEEP 1",
+                probe,
+                "NVX-WARP-PROBE-OK",
+                "after",
+            ],
+            result.stderr,
+        )
 
 
 VIOLATION = (
@@ -946,12 +993,40 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse(missing.passed)
         self.assertIn("was not found", missing.detail)
 
-    def test_rate_check_gates_on_stability_and_the_backend_rate_only(self):
-        def records(first: float, second: float):
-            return [
-                ("rate", {"tsc_hz": f"{first:.3f}"}),
-                ("rate", {"tsc_hz": f"{second:.3f}"}),
-            ]
+    def test_rate_check_applies_the_spec_bounds_to_sleep_separated_samples(self):
+        def records(
+            rates: list[float],
+            *,
+            disciplined: list[float] | None = None,
+            interval_s: float = 10.0,
+            bracket: int = 40,
+            clock_hz: int = 1_000_000_000,
+            resolution_ns: float = 1.0,
+            names: tuple[str, str] = ("CLOCK_MONOTONIC", "CLOCK_MONOTONIC_RAW"),
+        ) -> list[tuple[str, dict[str, str]]]:
+            """Probe records whose consecutive samples measure ``rates`` against
+            the stability clock and ``disciplined`` (default ``rates``) against
+            the rate clock."""
+            result: list[tuple[str, dict[str, str]]] = []
+            for role, name in zip(("rate", "stability"), names, strict=True):
+                clock = {"role": role, "name": name, "hz": str(clock_hz)}
+                clock["resolution_ns"] = f"{resolution_ns:.3f}"
+                result.append(("clock", clock))
+            series = {"rate": disciplined or rates, "stability": rates}
+            state = {role: (10**12, 5 * clock_hz) for role in series}
+            for index in range(len(rates) + 1):
+                sample = {"index": str(index)}
+                for role, role_rates in series.items():
+                    tsc, ticks = state[role]
+                    if index:
+                        tsc += round(role_rates[index - 1] * interval_s)
+                        ticks += round(interval_s * clock_hz)
+                    state[role] = (tsc, ticks)
+                    sample[f"{role}_tsc"] = str(tsc)
+                    sample[f"{role}_clock"] = str(ticks)
+                    sample[f"{role}_bracket"] = str(bracket)
+                result.append(("sample", sample))
+            return result
 
         def check(
             context: doctor.DoctorContext,
@@ -960,27 +1035,113 @@ class DoctorTests(unittest.TestCase):
             windows: bool = False,
         ) -> doctor.CheckResult:
             with (
-                patch.object(doctor, "run_probe", return_value=probe_records),
+                patch.object(doctor, "run_probe", return_value=probe_records) as run,
                 patch.object(doctor, "host_clocksource", return_value=clocksource),
                 patch.object(doctor, "host_is_windows", return_value=windows),
             ):
-                return doctor.check_rate(context)
+                result = doctor.check_rate(context)
+            self.assertEqual(
+                run.call_args.args[1:],
+                (
+                    "rate",
+                    "--samples",
+                    str(context.schedule.rate_samples),
+                    "--interval-ms",
+                    str(context.schedule.rate_interval_ms),
+                ),
+            )
+            return result
 
+        def ci_context(backend: str = "kvm") -> doctor.DoctorContext:
+            context = doctor_context(self.root, backend)
+            context.schedule = doctor.CI_SCHEDULE
+            return context
+
+        steady = [2793437000.0 + jitter for jitter in (0, 200, -150, 100) * 3]
         context = doctor_context(self.root)
         context.facts["tsc_hz"] = "2793437000"
-        result = check(context, records(2793437500, 2793437800))
+        result = check(context, records(steady))
         self.assertTrue(result.passed, result.detail)
+        self.assertIn(
+            "against CLOCK_MONOTONIC from 13 samples 10 s apart; against "
+            "CLOCK_MONOTONIC_RAW (resolution 1 ns) the interval rates agree within "
+            "0.125 ppm, largest interval uncertainty 0.004 ppm",
+            result.detail,
+        )
+        self.assertIn("0.0 ppm from the backend's 2793437000 Hz", result.detail)
         self.assertIn("host clocksource tsc (evidence)", result.detail)
+        self.assertEqual(context.facts["rate_agreement_ppm"], "0.125")
+        self.assertEqual(context.facts["rate_deviation_ppm"], "0.0")
+        # chrony steers CLOCK_MONOTONIC's rate by ppm between seconds, which
+        # says nothing about the TSC: the undisciplined clock judges stability,
+        # and the disciplined one the rate.
+        steered = [2300000100.0 + jitter for jitter in (0, 6900, -4600)] * 4
+        context = doctor_context(self.root, "mshv")
+        context.facts["native_tsc_hz"] = "2300000000"
+        result = check(context, records([2300000100.0] * 12, disciplined=steered))
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn("agree within 0.000 ppm", result.detail)
+        self.assertEqual(context.facts["measured_tsc_hz"], "2300000867")
+        self.assertIn("0.4 ppm from the backend's 2300000000 Hz", result.detail)
+        # CI's short schedule; Windows reads QueryPerformanceCounter, which time
+        # synchronization never steers, in both roles. Its 100 ns tick keeps a
+        # 1 s interval conclusive at 0.1 ppm.
+        qpc = records(
+            [2300000100.0, 2300000200.0],
+            interval_s=1.0,
+            bracket=0,
+            clock_hz=10_000_000,
+            resolution_ns=100.0,
+            names=("QueryPerformanceCounter", "QueryPerformanceCounter"),
+        )
+        windows = check(ci_context("whp"), qpc, windows=True)
+        self.assertTrue(windows.passed, windows.detail)
+        self.assertIn(
+            "against QueryPerformanceCounter from 3 samples 1 s apart", windows.detail
+        )
+        self.assertIn("uncertainty 0.100 ppm", windows.detail)
+        self.assertNotIn("clocksource", windows.detail)
+        # Hyper-V's reference TSC page advances CLOCK_MONOTONIC_RAW in 100 ns
+        # steps: the resolution, not the empty brackets, bounds the measurement.
+        tsc_page = records(
+            [2300000100.0, 2300000200.0], interval_s=1.0, bracket=0, resolution_ns=100.0
+        )
+        result = check(ci_context("mshv"), tsc_page, "hyperv_clocksource_tsc_page")
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn("CLOCK_MONOTONIC_RAW (resolution 100 ns)", result.detail)
+        self.assertIn("uncertainty 0.100 ppm", result.detail)
+        coarse = records(
+            [2300000100.0, 2300000200.0], interval_s=1.0, bracket=0, resolution_ns=300.0
+        )
+        result = check(ci_context("mshv"), coarse)
+        self.assertFalse(result.passed)
+        self.assertIn(
+            "inconclusive: an interval's uncertainty is 0.300 ppm", result.detail
+        )
         for probe_records, message in (
-            (records(2793437000, 2793440000), "unstable"),
-            (records(2794000000, 2794000001), "ppm from the measured"),
+            (
+                records([2793437000.0, 2793440000.0] * 6),
+                "unstable: interval rates differ by 1.074 ppm > 1.0 ppm",
+            ),
+            (
+                records([2793437000.0] * 2, interval_s=1.0, bracket=400),
+                "inconclusive: an interval's uncertainty is 0.401 ppm > 0.25 ppm",
+            ),
+            (records([2794000000.0] * 12), "201.5 ppm from the measured rate"),
+            (records([100_000_000.0] * 12), "[E_TSC_RATE_IMPLAUSIBLE]"),
         ):
             with self.subTest(message=message):
                 context = doctor_context(self.root)
+                if "inconclusive" in message:
+                    context = ci_context()
                 context.facts["tsc_hz"] = "2793437000"
                 result = check(context, probe_records)
                 self.assertFalse(result.passed)
                 self.assertIn(message, result.detail)
+        with self.assertRaisesRegex(doctor.ScriptError, "printed 3 samples, not 13"):
+            check(doctor_context(self.root), records([2793437000.0] * 2))
+        with self.assertRaisesRegex(doctor.ScriptError, "no stability clock"):
+            check(ci_context(), records([2793437000.0] * 2, interval_s=1.0)[:1])
         # The clocksource is evidence on every backend.
         for backend, clocksource in (
             ("kvm", "hpet"),
@@ -989,26 +1150,16 @@ class DoctorTests(unittest.TestCase):
             with self.subTest(backend=backend, clocksource=clocksource):
                 context = doctor_context(self.root, backend)
                 context.facts["native_tsc_hz"] = "2300000000"
-                result = check(context, records(2300000100, 2300000200), clocksource)
+                result = check(context, records([2300000100.0] * 12), clocksource)
                 self.assertTrue(result.passed, result.detail)
                 self.assertIn(
                     f"host clocksource {clocksource} (evidence)", result.detail
                 )
                 self.assertEqual(context.facts["host_clocksource"], clocksource)
-        windows = check(
-            doctor_context(self.root, "whp"),
-            records(2300000100, 2300000200),
-            windows=True,
-        )
-        self.assertTrue(windows.passed, windows.detail)
-        self.assertNotIn("clocksource", windows.detail)
         # Without H3 (validate-runner), H4 still checks stability.
-        standalone = check(doctor_context(self.root), records(2300000100, 2300000200))
+        standalone = check(ci_context(), records([2300000100.0] * 2, interval_s=1.0))
         self.assertTrue(standalone.passed, standalone.detail)
         self.assertIn("not compared with the backend's rate", standalone.detail)
-        unstable = check(doctor_context(self.root), records(2300000100, 2300009100))
-        self.assertFalse(unstable.passed)
-        self.assertIn("unstable", unstable.detail)
 
     def test_host_skew_check_applies_the_bound(self):
         summary = {
@@ -1039,46 +1190,101 @@ class DoctorTests(unittest.TestCase):
                 self.assertFalse(result.passed)
                 self.assertIn(message, result.detail)
 
-    def test_guest_warp_check_runs_the_idle_schedule_and_applies_the_bound(self):
+    def test_guest_warp_check_runs_the_idle_schedules_and_applies_the_bound(self):
         context = doctor_context(self.root)
         for path in (context.openvmm, context.kernel, context.initrd):
             path.write_bytes(b"")
-        boot = (
-            BOOT_LINE.replace("cpus=4", "cpus=8") + " ALPINE-MICROVM-BOOT-OK: 3.22.1\n"
-        )
-        text = boot + warp_output(pairs=28) + warp_output(pairs=28, offset=60)
+
+        def boot(cpus: int) -> str:
+            line = BOOT_LINE.replace("cpus=4", f"cpus={cpus}")
+            return line + " ALPINE-MICROVM-BOOT-OK: 3.22.1\n"
+
+        smp = boot(8) + warp_output(pairs=28) * 4 + warp_output(pairs=28, offset=60)
+        single = boot(1) + warp_output(pairs=0, offset=0)
         with (
             patch.object(doctor.os, "cpu_count", return_value=8),
             patch.object(
-                doctor, "run_guest_script", return_value={"text": text}
+                doctor,
+                "run_guest_script",
+                side_effect=[{"text": smp}, {"text": single}],
             ) as run,
         ):
             result = doctor.check_guest_warp(context)
         self.assertTrue(result.passed, result.detail)
-        self.assertIn("rounds=2 idle_s=1", result.detail)
+        self.assertIn("vcpus=8 rounds=5 idle_gaps_s=0.1,1,5,1", result.detail)
+        self.assertIn("vcpus=1 rounds=1 idle_gaps_s=none", result.detail)
         self.assertEqual(context.facts["guest_warp_ns"], "60")
-        command, script, marker = run.call_args.args
-        self.assertEqual(command[command.index("--processors") + 1], "8")
-        self.assertEqual(script, time_abi.warp_probe_script() + "nvx-exit 0\n")
-        self.assertEqual(marker, time_abi.WARP_PROBE_COMPLETION_MARKER)
-        cases = (
-            (boot + warp_output(pairs=28), "ran 1 rounds instead of 2"),
-            (
-                boot + warp_output(pairs=28) + warp_output(pairs=28, offset=1500),
-                "in round 2: max_abs_offset_ns=1500",
+        (smp_call, single_call) = run.call_args_list
+        for call, processors, gaps in (
+            (smp_call, "8", time_abi.QUALIFICATION_WARP_GAPS),
+            (single_call, "1", ()),
+        ):
+            command, script, marker = call.args
+            self.assertEqual(command[command.index("--processors") + 1], processors)
+            self.assertEqual(script, time_abi.warp_probe_script(gaps) + "nvx-exit 0\n")
+            self.assertEqual(marker, time_abi.WARP_PROBE_COMPLETION_MARKER)
+        # CI's schedule runs the probe twice with a 1 s gap.
+        context.schedule = doctor.CI_SCHEDULE
+        ci = boot(8) + warp_output(pairs=28) * 2
+        with (
+            patch.object(doctor.os, "cpu_count", return_value=8),
+            patch.object(
+                doctor,
+                "run_guest_script",
+                side_effect=[{"text": ci}, {"text": single}],
             ),
-            (warp_output(pairs=28) * 2, "NVX-TIME-ABI boot marker"),
+        ):
+            result = doctor.check_guest_warp(context)
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn("vcpus=8 rounds=2 idle_gaps_s=1 ", result.detail)
+        context.schedule = doctor.QUALIFICATION_SCHEDULE
+        cases = (
+            (
+                [boot(8) + warp_output(pairs=28) * 2],
+                "vcpus=8",
+                "ran 2 rounds instead of 5",
+            ),
+            (
+                [
+                    boot(8)
+                    + warp_output(pairs=28) * 4
+                    + warp_output(pairs=28, offset=1500)
+                ],
+                "vcpus=8",
+                "in round 5: max_abs_offset_ns=1500",
+            ),
+            ([warp_output(pairs=28) * 5], "vcpus=8", "NVX-TIME-ABI boot marker"),
+            (
+                [smp, boot(1) + warp_output(pairs=0, backward=2000, verdict="FAIL")],
+                "vcpus=1",
+                "max_backward_ns=2000",
+            ),
         )
-        for output, message in cases:
+        for outputs, guest, message in cases:
             with (
                 self.subTest(message=message),
                 patch.object(doctor.os, "cpu_count", return_value=8),
-                patch.object(doctor, "run_guest_script", return_value={"text": output}),
+                patch.object(
+                    doctor,
+                    "run_guest_script",
+                    side_effect=[{"text": output} for output in outputs],
+                ),
             ):
                 result = doctor.check_guest_warp(context)
                 self.assertFalse(result.passed)
-                self.assertIn("vcpus=8", result.detail)
+                self.assertTrue(result.detail.startswith(f"{guest}: "), result.detail)
                 self.assertIn(message, result.detail)
+        # A 1-vCPU host runs only the 1-vCPU guest.
+        with (
+            patch.object(doctor.os, "cpu_count", return_value=1),
+            patch.object(
+                doctor, "run_guest_script", return_value={"text": single}
+            ) as run,
+        ):
+            result = doctor.check_guest_warp(context)
+        self.assertTrue(result.passed, result.detail)
+        self.assertEqual(run.call_count, 1)
+        self.assertTrue(result.detail.startswith("vcpus=1 rounds=1 idle_gaps_s=none"))
         missing = doctor.check_guest_warp(doctor_context(self.root / "missing"))
         self.assertIn("OpenVMM was not found", missing.detail)
 
@@ -1162,9 +1368,11 @@ class DoctorTests(unittest.TestCase):
 
     def test_run_selects_the_cpu_fingerprint_or_runs_without_openvmm(self):
         seen: list[Path | None] = []
+        schedules: list[doctor.Schedule] = []
 
         def cpu(context: doctor.DoctorContext) -> doctor.CheckResult:
             seen.append(context.fingerprint)
+            schedules.append(context.schedule)
             context.facts["surface_digest"] = "sha256:62"
             return doctor.CheckResult("H2", True, "ok")
 
@@ -1178,7 +1386,7 @@ class DoctorTests(unittest.TestCase):
             for extra in (
                 [],
                 ["--cpu-fingerprint", str(self.root / "fingerprint.json")],
-                ["--no-openvmm"],
+                ["--no-openvmm", "--ci-schedule"],
             ):
                 arguments = doctor_parser().parse_args([*common, *extra])
                 self.assertEqual(doctor.run(arguments), 0)
@@ -1190,6 +1398,14 @@ class DoctorTests(unittest.TestCase):
                 None,
             ],
         )
+        self.assertEqual(
+            schedules,
+            [doctor.QUALIFICATION_SCHEDULE] * 2 + [doctor.CI_SCHEDULE],
+        )
+        self.assertEqual(doctor.QUALIFICATION_SCHEDULE.rate_samples, 13)
+        self.assertEqual(doctor.QUALIFICATION_SCHEDULE.rate_interval_ms, 10_000)
+        self.assertEqual(doctor.CI_SCHEDULE.rate_samples, 3)
+        self.assertEqual(doctor.CI_SCHEDULE.rate_interval_ms, 1_000)
         self.assertIn("CPU surface digest: `sha256:62`", summary.read_text("utf-8"))
         arguments = doctor_parser().parse_args(["--backend", "kvm", "--no-openvmm"])
         with self.assertRaisesRegex(doctor.ScriptError, "cannot run H3 and H6"):

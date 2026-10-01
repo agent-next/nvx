@@ -2291,6 +2291,7 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertIn('--backend "${{ inputs.backend }}"', step)
                 self.assertIn("--checks H1 H2 H4\n", step)
                 self.assertIn("--no-openvmm\n", step)
+                self.assertIn("--ci-schedule\n", step)
                 self.assertIn(summary, step)
         args = nvx.parse_args(
             ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4", "--no-openvmm"]

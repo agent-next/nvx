@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import itertools
 import os
 import platform
 import re
@@ -27,12 +28,13 @@ from .build_constants import AlpineBuildConstants, BuildConstants, KernelBuildCo
 from .ci import OPENVMM_TEST_BACKENDS
 from .common import ScriptError, artifact_path, openvmm_binary_path
 from .time_abi import (
+    CI_WARP_GAPS,
     LAPIC_HZ,
     MAX_TSC_HZ,
     MIN_TSC_HZ,
+    QUALIFICATION_WARP_GAPS,
     WARP_BOUND_NS,
     WARP_PROBE_COMPLETION_MARKER,
-    WARP_PROBE_IDLE_SECONDS,
     CpuGeneration,
     TimeAbiFailure,
     TimeAbiMonitor,
@@ -61,12 +63,28 @@ PROBE_PREFIX = "NVX-HOST-TIME-PROBE "
 VERIFY_PREFIX = "NVX-TIME-ABI-VERIFY:"
 CPU_PROFILE_PREFIX = "NVX-CPU-PROFILE:"
 RUST_ESCAPE = re.compile(r"\\(u\{[0-9a-fA-F]{1,6}\}|.)")
-RATE_MEASURE_MS = 1000
+# doc/design/time-abi.md, "Rate stability (H4)".
+RATE_UNCERTAINTY_PPM = 0.25
 RATE_AGREEMENT_PPM = 1.0
 RATE_TOLERANCE_PPM = 100.0
 SKEW_PAIR_DURATION_MS = 5
 GUEST_VCPU_COUNTS = (8, 4, 2, 1)
 GUEST_MEMORY_MIB = 128
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """How long H4 samples the TSC rate and how often H6 runs the warp probe."""
+
+    rate_samples: int
+    rate_interval_ms: int
+    warp_gaps: tuple[str, ...]
+
+
+# doc/design/time-abi.md, "Rate stability (H4)" and "Warp schedules": doctor
+# qualifies on the long schedules, and CI on the short ones.
+QUALIFICATION_SCHEDULE = Schedule(13, 10_000, QUALIFICATION_WARP_GAPS)
+CI_SCHEDULE = Schedule(3, 1_000, CI_WARP_GAPS)
 # Qualification gates only on measured properties, alike on every backend:
 # the guest warp probe, the TSC rate stability, and the CPU profile. The host
 # OS's invariant-TSC flags and clocksource are recorded as evidence only,
@@ -109,6 +127,7 @@ class DoctorContext:
     # Where H2 writes OpenVMM's CPU fingerprint; None skips the profile check
     # when qualification runs without OpenVMM.
     fingerprint: Path | None = None
+    schedule: Schedule = QUALIFICATION_SCHEDULE
 
 
 def host_is_windows() -> bool:
@@ -590,31 +609,97 @@ def check_openvmm_preflight(context: DoctorContext) -> CheckResult:
     return CheckResult("H3", True, detail)
 
 
+def _rate_points(
+    samples: Sequence[Mapping[str, str]], clock: Mapping[str, str], role: str
+) -> list[tuple[int, int, float]]:
+    """Return each sample's (TSC, bracket midpoint in half clock ticks,
+    uncertainty in clock ticks: half the bracket plus half the resolution)."""
+    half_resolution = float(clock["resolution_ns"]) * int(clock["hz"]) / 2e9
+    return [
+        (
+            int(sample[f"{role}_tsc"]),
+            2 * int(sample[f"{role}_clock"]) + int(sample[f"{role}_bracket"]),
+            int(sample[f"{role}_bracket"]) / 2 + half_resolution,
+        )
+        for sample in samples
+    ]
+
+
+def _window_rate(points: Sequence[tuple[int, int, float]], clock_hz: int) -> float:
+    seconds = (points[-1][1] - points[0][1]) / (2 * clock_hz)
+    if seconds <= 0:
+        raise ScriptError("the host clock did not advance between samples")
+    return (points[-1][0] - points[0][0]) / seconds
+
+
 def check_rate(context: DoctorContext) -> CheckResult:
     clocksource = ""
     if not host_is_windows():
         clocksource = host_clocksource()
         context.facts["host_clocksource"] = clocksource
+    schedule = context.schedule
     records = run_probe(
-        context, "rate", "--measure-ms", str(RATE_MEASURE_MS), "--count", "2"
+        context,
+        "rate",
+        "--samples",
+        str(schedule.rate_samples),
+        "--interval-ms",
+        str(schedule.rate_interval_ms),
     )
-    rates = [float(fields["tsc_hz"]) for kind, fields in records if kind == "rate"]
-    if len(rates) != 2:
-        raise ScriptError(f"host time probe printed {len(rates)} rate records, not 2")
-    measured = sum(rates) / len(rates)
-    spread_ppm = (max(rates) - min(rates)) / min(rates) * 1e6
+    clocks = {fields.get("role"): fields for kind, fields in records if kind == "clock"}
+    for role in ("rate", "stability"):
+        if role not in clocks:
+            raise ScriptError(f"host time probe printed no {role} clock")
+    samples = [fields for kind, fields in records if kind == "sample"]
+    if len(samples) != schedule.rate_samples:
+        raise ScriptError(
+            f"host time probe printed {len(samples)} samples, not "
+            f"{schedule.rate_samples}"
+        )
+    # The rate clock, which time synchronization disciplines, gives the true
+    # rate. The stability clock, which it never steers, shows whether the TSC
+    # keeps its rate across idle: chrony's frequency updates move
+    # CLOCK_MONOTONIC's rate by several ppm between seconds.
+    rate_clock, stability_clock = clocks["rate"], clocks["stability"]
+    measured = _window_rate(
+        _rate_points(samples, rate_clock, "rate"), int(rate_clock["hz"])
+    )
+    clock_hz = int(stability_clock["hz"])
+    points = _rate_points(samples, stability_clock, "stability")
+    rates: list[float] = []
+    uncertainties_ppm: list[float] = []
+    for (tsc0, mid0, error0), (tsc1, mid1, error1) in itertools.pairwise(points):
+        if mid1 <= mid0:
+            raise ScriptError("the host clock did not advance between samples")
+        seconds = (mid1 - mid0) / (2 * clock_hz)
+        rates.append((tsc1 - tsc0) / seconds)
+        uncertainties_ppm.append((error0 + error1) / clock_hz / seconds * 1e6)
+    stable_rate = _window_rate(points, clock_hz)
+    agreement_ppm = (max(rates) - min(rates)) / stable_rate * 1e6
+    uncertainty_ppm = max(uncertainties_ppm)
     context.facts["measured_tsc_hz"] = f"{measured:.0f}"
-    context.facts["rate_spread_ppm"] = f"{spread_ppm:.3f}"
+    context.facts["rate_agreement_ppm"] = f"{agreement_ppm:.3f}"
+    context.facts["rate_uncertainty_ppm"] = f"{uncertainty_ppm:.3f}"
     detail = (
-        f"tsc_hz={measured:.0f} two {RATE_MEASURE_MS} ms measurements differ by "
-        f"{spread_ppm:.3f} ppm"
+        f"tsc_hz={measured:.0f} against {rate_clock['name']} from {len(samples)} "
+        f"samples {schedule.rate_interval_ms / 1000:g} s apart; against "
+        f"{stability_clock['name']} (resolution "
+        f"{float(stability_clock['resolution_ns']):g} ns) the interval rates agree "
+        f"within {agreement_ppm:.3f} ppm, largest interval uncertainty "
+        f"{uncertainty_ppm:.3f} ppm"
     )
     problems: list[str] = []
     if not MIN_TSC_HZ <= measured <= MAX_TSC_HZ:
         problems.append(f"[E_TSC_RATE_IMPLAUSIBLE] measured {measured:.0f} Hz")
-    if spread_ppm > RATE_AGREEMENT_PPM:
+    if uncertainty_ppm > RATE_UNCERTAINTY_PPM:
         problems.append(
-            f"the TSC rate is unstable: {spread_ppm:.3f} ppm > {RATE_AGREEMENT_PPM} ppm"
+            f"the measurement is inconclusive: an interval's uncertainty is "
+            f"{uncertainty_ppm:.3f} ppm > {RATE_UNCERTAINTY_PPM} ppm"
+        )
+    if agreement_ppm > RATE_AGREEMENT_PPM:
+        problems.append(
+            f"the TSC rate is unstable: interval rates differ by "
+            f"{agreement_ppm:.3f} ppm > {RATE_AGREEMENT_PPM} ppm"
         )
     declared = context.facts.get("native_tsc_hz") or context.facts.get("tsc_hz")
     if declared is None:
@@ -623,6 +708,7 @@ def check_rate(context: DoctorContext) -> CheckResult:
         detail += "; not compared with the backend's rate (H3 did not run)"
     else:
         deviation_ppm = abs(measured - int(declared)) / int(declared) * 1e6
+        context.facts["rate_deviation_ppm"] = f"{deviation_ppm:.1f}"
         detail += f"; {deviation_ppm:.1f} ppm from the backend's {declared} Hz"
         if deviation_ppm > RATE_TOLERANCE_PPM:
             problems.append(
@@ -664,15 +750,10 @@ def check_host_skew(context: DoctorContext) -> CheckResult:
     return CheckResult("H5", True, detail)
 
 
-def check_guest_warp(context: DoctorContext) -> CheckResult:
-    for path, description in (
-        (context.openvmm, "OpenVMM"),
-        (context.kernel, "guest kernel"),
-        (context.initrd, "guest initramfs"),
-    ):
-        if not path.is_file():
-            return CheckResult("H6", False, f"{description} was not found at {path}")
-    vcpus = _guest_vcpus()
+def _warp_guest(
+    context: DoctorContext, vcpus: int, gaps: Sequence[str]
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Boot a guest, check its boot marker, and run a warp schedule in it."""
     command = workload_boot_command(
         context.openvmm,
         context.backend,
@@ -683,38 +764,66 @@ def check_guest_warp(context: DoctorContext) -> CheckResult:
         processors=vcpus,
     )
     command.extend(context.openvmm_args)
-    try:
-        result = run_guest_script(
-            command,
-            warp_probe_script() + "nvx-exit 0\n",
-            WARP_PROBE_COMPLETION_MARKER,
-            timeout=context.timeout,
+    result = run_guest_script(
+        command,
+        warp_probe_script(gaps) + "nvx-exit 0\n",
+        WARP_PROBE_COMPLETION_MARKER,
+        timeout=context.timeout,
+    )
+    monitor = TimeAbiMonitor(command)
+    monitor.feed(result["text"].encode())
+    monitor.finish()
+    boot = monitor.require_boot("the guest boot marker", online_cpus=vcpus)
+    rounds = check_warp_probe(
+        result["text"], cpus=vcpus, context="H6", rounds=warp_rounds(vcpus, gaps)
+    )
+    return boot, rounds
+
+
+def check_guest_warp(context: DoctorContext) -> CheckResult:
+    for path, description in (
+        (context.openvmm, "OpenVMM"),
+        (context.kernel, "guest kernel"),
+        (context.initrd, "guest initramfs"),
+    ):
+        if not path.is_file():
+            return CheckResult("H6", False, f"{description} was not found at {path}")
+    vcpus = _guest_vcpus()
+    # The largest guest runs the schedule, then a 1-vCPU guest runs the
+    # probe once.
+    guests: list[tuple[int, tuple[str, ...]]] = []
+    if vcpus > 1:
+        guests.append((vcpus, context.schedule.warp_gaps))
+    guests.append((1, ()))
+    boots: list[dict[str, str]] = []
+    rounds: list[dict[str, str]] = []
+    runs: list[str] = []
+    for count, count_gaps in guests:
+        try:
+            boot, count_rounds = _warp_guest(context, count, count_gaps)
+        except (RuntimeError, TimeAbiFailure) as error:
+            first = str(error).splitlines()[0]
+            return CheckResult("H6", False, f"vcpus={count}: {first}")
+        boots.append(boot)
+        rounds.extend(count_rounds)
+        runs.append(
+            f"vcpus={count} rounds={len(count_rounds)} "
+            f"idle_gaps_s={','.join(count_gaps) or 'none'} "
+            f"boot_elapsed_us={boot.get('elapsed_us', '?')}"
         )
-        monitor = TimeAbiMonitor(command)
-        monitor.feed(result["text"].encode())
-        monitor.finish()
-        boot = monitor.require_boot("the guest boot marker", online_cpus=vcpus)
-        rounds = check_warp_probe(
-            result["text"], cpus=vcpus, context="H6", rounds=warp_rounds(vcpus)
-        )
-    except (RuntimeError, TimeAbiFailure) as error:
-        first = str(error).splitlines()[0]
-        return CheckResult("H6", False, f"vcpus={vcpus}: {first}")
 
     def worst(name: str) -> int:
         return max(int(warp[name]) for warp in rounds)
 
     context.facts["guest_warp_ns"] = str(worst("max_abs_offset_ns"))
-    context.facts.setdefault("tsc_hz", boot["tsc_hz"])
-    context.facts.setdefault("lapic_hz", boot["lapic_hz"])
+    context.facts.setdefault("tsc_hz", boots[0]["tsc_hz"])
+    context.facts.setdefault("lapic_hz", boots[0]["lapic_hz"])
     return CheckResult(
         "H6",
         True,
-        f"vcpus={vcpus} rounds={len(rounds)} idle_s={WARP_PROBE_IDLE_SECONDS} "
-        f"max_backward_ns={worst('max_backward_ns')} "
+        "; ".join(runs) + f"; max_backward_ns={worst('max_backward_ns')} "
         f"max_abs_offset_ns={worst('max_abs_offset_ns')} "
-        f"max_uncertainty_ns={worst('max_uncertainty_ns')} boot_elapsed_us="
-        f"{boot.get('elapsed_us', '?')}",
+        f"max_uncertainty_ns={worst('max_uncertainty_ns')}",
     )
 
 
@@ -835,6 +944,9 @@ def summary_markdown(
         ("tsc_hz", "Declared TSC rate (Hz)"),
         ("lapic_hz", "LAPIC rate (Hz)"),
         ("measured_tsc_hz", "Measured TSC rate (Hz)"),
+        ("rate_deviation_ppm", "Rate deviation from the backend (ppm)"),
+        ("rate_agreement_ppm", "Interval rate agreement (ppm)"),
+        ("rate_uncertainty_ppm", "Largest interval uncertainty (ppm)"),
         ("host_skew_ns", "Host skew (ns)"),
         ("guest_warp_ns", "Guest warp offset (ns)"),
         ("invariant_tsc", "Host invariant TSC (evidence)"),
@@ -873,6 +985,7 @@ def run(args: argparse.Namespace) -> int:
         probe_directory=probe_directory,
         timeout=args.timeout,
         fingerprint=fingerprint,
+        schedule=CI_SCHEDULE if args.ci_schedule else QUALIFICATION_SCHEDULE,
     )
     results = run_checks(context, checks)
     failed = [result.check for result in results if not result.passed]
@@ -928,6 +1041,13 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="qualify without an OpenVMM binary: H2 checks the CPU identity and "
         "generation but not the CPU profile, and H3 and H6 cannot run",
+    )
+    parser.add_argument(
+        "--ci-schedule",
+        action="store_true",
+        help="run H4 and H6 on CI's short schedules: H4 takes 3 samples 1 s "
+        "apart instead of 13 samples 10 s apart, and H6 runs the warp probe "
+        "twice instead of five times",
     )
     parser.add_argument(
         "--probe-dir",
