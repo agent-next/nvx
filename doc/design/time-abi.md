@@ -264,7 +264,7 @@ settled cell on the registered hosts.
 | Obligation | KVM | MSHV | WHP |
 | --- | --- | --- | --- |
 | Identity CPUID (exact leaves, out-of-range rule) | `KVM_SET_CPUID2` with the identity and explicit zero leaves; every KVM `0x4xxxxxxx` entry removed. Other leaves in the range return KVM's Intel out-of-range result | No synthetic processor features, so the hypervisor reports no `0x400000xx` leaves; CPUID intercept results (`always_override`) for the identity and explicit zero leaves, read back with `get_cpuid_values` at preflight; programming them takes 43 to 62 µs | CPUID exits for the six identity leaves, served from OpenVMM's table; with synthetic features off, WHP returns zero natively for `0x40000006..=0x400000ff` and the bases from `0x40000100`, which preflight asserts |
-| Profile CPUID and time bits | `KVM_SET_CPUID2` with the effective CPUID. KVM 6.3 and newer hide invariant TSC while KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is 0, so the backend mirrors the guest-visible value, which core saves with the VM, into it with a host-initiated `KVM_SET_MSRS` after every accepted guest write and before a VP runs after a restore or reset; without it the guest loses `constant_tsc` and `nonstop_tsc` and boots about 160 ms slower | Processor feature banks derived from the profile (`hv_banks`), plus CPUID intercept results for leaves 1, 6, 7.0, `0xA`, and `0x80000007` | Processor feature banks derived from the profile (`hv_banks`), and the profile's pinned leaves as `CpuidResultList2` results (the banks cannot express the hypervisor bit, ARAT, or, on Azure, invariant TSC). CPUID exits only for the identity leaves and the per-VP topology leaves (`1`, `4`, `0xB`, and `0x1F` on Intel): each exit-list entry adds about 25 µs to partition setup, and the legacy 269-entry list cost about 7 ms per restore |
+| Profile CPUID and time bits | `KVM_SET_CPUID2` with the effective CPUID. KVM 6.3 and newer hide invariant TSC while KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is 0, so the backend mirrors the guest-visible value, which core saves with the VM, into it with a host-initiated `KVM_SET_MSRS` after every accepted guest write and before a VP runs after a restore or reset; without it the guest loses `constant_tsc` and `nonstop_tsc` and boots about 160 ms slower | Processor feature banks derived from the profile (`hv_banks`), plus a CPUID intercept result (`always_override`, subleaf-specific where the entry has a subleaf) for every entry of the effective CPUID, with the per-VP fields left to the hypervisor | Processor feature banks derived from the profile (`hv_banks`), and every effective-CPUID entry outside the hypervisor range as a `CpuidResultList2` result (the banks cannot express the hypervisor bit, ARAT, or, on Azure, invariant TSC). CPUID exits only for the identity leaves and the leaves with per-VP APIC fields (`1`, `0xB`, and `0x1F` where listed), 8 exits for every v1 profile: each exit-list entry adds about 25 µs to partition setup, and the legacy 269-entry list cost about 7 ms per restore. The exit handler presents the effective CPUID's `0xB` terminator, with the VP's x2APIC ID, instead of zeroing subleaves from 2 |
 | Identity MSRs routed to OpenVMM | `KVM_CAP_X86_USER_SPACE_MSR` (`UNKNOWN`, `FILTER`) and `KVM_X86_SET_MSR_FILTER` denying reads and writes of `0x40000000..=0x400001ff`; the filter takes precedence over KVM's in-kernel Hyper-V MSRs. A Linux boot takes four MSR exits, all on the BSP, at any vCPU count | MSR-index intercepts (`HV_INTERCEPT_TYPE_X64_MSR_INDEX`, `READ_WRITE`) for `0x40000002`, `0x40000022`, `0x40000023`, and `0x40000118`. The hypervisor itself raises #GP for writes to the three read-only MSRs and for every other MSR in the range. Native synthetic MSRs are forbidden: they pre-empt the intercepts, and the native `HV_X64_MSR_TSC_FREQUENCY` returns the destination's rate instead of `F`. Verified on hypervisor builds 26100.30000 (bare metal) and 26100.9444 (Azure) | `X64MsrExitBitmap` with `UnhandledMsrs` (capability `0x3f` on every host) and the offloaded APIC, no synthetic features and no `hv1_emulator`: the identity MSRs exit to OpenVMM, which raises #GP for every other MSR in the range |
 | Native rate `F_d` | `KVM_GET_TSC_KHZ` × 1000 on VP 0 (1 kHz granularity) | `ProcessorClockFrequency` partition property | `WHvCapabilityCodeProcessorClockFrequency` |
 | No TSC scaling | Never `KVM_SET_TSC_KHZ`; every vCPU reports the host rate | No frequency override | No `ProcessorClockFrequency` partition property; the 1 GHz request is removed |
@@ -303,9 +303,11 @@ an SMP-restored VM for its lifetime.
 ## CPU profiles
 
 A CPU profile is the complete guest-visible CPU surface of one vendor and CPU
-generation, shared by every backend. The guest sees only profile values, never
-host passthrough, except for a fixed, code-defined set of VMM-owned fields and
-the fields the time ABI owns. Profiles are data: derived mechanically by
+generation, shared by every backend. In every entry that an architectural
+enumeration reaches, the guest sees only profile values, never host
+passthrough, except for a fixed, code-defined set of VMM-owned fields and
+the fields the time ABI owns; entries beyond are reserved (see **Effective
+CPUID**). Profiles are data: derived mechanically by
 intersecting host fingerprints (`openvmm --cpu-fingerprint`, the Firecracker
 `cpu-template-helper` workflow) per register, first within each backend and
 then across backends, reviewed, checked in at
@@ -365,9 +367,12 @@ the profile, the VM topology, and the time ABI's identity leaves.
 
 **Effective CPUID.** The effective CPUID (`openvmm-effective-cpuid/v1`)
 lists exactly the governed leaves: every leaf and subleaf of the profile's
-`cpuid` table; the topology leaves `0xB` and `0x1F`, at the subleaves the
-VM's topology defines, when they are within the maximum basic leaf; and the
-identity leaves `0x40000000..=0x40000005` with the explicit zero leaves. Each
+`cpuid` table; the topology leaves `0xB` and `0x1F`, when they are within
+the maximum basic leaf, at the subleaves the VM's topology defines and the
+subleaf that terminates them (an invalid level: `EAX` and `EBX` zero,
+`ECX[7:0]` its own number, `ECX[15:8]` zero, and the x2APIC ID in `EDX`),
+which Linux reads to end its enumeration; and the identity leaves
+`0x40000000..=0x40000005` with the explicit zero leaves. Each
 entry holds the four registers and their masks; the per-VP fields hold VP 0's
 APIC identity, and the runtime-owned bits have mask 0. OpenVMM computes it,
 records it, and recomputes it on restore, so the record never depends on how
@@ -378,6 +383,26 @@ reports VP 0's CPUID for exactly the governed leaves (KVM from the
 WHP from VP 0's register view), reading an entry without a subleaf at
 subleaf 0, and OpenVMM compares the report with the effective CPUID under its
 masks.
+
+The effective CPUID is the single source of the guest's CPUID. Core passes it
+to the backend as `TimeAbiConfig::cpuid`, with the per-VP fields unmasked,
+and the backend presents every entry with each VP's own APIC identity (see
+[Backend obligations](#backend-obligations)). Banks and pinned MSRs come
+from the profile itself, which the backend looks up by
+`TimeAbiConfig::cpu_profile`. The governed entries are every entry an
+architectural enumeration reaches. Entries beyond them are reserved:
+
+- a leaf above the maximum basic or extended leaf;
+- a subleaf past its leaf's reported maximum or terminator;
+- a `0xD` subleaf of a component that is not enabled.
+
+A backend may answer a reserved entry with zeros, Intel's out-of-range
+result, or the hypervisor's own value. Reserved entries are neither recorded
+nor checked, and Linux reads none of them. Strict zeros would not be uniform
+anyway: KVM answers above the maximum basic leaf with the highest basic
+leaf's result, and it synthesizes a terminator for every topology subleaf
+past the last level. Registering zeros for them would also add 3 to 4.5 µs
+per entry to every MSHV cold boot and restore.
 
 Informational fields:
 
