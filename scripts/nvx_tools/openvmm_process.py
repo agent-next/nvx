@@ -15,6 +15,7 @@ from typing import NamedTuple
 
 from .benchmark import InteractiveProcess, terminate
 from .common import remaining_timeout
+from .time_abi import TimeAbiFailure, TimeAbiMonitor
 
 
 def _line_marker_end(
@@ -75,6 +76,7 @@ class OpenvmmProcess:
         self._search_offset = 0
         self._log_path = log_path
         self._finished = False
+        self._monitor = TimeAbiMonitor(command)
 
     @property
     def process(self):
@@ -84,11 +86,57 @@ class OpenvmmProcess:
     def output(self) -> bytes:
         return bytes(self._output)
 
+    @property
+    def time_abi(self) -> TimeAbiMonitor:
+        return self._monitor
+
     def send_bytes(self, data: bytes) -> None:
         self._interaction.write_input(data)
 
     def send_line(self, line: str) -> None:
         self.send_bytes(f"{line}\n".encode())
+
+    def _consume(self, chunk: bytes) -> None:
+        self._output.extend(chunk)
+        try:
+            self._monitor.feed(chunk)
+        except TimeAbiFailure as error:
+            self._fail(error)
+
+    def _exited(self, before: str) -> Exception:
+        try:
+            returncode: int | None = self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            returncode = None
+        try:
+            self._monitor.finish()
+            self._monitor.check_exit(returncode)
+        except TimeAbiFailure as error:
+            return error
+        return RuntimeError(f"OpenVMM exited with status {returncode} before {before}")
+
+    def wait_for_time_abi(self, phase: str, timeout: float) -> dict[str, str]:
+        """Wait for a passing ``NVX-TIME-ABI`` marker of a conformance phase."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if phase == "boot" and self._monitor.boot is not None:
+                return self._monitor.boot
+            if phase == "restore" and self._monitor.restores:
+                return self._monitor.restores[-1]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._fail(
+                    TimeoutError(
+                        f"time ABI {phase} marker was not observed within {timeout:g}s"
+                    )
+                )
+            try:
+                chunk = self._chunks.get(timeout=min(remaining, 0.1))
+            except queue.Empty:
+                continue
+            if chunk is None:
+                self._fail(self._exited(f"the time ABI {phase} marker"))
+            self._consume(chunk)
 
     def wait_for(self, marker: bytes, timeout: float) -> None:
         if not marker:
@@ -111,12 +159,8 @@ class OpenvmmProcess:
             except queue.Empty:
                 continue
             if chunk is None:
-                self._fail(
-                    RuntimeError(
-                        f"OpenVMM exited with status {self.process.poll()} before {marker!r}"
-                    )
-                )
-            self._output.extend(chunk)
+                self._fail(self._exited(repr(marker)))
+            self._consume(chunk)
 
     def wait_for_line(self, marker: bytes, timeout: float) -> None:
         if not marker or b"\n" in marker or b"\r" in marker:
@@ -139,13 +183,8 @@ class OpenvmmProcess:
             except queue.Empty:
                 continue
             if chunk is None:
-                self._fail(
-                    RuntimeError(
-                        "OpenVMM exited with status "
-                        f"{self.process.poll()} before line marker {marker!r}"
-                    )
-                )
-            self._output.extend(chunk)
+                self._fail(self._exited(f"line marker {marker!r}"))
+            self._consume(chunk)
 
     def wait(self, timeout: float) -> OpenvmmProcessResult:
         deadline = time.monotonic() + timeout
@@ -163,12 +202,17 @@ class OpenvmmProcess:
                 continue
             if chunk is None:
                 break
-            self._output.extend(chunk)
+            self._consume(chunk)
         remaining = remaining_timeout(deadline)
         try:
             returncode = self.process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             self._fail(TimeoutError(f"OpenVMM did not exit within {timeout:g}s"))
+        try:
+            self._monitor.finish()
+            self._monitor.check_exit(returncode)
+        except TimeAbiFailure as error:
+            self._fail(error)
         self._finished = True
         self._write_log()
         return OpenvmmProcessResult(returncode, bytes(self._output))
@@ -214,13 +258,25 @@ class OpenvmmProcess:
 
 
 class TcpConsole:
-    def __init__(self, connection: socket.socket) -> None:
+    def __init__(
+        self,
+        connection: socket.socket,
+        monitor: TimeAbiMonitor | None = None,
+    ) -> None:
         self._connection = connection
         self._output = bytearray()
         self._search_offset = 0
+        self._monitor = monitor
 
     @classmethod
-    def connect(cls, address: tuple[str, int], timeout: float) -> TcpConsole:
+    def connect(
+        cls,
+        address: tuple[str, int],
+        timeout: float,
+        *,
+        monitor: TimeAbiMonitor | None = None,
+    ) -> TcpConsole:
+        """Connect to a virtio console; ``monitor`` checks its time ABI lines."""
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -230,12 +286,17 @@ class TcpConsole:
                 except BaseException:
                     connection.close()
                     raise
-                return cls(connection)
+                return cls(connection, monitor)
             except OSError as error:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"failed to connect to virtio console at {address}"
                     ) from error
+
+    def _consume(self, chunk: bytes) -> None:
+        self._output.extend(chunk)
+        if self._monitor is not None:
+            self._monitor.feed(chunk)
 
     def send_bytes(self, data: bytes) -> None:
         self._connection.sendall(data)
@@ -266,7 +327,7 @@ class TcpConsole:
                 continue
             if not chunk:
                 raise RuntimeError(f"TCP console closed before marker {marker!r}")
-            self._output.extend(chunk)
+            self._consume(chunk)
 
     def wait_for_line(self, marker: bytes, timeout: float) -> None:
         if not marker or b"\n" in marker or b"\r" in marker:
@@ -289,7 +350,7 @@ class TcpConsole:
                 continue
             if not chunk:
                 raise RuntimeError(f"TCP console closed before line marker {marker!r}")
-            self._output.extend(chunk)
+            self._consume(chunk)
 
     def finish(self) -> bytes:
         self._connection.settimeout(0.1)

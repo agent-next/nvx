@@ -22,6 +22,13 @@ the NVX Linux kernel plus the selected Alpine or Ubuntu initramfs and exercises
 Linux, SMP, virtio, sandbox, and snapshot behavior through the public OpenVMM
 CLI. Alpine-control-only scenarios remain explicit and are rejected for the
 Ubuntu initramfs. Failure logs from the NVX layer are uploaded per backend.
+Every harness launch, in the tests and the benchmarks, scans the OpenVMM
+console for the guest's [time ABI](design/time-abi.md) output. An
+`NVX-TIME-ABI-VIOLATION` event or a failed `NVX-TIME-ABI` conformance line
+fails the scenario at once with the guest's code and detail. An OpenVMM exit
+status of 193, 194, or 195 is reported as the guest's time ABI conformance,
+runtime-violation, or restore-repair power-off, together with the event that
+preceded it, instead of as a generic exit status.
 The restore-processor scenario also rejects Linux TSC instability diagnostics,
 even if the requested CPUs came online, so clock skew cannot silently pass by
 falling back to a different clocksource. After the 1/2/4/8-CPU restores, it
