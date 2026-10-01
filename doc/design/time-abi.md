@@ -752,14 +752,17 @@ and the managed agent.
 Init runs the boot check immediately after mounting `/proc`, `/sys`, and
 `/dev`, before any other guest work, and starts the daemon only if it passes.
 CPUID is executed on every online CPU (the checker pins itself to each CPU in
-turn), and MSRs are read through `/dev/cpu/<n>/msr`. A CPU's VP index is its
-Linux CPU number, because CPUs come online as a prefix in APIC-ID order.
+turn, or runs one thread pinned to each CPU), and MSRs are read through
+`/dev/cpu/<n>/msr`. A CPU's VP index is its Linux CPU number, because CPUs
+come online as a prefix in APIC-ID order. CPUID tables are per VP on KVM, so
+`C1` and `C2` run on every CPU; the MSRs other than the VP index are
+partition-wide on every backend, so `C3` reads them on CPU 0 only.
 
 | ID | Check | Phases |
 | --- | --- | --- |
-| `C1` | Identity leaves `0x40000000..=0x40000005` equal the [identity table](#hypervisor-identity), with `C` equal to the number of possible CPUs; the explicit zero leaves `0x40000006..=0x4000000f` and `0x40000080..=0x40000082` are zero; at boot, on one CPU, no base `0x40000100..=0x4000ff00` carries `KVMKVMKVM` | boot, restore (new CPUs) |
+| `C1` | Identity leaves `0x40000000..=0x40000005` equal the [identity table](#hypervisor-identity), with `C` equal to the number of possible CPUs; the explicit zero leaves `0x40000006..=0x4000000f` and `0x40000080..=0x40000082` are zero | boot, restore (new CPUs) |
 | `C2` | The [CPU time bits](#cpu-time-bits) | boot, restore (new CPUs) |
-| `C3` | MSR `0x40000002` equals the CPU's VP index; `0x40000022` equals `F` with `floor(F / 1000)` equal to the kernel's `cpu MHz` in kHz; `0x40000023` equals 1,000,000,000 or 200,000,000; `0x40000118` equals 1; reads of `0x40000000`, `0x40000001`, and `0x40000020` fail with `EIO` | boot; restore (CPU 0 `0x40000022` only) |
+| `C3` | MSR `0x40000002` equals the CPU's VP index on every CPU; on CPU 0, `0x40000022` equals `F` with `floor(F / 1000)` equal to the kernel's `cpu MHz` in kHz, `0x40000023` equals 1,000,000,000 or 200,000,000, `0x40000118` equals 1, and reads of `0x40000000`, `0x40000001`, and `0x40000020` fail with `EIO` | boot; restore (CPU 0 `0x40000022` only) |
 | `C4` | The kernel log contains `Hypervisor detected: Microsoft Hyper-V`, `Hyper-V: privilege flags low 0x8860,`, `Hyper-V: LAPIC Timer Frequency: 0x989680` or `0x1e8480`, and `clocksource: Switched to clocksource tsc` as its last clocksource switch; it contains no record matching a watcher pattern other than `G_CLOCKSOURCE_SWITCH`, and none containing `Fast TSC calibration`, `Refined TSC clocksource calibration`, `kvm-clock`, or `APIC timer: using supplied frequency` | boot |
 | `C5` | `/proc/cpuinfo` flags as listed in [Clocksource, tick, and PIT](#clocksource-tick-and-pit) on every CPU (`nonstop_tsc` on WHP: TBD(whp)) | boot, restore (new CPUs) |
 | `C6` | `current_clocksource` is `tsc`; `available_clocksource` contains only `tsc`, `refined-jiffies`, and `jiffies` | boot, capture, restore |
@@ -773,9 +776,12 @@ Linux CPU number, because CPUs come online as a prefix in APIC-ID order.
 Capture and restore checks never wait. The boot `C7` check and the deferred
 restore `C7` check may poll for at most 200 ms, because a CPU switches to
 one-shot mode at its first tick. The CI conformance suite adds an exhaustive
-check: every leaf `0x40000006..=0x400000ff`, writes of 0 and 1 to
-`0x40000118` and of 2 (which must fail), writes to every read-only
-identity MSR (which must fail), and reads of `IA32_TSC_ADJUST` and
+check on every CPU: every leaf `0x40000006..=0x400000ff`; no base
+`0x40000100..=0x4000ff00` (step `0x100`) carrying `KVMKVMKVM` or another
+hypervisor signature (the NVX kernel has no KVM guest support, so the boot
+check leaves this static property of the backend to CI); every `C3` MSR;
+writes of 0 and 1 to `0x40000118` and of 2 (which must fail); writes to every
+read-only identity MSR (which must fail); and reads of `IA32_TSC_ADJUST` and
 `IA32_TSC_DEADLINE` (which must fail).
 
 On success the check prints one line to the console:
@@ -783,6 +789,12 @@ On success the check prints one line to the console:
 ```text
 NVX-TIME-ABI: v=1 phase=<boot|capture|restore> status=ok cpus=<online> tsc_hz=<F> lapic_hz=<L> generation=<g> elapsed_us=<duration>
 ```
+
+`elapsed_us` covers the checks and, at boot, the daemon start. The line is
+printed after it is taken, synchronously and before any workload starts, so
+a harness sees the marker before workload output and an early power-off
+cannot lose it; its console cost (one port exit per byte) is part of the
+cold-boot cost the performance gate measures.
 
 On failure it prints `status=fail check=<ID> detail="<text>"` in the same
 format, emits a violation event with code `G_CONFORMANCE_<ID>`, and powers
@@ -801,9 +813,13 @@ accept a report-only boot as conformant.
 
 ### Violation watcher
 
-The daemon reads `/dev/kmsg` from the start of the buffer and then follows
-it; it sets `oom_score_adj` to -1000. A record matches when its message text
-contains every substring of a row:
+The boot check opens `/dev/kmsg`, seeks it to its end, and only then reads
+the whole kernel log once with `syslog(SYSLOG_ACTION_READ_ALL)` for `C4`. The
+daemon inherits that descriptor and follows it, so no record is missed;
+records logged in between are seen twice, and identical lines are one event.
+A log buffer that wrapped before the boot check fails `C4`, because its
+required records are missing. The daemon sets `oom_score_adj` to -1000. A
+record matches when its message text contains every substring of a row:
 
 | Code | Substrings |
 | --- | --- |
@@ -1073,7 +1089,7 @@ Expected effects:
 | Wall clock from the packet instead of RTC polling | Removes at least 32 CMOS port exits and the update wait per tiered restore |
 | No capture-time clocksource waits | Removes up to 5 s of capture latency on MSHV and WHP; outside the restore metrics |
 | No LAPIC calibration and no `tsc-early` window at cold boot | Unchanged or faster cold boot |
-| Boot check and daemon start | Added cold-boot cost; budget 2 ms on KVM and MSHV and 5 ms on WHP, reported as `elapsed_us` |
+| Boot check and daemon start | Added cold-boot cost, reported as the first run's `elapsed_us`; budget 2.5 ms at one vCPU plus 0.3 ms per additional vCPU on KVM and MSHV, and 5 ms plus 0.6 ms per additional vCPU on WHP; the gate is authoritative |
 | Counting LAPIC instead of TSC-deadline on KVM | Different timer-programming exits; covered by the gate |
 | Restore repair and checks before the acknowledgement | Run in one helper process; the RCU release and deferred checks run after the acknowledgement |
 
