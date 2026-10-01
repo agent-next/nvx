@@ -282,6 +282,7 @@ class InitramfsBuildConstants:
         "nvx-port-io",
         "nvx-console-pending",
         "nvx-managed-agent",
+        "nvx-time",
     )
     TIME_PROBE_NAME: Final = "nvx-time-probe"
     TIME_PROBE_CFLAGS: Final = (
