@@ -645,8 +645,8 @@ class GuestTimeTests(unittest.TestCase):
             "adjust": GOOD_FLAGS + " tsc_adjust",
         }.items():
             with self.subTest(case=name):
-                self.assertIn("status=fail check=C5", cpuinfo(flags))
-        self.assertIn("status=fail check=C5", cpuinfo(GOOD_FLAGS, cpus=1))
+                self.assertIn("code=G_CONFORMANCE_C5", cpuinfo(flags))
+        self.assertIn("code=G_CONFORMANCE_C5", cpuinfo(GOOD_FLAGS, cpus=1))
 
     def test_command_line_rejects_clock_workarounds(self):
         accepted = "earlycon=xe9 console=hvc0 quiet clocksource=tsc tsc=reliable"
@@ -663,7 +663,7 @@ class GuestTimeTests(unittest.TestCase):
         ):
             with self.subTest(token=token):
                 self.assertIn(
-                    "status=fail check=C9",
+                    "code=G_CONFORMANCE_C9",
                     self.run_test("cmdline", f"{accepted} {token}"),
                 )
 
@@ -682,7 +682,7 @@ class GuestTimeTests(unittest.TestCase):
         ):
             with self.subTest(current=current, available=available):
                 self.assertIn(
-                    "status=fail check=C6",
+                    "code=G_CONFORMANCE_C6",
                     self.run_test("clocksource", current, available),
                 )
 
@@ -709,8 +709,11 @@ class GuestTimeTests(unittest.TestCase):
         self.assertTrue(long_line.endswith('\\x02"\n'))
 
     def test_state_file_round_trip(self):
+        # The keys and their order follow the spec's state file table.
         text = (
-            "version=1\ngeneration=2\ndiscontinuities=3\nlast_discontinuity=step\n"
+            "version=1\ngeneration=2\ncheck_phase=restore\ncheck_status=ok\n"
+            "check_cpus=4\ncheck_elapsed_us=1830\ntsc_hz=2194843000\n"
+            "lapic_hz=200000000\ndiscontinuities=3\nlast_discontinuity=step\n"
             "last_step_ns=-200000000\nlast_step_realtime_ns=1790841600000000000\n"
             "last_downtime_ns=31000000000\nlast_downtime_source=utc\n"
             "synchronized=1\noffset_ns=-42\nuncertainty_ns=1800\n"
@@ -718,6 +721,13 @@ class GuestTimeTests(unittest.TestCase):
             "last_sample_error=none\nviolations=0\n"
         )
         self.assertEqual(self.run_test("state", self.fixture("state.txt", text)), text)
+        # A fresh state is the pending boot check.
+        self.assertTrue(
+            self.run_test("state", self.fixture("state.txt", "version=1\n")).startswith(
+                "version=1\ngeneration=0\ncheck_phase=boot\ncheck_status=pending\n"
+                "check_cpus=0\ncheck_elapsed_us=0\ntsc_hz=0\nlapic_hz=0\n"
+            )
+        )
         self.assertEqual(
             self.run_test(
                 "state", self.fixture("state.txt", "unknown=x\nsamples=bad\n")
@@ -725,33 +735,69 @@ class GuestTimeTests(unittest.TestCase):
             "error",
         )
 
+    def status(self, text: str, mode: str = "enforcing", failures: int = 0) -> str:
+        return self.run_test(
+            "status", self.fixture("state.txt", text), mode, str(failures)
+        )
+
+    def test_status_prints_the_last_check_and_the_runtime_line(self):
+        state = (
+            "version=1\ngeneration=1\ncheck_phase=restore\ncheck_status=ok\n"
+            "check_cpus=4\ncheck_elapsed_us=1830\ntsc_hz=2194843000\n"
+            "lapic_hz=200000000\ndiscontinuities=1\nsynchronized=1\n"
+            "offset_ns=-42\nuncertainty_ns=1800\nrejected_samples=2\n"
+            "last_sample_error=G_SAMPLE_UNCERTAIN\n"
+        )
+        self.assertEqual(
+            self.status(state),
+            "NVX-TIME-ABI: v=1 phase=restore status=ok cpus=4 tsc_hz=2194843000 "
+            "lapic_hz=200000000 generation=1 elapsed_us=1830\n"
+            "NVX-TIME-ABI: v=1 phase=runtime status=synchronized generation=1 "
+            "discontinuities=1 offset_ns=-42 uncertainty_ns=1800 "
+            "rejected_samples=2 last_sample_error=G_SAMPLE_UNCERTAIN\n",
+        )
+        # A check still pending after the wait has no elapsed_us.
+        pending = state.replace("check_status=ok", "check_status=pending")
+        pending = pending.replace("synchronized=1", "synchronized=0")
+        self.assertEqual(
+            self.status(pending).splitlines(),
+            [
+                "NVX-TIME-ABI: v=1 phase=restore status=pending cpus=4 "
+                "tsc_hz=2194843000 lapic_hz=200000000 generation=1",
+                "NVX-TIME-ABI: v=1 phase=runtime status=unsynchronized "
+                "generation=1 discontinuities=1 offset_ns=-42 uncertainty_ns=1800 "
+                "rejected_samples=2 last_sample_error=G_SAMPLE_UNCERTAIN",
+            ],
+        )
+        # Report-only mode marks both lines and counts the check's failures.
+        report = self.status(state, "report-only", 3).splitlines()
+        self.assertTrue(report[0].startswith("NVX-TIME-REPORT: v=1 phase=restore "))
+        self.assertTrue(report[0].endswith(" elapsed_us=1830 failures=3"))
+        self.assertTrue(report[1].startswith("NVX-TIME-REPORT: v=1 phase=runtime "))
+
     def restore_record(self, text: str) -> str:
         return self.run_test(
             "restore-record", self.fixture("restore.txt", text)
         ).strip()
 
     def test_restore_record_names_the_cpus_that_restore_finish_onlined(self):
-        # The capture helper's record, which the daemon reads when the helper
-        # finished an untiered restore itself.
+        # restore-finish records the CPUs that activation brought online.
         self.assertEqual(
-            self.restore_record("generation=3\nelapsed_us=1234\n"),
-            "generation=3 elapsed_us=1234 new_cpus=none count=0",
-        )
-        # restore-finish adds the CPUs that activation brought online.
-        self.assertEqual(
-            self.restore_record("generation=3\nelapsed_us=1400\nnew_cpus=4-6,9\n"),
-            "generation=3 elapsed_us=1400 new_cpus=4,5,6,9 count=4",
+            self.restore_record("generation=3\nnew_cpus=4-6,9\n"),
+            "generation=3 new_cpus=4,5,6,9 count=4",
         )
         self.assertEqual(
-            self.restore_record("generation=3\nelapsed_us=1400\nnew_cpus=none\n"),
-            "generation=3 elapsed_us=1400 new_cpus=none count=0",
+            self.restore_record("generation=3\nnew_cpus=none\n"),
+            "generation=3 new_cpus=none count=0",
+        )
+        self.assertEqual(
+            self.restore_record("generation=3\n"), "generation=3 new_cpus=none count=0"
         )
         for text in (
             "",
-            "generation=3\n",
-            "elapsed_us=1400\ngeneration=3\n",
-            "generation=3\nelapsed_us=1400\nnew_cpus=7-4\n",
-            "generation=3\nelapsed_us=1400\nnew_cpus=64\n",
+            "new_cpus=4\ngeneration=3\n",
+            "generation=3\nnew_cpus=7-4\n",
+            "generation=3\nnew_cpus=64\n",
         ):
             self.assertEqual(self.restore_record(text), "error", text)
 
@@ -764,8 +810,8 @@ class GuestTimeTests(unittest.TestCase):
         for size in sorted({1, min(2, len(allowed)), min(4, len(allowed))}):
             output = self.run_test("parallel", ",".join(map(str, allowed[:size])))
             self.assertTrue(output.endswith("failures=7\n"), output)
-            self.assertEqual(output.count("check=C4"), 6, output)
-            self.assertEqual(output.count("check=C9"), 1, output)
+            self.assertEqual(output.count("code=G_CONFORMANCE_C4"), 6, output)
+            self.assertEqual(output.count("code=G_CONFORMANCE_C9"), 1, output)
         # A CPU the checks cannot run on fails C1 in its job.
         unusable = [cpu for cpu in range(64) if cpu not in allowed]
         if not unusable:

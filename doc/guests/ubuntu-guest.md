@@ -437,8 +437,9 @@ The Ubuntu initramfs boot remains identical to Alpine at the machine level:
 3. OpenVMM prepends its xe9/hvc console parameters and fixed virtio-mmio
    discovery.
 4. `/init` mounts procfs, sysfs, and devtmpfs, switches kernel module loading
-   off, mounts `/run`, and runs the time ABI boot check (`nvx-time boot`),
-   which also starts the time daemon, before it mounts tmpfs.
+   off, mounts `/run`, and runs the time ABI boot step (`nvx-time boot`),
+   which steps the clock to host UTC and leaves the other boot checks and the
+   time daemon running in the background, before it mounts tmpfs.
 5. `/init` configures loopback, optional static networking, and optional
    HostFs.
 6. `/init` handles an explicit `nvx_exec` workload or opens a root shell.
