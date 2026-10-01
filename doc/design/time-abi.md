@@ -972,10 +972,10 @@ mounting `/proc`, `/sys`, and `/dev`, it takes a time sample within the
 [uncertainty bound](#uncertainty-bounds) and steps the clock to host UTC
 (`C12`), so the workload starts on host time; this step is not counted as a
 discontinuity. Init then reports shell-ready (or starts the workload, in
-modes without a shell) and runs every other boot check asynchronously. The
-checks start the daemon when they pass. Every check stays fail-fast: a
-failure powers the guest off with status 193, even if the workload is
-running. A guest that powers off before its checks finish skips them, which
+modes without a shell) and runs every other boot check asynchronously, at
+`SCHED_IDLE`. The checks start the daemon when they pass. Every check stays
+fail-fast: a failure powers the guest off with status 193, even if the
+workload is running. A guest that powers off before its checks finish skips them, which
 is why CI takes its evidence from `nvx-time status`, which waits for them.
 
 CPUID is executed on every online CPU (the checker pins itself to each CPU in
@@ -1123,7 +1123,9 @@ before the acknowledgement:
 
 6. Read the status from `0xea`. Bit 1 is always set after a restore.
 7. Read `CLOCK_REALTIME` as `t0`, write `0xa5` to `0xea`, read it as `t1`,
-   and read the packet with four-byte reads. Validate the magic, version,
+   and read the packet with four-byte reads: `inl`, or `rep insl`, which
+   KVM serves in one exit and MSHV and WHP through OpenVMM's instruction
+   emulator. Validate the magic, version,
    reserved bits, counts, `g`, and the generation ID (`G_REPAIR_PACKET`,
    `G_REPAIR_GENERATION`).
 8. Set the wall clock. Compute `theta` and `epsilon` from the bracket. If
@@ -1152,7 +1154,16 @@ before the acknowledgement:
 
     It prints nothing unless a check fails.
 
-Steps 6, 7, and 8 run in one helper process. Repair failures emit a violation
+No restore check runs before the acknowledgement. The post-acknowledgement
+checks are `C1`, `C2`, `C3`, `C5`, `C6`, `C7`, and `C10`. Steps 6, 7, and 8
+run in one helper process, which may also run every other step before the
+acknowledgement and signal the daemon, so that a restore without shell work
+(for example, untiered with no processor or memory target) needs no second
+helper. Step 12 and the asynchronous boot checks run at `SCHED_IDLE`, so on
+few vCPUs they never take a CPU from the restored or starting workload; the
+watcher and the discipline run at normal priority. Under a CPU-bound
+workload they still progress, more slowly, and stall suppression stays set
+until the release. Repair failures emit a violation
 event and power off with status 195.
 
 ### RCU grace period release
