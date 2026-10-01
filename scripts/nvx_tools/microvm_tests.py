@@ -100,6 +100,15 @@ MICROVM_TEST_SCENARIOS = (
 UBUNTU_UNSUPPORTED_SCENARIOS = frozenset(
     ("console-snapshot", "sandbox-blocks", "scratch-snapshot", "snapshot-tiers")
 )
+# The spec runs the same-host restore cases on the CI debug kernel, whose
+# soft-lockup and hung-task detectors the guest's time ABI watcher reports.
+DEBUG_KERNEL_SCENARIOS = (
+    "smp",
+    "smp-snapshot",
+    "restore-processors",
+    "restore-downtime",
+    "snapshot-tiers",
+)
 MICROVM_PROCESSOR_COUNTS = (1, 2, 4, 8)
 MICROVM_TEST_SCRIPTS_DIR = Path(__file__).with_name("microvm_test_scripts")
 LIFECYCLE_COMPLETION_MARKER = b"NVX-LIFECYCLE-OK"
@@ -216,6 +225,15 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         action="append",
         choices=MICROVM_TEST_SCENARIOS,
         help="scenario to run; repeat to select multiple (default: all)",
+    )
+    parser.add_argument(
+        "--debug-kernel",
+        action="store_true",
+        help=(
+            "boot the CI debug kernel (build/vmlinux-debug), which enables the "
+            "soft-lockup and hung-task detectors; selects the same-host restore "
+            "scenarios unless --scenario is given"
+        ),
     )
     parser.add_argument(
         "--processors",
@@ -4171,15 +4189,47 @@ def run_snapshot_tiers(
         )
 
 
+def require_debug_kernel(config: Path) -> None:
+    """Fail unless a kernel config enables the debug kernel's detectors.
+
+    The guest's C11 check passes vacuously on a kernel without them, so a
+    production kernel would otherwise pass the debug-kernel job.
+    """
+    lines = set(
+        require_file(config, "microVM debug kernel config")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    missing = [
+        option
+        for option in KernelBuildConstants.DEBUG_WATCHDOG_CONFIG
+        if option not in lines
+    ]
+    if missing:
+        raise ScriptError(
+            f"{config} is not the CI debug kernel config; it lacks "
+            + ", ".join(missing)
+        )
+
+
 def run(args: argparse.Namespace) -> int:
     validate_openvmm_test_backend(args.backend)
     descriptor = guest_descriptor(args.guest)
     if args.memory_mib is None:
         args.memory_mib = descriptor.default_memory_mib
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
-    kernel = require_file(
-        artifact_path(KernelBuildConstants.BINARY_NAME), "microVM Linux direct kernel"
-    )
+    debug_kernel = getattr(args, "debug_kernel", False)
+    if debug_kernel:
+        require_debug_kernel(artifact_path(KernelBuildConstants.DEBUG_CONFIG_NAME))
+        kernel = require_file(
+            artifact_path(KernelBuildConstants.DEBUG_BINARY_NAME),
+            "microVM Linux debug kernel",
+        )
+    else:
+        kernel = require_file(
+            artifact_path(KernelBuildConstants.BINARY_NAME),
+            "microVM Linux direct kernel",
+        )
     initrd = require_file(
         artifact_path(descriptor.initramfs_name),
         f"microVM {descriptor.distribution} initramfs",
@@ -4187,9 +4237,10 @@ def run(args: argparse.Namespace) -> int:
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.scenario is None:
+        defaults = DEBUG_KERNEL_SCENARIOS if debug_kernel else MICROVM_TEST_SCENARIOS
         scenarios = tuple(
             scenario
-            for scenario in MICROVM_TEST_SCENARIOS
+            for scenario in defaults
             if descriptor.name != "ubuntu"
             or scenario not in UBUNTU_UNSUPPORTED_SCENARIOS
         )

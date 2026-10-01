@@ -1775,7 +1775,9 @@ class CiConfigurationTests(unittest.TestCase):
         openvmm_tests = set(ci.REQUIRED_CI_OPENVMM_TEST_JOBS)
         openvmm_artifact_tests = set(ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS)
         microvm_tests = set(ci.REQUIRED_CI_MICROVM_TEST_JOBS)
-        artifacts = {ci.REQUIRED_CI_ARTIFACT_JOB}
+        debug_kernel = set(ci.REQUIRED_CI_MICROVM_DEBUG_JOBS)
+        debug_kernel_push = set(ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS)
+        artifacts = {ci.REQUIRED_CI_ARTIFACT_JOB, ci.REQUIRED_CI_DEBUG_KERNEL_JOB}
         platforms = set(ci.REQUIRED_CI_PLATFORM_JOBS)
         cases = (
             ("pull_request", True, False, False, always_successful),
@@ -1807,6 +1809,7 @@ class CiConfigurationTests(unittest.TestCase):
                 | openvmm_tests
                 | openvmm_artifact_tests
                 | microvm_tests
+                | debug_kernel
                 | artifacts
                 | platforms
                 | {"performance-gate"},
@@ -1853,6 +1856,8 @@ class CiConfigurationTests(unittest.TestCase):
                 | openvmm_tests
                 | openvmm_artifact_tests
                 | microvm_tests
+                | debug_kernel
+                | debug_kernel_push
                 | platforms,
             ),
         )
@@ -2178,6 +2183,21 @@ class CiConfigurationTests(unittest.TestCase):
                 "openvmm-windows-msvc",
                 "run-nvx-microvm-tests.yml",
             ),
+            "nvx-microvm-debug-kvm": (
+                "build-openvmm-linux-gnu",
+                "openvmm-linux-gnu",
+                "run-nvx-microvm-tests.yml",
+            ),
+            "nvx-microvm-debug-mshv": (
+                "build-openvmm-linux-gnu",
+                "openvmm-linux-gnu",
+                "run-nvx-microvm-tests.yml",
+            ),
+            "nvx-microvm-debug-whp": (
+                "build-openvmm-windows-msvc",
+                "openvmm-windows-msvc",
+                "run-nvx-microvm-tests.yml",
+            ),
             "platform-kvm": (
                 "build-openvmm-linux-gnu",
                 "openvmm-linux-gnu",
@@ -2197,8 +2217,13 @@ class CiConfigurationTests(unittest.TestCase):
         for job_name, (producer, artifact, reusable_workflow) in consumers.items():
             with self.subTest(consumer=job_name):
                 job = _workflow_job(workflow, job_name)
+                debug_kernel = (
+                    "debug-kernel, "
+                    if job_name.startswith("nvx-microvm-debug-")
+                    else ""
+                )
                 self.assertIn(
-                    f"needs: [artifacts, {producer}, openvmm-changes]",
+                    f"needs: [artifacts, {debug_kernel}{producer}, openvmm-changes]",
                     job,
                 )
                 self.assertIn(f"needs.{producer}.result == 'success'", job)
@@ -2226,7 +2251,7 @@ class CiConfigurationTests(unittest.TestCase):
         self.assertEqual(build_workflow.count("overwrite: true"), 2)
         self.assertEqual(build_workflow.count("retention-days: 1"), 2)
         for consumer_workflow, download_count in (
-            (microvm_workflow, 3),
+            (microvm_workflow, 4),
             (platform_workflow, 2),
         ):
             self.assertIn("path: openvmm/target/release", consumer_workflow)
@@ -2324,6 +2349,81 @@ class CiConfigurationTests(unittest.TestCase):
         for job_name in ("platform-kvm", "platform-mshv", "platform-whp"):
             self.assertIn(job_name, performance_gate_job)
             self.assertIn(f"needs.{job_name}.result", performance_gate_job)
+
+    def test_ci_runs_the_debug_kernel_on_kvm_per_pull_request_and_all_on_dev(self):
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        microvm_workflow = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "workflows"
+            / "run-nvx-microvm-tests.yml"
+        ).read_text(encoding="utf-8")
+
+        artifacts = _workflow_job(workflow, "artifacts")
+        self.assertNotIn("debug-kernel", artifacts)
+        self.assertNotIn("vmlinux-debug", artifacts)
+        # The debug kernel builds on GitHub-hosted capacity beside the shared
+        # artifacts, under the same condition, and only the debug jobs wait.
+        debug_build = _workflow_job(workflow, "debug-kernel")
+        self.assertIn("runs-on: ubuntu-latest", debug_build)
+        self.assertIn('debug-kernel: "true"', debug_build)
+        self.assertIn('guest-images: "false"', debug_build)
+        self.assertIn("name: guest-debug-kernel", debug_build)
+        for name in (
+            KernelBuildConstants.DEBUG_BINARY_NAME,
+            KernelBuildConstants.DEBUG_CONFIG_NAME,
+        ):
+            self.assertIn(f"build/{name}\n", debug_build)
+
+        def condition(job: str) -> str:
+            return job[job.index("    if: >-\n") : job.index("    runs-on:")]
+
+        self.assertEqual(condition(debug_build), condition(artifacts))
+        for consumer in ("release", "performance-persist"):
+            with self.subTest(consumer=consumer):
+                job = _workflow_job(workflow, consumer)
+                self.assertIn("      - debug-kernel\n", job)
+                self.assertIn("needs.debug-kernel.result == 'success' &&", job)
+        kvm = _workflow_job(workflow, "nvx-microvm-debug-kvm")
+        self.assertIn("github.event.pull_request.head.repo.full_name", kvm)
+        for job_name in ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS:
+            with self.subTest(job=job_name):
+                job = _workflow_job(workflow, job_name)
+                self.assertIn("github.event_name == 'push' &&", job)
+                self.assertNotIn("pull_request", job)
+        for job_name in (
+            *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
+            *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,
+        ):
+            with self.subTest(job=job_name):
+                job = _workflow_job(workflow, job_name)
+                self.assertIn("debug-kernel: true", job)
+                self.assertIn("needs.debug-kernel.result == 'success' &&", job)
+                self.assertIn(job_name, ci.REQUIRED_CI_RESULT_ENVIRONMENTS)
+                for consumer in ("release", "performance-persist"):
+                    self.assertIn(
+                        f"needs.{job_name}.result == 'success' ||\n"
+                        f"          needs.{job_name}.result == 'skipped'",
+                        _workflow_job(workflow, consumer),
+                    )
+
+        self.assertIn("      debug-kernel:\n", microvm_workflow)
+        self.assertIn("        type: boolean\n", microvm_workflow)
+        download = microvm_workflow.index("name: guest-debug-kernel")
+        self.assertIn(
+            "if: inputs.debug-kernel",
+            microvm_workflow[download - 120 : download],
+        )
+        self.assertEqual(
+            microvm_workflow.count(
+                "${{ inputs.debug-kernel && '--debug-kernel' || '' }}"
+            ),
+            2,
+        )
+        # The debug run replaces the Ubuntu tests rather than adding to them.
+        self.assertEqual(microvm_workflow.count("!inputs.debug-kernel"), 5)
 
     def test_benchmarks_rely_on_the_microvm_correctness_jobs(self):
         # #286: the benchmark action ran a second smp-lapic gate before
@@ -4948,6 +5048,33 @@ class BuildTests(unittest.TestCase):
                     ),
                     2,
                 )
+
+    def test_ci_guest_images_input_leaves_only_the_debug_kernel(self):
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        guard = "inputs.guest-images == 'true'"
+        self.assertIn("  guest-images:\n", action)
+        self.assertIn('default: "true"', action)
+        steps = [
+            line.strip().removeprefix("- name: ")
+            for line in action.splitlines()
+            if line.startswith("    - name: ")
+        ]
+        debug_steps = {name for name in steps if "debug kernel" in name}
+        self.assertEqual(len(debug_steps), 3)
+        always = {"Resolve guest artifact versions", "Resolve guest cache keys"}
+        for name in steps:
+            with self.subTest(step=name):
+                step = _composite_action_step(action, name)
+                if name in debug_steps or name in always:
+                    self.assertNotIn("guest-images", step)
+                else:
+                    self.assertIn(guard, step)
 
     def test_ci_guest_cache_keys_include_shared_build_modules(self):
         action = (

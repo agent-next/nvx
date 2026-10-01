@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Callable
+from contextlib import ExitStack
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -3314,6 +3315,68 @@ class MicrovmTests(unittest.TestCase):
                         common.ScriptError,
                         "Ubuntu guest does not support",
                     ),
+                ):
+                    microvm_tests.run(args)
+
+    def test_debug_kernel_runs_the_same_host_restore_scenarios_on_vmlinux_debug(
+        self,
+    ):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        dispatch = {
+            "smp": "run_smp",
+            "smp-snapshot": "run_smp_snapshot",
+            "restore-processors": "run_restore_processors",
+            "restore-downtime": "run_restore_downtime",
+            "snapshot-tiers": "run_snapshot_tiers",
+        }
+        self.assertEqual(tuple(dispatch), microvm_tests.DEBUG_KERNEL_SCENARIOS)
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            config = build / "vmlinux-debug.config"
+            config.write_text(
+                "CONFIG_SOFTLOCKUP_DETECTOR=y\nCONFIG_DETECT_HUNG_TASK=y\n",
+                encoding="utf-8",
+            )
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "kvm",
+                    "--debug-kernel",
+                    "--processors",
+                    "2",
+                    "--output-dir",
+                    str(build / "logs"),
+                ]
+            )
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(microvm_tests, "validate_openvmm_test_backend")
+                )
+                stack.enter_context(
+                    patch.object(microvm_tests, "require_file", side_effect=require)
+                )
+                stack.enter_context(
+                    patch.object(
+                        microvm_tests,
+                        "artifact_path",
+                        side_effect=build.joinpath,
+                    )
+                )
+                runs = {
+                    scenario: stack.enter_context(patch.object(microvm_tests, runner))
+                    for scenario, runner in dispatch.items()
+                }
+                self.assertEqual(microvm_tests.run(args), 0)
+                for scenario, run in runs.items():
+                    with self.subTest(scenario=scenario):
+                        run.assert_called()
+                        self.assertEqual(run.call_args.args[1], build / "vmlinux-debug")
+                config.write_text("CONFIG_DETECT_HUNG_TASK=y\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    common.ScriptError, "lacks CONFIG_SOFTLOCKUP_DETECTOR=y"
                 ):
                     microvm_tests.run(args)
 
