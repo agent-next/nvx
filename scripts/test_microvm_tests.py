@@ -919,17 +919,17 @@ class MicrovmTests(unittest.TestCase):
                 )
         interaction.assert_not_called()
 
-    def test_snapshot_restore_uses_batched_port_io_and_zero_expansion_path(self):
+    def test_snapshot_restore_runs_the_time_abi_steps_through_nvx_time(self):
         snapshot = (
             Path(__file__).parents[1] / "guest" / "common" / "nvx-snapshot"
         ).read_text(encoding="utf-8")
 
         self.assertIn(
-            '/sbin/nvx-port-io read-restore-packet 233 234 "$restore_packet"',
+            "generation_id=$(/sbin/nvx-time generation-id)",
             snapshot,
         )
         self.assertIn(
-            "generation_id=$(/sbin/nvx-port-io read-generation-id 233 234)",
+            '/sbin/nvx-time capture "$capture_request" "$generation_id" "$entropy"',
             snapshot,
         )
         self.assertIn(
@@ -941,10 +941,14 @@ class MicrovmTests(unittest.TestCase):
             snapshot,
         )
         self.assertIn('export NVX_VM_GENERATION_ID="$generation_id"', snapshot)
-        self.assertNotIn("dd if=/dev/port", snapshot)
-        self.assertNotIn("dd of=/dev/port", snapshot)
+        self.assertNotIn("nvx-port-io", snapshot)
+        self.assertNotIn("/dev/port", snapshot)
         self.assertIn('[ "$range_count" -eq 0 ]', snapshot)
-        self.assertIn("RESTORE_MEMORY_EXPANSION_AVAILABLE=16", snapshot)
+        self.assertIn("PACKET_ACK_REQUIRED=4", snapshot)
+        self.assertIn(
+            '/sbin/nvx-time restore-finish --ack --new-cpus "$restore_new_cpus"',
+            snapshot,
+        )
         self.assertIn('console_status "NVX-SNAPSHOT-ERROR: $*"', snapshot)
         for stage in ("packet", "entropy", "identity", "runtime-hook", "acknowledge"):
             self.assertIn(
@@ -956,11 +960,19 @@ class MicrovmTests(unittest.TestCase):
             'memtotal_kib=$memtotal_kib elapsed_us=0"',
             snapshot,
         )
-        zero_expansion_fast_path = snapshot.index(
-            "[ $((restore_status & RESTORE_MEMORY_EXPANSION_AVAILABLE)) -eq 0 ]"
+        # Capture steps 1 to 3 precede the barriers and the request.
+        pre_capture = snapshot.index("/sbin/nvx-time pre-capture || exit 1")
+        freeze = snapshot.index('echo 1 >"$container_cgroup/cgroup.freeze"')
+        capture = snapshot.index("/sbin/nvx-time capture")
+        self.assertLess(pre_capture, freeze)
+        self.assertLess(freeze, capture)
+        # A rejected capture thaws the barriers before it restores the stall
+        # detectors.
+        cleanup_start = snapshot.index("cleanup() {")
+        cleanup = snapshot[cleanup_start : snapshot.index("\n}\n", cleanup_start)]
+        self.assertLess(
+            cleanup.index("cgroup.freeze"), cleanup.index("nvx-time cancel-capture")
         )
-        packet_restore = snapshot.index("    post_restore\n")
-        self.assertLess(zero_expansion_fast_path, packet_restore)
 
     def test_snapshot_console_diagnostics_are_nonfatal_and_ordered(self):
         shell = _posix_shell()
