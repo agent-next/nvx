@@ -184,6 +184,33 @@ class GuestTimeTests(unittest.TestCase):
             f"utc_ns={UTC_NS} generation_id={ENTROPY[:16].hex()}",
         )
 
+    def test_musl_build_matches_the_reference_build(self):
+        musl = shutil.which("musl-gcc")
+        if musl is None:
+            self.skipTest("musl-gcc is unavailable")
+        binary = Path(self.directory.name) / "nvx-time-musl"
+        subprocess.run(
+            [musl, "-static", "-Os", "-s", "-Wall", "-Wextra", "-Werror"]
+            + ["-o", str(binary), str(SOURCE)],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+        packet = self.fixture(
+            "musl-packet.bin", encode_packet(flags=ACK_REQUIRED, generation=2)
+        )
+        arguments = ["test", "packet", packet, "1", PREVIOUS_ID]
+        result = subprocess.run(
+            [str(binary), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, self.run_test(*arguments[1:]))
+
     def test_packet_memory_ranges_follow_the_header(self):
         packet = encode_packet(
             flags=MEMORY_TARGET,

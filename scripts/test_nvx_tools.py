@@ -5076,8 +5076,11 @@ class BuildTests(unittest.TestCase):
                 output = Path(command[command.index("-o") + 1])
                 output.write_bytes(f"static-elf {output.name}".encode())
 
+            def find_tool(name: str) -> str:
+                return name
+
             with (
-                patch.object(build, "require_tool", return_value="cc"),
+                patch.object(build, "require_tool", side_effect=find_tool),
                 patch.object(build, "run_checked", side_effect=compile_helper),
             ):
                 helpers = build._install_guest_files(
@@ -5091,16 +5094,33 @@ class BuildTests(unittest.TestCase):
             Path(command[-1]).stem: command[1 : command.index("-o")]
             for command in commands
         }
+        compiler_by_source = {
+            Path(command[-1]).stem: command[0] for command in commands
+        }
         self.assertEqual(
             flags_by_source[probe], list(InitramfsBuildConstants.TIME_PROBE_CFLAGS)
         )
         self.assertIn("-pthread", flags_by_source[probe])
+        musl = InitramfsBuildConstants.MUSL_COMPILER
+        self.assertEqual(compiler_by_source[probe], musl)
         for name in InitramfsBuildConstants.STATIC_HELPERS:
             with self.subTest(helper=name):
                 self.assertEqual(
                     flags_by_source[name],
                     list(InitramfsBuildConstants.STATIC_HELPER_CFLAGS),
                 )
+                self.assertEqual(compiler_by_source[name], "cc")
+        for name in InitramfsBuildConstants.MUSL_STATIC_HELPERS:
+            with self.subTest(helper=name):
+                self.assertEqual(
+                    flags_by_source[name],
+                    list(InitramfsBuildConstants.STATIC_HELPER_CFLAGS),
+                )
+                self.assertEqual(compiler_by_source[name], musl)
+        dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("        musl-tools \\\n", dockerfile)
         self.assertEqual(helpers[probe]["source_sha256"], common.sha256_file(source))
         self.assertEqual(
             helpers[probe]["binary_sha256"],

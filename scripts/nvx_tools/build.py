@@ -566,8 +566,9 @@ def _build_static_helper(
     source: Path,
     destination: Path,
     cflags: tuple[str, ...] = InitramfsBuildConstants.STATIC_HELPER_CFLAGS,
+    compiler_name: str = "cc",
 ) -> dict[str, str]:
-    compiler = require_tool("cc")
+    compiler = require_tool(compiler_name)
     output = work / source.stem
     run_checked(
         [
@@ -830,12 +831,20 @@ def _install_guest_files(
             common / f"{name}.c",
             root / "sbin" / name,
         )
+    for name in InitramfsBuildConstants.MUSL_STATIC_HELPERS:
+        helpers[name] = _build_static_helper(
+            config.work,
+            common / f"{name}.c",
+            root / "sbin" / name,
+            compiler_name=InitramfsBuildConstants.MUSL_COMPILER,
+        )
     probe = InitramfsBuildConstants.TIME_PROBE_NAME
     helpers[probe] = _build_static_helper(
         config.work,
         common / f"{probe}.c",
         root / "sbin" / probe,
         InitramfsBuildConstants.TIME_PROBE_CFLAGS,
+        compiler_name=InitramfsBuildConstants.MUSL_COMPILER,
     )
     helpers["nvx-device-io"] = _build_device_io_helper(
         config.work,

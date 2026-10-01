@@ -145,7 +145,9 @@ checks, the violation watcher, the restore packet v4 and time-sample parsers,
 the snapshot agent's time steps, and the wall-clock discipline. Its
 `--report-only` flag (or the `nvx_time_abi=report-only` kernel command-line
 token) reports violations without powering off, for runs against VMMs that
-predate the ABI. The matching kernel enables
+predate the ABI. Both time tools are linked statically against musl
+(`musl-gcc`): with static glibc each would add about 700 KB to the initramfs,
+and every unpacked kilobyte delays cold boot. The matching kernel enables
 virtio-blk, compressed EROFS, overlayfs, ext4 scratch, memory cgroups, and
 cgroup BPF. The build fails if `olddefconfig` drops any required option. The
 APK manifest records the `blkid` and `util-linux` tools used by the bootstrap

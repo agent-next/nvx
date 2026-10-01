@@ -35,8 +35,11 @@ For Debian/Ubuntu hosts:
 sudo apt-get update
 sudo apt-get install -y \
   bc binutils bison build-essential ca-certificates cpio curl flex gzip \
-  libelf-dev libssl-dev python3 rsync tar xz-utils
+  libelf-dev libssl-dev musl-tools python3 rsync tar xz-utils
 ```
+
+`musl-tools` provides `musl-gcc`, which native initramfs builds use for the
+guest time tools; Docker builds install it in the build image.
 
 ### Linux / KVM
 
