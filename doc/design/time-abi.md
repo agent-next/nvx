@@ -347,14 +347,15 @@ lists exactly the governed leaves: every leaf and subleaf of the profile's
 VM's topology defines, when they are within the maximum basic leaf; and the
 identity leaves `0x40000000..=0x40000005` with the explicit zero leaves. Each
 entry holds the four registers and their masks; the per-VP fields hold VP 0's
-APIC identity, and the runtime-owned bits are unmasked. OpenVMM computes it,
+APIC identity, and the runtime-owned bits have mask 0. OpenVMM computes it,
 records it, and recomputes it on restore, so the record never depends on how
 a backend enumerates or caches CPUID, and one profile and topology give the
 same record on every backend. At preflight, before any VP runs, each backend
 reports VP 0's CPUID for exactly the governed leaves (KVM from the
 `KVM_SET_CPUID2` table it programmed, MSHV with `get_cpuid_values` on VP 0,
-WHP from VP 0's register view; an entry without a subleaf at subleaf 0), and
-OpenVMM compares the report with the effective CPUID under its masks.
+WHP from VP 0's register view), reading an entry without a subleaf at
+subleaf 0, and OpenVMM compares the report with the effective CPUID under its
+masks.
 
 Informational fields:
 
