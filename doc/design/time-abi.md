@@ -775,14 +775,23 @@ otherwise, and then fails with a stable code:
 | Discipline poll (time samples) | 50 µs | 3 | `G_SAMPLE_UNCERTAIN`: the poll is skipped and the code is recorded in the state file and on the console; never fatal |
 
 `epsilon` is half the round trip of one PMIO write exit plus two
-`CLOCK_REALTIME` reads, so it is expected to stay far below both bounds on
-every backend. The backend agents measure it:
+`CLOCK_REALTIME` reads, so it stays far below both bounds on every backend.
+Measured from a guest with a release build of OpenVMM (`ea570db7e`) and a
+probe that brackets each selector write with `CLOCK_REALTIME` reads, two runs
+of 2,000 samples per boot at 1, 2, and 4 or 8 vCPUs, which made no
+difference:
 
-| Backend | Expected `epsilon` (p50 / p99) |
-| --- | --- |
-| KVM | TBD(kvm) |
-| MSHV | TBD(mshv) |
-| WHP | TBD(whp) |
+| Backend | Host | `epsilon` p50 / p99 | Worst sample |
+| --- | --- | --- | --- |
+| KVM | prometheus32 (bare metal, Linux 7.0) | 4.1 µs / 5 to 15 µs | 25 µs |
+| KVM | `azure-kvm-5` (nested, Linux 6.6) | 3.8 to 4.1 µs / 4 to 9 µs | 75 µs |
+| MSHV | prometheus30 (bare metal) | 6.3 µs / 7.1 µs | 37 µs |
+| MSHV | `azure-azlinux-5` (nested) | 12.7 to 13.0 µs / 15 to 25 µs | 102 µs |
+| WHP | | TBD(whp) | |
+
+The second run of each boot overlaps the console's drain of the first run's
+output, and it has the higher KVM p99s. A sample above the 50 µs discipline
+bound is rare, and the poll retries it.
 
 ### Generation counter and generation ID
 
