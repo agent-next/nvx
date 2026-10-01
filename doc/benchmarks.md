@@ -259,11 +259,11 @@ Each benchmark boots the guest with a fixed kernel command line. Two bases recur
 OpenVMM owns `BASE`; each `--cmdline` value below is appended to it. Restore phases do not pass a
 command line and resume the one captured in the snapshot. OpenVMM also appends device-discovery
 tokens (`virtio_mmio.device=...` for an attached mount or NIC) and may replace `console=hvc0` with
-`console=hvc1` when a virtio console is selected. Snapshot-source boots additionally receive the
-backend-derived `tsc_early_khz=...` token. All cold microVM boots also receive
-`lapic_timer_hz=...` when the backend reports its LAPIC frequency. The NVX kernel uses
-that rate without calibrating or verifying the counting LAPIC against emulated PIT
-interrupts, whose delivery can be delayed or coalesced by host scheduling.
+`console=hvc1` when a virtio console is selected. It appends no clock token: under the
+[time ABI](design/time-abi.md#rates) the NVX kernel reads the TSC and LAPIC timer rates from the
+hypervisor identity's frequency MSRs and never calibrates either clock, and OpenVMM rejects a
+supplied `tsc_early_khz=` or `lapic_timer_hz=` token (`E_CMDLINE_CLOCK_TOKEN`). No benchmark
+command line tunes the clock or clocksource, except the `cold_start_clocksource` variant below.
 
 | Benchmark | Phase | Kernel command line |
 | --- | --- | --- |
