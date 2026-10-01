@@ -244,9 +244,11 @@ translations and additions:
 | `--dry-run` | No equivalent; this only prints the generated command |
 
 Always include `--single-process`. When restoring, omit `--memory`, `--kernel`,
-and `--initrd`, and add `--restore-entropy`; the wrapper adds this option
-automatically. Do not pass `--guest ubuntu` during restore; the captured RAM
-and machine contract already identify the restored guest. For example:
+and `--initrd`. Every restore gives the guest fresh entropy through the time
+ABI's restore packet, so `--restore-entropy` is no longer needed; OpenVMM still
+accepts it without effect. Do not pass `--guest ubuntu` during restore; the
+captured RAM and machine contract already identify the restored guest. For
+example:
 
 ```bash
 ./bin/openvmm \
@@ -255,7 +257,6 @@ and machine contract already identify the restored guest. For example:
   --processors 8 \
   --hypervisor kvm \
   --restore-snapshot /var/lib/nvx/snapshot \
-  --restore-entropy \
   --restore-processors 4 \
   --restore-memory 1024M \
   --restore-ready-path /run/nvx/restore-ready.sock

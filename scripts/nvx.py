@@ -359,9 +359,7 @@ def command_run(args: argparse.Namespace) -> None:
         _hypervisor(args.hypervisor),
     ]
     if args.restore_snapshot is not None:
-        command.extend(
-            ["--restore-snapshot", str(args.restore_snapshot), "--restore-entropy"]
-        )
+        command.extend(["--restore-snapshot", str(args.restore_snapshot)])
         if args.restore_processors is not None:
             command.extend(["--restore-processors", str(args.restore_processors)])
         if args.restore_memory_mib is not None:

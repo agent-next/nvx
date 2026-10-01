@@ -1126,7 +1126,6 @@ class CliTests(unittest.TestCase):
                 "mshv",
                 "--restore-snapshot",
                 "snapshot",
-                "--restore-entropy",
                 "--restore-processors",
                 "2",
                 "--restore-ready-path",
@@ -7787,6 +7786,8 @@ class BenchmarkTests(unittest.TestCase):
 
         self.assertEqual(command[command.index("--processors") + 1], "8")
         self.assertEqual(command[command.index("--restore-processors") + 1], "4")
+        # Restore packet v4 gives every restore fresh entropy.
+        self.assertNotIn("--restore-entropy", command)
 
     def test_snapshot_restore_command_sets_memory_target_separately(self):
         command = benchmark.snapshot_restore_command(
