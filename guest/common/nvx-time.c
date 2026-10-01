@@ -33,6 +33,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -44,6 +45,7 @@
 #include <sys/file.h>
 #include <sys/io.h>
 #include <sys/klog.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
@@ -514,7 +516,8 @@ static int enable_ports(void)
 }
 
 // Reads SIZE bytes from PORT four bytes per exit; the device zero-fills
-// past the end of the selected record.
+// past the end of the selected record. A string read (rep insl) would take one
+// exit, but OpenVMM's MSHV and WHP emulation raises #GP for it in user mode.
 static void portb_read(uint16_t port, uint8_t *buffer, size_t size)
 {
     for (size_t offset = 0; offset < size; offset += 4) {
@@ -1417,25 +1420,16 @@ static void boot_log_scan(char *buffer, struct boot_log *log)
 // Reads the whole kernel log for C4 with one SYSLOG_ACTION_READ_ALL. The
 // caller has already positioned the daemon's /dev/kmsg descriptor at the end
 // of the log, so records logged in between are seen twice, never missed.
-static int read_boot_log(struct boot_log *log)
+// BUFFER holds SIZE + 1 bytes, the size SYSLOG_ACTION_SIZE_BUFFER reported.
+static int read_boot_log_into(struct boot_log *log, char *buffer, int size)
 {
-    int size = klogctl(SYSLOG_ACTION_SIZE_BUFFER, NULL, 0);
-    char *buffer;
-    int count;
-    int error;
+    int count = klogctl(SYSLOG_ACTION_READ_ALL, buffer, size);
+    int error = errno;
 
-    if (size <= 0)
-        return -1;
-    buffer = malloc((size_t)size + 1);
-    if (buffer == NULL)
-        return -1;
-    count = klogctl(SYSLOG_ACTION_READ_ALL, buffer, size);
-    error = errno;
     if (count >= 0) {
         buffer[count] = '\0';
         boot_log_scan(buffer, log);
     }
-    free(buffer);
     errno = error;
     return count < 0 ? -1 : 0;
 }
@@ -1460,6 +1454,10 @@ static bool check_failed_code(struct checks *checks, const char *id,
                               const char *code, const char *format, ...)
     __attribute__((format(printf, 4, 5)));
 
+// Serializes failure reports from the boot check's per-CPU threads, which
+// share the console and the violation count.
+static pthread_mutex_t g_report_lock = PTHREAD_MUTEX_INITIALIZER;
+
 // Prints the failure line, emits CODE, and powers off with status 193. In
 // report-only mode it returns false and the run continues.
 static bool check_failed_code(struct checks *checks, const char *id,
@@ -1477,11 +1475,13 @@ static bool check_failed_code(struct checks *checks, const char *id,
     snprintf(line, sizeof(line),
              "%s: v=1 phase=%s status=fail check=%s detail=\"%s\"\n",
              abi_prefix(), k_phase_names[checks->phase], id, escaped);
+    pthread_mutex_lock(&g_report_lock);
     console_write(line);
     checks->failures++;
     emit_event(code, "conformance", checks->phase, detail);
     if (!g_report_only)
         power_off(STATUS_CONFORMANCE);
+    pthread_mutex_unlock(&g_report_lock);
     return false;
 }
 
@@ -2395,6 +2395,32 @@ static pid_t daemon_pid(void)
     return (pid_t)pid;
 }
 
+// The daemon finishes a restore (restore step 13 and the deferred step 11)
+// at idle priority, so that on few vCPUs it never takes the CPU from the
+// restored workload. musl does not implement sched_setscheduler(), and the
+// daemon is single-threaded, so the per-thread system call applies to it.
+static void set_idle_priority(pid_t pid, bool idle)
+{
+    struct sched_param param = {0};
+
+    (void)syscall(SYS_sched_setscheduler, pid, idle ? SCHED_IDLE : SCHED_OTHER,
+                  &param);
+}
+
+// Restore steps 12 and 13 on the readiness path: the acknowledgement when the
+// host gated its input, then hand the rest of the restore to DAEMON. Returns
+// -1, without acknowledging, when no daemon runs; 1 when the daemon vanished
+// after the acknowledgement. The caller has enabled the ports when ACK is set.
+static int signal_restore(pid_t daemon, bool ack)
+{
+    if (daemon <= 0 || kill(daemon, 0) != 0)
+        return -1;
+    if (ack)
+        outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
+    set_idle_priority(daemon, true);
+    return kill(daemon, SIGUSR1) == 0 ? 0 : 1;
+}
+
 // C10: the daemon runs, has recorded no violation, and no stall was counted.
 static bool check_daemon(struct checks *checks)
 {
@@ -2465,6 +2491,156 @@ static bool check_cpus(struct checks *checks, const bool *selected,
     return ok;
 }
 
+struct cpu_job {
+    pthread_t thread;
+    struct checks checks;
+    bool identity;
+    bool msrs;
+    bool running;
+    int cpu;
+};
+
+static void *cpu_job_run(void *argument)
+{
+    struct cpu_job *job = argument;
+
+    if (pin_to_cpu(job->cpu) != 0) {
+        check_failed(&job->checks, "C1", "cannot run on cpu %d: %s", job->cpu,
+                     strerror(errno));
+        return NULL;
+    }
+    if (job->identity) {
+        check_identity(&job->checks, job->cpu);
+        check_time_bits(&job->checks, job->cpu);
+    }
+    if (job->msrs)
+        check_msrs(&job->checks, job->cpu, true);
+    return NULL;
+}
+
+// A boot check that runs in its own thread beside the per-CPU checks, on a
+// private copy of the checks.
+struct side_job {
+    pthread_t thread;
+    struct checks checks;
+    void (*run)(struct checks *checks, void *context);
+    void *context;
+    bool running;
+};
+
+static void *side_job_run(void *argument)
+{
+    struct side_job *job = argument;
+
+    job->run(&job->checks, job->context);
+    return NULL;
+}
+
+// check_cpus() with every CPU in its own thread pinned to it, beside the
+// SIDES checks, each in a thread of its own, while the caller runs FOREGROUND
+// (when set). Running them in parallel keeps the cost from growing with the
+// CPU count and leaves the caller on its warm CPU. The threads share one
+// stack mapping, so creating one maps nothing. Each job works on a copy of
+// CHECKS whose failures are added back; a job whose thread cannot start runs
+// in the caller afterwards.
+static void check_cpus_parallel(struct checks *checks, const bool *selected,
+                                bool identity, bool msrs,
+                                struct side_job *sides, int side_count,
+                                void (*foreground)(struct checks *, void *),
+                                void *foreground_context)
+{
+    enum { STACK_SIZE = 128 * 1024 };
+    static struct cpu_job jobs[MAX_CPUS];
+    bool serial[MAX_CPUS] = {false};
+    bool any_serial = false;
+    pthread_attr_t attributes;
+    pthread_attr_t *attr = NULL;
+    size_t threads = (size_t)side_count;
+    size_t next = 0;
+    uint8_t *stacks;
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+        threads += selected[cpu] ? 1 : 0;
+    // With one CPU, threads only add their own cost.
+    if (threads <= (size_t)side_count + 1) {
+        if (foreground != NULL)
+            foreground(checks, foreground_context);
+        for (int index = 0; index < side_count; index++) {
+            struct side_job *side = &sides[index];
+
+            side->checks = *checks;
+            side->checks.failures = 0;
+            side->run(&side->checks, side->context);
+            checks->failures += side->checks.failures;
+        }
+        check_cpus(checks, selected, identity, msrs);
+        return;
+    }
+    stacks = mmap(NULL, threads * STACK_SIZE, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stacks != MAP_FAILED && pthread_attr_init(&attributes) == 0)
+        attr = &attributes;
+    for (int index = 0; index < side_count; index++) {
+        struct side_job *side = &sides[index];
+
+        side->checks = *checks;
+        side->checks.failures = 0;
+        if (attr != NULL)
+            pthread_attr_setstack(attr, stacks + STACK_SIZE * next++,
+                                  STACK_SIZE);
+        side->running =
+            pthread_create(&side->thread, attr, side_job_run, side) == 0;
+    }
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        struct cpu_job *job = &jobs[cpu];
+
+        job->running = false;
+        if (!selected[cpu])
+            continue;
+        job->checks = *checks;
+        job->checks.failures = 0;
+        job->identity = identity;
+        job->msrs = msrs;
+        job->cpu = cpu;
+        if (attr != NULL)
+            pthread_attr_setstack(attr, stacks + STACK_SIZE * next++,
+                                  STACK_SIZE);
+        if (pthread_create(&job->thread, attr, cpu_job_run, job) == 0)
+            job->running = true;
+        else
+            serial[cpu] = any_serial = true;
+    }
+    if (foreground != NULL)
+        foreground(checks, foreground_context);
+    for (int index = 0; index < side_count; index++) {
+        struct side_job *side = &sides[index];
+
+        if (side->running)
+            pthread_join(side->thread, NULL);
+        else
+            side->run(&side->checks, side->context);
+        checks->failures += side->checks.failures;
+    }
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        struct cpu_job *job = &jobs[cpu];
+
+        if (!job->running)
+            continue;
+        pthread_join(job->thread, NULL);
+        checks->failures += job->checks.failures;
+        // C3 reads the partition-wide rates on CPU 0 only.
+        if (cpu == 0 && msrs) {
+            checks->tsc_hz = job->checks.tsc_hz;
+            checks->lapic_hz = job->checks.lapic_hz;
+        }
+    }
+    if (attr != NULL)
+        pthread_attr_destroy(attr);
+    if (stacks != MAP_FAILED)
+        munmap(stacks, threads * STACK_SIZE);
+    if (any_serial)
+        check_cpus(checks, serial, identity, msrs);
+}
 // ---------------------------------------------------------------------------
 // Host time samples and clock adjustment
 // ---------------------------------------------------------------------------
@@ -2616,6 +2792,7 @@ struct daemon {
     int release_status;
     int64_t release_deadline_ns;
     int64_t restore_elapsed_us;
+    int restore_failures;
 };
 
 static void watcher_consume(void *context, const char *message)
@@ -2829,11 +3006,37 @@ static void print_restore_marker(int failures, int cpus, uint64_t tsc_hz,
     console_write(line);
 }
 
+static void run_restore_checks(struct checks *checks, const bool *new_cpus,
+                               int new_count);
+
+static int parse_new_cpus(const char *text, bool *cpus)
+{
+    if (strcmp(text, "") == 0 || strcmp(text, "none") == 0) {
+        memset(cpus, 0, sizeof(bool) * MAX_CPUS);
+        return 0;
+    }
+    return parse_cpu_list(text, cpus);
+}
+
+// Parses the restore record: the generation and the repair time that the
+// capture helper wrote, and the CPUs that restore-finish onlined, when it ran.
+// Returns the number of those CPUs, or -1 when the record is malformed.
+static int parse_restore_record(const char *text, unsigned long long *generation,
+                                long long *elapsed_us, bool *new_cpus)
+{
+    char cpus[128] = "none";
+
+    if (sscanf(text, "generation=%llu elapsed_us=%lld new_cpus=%127s",
+               generation, elapsed_us, cpus) < 2)
+        return -1;
+    return parse_new_cpus(cpus, new_cpus);
+}
+
 // Step 13 after the grace period ended (or the stall timeout passed): put
 // the watchdog settings back, run the deferred C7, print the restore marker,
 // and restart the discipline at the fast cadence.
 static void complete_restore(bool released, uint64_t tsc_hz, uint64_t lapic_hz,
-                             int64_t elapsed_us)
+                             int64_t elapsed_us, int failures)
 {
     struct checks checks;
     char detail[DETAIL_MAX];
@@ -2848,35 +3051,50 @@ static void complete_restore(bool released, uint64_t tsc_hz, uint64_t lapic_hz,
         check_failed(&checks, "C7", "cannot read the online CPU set");
     else
         check_timer_list(&checks, TIMER_LIST_WAIT_NS);
-    print_restore_marker(checks.failures, checks.online_count, tsc_hz, lapic_hz,
-                         elapsed_us);
+    print_restore_marker(failures + checks.failures, checks.online_count,
+                         tsc_hz, lapic_hz, elapsed_us);
+    set_idle_priority(0, false);
 }
 
+// Restore step 13, and step 11 after the acknowledgement: the restore checks
+// fail fast as before, then the grace-period release runs in a child.
 static void start_restore(struct daemon *daemon)
 {
+    int64_t start = clock_ns(CLOCK_MONOTONIC);
+    bool new_cpus[MAX_CPUS];
+    struct checks checks;
     char text[256];
     unsigned long long generation;
     long long elapsed;
     int64_t timeout_s = DEFAULT_STALL_TIMEOUT_S;
+    int new_count;
     pid_t pid;
 
     if (daemon->release_pid > 0)
         return;
+    set_idle_priority(0, true);
     if (read_text(RESTORE_PATH, text, sizeof(text)) < 0 ||
-        sscanf(text, "generation=%llu elapsed_us=%lld", &generation,
-               &elapsed) != 2) {
+        (new_count = parse_restore_record(text, &generation, &elapsed,
+                                          new_cpus)) < 0) {
         fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
                    PHASE_RESTORE, "the restore record is unreadable");
         return;
     }
     g_generation = (uint32_t)generation;
-    daemon->restore_elapsed_us = elapsed;
+    if (checks_init(&checks, PHASE_RESTORE) != 0)
+        check_failed(&checks, "C6", "cannot read the CPU sets");
+    else
+        run_restore_checks(&checks, new_cpus, new_count);
+    daemon->restore_failures = checks.failures;
+    daemon->restore_elapsed_us =
+        elapsed + (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC;
     (void)read_int64(RCU_STALL_TIMEOUT, &timeout_s);
     pid = fork();
     if (pid == 0)
         release_child();
     if (pid < 0) {
-        complete_restore(false, daemon->tsc_hz, daemon->lapic_hz, elapsed);
+        complete_restore(false, daemon->tsc_hz, daemon->lapic_hz,
+                         daemon->restore_elapsed_us, daemon->restore_failures);
         return;
     }
     daemon->release_pid = pid;
@@ -2980,7 +3198,8 @@ static void daemon_loop(struct daemon *daemon)
 
             daemon->release_pid = 0;
             complete_restore(released, daemon->tsc_hz, daemon->lapic_hz,
-                             daemon->restore_elapsed_us);
+                             daemon->restore_elapsed_us,
+                             daemon->restore_failures);
             daemon->polls = 0;
             daemon->last_accepted_ns = clock_ns(CLOCK_MONOTONIC);
             arm_timer(daemon);
@@ -3081,16 +3300,84 @@ static void load_generation(void)
         g_generation = (uint32_t)state.generation;
 }
 
+struct boot_log_job {
+    struct boot_log *log;
+    char *buffer;
+    int size;
+    bool read_log;
+};
+
+// C4 and K1 over the kernel log, beside the per-CPU checks. The caller
+// allocates the buffer before the threads start: freeing a large allocation
+// unmaps it, and an unmap in a process with running threads waits for every
+// CPU running one of them.
+static void boot_kernel_log(struct checks *checks, void *context)
+{
+    struct boot_log_job *job = context;
+    char detail[DETAIL_MAX];
+
+    if (!job->read_log)
+        return;
+    if (job->buffer == NULL) {
+        check_failed(checks, "C4", "no buffer for the %d-byte kernel log",
+                     job->size);
+        return;
+    }
+    if (read_boot_log_into(job->log, job->buffer, job->size) != 0) {
+        check_failed(checks, "C4", "read the kernel log: %s", strerror(errno));
+        return;
+    }
+    if (!boot_log_verdict(job->log, detail, sizeof(detail)))
+        check_failed(checks, "C4", "%s", detail);
+    // K1 is kernel hardening, not time: a writable and executable kernel
+    // mapping, such as unprotected ITS thunk pages.
+    if (job->log->wx[0] != '\0')
+        check_failed_code(checks, "K1", "G_KERNEL_WX", "%s", job->log->wx);
+}
+
+// C7 beside the per-CPU checks.
+static void boot_timer_list(struct checks *checks, void *context)
+{
+    (void)context;
+    check_timer_list(checks, TIMER_LIST_WAIT_NS);
+}
+
+// C5 beside the per-CPU checks.
+static void boot_cpuinfo(struct checks *checks, void *context)
+{
+    (void)context;
+    check_cpuinfo(checks, checks->online, true);
+}
+
+struct boot_sample {
+    int64_t theta;
+    int64_t epsilon;
+    int64_t accepted_ns;
+};
+
+// The boot checks that need no CPU of their own, C12 included, run in the
+// caller while the parallel jobs run.
+static void boot_foreground(struct checks *checks, void *context)
+{
+    struct boot_sample *sample = context;
+
+    check_cmdline(checks);
+    check_platform(checks);
+    check_clocksource(checks);
+    check_debug_watchdogs(checks);
+    if (check_initial_sample(checks, &sample->theta, &sample->epsilon))
+        sample->accepted_ns = clock_ns(CLOCK_MONOTONIC);
+}
+
 static int cmd_boot(void)
 {
     int64_t start = clock_ns(CLOCK_MONOTONIC);
+    struct boot_log_job log_job;
+    struct side_job sides[3];
     struct checks checks;
     struct boot_log log;
     struct time_state state;
-    char detail[DETAIL_MAX];
-    int64_t theta = 0;
-    int64_t epsilon = 0;
-    int64_t accepted_ns = 0;
+    struct boot_sample sample = {0, 0, 0};
     int kmsg;
 
     g_generation = 0;
@@ -3099,46 +3386,50 @@ static int cmd_boot(void)
         check_failed(&checks, "C1", "cannot read the CPU sets");
         return 1;
     }
-    check_cmdline(&checks);
-    check_platform(&checks);
-    check_clocksource(&checks);
     memset(&log, 0, sizeof(log));
+    log_job.log = &log;
+    log_job.read_log = false;
+    log_job.size = klogctl(SYSLOG_ACTION_SIZE_BUFFER, NULL, 0);
+    log_job.buffer = log_job.size > 0 ? malloc((size_t)log_job.size + 1) : NULL;
     kmsg = open("/dev/kmsg", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (kmsg < 0 || lseek(kmsg, 0, SEEK_END) < 0) {
         check_failed(&checks, "C4", "open /dev/kmsg: %s", strerror(errno));
         if (kmsg >= 0)
             close(kmsg);
         kmsg = -1;
-    } else if (read_boot_log(&log) != 0) {
-        check_failed(&checks, "C4", "read the kernel log: %s",
-                     strerror(errno));
     } else {
-        if (!boot_log_verdict(&log, detail, sizeof(detail)))
-            check_failed(&checks, "C4", "%s", detail);
-        // K1 is kernel hardening, not time: a writable and executable kernel
-        // mapping, such as unprotected ITS thunk pages.
-        if (log.wx[0] != '\0')
-            check_failed_code(&checks, "K1", "G_KERNEL_WX", "%s", log.wx);
+        log_job.read_log = true;
     }
-    check_cpuinfo(&checks, checks.online, true);
-    check_cpus(&checks, checks.online, true, true);
-    check_timer_list(&checks, TIMER_LIST_WAIT_NS);
-    check_debug_watchdogs(&checks);
-    if (check_initial_sample(&checks, &theta, &epsilon))
-        accepted_ns = clock_ns(CLOCK_MONOTONIC);
+    // The kernel log, the tick mode, and cpuinfo run beside the per-CPU
+    // checks, longest first; the other checks run in the caller meanwhile.
+    sides[0] = (struct side_job){.run = boot_kernel_log, .context = &log_job};
+    sides[1] = (struct side_job){.run = boot_timer_list};
+    sides[2] = (struct side_job){.run = boot_cpuinfo};
+    check_cpus_parallel(&checks, checks.online, true, true, sides,
+                        ARRAY_SIZE(sides), boot_foreground, &sample);
+    free(log_job.buffer);
+    memcpy(checks.cpu_khz, sides[2].checks.cpu_khz, sizeof(checks.cpu_khz));
+    memcpy(checks.cpu_khz_known, sides[2].checks.cpu_khz_known,
+           sizeof(checks.cpu_khz_known));
+    // C3 compares CPU 0's declared rate with cpuinfo once both have run.
+    if (checks.tsc_hz != 0 && checks.cpu_khz_known[0] &&
+        checks.tsc_hz / 1000 != checks.cpu_khz[0])
+        check_failed(&checks, "C3",
+                     "cpu 0: floor(F / 1000) is %" PRIu64
+                     " kHz but cpu MHz is %" PRIu64 " kHz",
+                     checks.tsc_hz / 1000, checks.cpu_khz[0]);
     state_init(&state);
-    state.synchronized = accepted_ns != 0;
-    state.samples = accepted_ns != 0;
-    state.offset_ns = accepted_ns != 0 ? theta : 0;
-    state.uncertainty_ns = accepted_ns != 0 ? epsilon : 0;
+    state.synchronized = sample.accepted_ns != 0;
+    state.samples = sample.accepted_ns != 0;
+    state.offset_ns = sample.accepted_ns != 0 ? sample.theta : 0;
+    state.uncertainty_ns = sample.accepted_ns != 0 ? sample.epsilon : 0;
     state.frequency_ppb = frequency_to_ppb(current_frequency());
     if (rates_store(checks.tsc_hz, checks.lapic_hz) != 0 ||
         state_store(&state) != 0)
         check_failed(&checks, "C10", "cannot publish the time state: %s",
                      strerror(errno));
-    else if (kmsg >= 0 &&
-             start_daemon(kmsg, checks.tsc_hz, checks.lapic_hz, accepted_ns) !=
-                 0)
+    else if (kmsg >= 0 && start_daemon(kmsg, checks.tsc_hz, checks.lapic_hz,
+                                       sample.accepted_ns) != 0)
         check_failed(&checks, "C10", "cannot start the time daemon: %s",
                      strerror(errno));
     print_marker(&checks, start);
@@ -3175,15 +3466,6 @@ static void run_restore_checks(struct checks *checks, const bool *new_cpus,
     check_msrs(checks, 0, false);
     check_clocksource(checks);
     check_daemon(checks);
-}
-
-static int parse_new_cpus(const char *text, bool *cpus)
-{
-    if (strcmp(text, "") == 0 || strcmp(text, "none") == 0) {
-        memset(cpus, 0, sizeof(bool) * MAX_CPUS);
-        return 0;
-    }
-    return parse_cpu_list(text, cpus);
 }
 
 static int cmd_check(int argc, char **argv)
@@ -3302,9 +3584,12 @@ static int repair_failed(const char *code, const char *detail)
 
 // Restore steps 6 to 8: read the packet with four-byte reads, validate it,
 // and set the wall clock from its bracketed UTC. The caller holds the portb
-// lock.
+// lock. With DAEMON set, an untiered restore with no processors or memory to
+// activate needs no shell work before the acknowledgement, so steps 12 and 13
+// run here too and no second helper process starts; the metadata then begins
+// with 2 instead of 1.
 static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
-                          int64_t start_ns)
+                          int64_t start_ns, pid_t daemon)
 {
     static uint8_t body[PACKET_MAX_SIZE];
     static struct restore_packet packet;
@@ -3318,6 +3603,7 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
     int64_t t1;
     int64_t sample_theta;
     int64_t sample_epsilon;
+    int finished = -1;
     int fd;
 
     t0 = clock_ns(CLOCK_REALTIME);
@@ -3388,8 +3674,16 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
         return repair_failed("G_REPAIR_CLOCK", detail);
     }
     format_hex(packet.entropy, GENERATION_ID_SIZE, id);
-    printf("1 %u %u %u %s", packet.flags, packet.online_vp_count,
-           packet.range_count, id);
+    if (daemon > 0 && packet.online_vp_count == 0 && packet.range_count == 0 &&
+        (packet.flags & PACKET_MEMORY_TARGET) == 0) {
+        finished = signal_restore(daemon,
+                                  (packet.flags & PACKET_ACK_REQUIRED) != 0);
+        if (finished > 0)
+            fail_fatal(STATUS_CONFORMANCE, "G_CONFORMANCE_C10", "conformance",
+                       PHASE_RESTORE, "the time daemon is not running");
+    }
+    printf("%d %u %u %u %s", finished >= 0 ? 2 : 1, packet.flags,
+           packet.online_vp_count, packet.range_count, id);
     for (unsigned index = 0; index < packet.range_count; index++)
         printf(" %" PRIu64 " %" PRIu64, packet.ranges[index][0],
                packet.ranges[index][1]);
@@ -3411,14 +3705,16 @@ static int cmd_capture(int argc, char **argv)
     long request;
     int64_t start;
     unsigned status;
+    pid_t daemon = -1;
     int result;
     int lock;
 
-    if (argc != 3 || (request = strtol(argv[0], &end, 10), *end != '\0') ||
+    if ((argc != 3 && (argc != 4 || strcmp(argv[3], "--finish") != 0)) ||
+        (request = strtol(argv[0], &end, 10), *end != '\0') ||
         (request != 0 && request != 1) ||
         parse_hex(argv[1], previous_id, sizeof(previous_id)) != 0) {
         fprintf(stderr, "usage: nvx-time capture 0|1 GENERATION_ID "
-                        "ENTROPY_FILE\n");
+                        "ENTROPY_FILE [--finish]\n");
         return 2;
     }
     if (state_load(&(struct time_state){0}) != 0) {
@@ -3430,6 +3726,10 @@ static int cmd_capture(int argc, char **argv)
         fprintf(stderr, "nvx-time: ioperm: %s\n", strerror(errno));
         return 1;
     }
+    // The daemon keeps its PID in the restored guest; looking it up now keeps
+    // the file reads off the restore path.
+    if (argc == 4)
+        daemon = daemon_pid();
     lock = lock_portb(detail, sizeof(detail));
     if (lock < 0) {
         fprintf(stderr, "nvx-time: %s\n", detail);
@@ -3443,35 +3743,40 @@ static int cmd_capture(int argc, char **argv)
         puts("0");
         return 0;
     }
-    result = repair_restore(previous_id, argv[2], start);
+    result = repair_restore(previous_id, argv[2], start, daemon);
     close(lock);
     return result;
 }
 
-// Restore steps 11 to 13: checks, the acknowledgement when the packet asked
-// for one, then the daemon finishes the restore off the latency path.
+// Restore steps 12 and 13 after the shell's activation and identity work: the
+// acknowledgement when the packet asked for one, then the daemon runs the
+// restore checks (step 11, after the acknowledgement) and finishes the
+// restore off the latency path.
 static int cmd_restore_finish(int argc, char **argv)
 {
     int64_t start = clock_ns(CLOCK_MONOTONIC);
     bool new_cpus[MAX_CPUS] = {false};
+    const char *new_list = "none";
     unsigned long long generation;
     long long elapsed;
     struct checks checks;
-    char text[128];
+    char text[256];
     int64_t timeout_s = DEFAULT_STALL_TIMEOUT_S;
     bool ack = false;
     int new_count = 0;
-    pid_t pid;
+    int signaled;
 
     for (int index = 0; index < argc; index++) {
-        if (strcmp(argv[index], "--ack") == 0)
+        if (strcmp(argv[index], "--ack") == 0) {
             ack = true;
-        else if (strcmp(argv[index], "--new-cpus") == 0 && index + 1 < argc)
-            new_count = parse_new_cpus(argv[++index], new_cpus);
-        else
+        } else if (strcmp(argv[index], "--new-cpus") == 0 && index + 1 < argc) {
+            new_list = argv[++index];
+            new_count = parse_new_cpus(new_list, new_cpus);
+        } else {
             new_count = -1;
+        }
     }
-    if (new_count < 0) {
+    if (new_count < 0 || strlen(new_list) > 127) {
         fprintf(stderr, "usage: nvx-time restore-finish [--ack] "
                         "[--new-cpus LIST]\n");
         return 2;
@@ -3481,32 +3786,32 @@ static int cmd_restore_finish(int argc, char **argv)
         sscanf(text, "generation=%llu elapsed_us=%lld", &generation,
                &elapsed) != 2)
         return repair_failed("G_REPAIR_PACKET", "no restore record");
-    if (checks_init(&checks, PHASE_RESTORE) != 0)
-        check_failed(&checks, "C6", "cannot read the CPU sets");
-    else
-        run_restore_checks(&checks, new_cpus, new_count);
     elapsed += (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC;
-    snprintf(text, sizeof(text), "generation=%llu\nelapsed_us=%lld\n",
-             generation, elapsed);
+    snprintf(text, sizeof(text), "generation=%llu\nelapsed_us=%lld\nnew_cpus=%s\n",
+             generation, elapsed, new_count > 0 ? new_list : "none");
     (void)replace_file(RESTORE_PATH, RESTORE_PATH ".tmp", text);
-    if (ack) {
-        if (enable_ports() != 0) {
-            fprintf(stderr, "nvx-time: ioperm: %s\n", strerror(errno));
-            return 1;
-        }
-        outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
+    if (ack && enable_ports() != 0) {
+        fprintf(stderr, "nvx-time: ioperm: %s\n", strerror(errno));
+        return 1;
     }
-    pid = daemon_pid();
-    if (pid > 0 && kill(pid, SIGUSR1) == 0)
+    signaled = signal_restore(daemon_pid(), ack);
+    if (signaled == 0)
         return 0;
-    if (!g_report_only) {
+    if (checks_init(&checks, PHASE_RESTORE) != 0) {
+        check_failed(&checks, "C6", "cannot read the CPU sets");
+        return 1;
+    }
+    if (signaled > 0 || !g_report_only) {
         check_failed(&checks, "C10", "the time daemon is not running");
         return 1;
     }
     // Report-only runs may lack the daemon; finish the restore here.
+    if (ack)
+        outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
+    run_restore_checks(&checks, new_cpus, new_count);
     (void)read_int64(RCU_STALL_TIMEOUT, &timeout_s);
     complete_restore(release_with_deadline(timeout_s), checks.tsc_hz,
-                     checks.lapic_hz, elapsed);
+                     checks.lapic_hz, elapsed, checks.failures);
     return 0;
 }
 
@@ -3787,6 +4092,69 @@ static int test_state(int argc, char **argv)
     return 0;
 }
 
+static int test_restore_record(int argc, char **argv)
+{
+    static char text[4096];
+    unsigned long long generation;
+    long long elapsed_us;
+    bool cpus[MAX_CPUS];
+    const char *separator = "";
+    int count;
+
+    if (argc != 1 || test_text(argv[0], text, sizeof(text)) != 0)
+        return 2;
+    count = parse_restore_record(text, &generation, &elapsed_us, cpus);
+    if (count < 0) {
+        printf("error\n");
+        return 0;
+    }
+    printf("generation=%llu elapsed_us=%lld new_cpus=", generation, elapsed_us);
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (cpus[cpu]) {
+            printf("%s%d", separator, cpu);
+            separator = ",";
+        }
+    }
+    printf("%s count=%d\n", count == 0 ? "none" : "", count);
+    return 0;
+}
+
+// A side job and a foreground that fail a known number of times, so the test
+// sees whether check_cpus_parallel() merges every job's failures.
+static void test_failing_job(struct checks *checks, void *context)
+{
+    const int *failures = context;
+
+    for (int index = 0; index < *failures; index++)
+        check_failed(checks, "C4", "side job failure %d", index + 1);
+}
+
+static void test_failing_foreground(struct checks *checks, void *context)
+{
+    (void)context;
+    check_failed(checks, "C9", "foreground failure");
+}
+
+static int test_parallel(int argc, char **argv)
+{
+    static int failures[3] = {1, 2, 3};
+    struct side_job sides[ARRAY_SIZE(failures)];
+    struct checks checks;
+    bool cpus[MAX_CPUS];
+
+    if (argc != 1 || parse_cpu_list(argv[0], cpus) <= 0)
+        return 2;
+    memset(&checks, 0, sizeof(checks));
+    checks.phase = PHASE_BOOT;
+    for (size_t index = 0; index < ARRAY_SIZE(sides); index++)
+        sides[index] = (struct side_job){.run = test_failing_job,
+                                         .context = &failures[index]};
+    check_cpus_parallel(&checks, cpus, false, false, sides, ARRAY_SIZE(sides),
+                        test_failing_foreground, NULL);
+    printf("failures=%d\n", checks.failures);
+    return 0;
+}
+
 static int cmd_test(int argc, char **argv)
 {
     const char *name = argc > 0 ? argv[0] : "";
@@ -3882,6 +4250,20 @@ static int cmd_test(int argc, char **argv)
     }
     if (strcmp(name, "state") == 0)
         return test_state(argc, argv);
+    if (strcmp(name, "restore-record") == 0)
+        return test_restore_record(argc, argv);
+    if (strcmp(name, "parallel") == 0)
+        return test_parallel(argc, argv);
+    if (strcmp(name, "idle-priority") == 0 && argc == 0) {
+        long idle;
+
+        set_idle_priority(0, true);
+        idle = syscall(SYS_sched_getscheduler, 0);
+        set_idle_priority(0, false);
+        printf("idle=%ld normal=%ld\n", idle,
+               syscall(SYS_sched_getscheduler, 0));
+        return 0;
+    }
     return test_checks(name, argc, argv);
 }
 

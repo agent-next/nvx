@@ -7,6 +7,7 @@ the C decoders, so the tests check the guest against the specification.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import struct
@@ -211,6 +212,19 @@ class GuestTimeTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, self.run_test(*arguments[1:]))
+        # musl has no sched_setscheduler(); the daemon must still reach
+        # SCHED_IDLE after a restore. Returning to SCHED_OTHER needs
+        # CAP_SYS_NICE, which the guest has and a container may not.
+        result = subprocess.run(
+            [str(binary), "test", "idle-priority"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("idle=5 normal="), result.stdout)
+        self.assertTrue(self.run_test("idle-priority").startswith("idle=5 normal="))
 
     def test_packet_memory_ranges_follow_the_header(self):
         packet = encode_packet(
@@ -710,6 +724,55 @@ class GuestTimeTests(unittest.TestCase):
             ).strip(),
             "error",
         )
+
+    def restore_record(self, text: str) -> str:
+        return self.run_test(
+            "restore-record", self.fixture("restore.txt", text)
+        ).strip()
+
+    def test_restore_record_names_the_cpus_that_restore_finish_onlined(self):
+        # The capture helper's record, which the daemon reads when the helper
+        # finished an untiered restore itself.
+        self.assertEqual(
+            self.restore_record("generation=3\nelapsed_us=1234\n"),
+            "generation=3 elapsed_us=1234 new_cpus=none count=0",
+        )
+        # restore-finish adds the CPUs that activation brought online.
+        self.assertEqual(
+            self.restore_record("generation=3\nelapsed_us=1400\nnew_cpus=4-6,9\n"),
+            "generation=3 elapsed_us=1400 new_cpus=4,5,6,9 count=4",
+        )
+        self.assertEqual(
+            self.restore_record("generation=3\nelapsed_us=1400\nnew_cpus=none\n"),
+            "generation=3 elapsed_us=1400 new_cpus=none count=0",
+        )
+        for text in (
+            "",
+            "generation=3\n",
+            "elapsed_us=1400\ngeneration=3\n",
+            "generation=3\nelapsed_us=1400\nnew_cpus=7-4\n",
+            "generation=3\nelapsed_us=1400\nnew_cpus=64\n",
+        ):
+            self.assertEqual(self.restore_record(text), "error", text)
+
+    def test_parallel_checks_merge_every_failure(self):
+        if sys.platform != "linux":
+            self.skipTest("CPU affinity is Linux-only")
+        allowed: list[int] = sorted(os.sched_getaffinity(0))
+        # Three side jobs fail 1, 2, and 3 times and the foreground once,
+        # whether one CPU runs them in the caller or each has a thread.
+        for size in sorted({1, min(2, len(allowed)), min(4, len(allowed))}):
+            output = self.run_test("parallel", ",".join(map(str, allowed[:size])))
+            self.assertTrue(output.endswith("failures=7\n"), output)
+            self.assertEqual(output.count("check=C4"), 6, output)
+            self.assertEqual(output.count("check=C9"), 1, output)
+        # A CPU the checks cannot run on fails C1 in its job.
+        unusable = [cpu for cpu in range(64) if cpu not in allowed]
+        if not unusable:
+            self.skipTest("every CPU is usable")
+        output = self.run_test("parallel", f"{allowed[0]},{unusable[0]}")
+        self.assertTrue(output.endswith("failures=8\n"), output)
+        self.assertIn(f"cannot run on cpu {unusable[0]}", output)
 
 
 if __name__ == "__main__":
