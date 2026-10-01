@@ -383,15 +383,24 @@ path is limited to 4096 UTF-8 bytes; the combined execution request must also
 fit the existing 64 KiB control-payload bound.
 
 The explicit `test-microvm --scenario managed-exec-config --backend BACKEND`
-scenario checks these options through public `sandbox provision`, `start`,
-`exec`, `stop`, and `deprovision` commands with an Alpine control guest and an
-Ubuntu workload layer. It requires `build/ubuntu-distro.erofs`, its manifest,
-and the `build/ubuntu-smoke-scratch.ext4` template produced by the guest-artifact
-build. CI invokes it separately on every backend; it is not included in the
-default scenario set because downloaded packages do not include the scratch
-template. Empty environments are measured with `/usr/bin/env`, not a shell that
-can synthesize its own variables. The scenario retains bounded check statuses
-and OpenVMM logs without recording workload environment values.
+scenario is the authoritative acceptance for these public options. It invokes
+`scripts/nvx.py sandbox provision`, `start`, `exec`, `stop`, and `deprovision`
+as subprocesses with an Alpine control guest and an Ubuntu workload layer. It
+checks sequential distinct CWD and exact-environment requests followed by
+omitted defaults, public rejection of relative CWD and out-of-range `uint32`
+timeouts, timeout recovery, stdout/stderr forwarding, and typed exec outcome
+reports. It requires `build/ubuntu-distro.erofs`, its manifest, and the
+`build/ubuntu-smoke-scratch.ext4` template produced by the guest-artifact build.
+CI invokes it separately on every backend; it is not included in the default
+scenario set because downloaded packages do not include the scratch template.
+Empty environments are measured with `/usr/bin/env`, not a shell that can
+synthesize its own variables. The scenario retains bounded subprocess argument
+and status observations, typed exec outcomes, and OpenVMM logs. Inline
+environment values are redacted from the retained command observations.
+
+Decoder, helper, and direct control-session tests remain useful supplemental
+coverage for protocol boundaries and guest implementation details. They do not
+replace or establish support through the public `nvx.py sandbox` interface.
 
 `run --outcome-report PATH` and one-shot `sandbox run --outcome-report PATH`
 forward OpenVMM's bounded local JSON report. Managed `sandbox exec` writes only

@@ -20,6 +20,7 @@ from nvx_tools import (  # noqa: E402
     benchmark,
     common,
     control_session,
+    managed_exec_tests,
     microvm_tests,
     openvmm_process,
 )
@@ -124,6 +125,249 @@ class MicrovmTestParserTests(unittest.TestCase):
 
         self.assertEqual(args.guest, "ubuntu")
         self.assertIsNone(args.memory_mib)
+
+
+class PublicManagedExecAcceptanceTests(unittest.TestCase):
+    def _run_acceptance(
+        self,
+        root: Path,
+        *,
+        bad_pwd_output: bool = False,
+        malformed_outcome: bool = False,
+        stop_returncode: int = 0,
+    ) -> tuple[list[list[str]], list[dict[str, object]]]:
+        distro = root / "ubuntu-distro.erofs"
+        distro.write_bytes(b"distro")
+        distro.with_name("ubuntu-distro.erofs.manifest.json").write_text(
+            json.dumps({"uuid": "12345678-1234-1234-1234-123456789abc"}),
+            encoding="utf-8",
+        )
+        scratch = root / "ubuntu-smoke-scratch.ext4"
+        scratch.write_bytes(b"scratch")
+        output_dir = root / "results"
+        commands: list[list[str]] = []
+        options: list[dict[str, object]] = []
+
+        def artifact(name: str) -> Path:
+            return {
+                "ubuntu-distro.erofs": distro,
+                "ubuntu-smoke-scratch.ext4": scratch,
+            }[name]
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        def run(
+            command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[bytes]:
+            commands.append(command)
+            options.append(kwargs)
+            operation = command[3]
+            state = Path(command[command.index("--state-dir") + 1])
+            if operation == "provision":
+                state.mkdir(parents=True, exist_ok=True)
+            if operation == "start":
+                state.mkdir(parents=True, exist_ok=True)
+                (state / "openvmm.log").write_text("bounded log\n", encoding="utf-8")
+            if operation == "stop":
+                return subprocess.CompletedProcess(
+                    command, stop_returncode, b"", b"stop failed"
+                )
+            if operation == "deprovision":
+                shutil.rmtree(state)
+            if operation != "exec":
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+
+            cwd = command[command.index("--cwd") + 1] if "--cwd" in command else "/"
+            timeout_ms = (
+                command[command.index("--exec-timeout-ms") + 1]
+                if "--exec-timeout-ms" in command
+                else "0"
+            )
+            if not cwd.startswith("/"):
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    b"",
+                    b"managed exec working directory must be an absolute path\n",
+                )
+            if int(timeout_ms) < 0 or int(timeout_ms) > 0xFFFFFFFF:
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    b"",
+                    b"managed exec timeout must be 0 through 4294967295 ms\n",
+                )
+
+            entrypoint = command[command.index("--entrypoint") + 1]
+            stdout = b""
+            stderr = b""
+            returncode = 0
+            category = "exit"
+            if entrypoint == "/bin/pwd":
+                stdout = (
+                    b"x" * (managed_exec_tests.DIAGNOSTIC_LIMIT + 10)
+                    if bad_pwd_output
+                    else f"{cwd}\n".encode()
+                )
+            elif entrypoint == "/usr/bin/env":
+                if "--environment-file" in command:
+                    environment_file = Path(
+                        command[command.index("--environment-file") + 1]
+                    )
+                    entries = json.loads(environment_file.read_text(encoding="utf-8"))
+                    stdout = (
+                        b"" if not entries else ("\n".join(entries) + "\n").encode()
+                    )
+                elif "--environment" in command:
+                    entries = [
+                        command[index + 1]
+                        for index, value in enumerate(command)
+                        if value == "--environment"
+                    ]
+                    stdout = ("\n".join(entries) + "\n").encode()
+                else:
+                    stdout = b"PATH=/usr/bin\nHOME=/home/nvx\n"
+            elif entrypoint == "/bin/sleep":
+                returncode = 124
+                category = "timeout"
+            elif cwd in ("/does-not-exist", "/etc/passwd", "/root"):
+                returncode = 125
+                stderr = b"cannot use working directory\n"
+            elif entrypoint == "/bin/sh":
+                stdout = b"public stdout"
+                stderr = b"public stderr"
+                returncode = 7
+
+            if "--outcome-report" in command:
+                report = Path(command[command.index("--outcome-report") + 1])
+                report.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "operation_id": "1" * 32,
+                            "outcome": {
+                                "operation": "exec",
+                                "category": category,
+                                "status_code": (
+                                    True if malformed_outcome else returncode
+                                ),
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+        with (
+            patch.object(managed_exec_tests, "artifact_path", side_effect=artifact),
+            patch.object(managed_exec_tests, "require_file", side_effect=require),
+            patch.object(managed_exec_tests.subprocess, "run", side_effect=run),
+        ):
+            managed_exec_tests.run_managed_exec_configuration(
+                "whp", timeout=2, output_dir=output_dir
+            )
+        return commands, options
+
+    def test_public_acceptance_observes_full_cli_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands, options = self._run_acceptance(root)
+            records = json.loads(
+                (root / "results" / "public-exec-checks.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            exit_outcome = json.loads(
+                (root / "results" / "public-exec-exit-outcome.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            timeout_outcome = json.loads(
+                (root / "results" / "public-exec-timeout-outcome.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        exec_commands = [command for command in commands if command[3] == "exec"]
+        self.assertTrue(
+            all(
+                command[:3]
+                == [
+                    sys.executable,
+                    str(BuildConstants.REPO_ROOT / "scripts" / "nvx.py"),
+                    "sandbox",
+                ]
+                for command in commands
+            )
+        )
+        self.assertTrue(
+            all(
+                option
+                == {
+                    "cwd": BuildConstants.REPO_ROOT,
+                    "capture_output": True,
+                    "timeout": 12,
+                }
+                for option in options
+            )
+        )
+        state_directories = {
+            command[command.index("--state-dir") + 1] for command in commands
+        }
+        self.assertEqual(len(state_directories), 1)
+        self.assertTrue(
+            any(
+                "--cwd" in command and command[command.index("--cwd") + 1] == "relative"
+                for command in exec_commands
+            )
+        )
+        for value in ("-1", str(0x100000000)):
+            self.assertTrue(
+                any(
+                    "--exec-timeout-ms" in command
+                    and command[command.index("--exec-timeout-ms") + 1] == value
+                    for command in exec_commands
+                )
+            )
+        self.assertTrue(any("--outcome-report" in command for command in exec_commands))
+        self.assertEqual(
+            [record["operation"] for record in records[:2]], ["provision", "start"]
+        )
+        self.assertEqual(records[-1]["operation"], "deprovision")
+        self.assertTrue(all(record["state_exists"] for record in records[:-1]))
+        self.assertFalse(records[-1]["state_exists"])
+        self.assertTrue(all(isinstance(record.get("argv"), list) for record in records))
+        recorded_argv = [value for record in records for value in record["argv"]]
+        self.assertIn("<redacted>", recorded_argv)
+        self.assertNotIn("SECOND=inline value", recorded_argv)
+        self.assertEqual(exit_outcome["outcome"]["category"], "exit")
+        self.assertEqual(exit_outcome["outcome"]["status_code"], 7)
+        self.assertEqual(timeout_outcome["outcome"]["category"], "timeout")
+        self.assertEqual(timeout_outcome["outcome"]["status_code"], 124)
+
+    def test_public_acceptance_preserves_test_and_cleanup_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "unexpected output.*cleanup.*stop failed",
+            ) as raised:
+                self._run_acceptance(
+                    Path(temporary),
+                    bad_pwd_output=True,
+                    stop_returncode=9,
+                )
+        self.assertIn("10 bytes omitted", str(raised.exception))
+        self.assertLess(
+            len(str(raised.exception)), managed_exec_tests.DIAGNOSTIC_LIMIT + 512
+        )
+
+    def test_public_acceptance_rejects_malformed_outcome_packet(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError, "outcome has unexpected typed fields"
+            ):
+                self._run_acceptance(Path(temporary), malformed_outcome=True)
 
 
 class GuestIdentityScriptTests(unittest.TestCase):
