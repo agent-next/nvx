@@ -62,9 +62,11 @@ from .time_abi import (
     ABI_VERSION,
     WARP_PROBE_COMPLETION_MARKER,
     WARP_PROBE_FAILURE_MARKER,
+    WARP_SUMMARY_PREFIX,
     check_warp_probe,
     describe_exit_status,
     parse_fields,
+    parse_marker,
     warp_probe_script,
     warp_rounds,
 )
@@ -186,6 +188,10 @@ TIME_ABI_EXHAUSTIVE_CHECKS = ("X1", "X2", "X3", "X4", "X5", "X6")
 TIME_ABI_EXHAUSTIVE_EXIT_PREFIX = "NVX-EXHAUSTIVE-EXIT status="
 TIME_ABI_EXHAUSTIVE_COMPLETION_MARKER = b"NVX-EXHAUSTIVE-DONE"
 TIME_ABI_EXHAUSTIVE_REPORTED_FAILURES = 8
+# One line per test-microvm run that sums up the time ABI evidence in its guest
+# logs, which CI uploads only for failed jobs.
+TIME_ABI_EVIDENCE_PREFIX = "NVX-TIME-ABI-EVIDENCE: "
+RESTORE_DOWNTIME_REPORT_PREFIX = "NVX-RESTORE-DOWNTIME "
 OUTCOME_TOP_LEVEL_FIELDS = frozenset(
     {
         "schema_version",
@@ -1202,6 +1208,80 @@ def _check_exhaustive_report(text: str, *, processors: int) -> None:
         problems.append(f"exit status {exit_status}")
     if problems:
         raise RuntimeError("time ABI exhaustive check: " + "; ".join(problems))
+
+
+def time_abi_evidence(output_dir: Path) -> dict[str, str]:
+    """Sum up the time ABI evidence in the guest logs of one run."""
+    offsets: list[int] = []
+    backward: list[int] = []
+    elapsed: dict[str, list[int]] = {"boot": [], "capture": [], "restore": []}
+    exhaustive: list[str] = []
+    stalls: list[str] = []
+    for path in sorted(output_dir.rglob("*.log")):
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.removesuffix("\r")
+            try:
+                if line.startswith(WARP_SUMMARY_PREFIX):
+                    fields = parse_fields(line.removeprefix(WARP_SUMMARY_PREFIX))
+                    offsets.append(int(fields["max_abs_offset_ns"]))
+                    backward.append(int(fields["max_backward_ns"]))
+                elif line.startswith(TIME_ABI_EXHAUSTIVE_PREFIX):
+                    fields = parse_fields(line.removeprefix(TIME_ABI_EXHAUSTIVE_PREFIX))
+                    if "check" not in fields:
+                        exhaustive.append(
+                            f"{fields['status']}/{fields['cpus']}/{fields['failures']}"
+                        )
+                elif line.startswith(RESTORE_DOWNTIME_REPORT_PREFIX):
+                    fields = parse_fields(
+                        line.removeprefix(RESTORE_DOWNTIME_REPORT_PREFIX)
+                    )
+                    stalls.append(fields["stalls"])
+                else:
+                    marker = parse_marker(line)
+                    if (
+                        marker is not None
+                        and marker["status"] == "ok"
+                        and marker["phase"] in elapsed
+                    ):
+                        elapsed[marker["phase"]].append(int(marker["elapsed_us"]))
+            except (KeyError, ValueError):
+                continue
+    evidence: dict[str, str] = {}
+    if offsets:
+        evidence["warp_runs"] = str(len(offsets))
+        evidence["warp_max_abs_offset_ns"] = str(max(offsets))
+        evidence["warp_max_backward_ns"] = str(max(backward))
+    for phase, values in elapsed.items():
+        if values:
+            evidence[f"{phase}_markers"] = str(len(values))
+            evidence[f"{phase}_elapsed_us"] = f"{min(values)}-{max(values)}"
+    if exhaustive:
+        evidence["exhaustive"] = ",".join(exhaustive)
+    if stalls:
+        evidence["downtime_stalls"] = ",".join(stalls)
+    return evidence
+
+
+def report_time_abi_evidence(
+    output_dir: Path, *, backend: str, guest: str, debug_kernel: bool
+) -> str | None:
+    """Print the run's evidence line and add it to the GitHub job summary."""
+    evidence = time_abi_evidence(output_dir)
+    if not evidence:
+        return None
+    fields = {
+        "backend": backend,
+        "guest": guest,
+        "kernel": "debug" if debug_kernel else "default",
+        **evidence,
+    }
+    line = TIME_ABI_EVIDENCE_PREFIX + " ".join(f"{k}={v}" for k, v in fields.items())
+    print(line)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write(f"\n`{line}`\n")
+    return line
 
 
 def run_time_abi_conformance(
@@ -4584,5 +4664,11 @@ def run(args: argparse.Namespace) -> int:
             log_path=output_dir / "virtio-net.log",
         )
 
+    report_time_abi_evidence(
+        output_dir,
+        backend=args.backend,
+        guest=descriptor.name,
+        debug_kernel=debug_kernel,
+    )
     print(f"Wrote microVM correctness logs to {output_dir}")
     return 0

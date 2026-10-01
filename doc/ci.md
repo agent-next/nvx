@@ -85,6 +85,13 @@ failures, and exit status 0; a failure lists each failing check with the
 guest's detail. The guest command fits on one console line, so the console's
 echo of it ends before the check prints.
 
+At the end of a passing run, `test-microvm` prints one `NVX-TIME-ABI-EVIDENCE:`
+line and adds it to the GitHub job summary, because CI keeps the guest logs only
+for failed jobs: the number of warp probe runs with their worst
+`max_abs_offset_ns` and `max_backward_ns`, the count and `elapsed_us` range of
+the boot, capture, and restore markers, the exhaustive check's summary, and the
+`restore-downtime` stall counts.
+
 The `nvx-microvm-debug-{kvm,mshv,whp}` jobs run
 `test-microvm --debug-kernel` on the CI debug kernel (`build/vmlinux-debug`,
 built from `kernel/config-microvm-debug`), whose soft-lockup and hung-task

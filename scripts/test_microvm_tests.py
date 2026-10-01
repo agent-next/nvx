@@ -2,7 +2,9 @@
 # pyright: reportPrivateUsage=false
 
 import argparse
+import io
 import json
+import os
 import queue
 import re
 import shutil
@@ -12,7 +14,7 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -3126,6 +3128,76 @@ class MicrovmTests(unittest.TestCase):
                     ],
                     result.stderr,
                 )
+
+    def test_time_abi_evidence_sums_up_the_guest_logs(self):
+        boot = (
+            "NVX-TIME-ABI: v=1 phase=boot status=ok cpus=8 tsc_hz=2793437000 "
+            "lapic_hz=1000000000 generation=0 elapsed_us={elapsed}\r\n"
+        )
+        restore = boot.replace("phase=boot", "phase=restore").replace(
+            "generation=0", "generation=1"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            (output_dir / "smp-8.log").write_bytes(
+                boot.format(elapsed=10894).encode()
+                + _warp_probe_output(8, offset_ns=41)
+            )
+            (output_dir / "restore-downtime-8-vcpu.log").write_bytes(
+                restore.format(elapsed=1401).encode()
+                + _warp_probe_output(8, offset_ns=3)
+                + b"NVX-RESTORE-DOWNTIME stalls=0 uptime_s=37\r\n"
+                + restore.format(elapsed=6410).encode()
+            )
+            (output_dir / "time-abi-conformance.log").write_bytes(
+                b'/ # /sbin/nvx-time exhaustive; echo "NVX-EXHAUSTIVE-EXIT status=$?"\r\n'
+                b'NVX-TIME-ABI-EXHAUSTIVE: v=1 check=X1 cpu=0 status=pass detail=""\r\n'
+                b"NVX-TIME-ABI-EXHAUSTIVE: v=1 status=ok cpus=8 failures=0\r\n"
+                + boot.format(elapsed=1384).encode()
+            )
+            (output_dir / "lifecycle.log").write_text("no time ABI lines\n")
+            evidence = microvm_tests.time_abi_evidence(output_dir)
+        self.assertEqual(
+            evidence,
+            {
+                "warp_runs": "4",
+                "warp_max_abs_offset_ns": "41",
+                "warp_max_backward_ns": "0",
+                "boot_markers": "2",
+                "boot_elapsed_us": "1384-10894",
+                "restore_markers": "2",
+                "restore_elapsed_us": "1401-6410",
+                "exhaustive": "ok/8/0",
+                "downtime_stalls": "0",
+            },
+        )
+
+    def test_time_abi_evidence_line_goes_to_the_log_and_the_job_summary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "out"
+            output_dir.mkdir()
+            empty = Path(temporary) / "empty"
+            empty.mkdir()
+            summary = Path(temporary) / "summary.md"
+            (output_dir / "smp-2.log").write_bytes(_warp_probe_output(2, offset_ns=7))
+            with (
+                patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}),
+                redirect_stdout(io.StringIO()) as stdout,
+            ):
+                line = microvm_tests.report_time_abi_evidence(
+                    output_dir, backend="mshv", guest="alpine", debug_kernel=True
+                )
+                nothing = microvm_tests.report_time_abi_evidence(
+                    empty, backend="kvm", guest="alpine", debug_kernel=False
+                )
+            self.assertEqual(
+                line,
+                "NVX-TIME-ABI-EVIDENCE: backend=mshv guest=alpine kernel=debug "
+                "warp_runs=2 warp_max_abs_offset_ns=7 warp_max_backward_ns=0",
+            )
+            self.assertIsNone(nothing)
+            self.assertEqual(stdout.getvalue(), f"{line}\n")
+            self.assertEqual(summary.read_text(encoding="utf-8"), f"\n`{line}`\n")
 
     def test_removed_tsc_guards_stay_removed(self):
         # The warp probe replaced the restore-tsc-sync guard, its
