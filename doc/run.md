@@ -387,7 +387,11 @@ scenario is the authoritative acceptance for these public options. It invokes
 `scripts/nvx.py sandbox provision`, `start`, `exec`, `stop`, and `deprovision`
 as subprocesses with an Alpine control guest and an Ubuntu workload layer. It
 checks sequential distinct CWD and exact-environment requests followed by
-omitted defaults, public rejection of relative CWD and out-of-range `uint32`
+omitted defaults. It resolves the selected UID 65534 account from the Ubuntu
+workload's own passwd database through a public managed `getent` execution,
+then requires exactly the documented `PATH`, `TERM`, `HOME`, `USER`, and
+`LOGNAME` values with no additional environment entries. It also checks public
+rejection of relative CWD and out-of-range `uint32`
 timeouts, timeout recovery, stdout/stderr forwarding, and typed exec outcome
 reports. It requires `build/ubuntu-distro.erofs`, its manifest, and the
 `build/ubuntu-smoke-scratch.ext4` template produced by the guest-artifact build.

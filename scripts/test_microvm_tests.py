@@ -134,7 +134,14 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         *,
         bad_pwd_output: bool = False,
         malformed_outcome: bool = False,
+        outcome_mutation: str | None = None,
         stop_returncode: int = 0,
+        default_environment: bytes = (
+            b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
+            b"TERM=linux\nHOME=/nonexistent\nUSER=nobody\nLOGNAME=nobody\n"
+        ),
+        evidence_failure: bool = False,
+        command_log: list[list[str]] | None = None,
     ) -> tuple[list[list[str]], list[dict[str, object]]]:
         distro = root / "ubuntu-distro.erofs"
         distro.write_bytes(b"distro")
@@ -145,8 +152,9 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         scratch = root / "ubuntu-smoke-scratch.ext4"
         scratch.write_bytes(b"scratch")
         output_dir = root / "results"
-        commands: list[list[str]] = []
+        commands: list[list[str]] = command_log if command_log is not None else []
         options: list[dict[str, object]] = []
+        real_copyfile = shutil.copyfile
 
         def artifact(name: str) -> Path:
             return {
@@ -156,6 +164,13 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
 
         def require(path: Path, _description: str) -> Path:
             return path
+
+        def copyfile(
+            source: Path | str, destination: Path | str
+        ) -> Path | str:
+            if evidence_failure and Path(destination).parent == output_dir:
+                raise OSError("injected evidence failure")
+            return real_copyfile(source, destination)
 
         def run(
             command: list[str], **kwargs: object
@@ -227,7 +242,9 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     ]
                     stdout = ("\n".join(entries) + "\n").encode()
                 else:
-                    stdout = b"PATH=/usr/bin\nHOME=/home/nvx\n"
+                    stdout = default_environment
+            elif entrypoint == "/usr/bin/getent":
+                stdout = b"nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
             elif entrypoint == "/bin/sleep":
                 returncode = 124
                 category = "timeout"
@@ -241,20 +258,25 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
 
             if "--outcome-report" in command:
                 report = Path(command[command.index("--outcome-report") + 1])
+                payload: dict[str, object] = {
+                    "schema_version": 1,
+                    "operation_id": "1" * 32,
+                    "outcome": {
+                        "operation": "exec",
+                        "category": category,
+                        "status_code": True if malformed_outcome else returncode,
+                    },
+                }
+                if outcome_mutation == "extra-top-level":
+                    payload["extra"] = "unexpected"
+                elif outcome_mutation == "missing-top-level":
+                    del payload["operation_id"]
+                elif outcome_mutation == "extra-outcome":
+                    cast(dict[str, object], payload["outcome"])["extra"] = "unexpected"
+                elif outcome_mutation == "missing-outcome":
+                    del cast(dict[str, object], payload["outcome"])["category"]
                 report.write_text(
-                    json.dumps(
-                        {
-                            "schema_version": 1,
-                            "operation_id": "1" * 32,
-                            "outcome": {
-                                "operation": "exec",
-                                "category": category,
-                                "status_code": (
-                                    True if malformed_outcome else returncode
-                                ),
-                            },
-                        }
-                    ),
+                    json.dumps(payload),
                     encoding="utf-8",
                 )
             return subprocess.CompletedProcess(command, returncode, stdout, stderr)
@@ -263,6 +285,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             patch.object(managed_exec_tests, "artifact_path", side_effect=artifact),
             patch.object(managed_exec_tests, "require_file", side_effect=require),
             patch.object(managed_exec_tests.subprocess, "run", side_effect=run),
+            patch.object(managed_exec_tests.shutil, "copyfile", side_effect=copyfile),
         ):
             managed_exec_tests.run_managed_exec_configuration(
                 "whp", timeout=2, output_dir=output_dir
@@ -368,6 +391,83 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 RuntimeError, "outcome has unexpected typed fields"
             ):
                 self._run_acceptance(Path(temporary), malformed_outcome=True)
+
+    def test_public_acceptance_rejects_outcome_shape_mutations(self):
+        for mutation in (
+            "extra-top-level",
+            "missing-top-level",
+            "extra-outcome",
+            "missing-outcome",
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(
+                    RuntimeError, "outcome has unexpected typed fields"
+                ):
+                    self._run_acceptance(
+                        Path(temporary), outcome_mutation=mutation
+                    )
+
+    def test_public_acceptance_rejects_default_environment_mutations(self):
+        valid = {
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "TERM": "linux",
+            "HOME": "/nonexistent",
+            "USER": "nobody",
+            "LOGNAME": "nobody",
+        }
+        mutations = [
+            *[
+                (f"wrong-{name}", {**valid, name: f"wrong-{value}"})
+                for name, value in valid.items()
+            ],
+            *[
+                (
+                    f"missing-{missing}",
+                    {
+                        name: value
+                        for name, value in valid.items()
+                        if name != missing
+                    },
+                )
+                for missing in valid
+            ],
+            ("leaked-key", {**valid, "SECOND": "inline value"}),
+        ]
+        for mutation, environment in mutations:
+            output = "".join(
+                f"{name}={value}\n" for name, value in environment.items()
+            ).encode()
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(
+                    RuntimeError, "did not match workload defaults"
+                ):
+                    self._run_acceptance(
+                        Path(temporary), default_environment=output
+                    )
+
+    def test_evidence_failure_still_deprovisions_stopped_sandbox(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands: list[list[str]] = []
+            with self.assertRaisesRegex(RuntimeError, "injected evidence failure"):
+                self._run_acceptance(
+                    Path(temporary),
+                    evidence_failure=True,
+                    command_log=commands,
+                )
+
+        self.assertIn("deprovision", [command[3] for command in commands])
+
+    def test_failed_stop_does_not_deprovision_running_sandbox(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands: list[list[str]] = []
+            with self.assertRaisesRegex(RuntimeError, "stop failed"):
+                self._run_acceptance(
+                    Path(temporary),
+                    stop_returncode=9,
+                    command_log=commands,
+                )
+
+        self.assertNotIn("deprovision", [command[3] for command in commands])
 
 
 class GuestIdentityScriptTests(unittest.TestCase):

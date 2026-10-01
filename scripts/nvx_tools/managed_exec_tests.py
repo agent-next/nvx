@@ -14,6 +14,8 @@ from .build_constants import BuildConstants, UbuntuBuildConstants
 from .common import ScriptError, artifact_path, require_file
 
 DIAGNOSTIC_LIMIT = 4096
+DEFAULT_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+DEFAULT_TERM = "linux"
 
 
 def _bounded_text(value: bytes) -> str:
@@ -41,21 +43,71 @@ def _read_exec_outcome(
     if not isinstance(value, dict):
         raise RuntimeError("public exec outcome must be a JSON object")
     typed = cast(dict[str, object], value)
+    if set(typed) != {"schema_version", "operation_id", "outcome"}:
+        raise RuntimeError("public exec outcome has unexpected typed fields")
     schema_version = typed.get("schema_version")
     operation_id = typed.get("operation_id")
     outcome = typed.get("outcome")
+    typed_outcome = (
+        cast(dict[str, object], outcome) if isinstance(outcome, dict) else {}
+    )
     if (
         schema_version != 1
         or isinstance(schema_version, bool)
         or not isinstance(operation_id, str)
+        or len(operation_id) != 32
+        or any(character not in "0123456789abcdef" for character in operation_id)
         or not isinstance(outcome, dict)
-        or cast(dict[str, object], outcome).get("operation") != "exec"
-        or cast(dict[str, object], outcome).get("category") != category
-        or cast(dict[str, object], outcome).get("status_code") != status_code
-        or isinstance(cast(dict[str, object], outcome).get("status_code"), bool)
+        or set(typed_outcome) != {"operation", "category", "status_code"}
+        or typed_outcome.get("operation") != "exec"
+        or typed_outcome.get("category") != category
+        or typed_outcome.get("status_code") != status_code
+        or isinstance(typed_outcome.get("status_code"), bool)
     ):
         raise RuntimeError("public exec outcome has unexpected typed fields")
     return cast(dict[str, Any], typed)
+
+
+def _read_workload_identity(output: bytes) -> tuple[str, str]:
+    try:
+        text = output.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("public workload identity probe returned invalid UTF-8") from error
+    records = [line.split(":") for line in text.splitlines() if line]
+    if (
+        len(records) != 1
+        or len(records[0]) != 7
+        or records[0][2:4] != ["65534", "65534"]
+        or not records[0][0]
+        or not records[0][5].startswith("/")
+    ):
+        raise RuntimeError("public workload identity probe returned an invalid record")
+    return records[0][0], records[0][5]
+
+
+def _read_environment(output: bytes) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for line in output.splitlines():
+        name, separator, value = line.partition(b"=")
+        if not separator or not name:
+            raise RuntimeError("public managed environment returned an invalid entry")
+        try:
+            decoded_name = name.decode("utf-8")
+            decoded_value = value.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RuntimeError(
+                "public managed environment returned invalid UTF-8"
+            ) from error
+        if decoded_name in environment:
+            raise RuntimeError("public managed environment returned a duplicate entry")
+        environment[decoded_name] = decoded_value
+    return environment
+
+
+def _format_errors(errors: list[Exception]) -> str:
+    text = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+    encoded = text.encode("utf-8", errors="replace")
+    return _bounded_text(encoded)
 
 
 def run_managed_exec_configuration(
@@ -212,24 +264,27 @@ def run_managed_exec_configuration(
                 ),
                 b"SECOND=inline value\nORDER=two\n",
             )
-            default_environment = workload("/usr/bin/env")
-            if (
-                default_environment.stderr
-                or b"HOME=" not in default_environment.stdout
-                or any(
-                    line.startswith(
-                        (
-                            b"COMPLEX=",
-                            b"EMPTY=",
-                            b"SECOND=",
-                            b"ORDER=",
-                            b"NVX_EXEC_CONFIG_FD=",
-                        )
-                    )
-                    for line in default_environment.stdout.splitlines()
+            identity = workload("/usr/bin/getent", "--arg=passwd", "--arg=65534")
+            if identity.stderr:
+                raise RuntimeError(
+                    "public workload identity probe returned diagnostics: "
+                    f"{_bounded_text(identity.stderr)!r}"
                 )
-            ):
-                raise RuntimeError("public managed environment leaked between requests")
+            workload_name, workload_home = _read_workload_identity(identity.stdout)
+            default_environment = workload("/usr/bin/env")
+            expected_defaults = {
+                "PATH": DEFAULT_PATH,
+                "TERM": DEFAULT_TERM,
+                "HOME": workload_home,
+                "USER": workload_name,
+                "LOGNAME": workload_name,
+            }
+            if default_environment.stderr or _read_environment(
+                default_environment.stdout
+            ) != expected_defaults:
+                raise RuntimeError(
+                    "public managed environment did not match workload defaults"
+                )
 
             relative = workload(
                 "/bin/sh",
@@ -304,30 +359,36 @@ def run_managed_exec_configuration(
         except Exception as error:
             acceptance_error = error
         finally:
+            stopped = False
             try:
                 if started:
                     invoke("stop")
+                    stopped = True
             except Exception as error:
                 cleanup_errors.append(error)
             try:
                 persist_evidence()
             except Exception as error:
                 cleanup_errors.append(error)
+            if stopped:
+                try:
+                    invoke("deprovision")
+                except Exception as error:
+                    cleanup_errors.append(error)
+                try:
+                    persist_evidence()
+                except Exception as error:
+                    cleanup_errors.append(error)
         if acceptance_error is not None:
             if cleanup_errors:
-                cleanup = "; ".join(str(error) for error in cleanup_errors)
                 raise RuntimeError(
-                    f"{acceptance_error}; cleanup failed: {cleanup}"
+                    f"{acceptance_error}; cleanup failed: "
+                    f"{_format_errors(cleanup_errors)}"
                 ) from acceptance_error
             raise acceptance_error.with_traceback(acceptance_error.__traceback__)
         if cleanup_errors:
-            cleanup = "; ".join(str(error) for error in cleanup_errors)
-            raise RuntimeError(f"public managed cleanup failed: {cleanup}")
-        try:
-            invoke("deprovision")
-        except Exception:
-            persist_evidence()
-            raise
-        persist_evidence()
+            raise RuntimeError(
+                f"public managed cleanup failed: {_format_errors(cleanup_errors)}"
+            ) from cleanup_errors[0]
         if not scratch.is_file() or not distro.is_file():
             raise RuntimeError("managed cleanup removed a supplied workload artifact")
