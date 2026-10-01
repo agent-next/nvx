@@ -118,15 +118,17 @@ runs:
         }
 
     # Time ABI host qualification (doc/design/time-abi.md, "Host
-    # qualification"); it replaces the nonstop_tsc check. H3 and H6 need the
-    # OpenVMM binary and guest artifacts, which jobs download later.
+    # qualification"): the backend, the CPU fingerprint and generation, and
+    # the TSC rate stability. It replaces the nonstop_tsc check, which is now
+    # recorded as evidence only. The guest warp probe runs in the microVM
+    # scenarios, which boot the time ABI.
     - name: Qualify host time on Linux
       if: runner.os != 'Windows'
       shell: bash
       run: >-
         python3 scripts/nvx.py doctor
         --backend "${{ inputs.backend }}"
-        --checks H1 H2 H4 H5 H7
+        --checks H1 H2 H4
         --summary "${GITHUB_STEP_SUMMARY}"
 
     - name: Qualify host time on Windows
@@ -135,7 +137,7 @@ runs:
       run: >-
         python scripts\nvx.py doctor
         --backend "${{ inputs.backend }}"
-        --checks H1 H2 H4 H5 H7
+        --checks H1 H2 H4
         --summary "$env:GITHUB_STEP_SUMMARY"
 
     - name: Validate KVM

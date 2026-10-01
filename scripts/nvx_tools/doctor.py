@@ -31,12 +31,15 @@ from .time_abi import (
     MAX_TSC_HZ,
     MIN_TSC_HZ,
     WARP_BOUND_NS,
+    WARP_PROBE_COMPLETION_MARKER,
+    WARP_PROBE_IDLE_SECONDS,
     TimeAbiFailure,
     TimeAbiMonitor,
     check_warp_probe,
     cpu_generation,
     parse_fields,
-    warp_probe_command,
+    warp_probe_script,
+    warp_rounds,
 )
 
 CHECK_IDS = ("H1", "H2", "H3", "H4", "H5", "H6", "H7")
@@ -59,19 +62,12 @@ RATE_TOLERANCE_PPM = 100.0
 SKEW_PAIR_DURATION_MS = 5
 GUEST_VCPU_COUNTS = (8, 4, 2, 1)
 GUEST_MEMORY_MIB = 128
-GUEST_WARP_MARKER = b"NVX-DOCTOR-WARP-DONE"
-# Azure WHP hosts cannot see an invariant TSC; the spec qualifies them on the
-# measured warp (H6) and rate stability (H4), so the bit is only reported.
-# A Linux host whose root sees no invariant TSC (azure-azlinux-2) stays
-# unqualified, which the spec's restore matrix expects.
-WHP_REQUIRES_INVARIANT_TSC = False
+# Qualification gates only on measured properties, alike on every backend:
+# the guest warp probe, the TSC rate stability, and the CPU profile. The host
+# OS's invariant-TSC flags and clocksource are recorded as evidence only;
+# Azure WHP hosts lack the flag while their guests measure tens of
+# nanoseconds of skew.
 LINUX_INVARIANT_TSC_FLAGS = ("constant_tsc", "nonstop_tsc")
-# KVM rewrites per-vCPU TSC offsets on a host whose TSC Linux distrusts. An
-# MSHV root's Linux reads time through the hypervisor's TSC page instead.
-HOST_CLOCKSOURCES: Mapping[str, tuple[str, ...]] = {
-    "kvm": ("tsc",),
-    "mshv": ("tsc", "hyperv_clocksource_tsc_page"),
-}
 CLOCKSOURCE_PATH = Path(
     "/sys/devices/system/clocksource/clocksource0/current_clocksource"
 )
@@ -358,14 +354,6 @@ def check_cpu(context: DoctorContext) -> CheckResult:
             "(skylake-sp 6/85 steppings 0-4, icelake-sp 6/106, emeraldrapids "
             f"6/207); {detail}",
         )
-    required = context.backend != "whp" or WHP_REQUIRES_INVARIANT_TSC
-    if required and info["invariant_tsc"] != "yes":
-        return CheckResult(
-            "H2",
-            False,
-            "[E_PROFILE_UNSUPPORTED] the host does not expose an invariant TSC, "
-            f"which every CPU profile requires; {detail}",
-        )
     return CheckResult("H2", True, detail)
 
 
@@ -489,7 +477,7 @@ def check_openvmm_preflight(context: DoctorContext) -> CheckResult:
 
 def check_rate(context: DoctorContext) -> CheckResult:
     clocksource = ""
-    if context.backend in HOST_CLOCKSOURCES:
+    if not host_is_windows():
         clocksource = host_clocksource()
         context.facts["host_clocksource"] = clocksource
     records = run_probe(
@@ -527,12 +515,7 @@ def check_rate(context: DoctorContext) -> CheckResult:
                 f"rate (limit {RATE_TOLERANCE_PPM:g} ppm)"
             )
     if clocksource:
-        detail += f"; host clocksource {clocksource}"
-        if clocksource not in HOST_CLOCKSOURCES[context.backend]:
-            problems.append(
-                f"the host clocksource is {clocksource}, not "
-                + " or ".join(HOST_CLOCKSOURCES[context.backend])
-            )
+        detail += f"; host clocksource {clocksource} (evidence)"
     if problems:
         return CheckResult("H4", False, "; ".join(problems) + f"; {detail}")
     return CheckResult("H4", True, detail)
@@ -585,31 +568,37 @@ def check_guest_warp(context: DoctorContext) -> CheckResult:
         processors=vcpus,
     )
     command.extend(context.openvmm_args)
-    script = f"{warp_probe_command()}\necho {GUEST_WARP_MARKER.decode()}\nnvx-exit 0\n"
     try:
         result = run_guest_script(
             command,
-            script,
-            GUEST_WARP_MARKER,
+            warp_probe_script() + "nvx-exit 0\n",
+            WARP_PROBE_COMPLETION_MARKER,
             timeout=context.timeout,
         )
         monitor = TimeAbiMonitor(command)
         monitor.feed(result["text"].encode())
         monitor.finish()
         boot = monitor.require_boot("the guest boot marker", online_cpus=vcpus)
-        warp = check_warp_probe(result["text"], cpus=vcpus, context="H6")[-1]
+        rounds = check_warp_probe(
+            result["text"], cpus=vcpus, context="H6", rounds=warp_rounds(vcpus)
+        )
     except (RuntimeError, TimeAbiFailure) as error:
         first = str(error).splitlines()[0]
         return CheckResult("H6", False, f"vcpus={vcpus}: {first}")
-    context.facts["guest_warp_ns"] = warp["max_abs_offset_ns"]
+
+    def worst(name: str) -> int:
+        return max(int(warp[name]) for warp in rounds)
+
+    context.facts["guest_warp_ns"] = str(worst("max_abs_offset_ns"))
     context.facts.setdefault("tsc_hz", boot["tsc_hz"])
     context.facts.setdefault("lapic_hz", boot["lapic_hz"])
     return CheckResult(
         "H6",
         True,
-        f"vcpus={vcpus} max_backward_ns={warp['max_backward_ns']} "
-        f"max_abs_offset_ns={warp['max_abs_offset_ns']} "
-        f"max_uncertainty_ns={warp['max_uncertainty_ns']} boot_elapsed_us="
+        f"vcpus={vcpus} rounds={len(rounds)} idle_s={WARP_PROBE_IDLE_SECONDS} "
+        f"max_backward_ns={worst('max_backward_ns')} "
+        f"max_abs_offset_ns={worst('max_abs_offset_ns')} "
+        f"max_uncertainty_ns={worst('max_uncertainty_ns')} boot_elapsed_us="
         f"{boot.get('elapsed_us', '?')}",
     )
 
@@ -731,6 +720,8 @@ def summary_markdown(
         ("measured_tsc_hz", "Measured TSC rate (Hz)"),
         ("host_skew_ns", "Host skew (ns)"),
         ("guest_warp_ns", "Guest warp offset (ns)"),
+        ("invariant_tsc", "Host invariant TSC (evidence)"),
+        ("host_clocksource", "Host clocksource (evidence)"),
     )
     facts_line = " · ".join(
         f"{label}: `{facts[name]}`" for name, label in reported if name in facts

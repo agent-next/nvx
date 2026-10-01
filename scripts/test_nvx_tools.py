@@ -2265,7 +2265,8 @@ class CiConfigurationTests(unittest.TestCase):
             BuildConstants.REPO_ROOT / "scripts" / "setup" / "setup-linux-runner.sh"
         ).read_text(encoding="utf-8")
 
-        # The doctor replaces the nonstop_tsc check (doc/design/time-abi.md).
+        # The doctor replaces the nonstop_tsc check: the backend, the CPU
+        # fingerprint and generation, and the TSC rate stability.
         self.assertNotIn("Validate host TSC", validate_runner)
         for name, shell, command, summary in (
             (
@@ -2287,22 +2288,24 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertIn(f"      shell: {shell}\n", step)
                 self.assertIn(command, step)
                 self.assertIn('--backend "${{ inputs.backend }}"', step)
-                self.assertIn("--checks H1 H2 H4 H5 H7", step)
+                self.assertIn("--checks H1 H2 H4\n", step)
                 self.assertIn(summary, step)
         args = nvx.parse_args(
-            ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4", "H5", "H7"]
+            ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4"]
         )
-        self.assertEqual(args.checks, ["H1", "H2", "H4", "H5", "H7"])
+        self.assertEqual(args.checks, ["H1", "H2", "H4"])
         self.assertLess(
             validate_runner.index("Validate Linux toolchain"),
             validate_runner.index("Qualify host time on Linux"),
         )
 
-        function = linux_setup.split("require_invariant_tsc() {\n", 1)[1]
-        function = "require_invariant_tsc() {\n" + function.split("\n}\n", 1)[0]
+        # The runner setup records the host's invariant-TSC flag as evidence.
+        self.assertNotIn("require_invariant_tsc", linux_setup)
+        function = linux_setup.split("report_invariant_tsc() {\n", 1)[1]
+        function = "report_invariant_tsc() {\n" + function.split("\n}\n", 1)[0]
         function += "\n}\n"
         self.assertLess(
-            linux_setup.index("require_invariant_tsc /proc/cpuinfo\n"),
+            linux_setup.index("report_invariant_tsc /proc/cpuinfo\n"),
             linux_setup.index('sudo -n true || die "passwordless sudo is required"'),
         )
         if os.name != "posix":
@@ -2326,14 +2329,15 @@ class CiConfigurationTests(unittest.TestCase):
                             "-c",
                             'die() { echo "$*" >&2; exit 1; }\n'
                             f"{function}"
-                            f"require_invariant_tsc '{cpuinfo}'\n",
+                            f"report_invariant_tsc '{cpuinfo}'\n",
                         ],
                         capture_output=True,
                         text=True,
                         timeout=10,
                         check=False,
                     )
-                    self.assertEqual(result.returncode == 0, invariant, result.stderr)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual("warning:" in result.stderr, not invariant)
 
     def test_runner_setups_install_backend_native_openvmm_targets(self):
         linux_setup = (

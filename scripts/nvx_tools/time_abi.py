@@ -32,6 +32,12 @@ WARP_BOUND_NS = 1000
 WARP_PROBE_PATH = "/sbin/nvx-time-probe"
 WARP_SUMMARY_PREFIX = "NVX-TIME-PROBE warp "
 WARP_DETAIL_PREFIX = "NVX-TIME-PROBE warp-detail "
+WARP_PROBE_COMPLETION_MARKER = b"NVX-WARP-PROBE-OK"
+WARP_PROBE_FAILURE_MARKER = b"NVX-WARP-PROBE-FAIL"
+WARP_PROBE_FAILURE_STATUS = 97
+# The idle-inducing warp schedule: probe rounds separated by halted vCPUs.
+WARP_PROBE_ROUNDS = 2
+WARP_PROBE_IDLE_SECONDS = 1
 PROFILE_VENDORS: Mapping[str, str] = {"GenuineIntel": "intel"}
 
 
@@ -343,16 +349,61 @@ def warp_probe_command(*, cpus: str | None = None) -> str:
     return command if cpus is None else f"{command} --cpus {cpus}"
 
 
+def warp_rounds(cpus: int) -> int:
+    """Return how many probe rounds the warp schedule runs on ``cpus`` CPUs."""
+    return 1 if cpus < 2 else WARP_PROBE_ROUNDS
+
+
+def warp_probe_script() -> str:
+    """Return a guest shell fragment that runs the idle-inducing warp schedule.
+
+    The probe runs over every online CPU in WARP_PROBE_ROUNDS rounds with all
+    vCPUs halted for WARP_PROBE_IDLE_SECONDS between rounds: a host without an
+    invariant TSC corrects guest TSC timing when an idle host CPU wakes, which
+    busy probe rounds alone never trigger (#265). The CPU list is read when
+    the fragment runs, so one post-restore script serves every restore target.
+    A failed round prints WARP_PROBE_FAILURE_MARKER and powers the guest off
+    with WARP_PROBE_FAILURE_STATUS; otherwise the fragment prints
+    WARP_PROBE_COMPLETION_MARKER.
+    """
+    probe = warp_probe_command(cpus='"$warp_cpus"')
+    return (
+        'warp_cpus="$(cat /sys/devices/system/cpu/online)"\n'
+        f"warp_rounds={WARP_PROBE_ROUNDS}\n"
+        'case "$warp_cpus" in\n'
+        "    *[-,]*) ;;\n"
+        "    *) warp_rounds=1 ;;\n"
+        "esac\n"
+        "warp_round=1\n"
+        "while :; do\n"
+        "    warp_status=0\n"
+        f"    {probe} || warp_status=$?\n"
+        '    if [ "$warp_status" -ne 0 ]; then\n'
+        f'        echo "{WARP_PROBE_FAILURE_MARKER.decode()} '
+        'status=$warp_status round=$warp_round"\n'
+        f"        nvx-exit {WARP_PROBE_FAILURE_STATUS}\n"
+        f"        exit {WARP_PROBE_FAILURE_STATUS}\n"
+        "    fi\n"
+        '    [ "$warp_round" -lt "$warp_rounds" ] || break\n'
+        f"    sleep {WARP_PROBE_IDLE_SECONDS}\n"
+        "    warp_round=$((warp_round + 1))\n"
+        "done\n"
+        f"echo {WARP_PROBE_COMPLETION_MARKER.decode()}\n"
+    )
+
+
 def check_warp_probe(
     text: str,
     *,
     cpus: int,
     context: str,
+    rounds: int | None = None,
 ) -> list[dict[str, str]]:
     """Validate every warp probe summary in console output.
 
     The spec bounds both the backward step and the ping-pong offset by 1 us
     and forbids stalled pairs; an inconclusive measurement proves nothing.
+    ``rounds``, when given, is the exact number of probe rounds expected.
     """
     summaries: list[dict[str, str]] = []
     details: list[dict[str, str]] = []
@@ -374,9 +425,16 @@ def check_warp_probe(
             f"{context}: the guest warp probe printed {len(summaries)} summaries "
             f"and {len(details)} detail lines"
         )
+    if rounds is not None and len(summaries) != rounds:
+        raise TimeAbiFailure(
+            f"{context}: the guest warp probe ran {len(summaries)} rounds instead "
+            f"of {rounds}"
+        )
     expected_pairs = cpus * (cpus - 1) // 2
     results: list[dict[str, str]] = []
-    for summary, detail in zip(summaries, details, strict=True):
+    for index, (summary, detail) in enumerate(
+        zip(summaries, details, strict=True), start=1
+    ):
         merged = {**summary, **detail}
         problems: list[str] = []
         try:
@@ -404,8 +462,10 @@ def check_warp_probe(
         if merged.get("verdict") != "PASS":
             problems.append(f"verdict={merged.get('verdict')}")
         if problems:
+            where = f" in round {index}" if len(summaries) > 1 else ""
             raise TimeAbiFailure(
-                f"{context}: cross-vCPU TSC skew check failed: " + "; ".join(problems)
+                f"{context}: cross-vCPU TSC skew check failed{where}: "
+                + "; ".join(problems)
             )
         results.append(merged)
     return results

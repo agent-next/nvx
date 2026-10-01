@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -278,6 +279,88 @@ class WarpProbeTests(unittest.TestCase):
                 with self.assertRaisesRegex(TimeAbiFailure, message):
                     time_abi.check_warp_probe(text, cpus=4, context="restore 4")
 
+    def test_counts_rounds_and_names_the_failing_round(self):
+        self.assertEqual(
+            [time_abi.warp_rounds(cpus) for cpus in (1, 2, 8)],
+            [1, time_abi.WARP_PROBE_ROUNDS, time_abi.WARP_PROBE_ROUNDS],
+        )
+        two = warp_output() + warp_output(offset=30)
+        results = time_abi.check_warp_probe(two, cpus=4, context="boot", rounds=2)
+        self.assertEqual(
+            [result["max_abs_offset_ns"] for result in results], ["15", "30"]
+        )
+        with self.assertRaisesRegex(TimeAbiFailure, "ran 1 rounds instead of 2"):
+            time_abi.check_warp_probe(warp_output(), cpus=4, context="boot", rounds=2)
+        with self.assertRaisesRegex(
+            TimeAbiFailure, "failed in round 2: max_backward_ns=2000"
+        ):
+            time_abi.check_warp_probe(
+                warp_output() + warp_output(backward=2000, verdict="FAIL"),
+                cpus=4,
+                context="boot",
+            )
+
+    def test_warp_fragment_idles_between_rounds_and_powers_off_on_failure(self):
+        shell = shutil.which("sh")
+        if shell is None and (git := shutil.which("git")) is not None:
+            candidate = Path(git).parent.parent / "bin" / "sh.exe"
+            shell = str(candidate) if candidate.is_file() else None
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        fragment = (
+            time_abi.warp_probe_script()
+            .replace(time_abi.WARP_PROBE_PATH, "probe")
+            .replace("nvx-exit", "nvx_exit")
+        )
+        for online, failing_round, calls, sleeps in (
+            ("0-3", 0, 2, 1),
+            ("0-3", 2, 2, 1),
+            ("0-3", 1, 1, 0),
+            ("0", 0, 1, 0),
+        ):
+            with self.subTest(online=online, failing_round=failing_round):
+                result = subprocess.run(
+                    [shell],
+                    input=(
+                        f"cat() {{ printf '%s\\n' '{online}'; }}\n"
+                        "calls=0\n"
+                        "probe() {\n"
+                        "    calls=$((calls + 1))\n"
+                        '    printf "probe %s\\n" "$*"\n'
+                        f'    [ "$calls" -ne {failing_round} ]\n'
+                        "}\n"
+                        'sleep() { printf "SLEEP %s\\n" "$1"; }\n'
+                        'nvx_exit() { printf "NVX-EXIT %s\\n" "$1"; }\n'
+                        + fragment
+                        + "echo after\n"
+                    ),
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                lines = result.stdout.splitlines()
+                self.assertEqual(
+                    lines.count(f"probe warp --bound-ns 1000 --cpus {online}"),
+                    calls,
+                    result.stdout + result.stderr,
+                )
+                self.assertEqual(
+                    lines.count(f"SLEEP {time_abi.WARP_PROBE_IDLE_SECONDS}"), sleeps
+                )
+                if failing_round:
+                    self.assertEqual(result.returncode, 97)
+                    self.assertIn(
+                        f"NVX-WARP-PROBE-FAIL status=1 round={failing_round}", lines
+                    )
+                    self.assertIn("NVX-EXIT 97", lines)
+                    self.assertNotIn("NVX-WARP-PROBE-OK", lines)
+                    self.assertNotIn("after", lines)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("NVX-WARP-PROBE-OK", lines)
+                    self.assertIn("after", lines)
+
 
 VIOLATION = (
     b"NVX-TIME-ABI-VIOLATION: v=1 code=G_RCU_STALL source=watcher phase=runtime "
@@ -541,7 +624,9 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse(whp.passed)
         self.assertIn("requires Windows", whp.detail)
 
-    def test_cpu_check_names_the_generation_and_applies_the_invariant_tsc_rule(self):
+    def test_cpu_check_names_the_generation_and_records_invariant_tsc_as_evidence(
+        self,
+    ):
         context = doctor_context(self.root)
         with patch.object(doctor, "host_cpu", return_value=dict(CPU)):
             result = doctor.check_cpu(context)
@@ -560,12 +645,17 @@ class DoctorTests(unittest.TestCase):
                 result = doctor.check_cpu(doctor_context(self.root, backend))
                 self.assertTrue(result.passed, result.detail)
                 self.assertIn("profile=intel.emeraldrapids.v1", result.detail)
+        # The host OS's invariant-TSC flags are evidence, never a gate.
         variant = dict(CPU, invariant_tsc="no (missing nonstop_tsc)")
         with patch.object(doctor, "host_cpu", return_value=variant):
-            result = doctor.check_cpu(doctor_context(self.root, "mshv"))
-            self.assertTrue(result.detail.startswith("[E_PROFILE_UNSUPPORTED] "))
-            # A WHP host qualifies on measured properties instead.
-            self.assertTrue(doctor.check_cpu(doctor_context(self.root, "whp")).passed)
+            for backend in ("kvm", "mshv", "whp"):
+                context = doctor_context(self.root, backend)
+                result = doctor.check_cpu(context)
+                self.assertTrue(result.passed, result.detail)
+                self.assertIn("invariant_tsc=no (missing nonstop_tsc)", result.detail)
+                self.assertEqual(
+                    context.facts["invariant_tsc"], "no (missing nonstop_tsc)"
+                )
 
     def test_reads_the_first_processor_from_cpuinfo(self):
         path = self.root / "cpuinfo"
@@ -667,67 +757,67 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse(missing.passed)
         self.assertIn("was not found", missing.detail)
 
-    def test_rate_check_requires_stability_the_backend_rate_and_a_tsc_clocksource(self):
+    def test_rate_check_gates_on_stability_and_the_backend_rate_only(self):
         def records(first: float, second: float):
             return [
                 ("rate", {"tsc_hz": f"{first:.3f}"}),
                 ("rate", {"tsc_hz": f"{second:.3f}"}),
             ]
 
+        def check(
+            context: doctor.DoctorContext,
+            probe_records: list[tuple[str, dict[str, str]]],
+            clocksource: str = "tsc",
+            windows: bool = False,
+        ) -> doctor.CheckResult:
+            with (
+                patch.object(doctor, "run_probe", return_value=probe_records),
+                patch.object(doctor, "host_clocksource", return_value=clocksource),
+                patch.object(doctor, "host_is_windows", return_value=windows),
+            ):
+                return doctor.check_rate(context)
+
         context = doctor_context(self.root)
         context.facts["tsc_hz"] = "2793437000"
-        with (
-            patch.object(
-                doctor, "run_probe", return_value=records(2793437500, 2793437800)
-            ),
-            patch.object(doctor, "host_clocksource", return_value="tsc"),
-        ):
-            result = doctor.check_rate(context)
+        result = check(context, records(2793437500, 2793437800))
         self.assertTrue(result.passed, result.detail)
-        cases = (
-            (records(2793437000, 2793440000), "tsc", "unstable"),
-            (records(2794000000, 2794000001), "tsc", "ppm from the measured"),
-            (records(2793437000, 2793437000), "hpet", "clocksource is hpet"),
-        )
-        for probe_records, clocksource, message in cases:
+        self.assertIn("host clocksource tsc (evidence)", result.detail)
+        for probe_records, message in (
+            (records(2793437000, 2793440000), "unstable"),
+            (records(2794000000, 2794000001), "ppm from the measured"),
+        ):
             with self.subTest(message=message):
                 context = doctor_context(self.root)
                 context.facts["tsc_hz"] = "2793437000"
-                with (
-                    patch.object(doctor, "run_probe", return_value=probe_records),
-                    patch.object(doctor, "host_clocksource", return_value=clocksource),
-                ):
-                    result = doctor.check_rate(context)
+                result = check(context, probe_records)
                 self.assertFalse(result.passed)
                 self.assertIn(message, result.detail)
-        mshv = doctor_context(self.root, "mshv")
-        mshv.facts["tsc_hz"] = "2300000000"
-        with (
-            patch.object(
-                doctor, "run_probe", return_value=records(2300000100, 2300000200)
-            ),
-            patch.object(
-                doctor, "host_clocksource", return_value="hyperv_clocksource_tsc_page"
-            ),
+        # The clocksource is evidence on every backend.
+        for backend, clocksource in (
+            ("kvm", "hpet"),
+            ("mshv", "hyperv_clocksource_tsc_page"),
         ):
-            self.assertTrue(doctor.check_rate(mshv).passed)
-        with (
-            patch.object(
-                doctor, "run_probe", return_value=records(2300000100, 2300000200)
-            ),
-            patch.object(doctor, "host_clocksource", return_value="tsc"),
-        ):
-            standalone = doctor.check_rate(doctor_context(self.root))
+            with self.subTest(backend=backend, clocksource=clocksource):
+                context = doctor_context(self.root, backend)
+                context.facts["native_tsc_hz"] = "2300000000"
+                result = check(context, records(2300000100, 2300000200), clocksource)
+                self.assertTrue(result.passed, result.detail)
+                self.assertIn(
+                    f"host clocksource {clocksource} (evidence)", result.detail
+                )
+                self.assertEqual(context.facts["host_clocksource"], clocksource)
+        windows = check(
+            doctor_context(self.root, "whp"),
+            records(2300000100, 2300000200),
+            windows=True,
+        )
+        self.assertTrue(windows.passed, windows.detail)
+        self.assertNotIn("clocksource", windows.detail)
         # Without H3 (validate-runner), H4 still checks stability.
+        standalone = check(doctor_context(self.root), records(2300000100, 2300000200))
         self.assertTrue(standalone.passed, standalone.detail)
         self.assertIn("not compared with the backend's rate", standalone.detail)
-        with (
-            patch.object(
-                doctor, "run_probe", return_value=records(2300000100, 2300009100)
-            ),
-            patch.object(doctor, "host_clocksource", return_value="tsc"),
-        ):
-            unstable = doctor.check_rate(doctor_context(self.root))
+        unstable = check(doctor_context(self.root), records(2300000100, 2300009100))
         self.assertFalse(unstable.passed)
         self.assertIn("unstable", unstable.detail)
 
@@ -760,15 +850,14 @@ class DoctorTests(unittest.TestCase):
                 self.assertFalse(result.passed)
                 self.assertIn(message, result.detail)
 
-    def test_guest_warp_check_requires_the_boot_marker_and_the_skew_bound(self):
+    def test_guest_warp_check_runs_the_idle_schedule_and_applies_the_bound(self):
         context = doctor_context(self.root)
         for path in (context.openvmm, context.kernel, context.initrd):
             path.write_bytes(b"")
-        text = (
-            BOOT_LINE.replace("cpus=4", "cpus=8")
-            + " ALPINE-MICROVM-BOOT-OK: 3.22.1\n"
-            + warp_output(pairs=28)
+        boot = (
+            BOOT_LINE.replace("cpus=4", "cpus=8") + " ALPINE-MICROVM-BOOT-OK: 3.22.1\n"
         )
+        text = boot + warp_output(pairs=28) + warp_output(pairs=28, offset=60)
         with (
             patch.object(doctor.os, "cpu_count", return_value=8),
             patch.object(
@@ -777,21 +866,30 @@ class DoctorTests(unittest.TestCase):
         ):
             result = doctor.check_guest_warp(context)
         self.assertTrue(result.passed, result.detail)
-        self.assertEqual(context.facts["guest_warp_ns"], "15")
-        command = run.call_args.args[0]
+        self.assertIn("rounds=2 idle_s=1", result.detail)
+        self.assertEqual(context.facts["guest_warp_ns"], "60")
+        command, script, marker = run.call_args.args
         self.assertEqual(command[command.index("--processors") + 1], "8")
-        with (
-            patch.object(doctor.os, "cpu_count", return_value=6),
-            patch.object(
-                doctor,
-                "run_guest_script",
-                return_value={"text": warp_output(pairs=6)},
+        self.assertEqual(script, time_abi.warp_probe_script() + "nvx-exit 0\n")
+        self.assertEqual(marker, time_abi.WARP_PROBE_COMPLETION_MARKER)
+        cases = (
+            (boot + warp_output(pairs=28), "ran 1 rounds instead of 2"),
+            (
+                boot + warp_output(pairs=28) + warp_output(pairs=28, offset=1500),
+                "in round 2: max_abs_offset_ns=1500",
             ),
-        ):
-            result = doctor.check_guest_warp(doctor_context(self.root))
-        self.assertFalse(result.passed)
-        self.assertIn("vcpus=4", result.detail)
-        self.assertIn("NVX-TIME-ABI boot marker", result.detail)
+            (warp_output(pairs=28) * 2, "NVX-TIME-ABI boot marker"),
+        )
+        for output, message in cases:
+            with (
+                self.subTest(message=message),
+                patch.object(doctor.os, "cpu_count", return_value=8),
+                patch.object(doctor, "run_guest_script", return_value={"text": output}),
+            ):
+                result = doctor.check_guest_warp(context)
+                self.assertFalse(result.passed)
+                self.assertIn("vcpus=8", result.detail)
+                self.assertIn(message, result.detail)
         missing = doctor.check_guest_warp(doctor_context(self.root / "missing"))
         self.assertIn("OpenVMM was not found", missing.detail)
 
