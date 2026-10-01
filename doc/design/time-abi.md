@@ -29,8 +29,10 @@ behavior. Every check in this document is a hard check.
 
 Goals:
 
-- One time ABI on every backend: the same CPUID identity, synthetic MSRs,
-  CPU time bits, clocksource, tick, timers, and restore semantics.
+- One time ABI on every backend and for every microVM, whether launched from
+  the command line or through OpenVMM's management endpoint: the same CPUID
+  identity, synthetic MSRs, CPU time bits, clocksource, tick, timers, and
+  restore semantics.
 - No guest kernel patches and no clock command-line tokens.
 - No implicit fallbacks. A host or snapshot that cannot meet the contract is
   rejected with a stable error code.
@@ -1477,6 +1479,9 @@ behavior:
 - WHP: the 1 GHz rate request and its silent fallback, and `RestoredTsc`
   with its RDTSC, RDTSCP, and `IA32_TSC` exits.
 - Restore packets v1 to v3 and manifest versions 2 to 5.
+- The effect of `--restore-entropy`: every restore exposes packet v4, which
+  carries fresh entropy. OpenVMM still accepts the option without effect,
+  and the harness stops passing it.
 
 Removed from NVX:
 
