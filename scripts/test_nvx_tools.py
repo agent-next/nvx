@@ -3,6 +3,7 @@
 
 import argparse
 import ast
+import contextlib
 import hashlib
 import http.client
 import http.server
@@ -7647,10 +7648,50 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(benchmark.parse_dd_rate(output, 1), 268.4)
         self.assertEqual(benchmark.parse_dd_rate(output, 2), 1600.0)
         self.assertEqual(benchmark.network_gateway("10.0.0.2/24"), "10.0.0.1")
-        self.assertEqual(
-            benchmark.clocksource_parameter("kvm"), "clocksource=kvm-clock"
+
+    def test_benchmark_command_lines_carry_no_clock_tuning(self):
+        # Under time ABI v1 the hypervisor identity gives Linux its TSC and
+        # LAPIC rates and trust, so the lifecycle line tunes no clock and the
+        # cold-start clocksource variant selects tsc on every backend.
+        for token in (
+            "tsc=",
+            "no_timer_check",
+            "clocksource=",
+            "tsc_early_khz=",
+            "lapic_timer_hz=",
+        ):
+            self.assertNotIn(token, benchmark.BASE_TUNING)
+        args = argparse.Namespace(
+            runs=1,
+            warmups=0,
+            memory_mib=128,
+            processors=1,
+            timeout=10.0,
+            teardown_mode="guest-exit",
         )
-        self.assertEqual(benchmark.clocksource_parameter("mshv"), "clocksource=tsc")
+        for backend in ("kvm", "mshv", "whp"):
+            commands: list[list[str]] = []
+
+            def fake_benchmark(
+                command: list[str],
+                commands: list[list[str]] = commands,
+                **_kwargs: object,
+            ):
+                commands.append(command)
+                return {"samples_ms": [100.0]}
+
+            with (
+                self.subTest(backend=backend),
+                patch.object(benchmark, "benchmark", side_effect=fake_benchmark),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                benchmark.benchmark_cold_start_workload(
+                    args, Path("openvmm"), Path("vmlinux"), Path("initrd"), backend
+                )
+            cmdlines = [command[command.index("--cmdline") + 1] for command in commands]
+            self.assertIn("quiet loglevel=0 clocksource=tsc", cmdlines)
+            self.assertFalse(any("kvm-clock" in cmdline for cmdline in cmdlines))
+            self.assertIn("  clocksource=tsc          :", stdout.getvalue())
 
     def test_smp_probe_uses_explicit_topology_and_worker_rendezvous(self):
         script = benchmark.smp_probe_script(4)

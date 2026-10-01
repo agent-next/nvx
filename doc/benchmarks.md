@@ -267,10 +267,10 @@ command line tunes the clock or clocksource, except the `cold_start_clocksource`
 
 | Benchmark | Phase | Kernel command line |
 | --- | --- | --- |
-| Shell lifecycle | cold/capture | `BASE` plus the combined `BASE_TUNING` parameters; CI uses 128 MiB. |
+| Shell lifecycle | cold/capture | `BASE` plus `BASE_TUNING`: `random.trust_cpu=on rcupdate.rcu_expedited=1 nokaslr mitigations=off cryptomgr.notests quiet loglevel=0`; CI uses 128 MiB. |
 | Shell lifecycle | restore | restore (from the measured shell-ready snapshot) |
 | Cold start | baseline | `QUIET` |
-| Cold start | tuning variant | `QUIET` plus one of `clocksource=<backend>`, `tsc=reliable`, `no_timer_check`, `random.trust_cpu=on`, `rcupdate.rcu_expedited=1`, `nokaslr`, `mitigations=off`, or `cryptomgr.notests` |
+| Cold start | tuning variant | `QUIET` plus one of `clocksource=tsc`, `tsc=reliable`, `no_timer_check`, `random.trust_cpu=on`, `rcupdate.rcu_expedited=1`, `nokaslr`, `mitigations=off`, or `cryptomgr.notests` |
 | Virtual file system | guest runs | `QUIET` |
 | Device operation rates | guest runs | `QUIET`; virtio-net uses the portable profile at `10.0.0.2/24` |
 | Shell snapshot | cold | `QUIET` |
@@ -346,7 +346,7 @@ exactly one kernel parameter to the quiet baseline.
 | Metric | Description |
 | --- | --- |
 | `cold_start_base` | Quiet baseline with no additional tuning parameter. |
-| `cold_start_clocksource` | Baseline plus `clocksource=kvm-clock` on KVM or `clocksource=tsc` on MSHV/WHP. |
+| `cold_start_clocksource` | Baseline plus `clocksource=tsc` on every backend. Before the time ABI, KVM measured `clocksource=kvm-clock`, so KVM history before that change measures a different clocksource. |
 | `cold_start_tsc_reliable` | Baseline plus `tsc=reliable`. |
 | `cold_start_no_timer_check` | Baseline plus `no_timer_check`. |
 | `cold_start_random_trust_cpu` | Baseline plus `random.trust_cpu=on`. |
