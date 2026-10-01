@@ -300,6 +300,9 @@ revisions are never deleted, so old snapshots stay restorable. One surface
 serves all three backends: MSHV and WHP derive their processor feature banks
 from the profile's CPUID (`cpu_profile::hv_banks`) instead of from the host's,
 and each backend verifies at partition creation that it supports the profile.
+Every backend programs the whole surface explicitly and never relies on
+hypervisor defaults; WHP's default processor features, for example, omit
+SPEC_CTRL, IBPB, STIBP, and SSBD on Skylake and PSFD on Ice Lake.
 A shared profile gives the same guest behavior on every backend; it does not
 make snapshots portable, because cross-backend restore is rejected
 (`E_BACKEND_MISMATCH`).
@@ -321,7 +324,7 @@ document in pretty form.
 | `cpuid` | A dense table of every leaf and subleaf in `[0, max basic]` and `[0x80000000, max extended]` with a value and a mask per register; mask bit 1 pins the value, mask bit 0 marks a VMM-owned or runtime-owned bit |
 | `xcr0`, `xss`, `xsave_components` | The XSAVE features the guest may enable, and the size, offset, and flags of every enabled component |
 | `physical_address_width` | The guest physical address width |
-| `msrs` | Pinned MSR values with masks; v1 pins `IA32_ARCH_CAPABILITIES` only |
+| `msrs` | Pinned MSR values with masks; v1 pins `IA32_ARCH_CAPABILITIES` only, under the mask of the bits that Hyper-V's feature banks derive plus `ITS_NO`. KVM presents it as a feature MSR; MSHV and WHP present it through their banks' `*_NO` bits, because neither has a register to set or read it back |
 | `provenance` | The derivation method and the source fingerprints' backends, host counts, and surface digests (informative) |
 
 VMM-owned bits are a code table, not profile data: `CPUID.1:EBX[31:16]`
@@ -335,17 +338,33 @@ pinned set and, with the hypervisor bit, exempt from host-support
 verification, because nested Azure hypervisors hide them from fingerprints;
 host qualification measures them instead. Profiles also pin policy zeros
 (VMX and SVM, SGX, PT, RDT, PCONFIG, and the other features listed by the
-profiles' derivation policy). `IA32_UCODE_REV` is not pinned in v1. The
-effective guest CPUID is a pure function of the profile, the VM topology,
-and the time ABI's identity leaves.
+profiles' derivation policy). The effective guest CPUID is a pure function of
+the profile, the VM topology, and the time ABI's identity leaves.
+
+Informational fields:
+
+- The brand string (`0x80000002..=0x80000004`) is generic per generation:
+  `Intel(R) Xeon(R) Processor (<name>)` with the generation's display name
+  (`Skylake-SP`, `Ice Lake-SP`, or `Emerald Rapids`), zero-padded, without a
+  frequency. Every host of a generation presents it whatever its SKU, and
+  derivation needs no common brand across the source hosts.
+- The cache leaves (`0x2` and `0x4`, except their VMM-owned counts) come from
+  the reference hosts; other SKUs of the generation differ, and verification
+  does not compare them. Address widths are checked as limits.
+- `IA32_UCODE_REV` is not pinned: Linux disables its microcode loader and
+  skips its microcode checks under a hypervisor, so the value only reaches
+  `/proc/cpuinfo`, and it is outside the effective-CPUID record and every
+  restore check.
 
 Mitigation-relevant bits follow the hardware. A profile sets `ITS_NO`
 (`IA32_ARCH_CAPABILITIES` bit 62) or `BHI_CTRL` (`CPUID.7.2:EDX[4]`) only if
 every CPU of its generation is immune or has the control and every backend
-can present the value; MSHV cannot intercept `IA32_ARCH_CAPABILITIES`.
-Without `ITS_NO`, the hypervisor bit makes Linux enable its ITS mitigation.
-NVX keeps every such mitigation enabled, and the kernel must not leave its
-thunk pages writable and executable (boot check `K1`).
+can present the value; MSHV cannot intercept `IA32_ARCH_CAPABILITIES`. The
+v1 profiles clear both: MSHV and WHP cannot present `ITS_NO`, and no host
+available to the fleet exposes `BHI_CTRL`. Without `ITS_NO`, the hypervisor
+bit makes Linux enable its ITS mitigation. NVX keeps every such mitigation
+enabled, and the kernel must not leave its thunk pages writable and
+executable (boot check `K1`).
 
 **Selection.** A microVM always has a profile. A cold boot uses
 `--cpu-profile <id>`, or `auto` (the default), which selects the highest
@@ -386,6 +405,13 @@ bare-metal hosts (one per backend) and fifteen Azure hosts:
 | `intel.skylake-sp.v1` | 6/85, steppings 0 to 4 | Bare-metal prometheus hosts | KVM, MSHV, WHP |
 | `intel.icelake-sp.v1` | 6/106 | Xeon Platinum 8370C runners | KVM, MSHV, WHP |
 | `intel.emeraldrapids.v1` | 6/207 | Xeon Platinum 8573C runners | MSHV, WHP (no KVM host exists) |
+
+Sharing costs nothing on Ice Lake-SP and Emerald Rapids, where every backend
+offers the same features. On Skylake-SP, used only by the bare-metal
+development hosts, the shared profile drops what one backend alone offers:
+PKU, UMIP, and FDP_EXCPTN_ONLY (KVM only), FLUSH_L1D (not on WHP), and the
+AMD-alias speculation bits in `0x80000008` EBX (KVM only; Intel guests use
+the `7.0` EDX equivalents, which every backend presents).
 
 No profile pins the legacy P6 L2-cache MSRs (`0x88..=0x8a`, `0x116`,
 `0x118..=0x11b`, and `0x11e`) that the KVM and WHP backends stub for Windows
@@ -1166,7 +1192,7 @@ line per check and fail if any check fails. The time checks replace the
 | ID | Check |
 | --- | --- |
 | `H1` | The backend device or API is present and usable |
-| `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, the generation name, and the profile that `auto` selects; an unmapped generation fails (`E_PROFILE_HOST_UNKNOWN`). The host's invariant TSC (`constant_tsc` and `nonstop_tsc` on Linux, the CPUID bit on Windows) is reported as evidence only |
+| `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, the generation name, and the profile that `auto` selects; an unmapped generation fails (`E_PROFILE_HOST_UNKNOWN`). `openvmm --hypervisor <backend> --cpu-fingerprint <path>` writes the fingerprint (`openvmm-cpu-fingerprint/v1`), checks it against the generation's profile, and prints one `NVX-CPU-PROFILE:` line (`E_PROFILE_HOST_UNKNOWN`, `E_PROFILE_UNSUPPORTED`). The host's invariant TSC (`constant_tsc` and `nonstop_tsc` on Linux, the CPUID bit on Windows) is reported as evidence only |
 | `H3` | OpenVMM preflight in verification mode: profile support, identity routing, synchronized TSC set, no scaling, and both rates, without booting a guest |
 | `H4` | Host TSC rate stability: two 1 s measurements of the TSC against host monotonic time agree within 1 ppm and are within 100 ppm of `F_d`. The Linux host clocksource is reported as evidence only: MSHV roots and Azure KVM hosts run `hyperv_clocksource_tsc_page`, and KVM rewrites per-vCPU TSC offsets only on a host that marked its TSC unstable without that clocksource, which `H6` measures |
 | `H5` | Host cross-CPU TSC skew: a pinned-thread probe over all host CPU pairs, `max_abs_offset_ns <= 1000` |
