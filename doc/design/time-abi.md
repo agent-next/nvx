@@ -783,9 +783,9 @@ difference:
 
 | Backend | Host | `epsilon` p50 / p99 | Worst sample |
 | --- | --- | --- | --- |
-| KVM | prometheus32 (bare metal, Linux 7.0) | 4.1 µs / 5 to 15 µs | 25 µs |
+| KVM | prometheus32 (bare metal, Linux 7.0) | 4.0 to 4.1 µs / 4 to 15 µs | 33 µs |
 | KVM | `azure-kvm-5` (nested, Linux 6.6) | 3.8 to 4.1 µs / 4 to 9 µs | 75 µs |
-| MSHV | prometheus30 (bare metal) | 6.3 µs / 7.1 µs | 37 µs |
+| MSHV | prometheus30 (bare metal) | 6.3 to 6.4 µs / 6.8 to 7.1 µs | 37 µs |
 | MSHV | `azure-azlinux-5` (nested) | 12.7 to 13.0 µs / 15 to 25 µs | 102 µs |
 | WHP | | TBD(whp) | |
 
