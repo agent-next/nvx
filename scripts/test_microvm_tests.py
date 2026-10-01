@@ -81,6 +81,28 @@ def _warp_probe_output(cpus: int, *, offset_ns: int = 40) -> bytes:
     return (probe_round * time_abi.warp_rounds(cpus) + "NVX-WARP-PROBE-OK\r\n").encode()
 
 
+def _restore_status_output(
+    backend: str, cpus: int, *, boot_cpus: int | None = None
+) -> bytes:
+    """Return what the post-restore ``nvx-time status`` query prints: every
+    recorded phase, oldest first, with the values from when its check ran,
+    then the runtime line."""
+    boot_cpus = cpus if boot_cpus is None else boot_cpus
+    rates = f"tsc_hz=2793437000 lapic_hz={time_abi.LAPIC_HZ[backend]}"
+    return (
+        f"NVX-TIME-ABI: v=1 phase=boot status=ok cpus={boot_cpus} {rates} "
+        "generation=0 elapsed_us=2390\r\n"
+        f"NVX-TIME-ABI: v=1 phase=capture status=ok cpus={boot_cpus} {rates} "
+        "generation=0 elapsed_us=95\r\n"
+        f"NVX-TIME-ABI: v=1 phase=restore status=ok cpus={cpus} {rates} "
+        "generation=1 elapsed_us=310\r\n"
+        "NVX-TIME-ABI: v=1 phase=runtime status=synchronized generation=1 "
+        "discontinuities=1 offset_ns=-1200 uncertainty_ns=900 rejected_samples=0 "
+        "last_sample_error=none\r\n"
+        "NVX-TIME-STATUS-EXIT status=0\r\n"
+    ).encode()
+
+
 def _restore_processors_measure(
     backend: str,
     *,
@@ -98,6 +120,8 @@ def _restore_processors_measure(
         log_path.write_bytes(
             f"NVX-RESTORE-PROCESSORS-OK count={online}\r\n".encode()
             + _warp_probe_output(online, offset_ns=warp_offset_ns)
+            # The snapshot's guest booted with one online CPU.
+            + _restore_status_output(backend, online, boot_cpus=1)
             + benchmark.RESTORE_MARKER
             + b"\r\n"
             + _vp_binding_profile(list(range(vp_count)))
@@ -2335,7 +2359,10 @@ class MicrovmTests(unittest.TestCase):
             processors = int(command[command.index("--processors") + 1])
             log_path = cast(Path, kwargs["log_path"])
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_bytes(_warp_probe_output(processors))
+            log_path.write_bytes(
+                _warp_probe_output(processors)
+                + _restore_status_output("whp", processors)
+            )
 
         with tempfile.TemporaryDirectory() as temporary:
             output_dir = Path(temporary) / "logs"
@@ -2383,7 +2410,7 @@ class MicrovmTests(unittest.TestCase):
         self.assertTrue(
             all(
                 call.kwargs["post_restore_script"]
-                == "probe\n" + time_abi.warp_probe_script()
+                == "probe\n" + time_abi.warp_probe_script() + time_abi.status_script()
                 for call in capture_snapshot.call_args_list
             )
         )
@@ -2422,6 +2449,25 @@ class MicrovmTests(unittest.TestCase):
         cases = (
             (b"", "did not finish its warp probe"),
             (_warp_probe_output(4, offset_ns=5000), "max_abs_offset_ns=5000"),
+            (
+                _warp_probe_output(4),
+                "nvx-time status did not finish before the restore checks",
+            ),
+            (
+                _warp_probe_output(4) + _restore_status_output("kvm", 2),
+                "restore marker is invalid: cpus=2 is not 4",
+            ),
+            (
+                _warp_probe_output(4)
+                + _restore_status_output("kvm", 4).replace(
+                    b"generation=1", b"generation=2"
+                ),
+                "restore marker is invalid: generation=2 is not 1",
+            ),
+            (
+                _warp_probe_output(4) + b"NVX-TIME-STATUS-EXIT status=0\r\n",
+                "did not report an NVX-TIME-ABI restore marker",
+            ),
         )
         for output, message in cases:
             with self.subTest(message=message):
@@ -2514,7 +2560,8 @@ class MicrovmTests(unittest.TestCase):
         self.assertEqual(
             script,
             microvm_tests._read_script("restore-processors.sh")
-            + time_abi.warp_probe_script(),
+            + time_abi.warp_probe_script()
+            + time_abi.status_script(),
         )
         self.assertEqual(
             logs,
@@ -2563,11 +2610,14 @@ class MicrovmTests(unittest.TestCase):
             with self.subTest(backend=backend):
                 with tempfile.TemporaryDirectory() as temporary:
 
-                    def measure(command: list[str], **kwargs: object) -> None:
+                    def measure(
+                        command: list[str], backend: str = backend, **kwargs: object
+                    ) -> None:
                         log_path = cast(Path, kwargs["log_path"])
                         log_path.write_bytes(
                             b"NVX-RESTORE-PROCESSORS-OK count=2\r\n"
                             + _warp_probe_output(2)
+                            + _restore_status_output(backend, 2, boot_cpus=1)
                             + _vp_binding_profile([0, 1])
                         )
 
@@ -2858,8 +2908,17 @@ class MicrovmTests(unittest.TestCase):
         for call in capture.call_args_list:
             self.assertEqual(call.kwargs["teardown_mode"], "host-terminate")
             self.assertEqual(
-                call.kwargs["post_restore_script"], time_abi.warp_probe_script()
+                call.kwargs["post_restore_script"],
+                time_abi.warp_probe_script() + time_abi.status_script(),
             )
+        self.assertEqual(
+            [
+                (call.kwargs["online_cpus"], call.kwargs["generation"])
+                for call in active.time_abi.require_restore.call_args_list
+            ],
+            [(1, 1), (1, 1), (8, 1), (8, 1)],
+        )
+        self.assertEqual(active.time_abi.require_status.call_count, 4)
         # Every capture precedes one shared 30 s window.
         self.assertEqual(sleeps, [30.0, 0.0, 0.0, 0.0])
         self.assertEqual(
@@ -2890,15 +2949,19 @@ class MicrovmTests(unittest.TestCase):
 
     def test_restore_downtime_rejects_a_failed_check_or_warp_probe(self):
         fatal = "[E_TSC_SYNC_UNSUPPORTED] failed to launch vm worker"
+        context = "1-vcpu restore after a 0 s downtime"
+        passed = openvmm_process.OpenvmmProcessResult(0, _warp_probe_output(1))
         cases = (
             (
                 openvmm_process.OpenvmmProcessResult(99, b""),
                 None,
+                b"",
                 "downtime: OpenVMM exited with status 99$",
             ),
             (
                 openvmm_process.OpenvmmProcessResult(1, b""),
                 fatal,
+                b"",
                 f"downtime: OpenVMM exited with status 1: {re.escape(fatal)}$",
             ),
             (
@@ -2906,10 +2969,18 @@ class MicrovmTests(unittest.TestCase):
                     0, _warp_probe_output(1).replace(b"conclusive=1", b"conclusive=0")
                 ),
                 None,
-                "1-vcpu restore after a 0 s downtime: .*inconclusive",
+                b"",
+                f"{context}: .*inconclusive",
+            ),
+            (passed, None, b"", f"{context}: nvx-time status did not finish"),
+            (
+                passed,
+                None,
+                _restore_status_output("mshv", 2),
+                f"{context}: guest time ABI restore marker is invalid: cpus=2 is not 1",
             ),
         )
-        for result, fatal_error, message in cases:
+        for result, fatal_error, status, message in cases:
             with self.subTest(message=message):
                 with tempfile.TemporaryDirectory() as temporary:
                     with (
@@ -2921,6 +2992,7 @@ class MicrovmTests(unittest.TestCase):
                         active.wait.return_value = result
                         active.time_abi = time_abi.TimeAbiMonitor()
                         active.time_abi.fatal = fatal_error
+                        active.time_abi.feed(status)
                         with self.assertRaisesRegex(RuntimeError, message):
                             microvm_tests.run_restore_downtime(
                                 Path("openvmm"),
@@ -3130,32 +3202,47 @@ class MicrovmTests(unittest.TestCase):
                 )
 
     def test_time_abi_evidence_sums_up_the_guest_logs(self):
-        boot = (
-            "NVX-TIME-ABI: v=1 phase=boot status=ok cpus=8 tsc_hz=2793437000 "
-            "lapic_hz=1000000000 generation=0 elapsed_us={elapsed}\r\n"
+        runtime = (
+            "NVX-TIME-ABI: v=1 phase=runtime status=synchronized generation={g} "
+            "discontinuities={g} offset_ns=0 uncertainty_ns=900 rejected_samples=0 "
+            "last_sample_error=none\r\n"
         )
-        restore = boot.replace("phase=boot", "phase=restore").replace(
-            "generation=0", "generation=1"
-        )
+
+        def line(phase: str, generation: int, elapsed: int) -> str:
+            return (
+                f"NVX-TIME-ABI: v=1 phase={phase} status=ok cpus=8 tsc_hz=2793437000 "
+                f"lapic_hz=1000000000 generation={generation} elapsed_us={elapsed}\r\n"
+            )
+
+        def restored(elapsed: int) -> bytes:
+            # A restored guest repeats its source's boot and capture lines.
+            return (
+                line("boot", 0, 10894)
+                + line("capture", 0, 95)
+                + line("restore", 1, elapsed)
+                + runtime.format(g=1)
+            ).encode()
+
         with tempfile.TemporaryDirectory() as temporary:
             output_dir = Path(temporary)
             (output_dir / "smp-8.log").write_bytes(
-                boot.format(elapsed=10894).encode()
+                (line("boot", 0, 10894) + runtime.format(g=0)).encode()
                 + _warp_probe_output(8, offset_ns=41)
             )
             (output_dir / "restore-downtime-8-vcpu.log").write_bytes(
-                restore.format(elapsed=1401).encode()
-                + _warp_probe_output(8, offset_ns=3)
+                _warp_probe_output(8, offset_ns=3)
+                + restored(1401)
                 + b"NVX-RESTORE-DOWNTIME stalls=0 uptime_s=37\r\n"
-                + restore.format(elapsed=6410).encode()
             )
+            (output_dir / "smp-snapshot-8-restore-0.log").write_bytes(restored(6410))
             (output_dir / "time-abi-conformance.log").write_bytes(
-                b'/ # /sbin/nvx-time exhaustive; echo "NVX-EXHAUSTIVE-EXIT status=$?"\r\n'
+                (line("boot", 0, 1384) + runtime.format(g=0)).encode()
+                + b'/ # /sbin/nvx-time exhaustive; echo "NVX-EXHAUSTIVE-EXIT status=$?"\r\n'
                 b'NVX-TIME-ABI-EXHAUSTIVE: v=1 check=X1 cpu=0 status=pass detail=""\r\n'
                 b"NVX-TIME-ABI-EXHAUSTIVE: v=1 status=ok cpus=8 failures=0\r\n"
-                + boot.format(elapsed=1384).encode()
             )
-            (output_dir / "lifecycle.log").write_text("no time ABI lines\n")
+            # A phase line outside a status query is not counted.
+            (output_dir / "lifecycle.log").write_text(line("boot", 0, 7))
             evidence = microvm_tests.time_abi_evidence(output_dir)
         self.assertEqual(
             evidence,

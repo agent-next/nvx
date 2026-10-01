@@ -63,10 +63,13 @@ from .time_abi import (
     WARP_PROBE_COMPLETION_MARKER,
     WARP_PROBE_FAILURE_MARKER,
     WARP_SUMMARY_PREFIX,
+    TimeAbiFailure,
+    TimeAbiMonitor,
     check_warp_probe,
     describe_exit_status,
     parse_fields,
     parse_marker,
+    status_script,
     warp_probe_script,
     warp_rounds,
 )
@@ -172,6 +175,9 @@ TIME_ABI_RESTORE_LOG_FILTER = "off,openvmm_core::worker::dispatch::time_abi=info
 # The guest finishes a restore after the RCU grace-period release, which gives
 # up after rcu_cpu_stall_timeout (21 s), and the deferred C7 check.
 TIME_ABI_RESTORE_FINISH_SECONDS = 30.0
+# Every scenario captures a cold-booted guest (generation 0), and OpenVMM
+# cannot capture a restored one, so every restore carries generation 1.
+RESTORED_GENERATION = 1
 # The spec's long-downtime case: longer than the 21 s RCU stall timeout, at 1
 # and 8 vCPUs, with and without expedited grace periods.
 RESTORE_DOWNTIME_SECONDS = 30.0
@@ -291,6 +297,7 @@ def run_guest_script(
         log_path=log_path,
         boot_marker=BOOT_MARKER,
         contain_process_tree=contain_process_tree,
+        time_abi_status=True,
     )
 
 
@@ -323,6 +330,7 @@ def capture_snapshot(
         post_restore_script=post_restore_script,
         log_path=log_path,
         boot_marker=BOOT_MARKER,
+        time_abi_status=True,
     )
 
 
@@ -1211,13 +1219,20 @@ def _check_exhaustive_report(text: str, *, processors: int) -> None:
 
 
 def time_abi_evidence(output_dir: Path) -> dict[str, str]:
-    """Sum up the time ABI evidence in the guest logs of one run."""
+    """Sum up the time ABI evidence in the guest logs of one run.
+
+    nvx-time status prints every recorded phase, oldest first, and then its
+    runtime line, so a restored guest repeats its source's boot and capture
+    lines. Only each query's newest phase line counts: one boot per cold-boot
+    query and one restore per post-restore query.
+    """
     offsets: list[int] = []
     backward: list[int] = []
     elapsed: dict[str, list[int]] = {"boot": [], "capture": [], "restore": []}
     exhaustive: list[str] = []
     stalls: list[str] = []
     for path in sorted(output_dir.rglob("*.log")):
+        newest: dict[str, str] | None = None
         for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = raw.removesuffix("\r")
             try:
@@ -1238,12 +1253,18 @@ def time_abi_evidence(output_dir: Path) -> dict[str, str]:
                     stalls.append(fields["stalls"])
                 else:
                     marker = parse_marker(line)
+                    if marker is None:
+                        continue
+                    if marker["phase"] != "runtime":
+                        newest = marker
+                        continue
+                    last, newest = newest, None
                     if (
-                        marker is not None
-                        and marker["status"] == "ok"
-                        and marker["phase"] in elapsed
+                        last is not None
+                        and last["status"] == "ok"
+                        and last["phase"] in elapsed
                     ):
-                        elapsed[marker["phase"]].append(int(marker["elapsed_us"]))
+                        elapsed[last["phase"]].append(int(last["elapsed_us"]))
             except (KeyError, ValueError):
                 continue
     evidence: dict[str, str] = {}
@@ -2480,6 +2501,35 @@ def _check_restore_warp(output: bytes, *, processors: int, context: str) -> None
     )
 
 
+def post_restore_checks() -> str:
+    """Return the guest checks that run after every restore of the restore
+    scenarios: the warp probe, then the time ABI status, which waits for the
+    restore's deferred checks."""
+    return warp_probe_script() + status_script()
+
+
+def _check_restore_status(
+    output: bytes,
+    command: Sequence[str],
+    *,
+    processors: int,
+    context: str,
+) -> dict[str, str]:
+    """Validate the restore line that the post-restore status query printed."""
+    monitor = TimeAbiMonitor(command)
+    try:
+        monitor.feed(output)
+        monitor.finish()
+        monitor.require_status("the restore checks finished")
+        return monitor.require_restore(
+            "the restore checks finished",
+            online_cpus=processors,
+            generation=RESTORED_GENERATION,
+        )
+    except TimeAbiFailure as error:
+        raise RuntimeError(f"{context}: {error}") from error
+
+
 def run_smp_snapshot(
     executable: Path,
     kernel: Path,
@@ -2513,19 +2563,20 @@ def run_smp_snapshot(
                 timeout=timeout,
                 processors=processors,
                 post_restore_script=smp_probe_script(processors, exit_guest=False)
-                + warp_probe_script(),
+                + post_restore_checks(),
                 log_path=output_dir / f"smp-snapshot-{processors}-capture.log",
             )
             fingerprint = _snapshot_fingerprint(snapshot_path)
             for restore_index in range(restores):
                 context = f"{processors}-vCPU SMP restore {restore_index}"
+                restore_command = snapshot_restore_command(
+                    executable,
+                    backend,
+                    snapshot_path,
+                    processors=processors,
+                )
                 output = _measure_restore(
-                    snapshot_restore_command(
-                        executable,
-                        backend,
-                        snapshot_path,
-                        processors=processors,
-                    ),
+                    restore_command,
                     context=context,
                     environment=_restore_environment(),
                     timeout=timeout,
@@ -2534,6 +2585,9 @@ def run_smp_snapshot(
                     failure_marker=WARP_PROBE_FAILURE_MARKER,
                 )
                 _check_restore_warp(output, processors=processors, context=context)
+                _check_restore_status(
+                    output, restore_command, processors=processors, context=context
+                )
                 if _snapshot_fingerprint(snapshot_path) != fingerprint:
                     raise RuntimeError(f"{context} modified snapshot artifacts")
 
@@ -2602,7 +2656,7 @@ def run_restore_processors(
     cmdline = f"quiet loglevel=0 maxcpus={boot_online}"
     # The warp probe replaces the guest TSC warp guard: it measures the skew
     # between every pair of CPUs, including the ones the restore activated.
-    script = _read_script("restore-processors.sh") + warp_probe_script()
+    script = _read_script("restore-processors.sh") + post_restore_checks()
     # The VP-binding lifecycle records identify the VPs that each restore
     # instantiates without changing restore behavior.
     environment = _restore_environment()
@@ -2633,14 +2687,15 @@ def run_restore_processors(
         for target in targets:
             name = "untargeted" if target is None else str(target)
             online = boot_online if target is None else target
+            restore_command = snapshot_restore_command(
+                executable,
+                backend,
+                snapshot_path,
+                processors=capacity,
+                restore_processors=target,
+            )
             output = _measure_restore(
-                snapshot_restore_command(
-                    executable,
-                    backend,
-                    snapshot_path,
-                    processors=capacity,
-                    restore_processors=target,
-                ),
+                restore_command,
                 context=_restore_label(target),
                 environment=environment,
                 timeout=timeout,
@@ -2654,6 +2709,12 @@ def run_restore_processors(
                 )
             _check_restore_warp(
                 output, processors=online, context=_restore_label(target)
+            )
+            _check_restore_status(
+                output,
+                restore_command,
+                processors=online,
+                context=_restore_label(target),
             )
             _check_restore_vp_bindings(
                 output,
@@ -2712,14 +2773,15 @@ def run_restore_downtime(
                 processors=processors,
             )
             # The restored guest keeps running after the restore marker so the
-            # harness can wait for the daemon's restore marker.
+            # harness can stage its downtime check; the post-restore status
+            # query waits for the restore to finish first.
             capture_snapshot(
                 [*boot_command, "--snapshot-destination", str(snapshot_path)],
                 snapshot_path,
                 timeout=timeout,
                 processors=processors,
                 teardown_mode="host-terminate",
-                post_restore_script=warp_probe_script(),
+                post_restore_script=post_restore_checks(),
                 log_path=output_dir / f"restore-downtime-{name}-capture.log",
             )
             snapshots.append((name, processors, snapshot_path))
@@ -2748,6 +2810,13 @@ def run_restore_downtime(
                 error = process.time_abi.exit_error(result.returncode)
                 raise RuntimeError(f"{context}: {error}")
             _check_restore_warp(result.output, processors=processors, context=context)
+            try:
+                process.time_abi.require_status(context)
+                process.time_abi.require_restore(
+                    context, online_cpus=processors, generation=RESTORED_GENERATION
+                )
+            except TimeAbiFailure as error:
+                raise RuntimeError(f"{context}: {error}") from error
 
 
 def run_restore_memory(

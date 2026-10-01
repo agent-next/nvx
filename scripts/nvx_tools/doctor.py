@@ -769,11 +769,13 @@ def _warp_guest(
         warp_probe_script(gaps) + "nvx-exit 0\n",
         WARP_PROBE_COMPLETION_MARKER,
         timeout=context.timeout,
+        time_abi_status=True,
     )
     monitor = TimeAbiMonitor(command)
     monitor.feed(result["text"].encode())
     monitor.finish()
-    boot = monitor.require_boot("the guest boot marker", online_cpus=vcpus)
+    monitor.require_status("the warp probe")
+    boot = monitor.require_boot("the warp probe", online_cpus=vcpus)
     rounds = check_warp_probe(
         result["text"], cpus=vcpus, context="H6", rounds=warp_rounds(vcpus, gaps)
     )

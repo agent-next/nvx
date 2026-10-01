@@ -24,6 +24,17 @@ BOOT_LINE = (
     "NVX-TIME-ABI: v=1 phase=boot status=ok cpus=4 tsc_hz=2194804000 "
     "lapic_hz=1000000000 generation=0 elapsed_us=1873\n"
 )
+RESTORE_LINE = (
+    "NVX-TIME-ABI: v=1 phase=restore status=ok cpus=4 tsc_hz=2194804000 "
+    "lapic_hz=1000000000 generation=2 elapsed_us=41\n"
+)
+# nvx-time status prints the last check's marker, then this line.
+RUNTIME_LINE = (
+    "NVX-TIME-ABI: v=1 phase=runtime status=unsynchronized generation=0 "
+    "discontinuities=0 offset_ns=0 uncertainty_ns=0 rejected_samples=0 "
+    "last_sample_error=none\n"
+)
+STATUS_OK = "NVX-TIME-STATUS-EXIT status=0\n"
 KVM_BOOT = ["openvmm", "--hypervisor", "kvm", "--kernel", "vmlinux"]
 MSHV_RESTORE = ["openvmm", "--hypervisor", "mshv", "--restore-snapshot", "snap"]
 # OpenVMM's openvmm_entry fatal_error_message, after a guest prompt.
@@ -138,10 +149,9 @@ class MonitorTests(unittest.TestCase):
         monitor = TimeAbiMonitor(KVM_BOOT)
         data = (
             "[    0.1] early\n"
-            + BOOT_LINE
             + " ALPINE-MICROVM-BOOT-OK: 3.22.1\n"
-            + "NVX-TIME-ABI: v=1 phase=runtime status=uncertain "
-            + "code=G_SAMPLE_UNCERTAIN epsilon_ns=-1\n"
+            + BOOT_LINE
+            + RUNTIME_LINE
             + "NVX-TIME-ABI: v=1 phase=restore status=ok cpus=4 tsc_hz=2194804000 "
             + "lapic_hz=1000000000 generation=1 elapsed_us=12\n"
         ).encode()
@@ -149,8 +159,25 @@ class MonitorTests(unittest.TestCase):
             monitor.feed(data[index : index + 7])
         self.assertTrue(monitor.guest_booted)
         self.assertEqual(monitor.require_boot("test", online_cpus=4)["cpus"], "4")
-        self.assertEqual(len(monitor.uncertain), 1)
+        assert monitor.runtime is not None
+        self.assertEqual(monitor.runtime["status"], "unsynchronized")
         self.assertEqual(monitor.restores[0]["generation"], "1")
+        # The runtime line is the discipline's state and never fails a run.
+        TimeAbiMonitor(KVM_BOOT).feed(
+            RUNTIME_LINE.replace("unsynchronized", "uncertain").encode()
+        )
+
+    def test_reports_a_check_that_stayed_pending(self):
+        pending = (
+            "NVX-TIME-ABI: v=1 phase=restore status=pending cpus=4 "
+            "tsc_hz=2194804000 lapic_hz=200000000 generation=1\n"
+        )
+        with self.assertRaisesRegex(
+            TimeAbiFailure,
+            "restore check was still pending when nvx-time status stopped "
+            "waiting after 30 s",
+        ):
+            TimeAbiMonitor(MSHV_RESTORE).feed(pending.encode() + STATUS_OK.encode())
 
     def test_fails_fast_on_violation_events_and_failed_checks(self):
         monitor = TimeAbiMonitor(KVM_BOOT)
@@ -171,36 +198,130 @@ class MonitorTests(unittest.TestCase):
                 b"NVX-TIME-ABI: v=1 phase=boot status=maybe\n"
             )
 
-    def test_rejects_a_report_only_boot_when_the_guest_reaches_its_shell(self):
+    def test_rejects_a_report_only_boot_when_a_status_query_exits(self):
         monitor = TimeAbiMonitor(KVM_BOOT)
         monitor.feed(
             b"NVX-TIME-REPORT-VIOLATION: v=1 code=G_TSC_WARP source=watcher "
             b'phase=boot generation=0 boottime_ns=1 detail="x"\n'
-            b"NVX-TIME-REPORT: v=1 phase=boot status=fail cpus=1 failures=3\n"
+            b"NVX-GUEST-BOOT-OK: alpine\n"
         )
         self.assertTrue(monitor.report_only)
+        # A report-only guest whose check failed exits 1; the failure names
+        # report-only mode, not the exit status.
+        report = (
+            b"NVX-TIME-REPORT: v=1 phase=boot status=fail cpus=1 tsc_hz=2194804000 "
+            b"lapic_hz=1000000000 generation=0 elapsed_us=9 failures=3\n"
+        )
         with self.assertRaisesRegex(TimeAbiFailure, "report-only"):
-            monitor.feed(b"NVX-GUEST-BOOT-OK: alpine\n")
-
-    def test_requires_a_valid_boot_marker_only_for_cold_boots(self):
+            monitor.feed(report + b"NVX-TIME-STATUS-EXIT status=1\n")
+        restored = TimeAbiMonitor(MSHV_RESTORE)
         with self.assertRaisesRegex(
             TimeAbiFailure,
-            "did not print the NVX-TIME-ABI boot marker before the guest boot "
-            "marker; the guest image or OpenVMM does not implement time ABI v1",
+            "restore marker before nvx-time status exited; .*report-only",
         ):
-            TimeAbiMonitor(KVM_BOOT).feed(b"NVX-GUEST-BOOT-OK: alpine\n")
+            restored.feed(
+                report.replace(b"phase=boot", b"phase=restore")
+                + b"NVX-TIME-STATUS-EXIT status=0\n"
+            )
+
+    def test_status_queries_require_the_line_of_the_launch_kind(self):
+        # A quiet guest reaches its shell without printing any time ABI line.
+        quiet = TimeAbiMonitor(KVM_BOOT)
+        quiet.feed(b" ALPINE-MICROVM-BOOT-OK: 3.22.1\nNVX-GUEST-BOOT-OK: alpine\n")
+        self.assertTrue(quiet.guest_booted)
+        with self.assertRaisesRegex(
+            TimeAbiFailure,
+            "nvx-time status did not finish before the scenario; the guest never "
+            "reported its time ABI state",
+        ):
+            quiet.require_status("the scenario")
+        # The shell's echo of the query is not its exit line.
+        quiet.feed(
+            b'/ # /sbin/nvx-time status; echo "NVX-TIME-STATUS-EXIT status=$?"\n'
+        )
+        self.assertEqual(quiet.status_queries, 0)
+        with self.assertRaisesRegex(
+            TimeAbiFailure,
+            "did not report the NVX-TIME-ABI boot marker before nvx-time status "
+            "exited; the guest image or OpenVMM does not implement time ABI v1",
+        ):
+            quiet.feed(b"NVX-TIME-STATUS-EXIT status=0\r\n")
+
+        booted = TimeAbiMonitor(KVM_BOOT)
+        booted.feed((BOOT_LINE + RUNTIME_LINE + STATUS_OK).encode())
+        self.assertEqual(booted.status_queries, 1)
+        booted.require_status("the scenario")
+        self.assertEqual(booted.require_boot("x", online_cpus=4)["cpus"], "4")
         mismatched = BOOT_LINE.replace("lapic_hz=1000000000", "lapic_hz=200000000")
         monitor = TimeAbiMonitor(KVM_BOOT)
         monitor.feed(mismatched.encode())
         with self.assertRaisesRegex(TimeAbiFailure, "is not the kvm rate"):
-            monitor.feed(b" ALPINE-MICROVM-BOOT-OK: 3.22.1\n")
-        # Restores and launches without a kernel never print a boot marker.
-        TimeAbiMonitor(MSHV_RESTORE).feed(b" ALPINE-MICROVM-BOOT-OK: 3.22.1\n")
-        TimeAbiMonitor(["openvmm"]).feed(b"NVX-GUEST-BOOT-OK: alpine\n")
-        with patch.object(time_abi, "REQUIRE_BOOT_MARKER", False):
-            legacy = TimeAbiMonitor(KVM_BOOT)
-        legacy.feed(b"NVX-GUEST-BOOT-OK: alpine\n")
-        self.assertTrue(legacy.guest_booted)
+            monitor.feed(b"NVX-TIME-STATUS-EXIT status=0\n")
+
+        with self.assertRaisesRegex(
+            TimeAbiFailure,
+            "did not report an NVX-TIME-ABI restore marker before nvx-time status "
+            "exited",
+        ):
+            TimeAbiMonitor(MSHV_RESTORE).feed(b"NVX-TIME-STATUS-EXIT status=0\n")
+        restored = TimeAbiMonitor(MSHV_RESTORE)
+        restored.feed(
+            RESTORE_LINE.replace("lapic_hz=1000000000", "lapic_hz=200000000").encode()
+            + RUNTIME_LINE.replace("generation=0", "generation=2").encode()
+            + b"NVX-TIME-STATUS-EXIT status=0\n"
+        )
+        self.assertEqual(
+            restored.require_restore("x", online_cpus=4)["generation"], "2"
+        )
+        # After a restore, status prints every recorded phase, oldest first,
+        # each with the values from when its check ran: the boot and capture
+        # lines keep their boot-time CPU count, and only the newest line counts.
+        activated = TimeAbiMonitor(MSHV_RESTORE)
+        mshv = "lapic_hz=200000000"
+        activated.feed(
+            (
+                BOOT_LINE.replace("cpus=4", "cpus=1").replace(
+                    "lapic_hz=1000000000", mshv
+                )
+                + BOOT_LINE.replace("phase=boot", "phase=capture")
+                .replace("cpus=4", "cpus=1")
+                .replace("lapic_hz=1000000000", mshv)
+                + RESTORE_LINE.replace("generation=2", "generation=1").replace(
+                    "lapic_hz=1000000000", mshv
+                )
+                + RUNTIME_LINE.replace("generation=0", "generation=1")
+                + STATUS_OK
+            ).encode()
+        )
+        self.assertEqual(
+            activated.require_restore("x", online_cpus=4, generation=1)["cpus"], "4"
+        )
+        assert activated.boot is not None
+        self.assertEqual(activated.boot["cpus"], "1")
+        # A launch that neither boots a kernel nor restores has no line to require.
+        TimeAbiMonitor(["openvmm"]).feed(b"NVX-TIME-STATUS-EXIT status=0\n")
+
+        with self.assertRaisesRegex(
+            TimeAbiFailure, "exited 2: the guest image has no status subcommand"
+        ):
+            # An old nvx-time's usage text can end without a newline.
+            TimeAbiMonitor(KVM_BOOT).feed(
+                b"usage: nvx-time boot|exhaustiveNVX-TIME-STATUS-EXIT status=2\n"
+            )
+        with self.assertRaisesRegex(TimeAbiFailure, "nvx-time status exited 1$"):
+            TimeAbiMonitor(KVM_BOOT).feed(
+                BOOT_LINE.encode() + b"NVX-TIME-STATUS-EXIT status=1\n"
+            )
+
+    def test_builds_the_status_query(self):
+        self.assertEqual(
+            time_abi.status_script(),
+            '/sbin/nvx-time status; echo "NVX-TIME-STATUS-EXIT status=$?"\n',
+        )
+        # The harness waits longer than the guest, which reports pending checks.
+        self.assertGreater(
+            time_abi.STATUS_TIMEOUT_SECONDS, time_abi.STATUS_WAIT_SECONDS
+        )
 
     def test_validates_boot_marker_fields_against_the_backend(self):
         cases = (
@@ -222,6 +343,32 @@ class MonitorTests(unittest.TestCase):
         )
         assert mshv is not None
         time_abi.validate_boot_marker(mshv, backend="mshv")
+
+    def test_validates_restore_marker_fields_against_the_backend(self):
+        restore = time_abi.parse_marker(RESTORE_LINE)
+        assert restore is not None
+        time_abi.validate_restore_marker(restore, backend="kvm", online_cpus=4)
+        cases = (
+            ("generation=2", "generation=0", "generation=0 is not 1 or later"),
+            ("generation=2", "generation=x", "generation=x is not 1 or later"),
+            ("phase=restore", "phase=boot", "not a passing restore check"),
+            ("lapic_hz=1000000000", "lapic_hz=200000000", "kvm rate"),
+            ("cpus=4", "cpus=8", "cpus=8 is not 4"),
+        )
+        for valid, invalid, message in cases:
+            fields = time_abi.parse_marker(RESTORE_LINE.replace(valid, invalid))
+            assert fields is not None
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    TimeAbiFailure, f"restore marker is invalid: .*{message}"
+                ):
+                    time_abi.validate_restore_marker(
+                        fields, backend="kvm", online_cpus=4
+                    )
+        # A restore of a snapshot captured at generation 0 carries generation 1.
+        with self.assertRaisesRegex(TimeAbiFailure, "generation=2 is not 1$"):
+            time_abi.validate_restore_marker(restore, backend="kvm", generation=1)
+        time_abi.validate_restore_marker(restore, backend="kvm", generation=2)
 
     def test_classifies_time_abi_exit_statuses_with_the_violation_event(self):
         monitor = TimeAbiMonitor(MSHV_RESTORE)
@@ -484,12 +631,53 @@ class FakeInteraction:
         pass
 
 
+class ScriptedInteraction(FakeInteraction):
+    """A guest that answers each console write with the next scripted reply
+    and exits after the last one."""
+
+    def __init__(
+        self, chunks: list[bytes], status: int, replies: list[list[bytes]]
+    ) -> None:
+        super().__init__(chunks, status)
+        self.replies = list(replies)
+        self._sink: queue.Queue[bytes | None] | None = None
+
+    def read_output(self, chunks: queue.Queue[bytes | None]) -> None:
+        self._sink = chunks
+        for chunk in self.chunks:
+            chunks.put(chunk)
+        if not self.replies:
+            self._exit()
+
+    def write_input(self, data: bytes) -> None:
+        self.writes.append(data)
+        assert self._sink is not None
+        for chunk in self.replies.pop(0):
+            self._sink.put(chunk)
+        if not self.replies:
+            self._exit()
+
+    def _exit(self) -> None:
+        assert self._sink is not None
+        self.process.exited = True
+        self._sink.put(None)
+
+
 class RunnerWiringTests(unittest.TestCase):
+    @staticmethod
+    def _fake_exit(process: FakeProcess, _timeout: float) -> int:
+        """Wait for a fake OpenVMM, whose PID is not a real process."""
+        return process.wait()
+
     def _measure(self, chunks: list[bytes], status: int, command: list[str]):
         interaction = FakeInteraction(chunks, status)
         with (
             patch.object(benchmark, "InteractiveProcess", return_value=interaction),
             patch.object(benchmark, "live_peak_rss_bytes", return_value=1024),
+            # Never pidfd_open the fake's PID.
+            patch.object(
+                benchmark, "wait_for_process_exit", side_effect=self._fake_exit
+            ),
         ):
             return benchmark.measure_once(
                 command,
@@ -586,19 +774,145 @@ class RunnerWiringTests(unittest.TestCase):
                     KVM_BOOT, "true\n", b"DONE", timeout=5, boot_marker=b"BOOT"
                 )
 
-    def test_cold_boot_runners_require_the_boot_marker(self):
+    def test_cold_boot_runners_query_the_status_before_other_input(self):
+        status = time_abi.status_script().encode()
         boot = benchmark.BOOT_MARKER + b": 3.22.1\n"
-        interaction = FakeInteraction([boot, b"DONE\n"], 0)
-        with patch.object(benchmark, "InteractiveProcess", return_value=interaction):
+        # A quiet guest that answers the query without a boot line fails, and
+        # never receives the script.
+        quiet = ScriptedInteraction([boot], 0, [[STATUS_OK.encode()], [b"DONE\n"]])
+        with patch.object(benchmark, "InteractiveProcess", return_value=quiet):
             with self.assertRaisesRegex(RuntimeError, "NVX-TIME-ABI boot marker"):
-                benchmark.run_guest_script(KVM_BOOT, "true\n", b"DONE", timeout=5)
-        self.assertEqual(interaction.writes, [])
-        conformant = FakeInteraction([BOOT_LINE.encode(), boot, b"DONE\n"], 0)
+                benchmark.run_guest_script(
+                    KVM_BOOT, "true\n", b"DONE", timeout=5, time_abi_status=True
+                )
+        self.assertEqual(quiet.writes, [status])
+        answered = [BOOT_LINE.encode(), STATUS_OK.encode()]
+        conformant = ScriptedInteraction([boot], 0, [answered, [b"DONE\n"]])
         with patch.object(benchmark, "InteractiveProcess", return_value=conformant):
-            result = benchmark.run_guest_script(KVM_BOOT, "true\n", b"DONE", timeout=5)
+            result = benchmark.run_guest_script(
+                KVM_BOOT, "true\n", b"DONE", timeout=5, time_abi_status=True
+            )
+        self.assertEqual(conformant.writes, [status, b"true\n"])
         self.assertIn("phase=boot status=ok", result["text"])
-        with self.assertRaisesRegex(RuntimeError, "NVX-TIME-ABI boot marker"):
-            self._measure([boot, benchmark.RESTORE_MARKER + b"\n"], 0, KVM_BOOT)
+        # A guest that exits during the query names the query.
+        exiting = ScriptedInteraction([boot], 0, [[]])
+        with patch.object(benchmark, "InteractiveProcess", return_value=exiting):
+            with self.assertRaisesRegex(
+                RuntimeError, "nvx-time status did not finish before the guest exited"
+            ):
+                benchmark.run_guest_script(
+                    KVM_BOOT, "true\n", b"DONE", timeout=5, time_abi_status=True
+                )
+        # Benchmarks and restores never query: the console stays quiet.
+        for command in (KVM_BOOT, MSHV_RESTORE):
+            silent = ScriptedInteraction([boot], 0, [[b"DONE\n"]])
+            with patch.object(benchmark, "InteractiveProcess", return_value=silent):
+                benchmark.run_guest_script(
+                    command,
+                    "true\n",
+                    b"DONE",
+                    timeout=5,
+                    time_abi_status=command is MSHV_RESTORE,
+                )
+            self.assertEqual(silent.writes, [b"true\n"])
+        self._measure([boot, benchmark.RESTORE_MARKER + b"\n"], 0, KVM_BOOT)
+
+    def test_capture_snapshot_queries_the_status_before_the_capture_script(self):
+        boot = benchmark.BOOT_MARKER + b": 3.22.1\n"
+        answered = [BOOT_LINE.encode(), STATUS_OK.encode()]
+        for queried in (False, True):
+            replies = [[b"capture script exited\n"]]
+            if queried:
+                replies.insert(0, answered)
+            interaction = ScriptedInteraction([boot], 0, replies)
+            with tempfile.TemporaryDirectory() as temporary:
+                with patch.object(
+                    benchmark, "InteractiveProcess", return_value=interaction
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "exited before its snapshot request"
+                    ):
+                        benchmark.capture_snapshot(
+                            KVM_BOOT,
+                            Path(temporary) / "snapshot",
+                            timeout=5,
+                            processors=1,
+                            time_abi_status=queried,
+                        )
+            with self.subTest(queried=queried):
+                capture = benchmark.prepare_snapshot_capture_script(
+                    1, teardown_mode="guest-exit"
+                ).encode()
+                status = time_abi.status_script().encode()
+                expected = [status, capture] if queried else [capture]
+                self.assertEqual(interaction.writes, expected)
+        quiet = ScriptedInteraction([boot], 0, [[STATUS_OK.encode()]])
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(benchmark, "InteractiveProcess", return_value=quiet):
+                with self.assertRaisesRegex(RuntimeError, "NVX-TIME-ABI boot marker"):
+                    benchmark.capture_snapshot(
+                        KVM_BOOT,
+                        Path(temporary) / "snapshot",
+                        timeout=5,
+                        processors=1,
+                        time_abi_status=True,
+                    )
+        self.assertEqual(len(quiet.writes), 1)
+
+    def test_openvmm_process_queries_the_status_before_the_first_input(self):
+        status = time_abi.status_script().encode()
+        answered = [BOOT_LINE.encode(), STATUS_OK.encode()]
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "process.log"
+            # The scenario's substring wait can return before the boot line
+            # ends; its input still follows the finished query.
+            guest = ScriptedInteraction(
+                [b"NVX-GUEST-BOOT-OK:"], 0, [[b" alpine\n", *answered], [b"OK\n"]]
+            )
+            with patch.object(
+                openvmm_process, "InteractiveProcess", return_value=guest
+            ):
+                with openvmm_process.OpenvmmProcess(KVM_BOOT, log_path) as process:
+                    process.wait_for(b"NVX-GUEST-BOOT-OK:", 1)
+                    process.send_line("echo OK")
+                    self.assertEqual(process.time_abi.status_queries, 1)
+                    process.wait_for_line(b"OK", 1)
+                    self.assertEqual(process.wait(1).returncode, 0)
+            self.assertEqual(guest.writes, [status, b"echo OK\n"])
+
+            quiet = ScriptedInteraction(
+                [b"NVX-GUEST-BOOT-OK: alpine\n"], 0, [[STATUS_OK.encode()], []]
+            )
+            with patch.object(
+                openvmm_process, "InteractiveProcess", return_value=quiet
+            ):
+                with openvmm_process.OpenvmmProcess(KVM_BOOT, log_path) as process:
+                    process.wait_for(b"NVX-GUEST-BOOT-OK:", 1)
+                    with self.assertRaisesRegex(
+                        RuntimeError, "did not report the NVX-TIME-ABI boot marker"
+                    ):
+                        process.send_line("echo OK")
+            self.assertEqual(quiet.writes, [status])
+
+            # Restores, guests whose shell is on another console, and opted-out
+            # processes receive only the scenario's input.
+            for command, output, enabled in (
+                (MSHV_RESTORE, b"NVX-GUEST-BOOT-OK: alpine\n", True),
+                (KVM_BOOT, b"booting\n", True),
+                (KVM_BOOT, b"NVX-GUEST-BOOT-OK: alpine\n", False),
+            ):
+                other = ScriptedInteraction([output], 0, [[]])
+                with patch.object(
+                    openvmm_process, "InteractiveProcess", return_value=other
+                ):
+                    with openvmm_process.OpenvmmProcess(
+                        command, log_path, time_abi_status=enabled
+                    ) as process:
+                        process.wait_for(output.rstrip(b"\n"), 1)
+                        process.send_bytes(b"\x01")
+                        self.assertEqual(process.wait(1).returncode, 0)
+                with self.subTest(command=command, output=output, enabled=enabled):
+                    self.assertEqual(other.writes, [b"\x01"])
 
     def test_capture_snapshot_classifies_a_failed_capture_check(self):
         interaction = FakeInteraction([b"booting\n"], 193)
@@ -1211,7 +1525,7 @@ class DoctorTests(unittest.TestCase):
 
         def boot(cpus: int) -> str:
             line = BOOT_LINE.replace("cpus=4", f"cpus={cpus}")
-            return line + " ALPINE-MICROVM-BOOT-OK: 3.22.1\n"
+            return " ALPINE-MICROVM-BOOT-OK: 3.22.1\n" + line + STATUS_OK
 
         smp = boot(8) + warp_output(pairs=28) * 4 + warp_output(pairs=28, offset=60)
         single = boot(1) + warp_output(pairs=0, offset=0)
@@ -1237,6 +1551,7 @@ class DoctorTests(unittest.TestCase):
             self.assertEqual(command[command.index("--processors") + 1], processors)
             self.assertEqual(script, time_abi.warp_probe_script(gaps) + "nvx-exit 0\n")
             self.assertEqual(marker, time_abi.WARP_PROBE_COMPLETION_MARKER)
+            self.assertIs(call.kwargs["time_abi_status"], True)
         # CI's schedule runs the probe twice with a 1 s gap.
         context.schedule = doctor.CI_SCHEDULE
         ci = boot(8) + warp_output(pairs=28) * 2
@@ -1267,7 +1582,16 @@ class DoctorTests(unittest.TestCase):
                 "vcpus=8",
                 "in round 5: max_abs_offset_ns=1500",
             ),
-            ([warp_output(pairs=28) * 5], "vcpus=8", "NVX-TIME-ABI boot marker"),
+            (
+                [STATUS_OK + warp_output(pairs=28) * 5],
+                "vcpus=8",
+                "NVX-TIME-ABI boot marker",
+            ),
+            (
+                [BOOT_LINE.replace("cpus=4", "cpus=8") + warp_output(pairs=28) * 5],
+                "vcpus=8",
+                "nvx-time status did not finish before the warp probe",
+            ),
             (
                 [smp, boot(1) + warp_output(pairs=0, backward=2000, verdict="FAIL")],
                 "vcpus=1",

@@ -25,13 +25,24 @@ Ubuntu initramfs. Failure logs from the NVX layer are uploaded per backend.
 Every harness launch, in the tests and the benchmarks, scans the OpenVMM
 console for the guest's [time ABI](design/time-abi.md) output. An
 `NVX-TIME-ABI-VIOLATION` event or a failed `NVX-TIME-ABI` conformance line
-fails the scenario at once with the guest's code and detail. A cold boot whose
-guest reaches its boot marker without a passing `NVX-TIME-ABI` boot line also
-fails at once: init runs the boot check before any other guest work, so a
-missing line means the guest image or OpenVMM does not implement the ABI. The
-line must report ABI version 1, generation 0, a plausible TSC rate, and the
-backend's LAPIC rate; a report-only boot (`NVX-TIME-REPORT`) is never accepted.
-Restores carry no boot line. An OpenVMM exit
+fails the scenario at once with the guest's code and detail. Guests keep the
+console quiet, because every console byte costs a port exit. Only the initial
+clock step precedes the guest's boot marker; the other boot checks finish
+afterwards and still power off with status 193 on failure, possibly in the
+middle of a scenario. A guest prints one `NVX-TIME-ABI` line per recorded
+check phase (boot, then capture and restore after a restore) and a runtime
+line only when `/sbin/nvx-time status` asks, after waiting up to 30 s for
+pending checks. The test runners ask after every cold boot whose shell is on
+the OpenVMM console, before any other input, and wait for the query to exit,
+so the console's echo of later input cannot split its lines. The query must
+exit 0 with a passing `NVX-TIME-ABI` boot line, which reports ABI version 1,
+generation 0, a plausible TSC rate, and the backend's LAPIC rate; a missing
+line means the guest image or OpenVMM does not implement the ABI, a check
+still pending after the guest's 30 s wait fails, and a report-only guest
+(`NVX-TIME-REPORT`) is never accepted. A guest image whose `nvx-time` has no
+`status` subcommand fails with that reason. The runtime line only records
+the wall-clock discipline's state. Benchmarks never ask, so their measured
+intervals stay quiet. An OpenVMM exit
 status of 193, 194, or 195 is reported as the guest's time ABI conformance,
 runtime-violation, or restore-repair power-off, together with the event that
 preceded it, instead of as a generic exit status.
@@ -49,6 +60,14 @@ it once, and the first snapshot a second time to prove that a restore leaves it
 reusable. `restore-processors` captures one boot-online CPU with capacity 8 and
 probes the CPUs that each restore target activated. After the 1/2/4/8-CPU
 restores, it restores the same snapshot once without `--restore-processors`.
+After the warp probe, every `smp-snapshot` and `restore-processors` restore
+runs `/sbin/nvx-time status`, which waits for the restore's deferred checks;
+it must exit 0 with a passing `NVX-TIME-ABI ... phase=restore` line that
+reports the backend's LAPIC rate, the restored CPU count, and generation 1:
+every scenario captures a cold-booted guest, and OpenVMM cannot capture a
+restored one. The query also prints the source's boot and capture lines,
+which keep the CPU count their checks covered, so only the restore line must
+match the restored CPU count.
 Every restore runs with OpenVMM lifecycle profiling and must report exactly one
 `startup.vp_thread_bind` record. Its `startup.vp_bind_*` records must show that
 an explicit MSHV target binds exactly VPs `0..N-1`, while untargeted MSHV
@@ -67,11 +86,11 @@ The `restore-downtime` scenario covers the time ABI's long-downtime case. It
 captures four snapshots, at 1 and 8 vCPUs, each with and without
 `rcupdate.rcu_expedited=1`, then waits 30 s, longer than the guest's 21 s RCU
 stall timeout, and restores each one. Every restored guest must run the warp
-probe, print its `NVX-TIME-ABI ... phase=restore status=ok` line within 30 s of
-the restore marker, report `/sys/kernel/rcu_stall_count` as 0 two seconds
-later, and show an uptime of at least 30 s, which proves that monotonic time
-advanced by the downtime. The captures share one downtime window, so the
-scenario adds about a minute per backend.
+probe, report a passing restore line through `nvx-time status` before the
+harness stages its check, report `/sys/kernel/rcu_stall_count` as 0 two
+seconds later, and show an uptime of at least 30 s, which proves that
+monotonic time advanced by the downtime. The captures share one downtime
+window, so the scenario adds about a minute per backend.
 The `time-abi-conformance` scenario boots the largest requested vCPU count and
 runs the guest's exhaustive CI check, `/sbin/nvx-time exhaustive`, which the
 boot check leaves to CI. On every online CPU it checks every leaf
@@ -89,7 +108,8 @@ At the end of a passing run, `test-microvm` prints one `NVX-TIME-ABI-EVIDENCE:`
 line and adds it to the GitHub job summary, because CI keeps the guest logs only
 for failed jobs: the number of warp probe runs with their worst
 `max_abs_offset_ns` and `max_backward_ns`, the count and `elapsed_us` range of
-the boot, capture, and restore markers, the exhaustive check's summary, and the
+the newest check that each `nvx-time status` query reported (boot after a cold
+boot, restore after a restore), the exhaustive check's summary, and the
 `restore-downtime` stall counts.
 
 The `nvx-microvm-debug-{kvm,mshv,whp}` jobs run
@@ -244,7 +264,7 @@ ABI failure code starts its detail with the code in brackets, for example
 | H3 | `openvmm --x-time-abi-verify` builds the partition and runs the time ABI preflight without running the guest. Its `NVX-TIME-ABI-VERIFY:` line must report `status=ok` for the backend, plausible declared and native TSC rates, the backend's LAPIC rate, and a revision of the profile H2 names. A failed preflight reports OpenVMM's code, for example `[E_TSC_SYNC_UNSUPPORTED]`. Before the flip, pass `--openvmm-arg=--x-time-abi-v1` |
 | H4 | Samples of the TSC against the host's monotonic clocks, with sleeps between them so the host's CPUs idle: 13 samples 10 s apart, or 3 samples 1 s apart with `--ci-schedule`. Each sample reads the TSC between two reads of a clock, keeping the tightest of 64 brackets; its uncertainty is half the bracket plus half the clock's resolution. A clock that returns the same value to consecutive reads is coarser than one read, so the probe takes its smallest step as its resolution: Hyper-V's reference TSC page advances the Linux clocks in 100 ns steps although `clock_getres` reports 1 ns. The interval stability is judged against a clock that time synchronization never steers, `CLOCK_MONOTONIC_RAW` on Linux and `QueryPerformanceCounter` on Windows: every interval between consecutive samples must be conclusive within 0.25 ppm, and the interval rates must agree within 1 ppm. chrony's frequency updates move `CLOCK_MONOTONIC`'s rate by up to several ppm between seconds on the Azure runners, which says nothing about the TSC. The rate over the whole window is measured against the disciplined clock, `CLOCK_MONOTONIC` on Linux, and must lie within 100 ppm of the rate H3 reports when H3 runs in the same invocation. A Linux host's clocksource is recorded as evidence |
 | H5 | Pinned-thread ping-pong rounds over every pair of host CPUs; `max_abs_offset_ns` is at most 1,000, the measurement is conclusive, and no pair stalls |
-| H6 | A microVM with the largest supported vCPU count up to 8 prints a valid `NVX-TIME-ABI` boot marker and runs `nvx-time-probe warp` over every CPU pair five times, with all vCPUs halted for 0.1, 1, 5, and 1 s between the runs, so that a host without an invariant TSC corrects the guest TSC as idle host CPUs wake (#265); then a 1-vCPU microVM runs it once. Every run stays within 1,000 ns. `--ci-schedule` runs CI's schedule instead: two runs 1 s apart |
+| H6 | A microVM with the largest supported vCPU count up to 8 reports a valid `NVX-TIME-ABI` boot line through `nvx-time status` and runs `nvx-time-probe warp` over every CPU pair five times, with all vCPUs halted for 0.1, 1, 5, and 1 s between the runs, so that a host without an invariant TSC corrects the guest TSC as idle host CPUs wake (#265); then a 1-vCPU microVM runs it once. Every run stays within 1,000 ns. `--ci-schedule` runs CI's schedule instead: two runs 1 s apart |
 | H7 | `adjtimex` reports no `STA_UNSYNC` on Linux; `w32tm /query /status` names a synchronized source on Windows |
 
 H2, H4, and H5 use a dependency-free host probe,

@@ -75,11 +75,27 @@ CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
     CpuGeneration("icelake-sp", "GenuineIntel", 6, 106, range(16)),
     CpuGeneration("emeraldrapids", "GenuineIntel", 6, 207, range(16)),
 )
-# Guest boot markers that init prints after the time ABI boot check.
+# Guest boot markers that init prints once the guest is shell-ready. Only the
+# time ABI's initial clock step (C12) precedes them; the other boot checks
+# finish asynchronously.
 GUEST_BOOT_MARKERS = ("ALPINE-MICROVM-BOOT-OK", "NVX-GUEST-BOOT-OK:")
-# Init runs the boot check before any other guest work, so a cold boot whose
-# guest reaches its shell without the boot marker is not conformant.
-REQUIRE_BOOT_MARKER = True
+# Guests keep the console quiet, because every console byte is a port exit:
+# they print one line per recorded check phase (boot, capture, restore, oldest
+# first) and a runtime line only when nvx-time status asks. Test runners ask
+# once after a cold boot, before any other input, and after each restore;
+# benchmarks never ask, so measured intervals stay quiet.
+STATUS_COMMAND = "/sbin/nvx-time status"
+# nvx-time status waits this long for pending checks, then reports
+# status=pending and exits 1.
+STATUS_WAIT_SECONDS = 30
+STATUS_EXIT_PREFIX = "NVX-TIME-STATUS-EXIT status="
+# The token ends its line even when the query's last output lacked a newline;
+# the shell's echo of the query line ends in "$?" instead of a status.
+_STATUS_EXIT = re.compile(rf"{re.escape(STATUS_EXIT_PREFIX)}(\d+)$")
+# The exit status of an nvx-time that has no status subcommand.
+STATUS_USAGE_EXIT = 2
+# Leaves the guest time to report a check that is still pending.
+STATUS_TIMEOUT_SECONDS = STATUS_WAIT_SECONDS + 30.0
 _MAX_PENDING_LINE = 64 * 1024
 
 
@@ -207,18 +223,20 @@ def is_cold_boot_command(command: Sequence[str]) -> bool:
     return "--kernel" in command and "--restore-snapshot" not in command
 
 
-def validate_boot_marker(
+def _validate_marker(
     fields: Mapping[str, str],
     *,
+    phase: str,
     backend: str | None,
-    online_cpus: int | None = None,
+    online_cpus: int | None,
+    generation: int | None = None,
 ) -> None:
-    """Check the boot marker's fields against the backend's declared rates."""
+    """Check a boot or restore line's fields against the backend's rates."""
     problems: list[str] = []
     if fields.get("v") != ABI_VERSION:
         problems.append(f"version {fields.get('v')!r} is not {ABI_VERSION}")
-    if fields.get("phase") != "boot" or fields.get("status") != "ok":
-        problems.append("it is not a passing boot check")
+    if fields.get("phase") != phase or fields.get("status") != "ok":
+        problems.append(f"it is not a passing {phase} check")
     try:
         tsc_hz = int(fields.get("tsc_hz", ""))
         if not MIN_TSC_HZ <= tsc_hz <= MAX_TSC_HZ:
@@ -229,14 +247,50 @@ def validate_boot_marker(
     expected_lapic = LAPIC_HZ.get(backend) if backend is not None else None
     if expected_lapic is not None and lapic != str(expected_lapic):
         problems.append(f"lapic_hz={lapic} is not the {backend} rate {expected_lapic}")
-    if fields.get("generation") != "0":
-        problems.append(f"generation={fields.get('generation')} is not 0 at cold boot")
+    actual = fields.get("generation", "")
+    if phase == "boot" and actual != "0":
+        problems.append(f"generation={actual} is not 0 at cold boot")
+    if phase == "restore" and not (actual.isdecimal() and int(actual) >= 1):
+        problems.append(f"generation={actual} is not 1 or later after a restore")
+    elif generation is not None and actual != str(generation):
+        problems.append(f"generation={actual} is not {generation}")
     if online_cpus is not None and fields.get("cpus") != str(online_cpus):
         problems.append(f"cpus={fields.get('cpus')} is not {online_cpus}")
     if problems:
         raise TimeAbiFailure(
-            "guest time ABI boot marker is invalid: " + "; ".join(problems)
+            f"guest time ABI {phase} marker is invalid: " + "; ".join(problems)
         )
+
+
+def validate_boot_marker(
+    fields: Mapping[str, str],
+    *,
+    backend: str | None,
+    online_cpus: int | None = None,
+) -> None:
+    """Check the boot marker's fields against the backend's declared rates."""
+    _validate_marker(fields, phase="boot", backend=backend, online_cpus=online_cpus)
+
+
+def validate_restore_marker(
+    fields: Mapping[str, str],
+    *,
+    backend: str | None,
+    online_cpus: int | None = None,
+    generation: int | None = None,
+) -> None:
+    """Check a restore marker's fields against the backend's declared rates.
+
+    ``generation`` is the lineage generation the restore must carry: one more
+    than the generation of the process that was captured.
+    """
+    _validate_marker(
+        fields,
+        phase="restore",
+        backend=backend,
+        online_cpus=online_cpus,
+        generation=generation,
+    )
 
 
 class TimeAbiMonitor:
@@ -244,22 +298,24 @@ class TimeAbiMonitor:
 
     ``feed`` raises TimeAbiFailure as soon as a completed line carries a
     violation event or a failed conformance check, so a scenario fails fast
-    with the guest's own explanation instead of a marker timeout. On a cold
-    boot it also fails when the guest reaches its shell without a valid
-    boot marker.
+    with the guest's own explanation instead of a marker timeout. Guests print
+    their boot and restore lines only for ``nvx-time status``: when a query
+    ends, a cold boot must have reported a valid boot line, and a restored
+    guest a restore line. The query's runtime line is kept as ``runtime``.
     """
 
     def __init__(self, command: Sequence[str] = ()) -> None:
         self.backend = _command_option(command, "--hypervisor")
         self.cold_boot = is_cold_boot_command(command)
-        self.require_boot_marker = REQUIRE_BOOT_MARKER and self.cold_boot
+        self.restored = "--restore-snapshot" in command
         self.boot: dict[str, str] | None = None
         self.restores: list[dict[str, str]] = []
-        self.uncertain: list[dict[str, str]] = []
+        self.runtime: dict[str, str] | None = None
         self.violation: str | None = None
         self.fatal: str | None = None
         self.report_only = False
         self.guest_booted = False
+        self.status_queries = 0
         self._pending = bytearray()
 
     def feed(self, chunk: bytes | bytearray) -> None:
@@ -306,8 +362,10 @@ class TimeAbiMonitor:
             f" {marker}" in line for marker in GUEST_BOOT_MARKERS
         ):
             self.guest_booted = True
-            if self.require_boot_marker:
-                self.require_boot("the guest boot marker")
+        status_exit = _STATUS_EXIT.search(line)
+        if status_exit is not None:
+            self._finish_status(int(status_exit.group(1)))
+            return
         if not line.startswith(MARKER_PREFIX):
             return
         try:
@@ -316,19 +374,27 @@ class TimeAbiMonitor:
             raise TimeAbiFailure(f"malformed time ABI marker: {error}") from error
         assert fields is not None
         status = fields["status"]
+        phase = fields["phase"]
+        if phase == "runtime":
+            # The wall-clock discipline's state; it never gates.
+            self.runtime = fields
+            return
         if status == "fail":
             raise TimeAbiFailure(
-                f"guest time ABI {fields['phase']} check {fields.get('check', '?')} "
+                f"guest time ABI {phase} check {fields.get('check', '?')} "
                 f"failed: {fields.get('detail', line)}"
             )
-        if status == "uncertain":
-            self.uncertain.append(fields)
-        elif status != "ok":
+        if status == "pending":
+            raise TimeAbiFailure(
+                f"guest time ABI {phase} check was still pending when nvx-time "
+                f"status stopped waiting after {STATUS_WAIT_SECONDS} s"
+            )
+        if status != "ok":
             raise TimeAbiFailure(f"unknown time ABI marker status: {line}")
-        elif fields["phase"] == "boot":
+        if phase == "boot":
             if self.boot is None:
                 self.boot = fields
-        elif fields["phase"] == "restore":
+        elif phase == "restore":
             self.restores.append(fields)
 
     def check_exit(self, returncode: int | None) -> None:
@@ -350,6 +416,36 @@ class TimeAbiMonitor:
             message += f": {self.fatal}"
         return RuntimeError(message)
 
+    def _finish_status(self, code: int) -> None:
+        """Check what one ``nvx-time status`` query printed before it exited."""
+        self.status_queries += 1
+        if code == STATUS_USAGE_EXIT:
+            raise TimeAbiFailure(
+                f"nvx-time status exited {code}: the guest image has no status "
+                "subcommand and predates the quiet console"
+            )
+        # A report-only guest exits 1 when a check failed; the requirement
+        # below names report-only mode instead.
+        if code != 0 and not self.report_only:
+            raise TimeAbiFailure(f"nvx-time status exited {code}")
+        if self.cold_boot:
+            self.require_boot("nvx-time status exited")
+        elif self.restored:
+            self.require_restore("nvx-time status exited")
+
+    def require_status(self, context: str) -> None:
+        """Fail unless an ``nvx-time status`` query finished before ``context``."""
+        if self.status_queries == 0:
+            raise TimeAbiFailure(
+                f"nvx-time status did not finish before {context}; the guest never "
+                "reported its time ABI state"
+            )
+
+    def _missing_reason(self) -> str:
+        if self.report_only:
+            return "the guest ran nvx-time in report-only mode"
+        return "the guest image or OpenVMM does not implement time ABI v1"
+
     def require_boot(
         self,
         context: str,
@@ -358,14 +454,9 @@ class TimeAbiMonitor:
     ) -> dict[str, str]:
         """Return the validated boot marker of a cold boot, or fail clearly."""
         if self.boot is None:
-            reason = (
-                "the guest ran nvx-time in report-only mode"
-                if self.report_only
-                else "the guest image or OpenVMM does not implement time ABI v1"
-            )
             raise TimeAbiFailure(
-                f"guest did not print the NVX-TIME-ABI boot marker before {context}; "
-                f"{reason}"
+                f"guest did not report the NVX-TIME-ABI boot marker before {context}; "
+                f"{self._missing_reason()}"
             )
         validate_boot_marker(
             self.boot,
@@ -373,6 +464,43 @@ class TimeAbiMonitor:
             online_cpus=online_cpus,
         )
         return self.boot
+
+    def require_restore(
+        self,
+        context: str,
+        *,
+        online_cpus: int | None = None,
+        generation: int | None = None,
+    ) -> dict[str, str]:
+        """Return the validated latest restore marker, or fail clearly.
+
+        After a restore, nvx-time status prints every recorded phase, oldest
+        first, and each line keeps the values from when its check ran: only
+        the restore line describes the CPUs that are online now.
+        """
+        if not self.restores:
+            raise TimeAbiFailure(
+                f"guest did not report an NVX-TIME-ABI restore marker before "
+                f"{context}; {self._missing_reason()}"
+            )
+        validate_restore_marker(
+            self.restores[-1],
+            backend=self.backend,
+            online_cpus=online_cpus,
+            generation=generation,
+        )
+        return self.restores[-1]
+
+
+def status_script() -> str:
+    """Return a guest command line that prints the time ABI status lines.
+
+    nvx-time status first waits for pending checks: the asynchronous boot
+    checks, or a restore's deferred work. The line then echoes
+    STATUS_EXIT_PREFIX with the exit status, where the monitor checks what
+    the query printed.
+    """
+    return f'{STATUS_COMMAND}; echo "{STATUS_EXIT_PREFIX}$?"\n'
 
 
 def warp_probe_command(*, cpus: str | None = None) -> str:

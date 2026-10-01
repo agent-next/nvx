@@ -15,7 +15,15 @@ from typing import NamedTuple
 
 from .benchmark import InteractiveProcess, terminate
 from .common import remaining_timeout
-from .time_abi import TimeAbiFailure, TimeAbiMonitor
+from .time_abi import (
+    GUEST_BOOT_MARKERS,
+    STATUS_TIMEOUT_SECONDS,
+    TimeAbiFailure,
+    TimeAbiMonitor,
+    status_script,
+)
+
+_GUEST_BOOT_MARKERS = tuple(marker.encode() for marker in GUEST_BOOT_MARKERS)
 
 
 def _line_marker_end(
@@ -50,7 +58,16 @@ class OpenvmmProcess:
         *,
         environment: Mapping[str, str] | None = None,
         output_read_delay: float = 0.0,
+        time_abi_status: bool = True,
     ) -> None:
+        """Start OpenVMM and scan its console output for the time ABI.
+
+        With ``time_abi_status``, a cold-booted guest whose boot marker
+        appeared on this console answers a time ABI status query before its
+        first other input, which waits until the query exits so the guest's
+        tty cannot echo that input into the status lines. The query fails
+        unless the guest reported a valid boot line.
+        """
         if output_read_delay < 0:
             raise ValueError("OpenVMM output read delay cannot be negative")
         process_environment = os.environ.copy()
@@ -77,6 +94,8 @@ class OpenvmmProcess:
         self._log_path = log_path
         self._finished = False
         self._monitor = TimeAbiMonitor(command)
+        self._query_status = time_abi_status and self._monitor.cold_boot
+        self._status_sent = False
 
     @property
     def process(self):
@@ -91,10 +110,39 @@ class OpenvmmProcess:
         return self._monitor
 
     def send_bytes(self, data: bytes) -> None:
+        self._query_status_first()
         self._interaction.write_input(data)
 
     def send_line(self, line: str) -> None:
         self.send_bytes(f"{line}\n".encode())
+
+    def _query_status_first(self) -> None:
+        if (
+            not self._query_status
+            or self._status_sent
+            # The guest's shell is not on this console, or has not booted.
+            or not any(marker in self._output for marker in _GUEST_BOOT_MARKERS)
+        ):
+            return
+        self._status_sent = True
+        self._interaction.write_input(status_script().encode())
+        deadline = time.monotonic() + STATUS_TIMEOUT_SECONDS
+        while self._monitor.status_queries == 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._fail(
+                    TimeoutError(
+                        "nvx-time status did not exit within "
+                        f"{STATUS_TIMEOUT_SECONDS:g}s"
+                    )
+                )
+            try:
+                chunk = self._chunks.get(timeout=min(remaining, 0.1))
+            except queue.Empty:
+                continue
+            if chunk is None:
+                self._fail(self._exited("nvx-time status exited"))
+            self._consume(chunk)
 
     def _consume(self, chunk: bytes) -> None:
         self._output.extend(chunk)
