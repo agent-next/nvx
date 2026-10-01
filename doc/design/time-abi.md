@@ -180,7 +180,11 @@ measured invariance (see [Host qualification](#host-qualification)).
 - **TSC.** The guest TSC runs at the destination's native rate `F_d` and is
   never scaled. The declared rate `F` is fixed for the life of a snapshot
   lineage: a cold boot declares its native rate, and every restored process
-  keeps `F = F_s`, including when it is captured again. The kernel computes
+  keeps `F = F_s`. OpenVMM does not capture a restored process
+  (`--snapshot-destination` and `--restore-snapshot` are exclusive, and so
+  are the management endpoint's capture and restore paths), so a lineage is
+  one capture and its restores; if re-capture is added, the new snapshot
+  records `F_s` and the restored process's `g`. The kernel computes
   `tsc_khz = floor(F / 1000)` once and never recalibrates. The
   [rate policy](#tsc-rate-policy-and-lapic-rate-rule) bounds
   `|F_d - F| / F`.
@@ -598,7 +602,11 @@ across restores with 0 s and 30 s of downtime at 1 to 8 vCPUs; its positive
 part came from a host sample taken before the per-VP TSC save, which the
 paired capture anchor removes. MSHV measured −0.05 to −0.55 ms with the
 resume at the read-back, at parity with KVM, against −0.9 to −1.6 ms when the
-first VP run thawed time; warps and restore latency were unchanged.
+first VP run thawed time; warps and restore latency were unchanged. The
+legacy path, which stopped guest time during restore setup, left guest
+`CLOCK_MONOTONIC` about 400 ms behind the host on every restore on
+`azure-kvm-5` with 512 MiB (7 to 12 ms on prometheus32); the time ABI stays
+within 1.5 ms there.
 
 **Anchor pairing bound.** An anchor that pairs a TSC read with a host time
 sample (the capture anchor on every backend, and KVM's restore anchor)
@@ -1446,7 +1454,7 @@ can use as the fleet restore matrix.
 | Across backends | prometheus32 (KVM) to prometheus30 (MSHV) | `E_BACKEND_MISMATCH` |
 | Pre-v1 snapshot | Any | `E_SNAPSHOT_VERSION` |
 | Processor activation from one boot-online CPU to 2, 4, and 8 | All backends | Restored; warp probe passes |
-| Every tier and an untiered snapshot; capture-restore chains | All backends | Restored; `g` increments by one per restore |
+| Every tier and an untiered snapshot, restored more than once | All backends | Restored; each restore of a snapshot captured at `g = 0` carries `g = 1` and a new generation ID. OpenVMM cannot capture a restored process, so unit tests cover the generation arithmetic beyond one restore, including `E_GENERATION_EXHAUSTED` |
 
 No test reboots a host. The orchestrator asks the user before any real
 reboot.
