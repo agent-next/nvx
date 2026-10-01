@@ -233,14 +233,14 @@ settled cell on the registered hosts.
 | TSC-deadline and `TSC_ADJUST` hidden | CPUID bits cleared; the MSR filter also denies `IA32_TSC_ADJUST` (`0x3b`) and `IA32_TSC_DEADLINE` (`0x6e0`), which KVM would otherwise serve, and OpenVMM raises #GP | Feature-bank bits `tsc_deadline_tmr_support`, `tsc_adjust_support`, and `a_count_m_count_support` cleared, and CPUID bits cleared | Feature-bank bits `TscDeadlineTmr`, `TscAdjust`, and `ACountMCount` cleared, and CPUID bits cleared; the hypervisor raises #GP for `IA32_TSC_ADJUST` |
 | Invariant TSC exposed | CPUID bit. KVM hides it from a guest with `"Hv#1"` until KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is set, so OpenVMM writes 1 to it host-side at vCPU creation | Forced by the profile: Azure's nested MSHV does not pass the bit through, and without it each AP pays about 150 ms of calibration. Hosts without an invariant TSC fail qualification (`azure-azlinux-2`) | Set by the CPUID override: Azure WHP hosts cannot expose it through the feature banks (bank 1 lacks `TscInvariant`), so those hosts qualify on the warp probe and rate stability (the guest TSC matched the declared rate against host QPC within 0.001 ppm over 118 s) |
 | No paravirtual or synthetic features | No KVM leaves; `KVM_CAP_ENFORCE_PV_FEATURE_CPUID`, so KVM's paravirtual MSRs raise #GP; KVM's in-kernel Hyper-V MSRs are unreachable behind the filter | No synthetic processor features | `--hv` stays rejected for the microVM |
-| Capture anchor: VP 0 TSC paired with a host time sample within 10 µs | Host `rdtsc` plus VP 0's `KVM_VCPU_TSC_OFFSET`, bracketed by two host `rdtsc` reads around the host clock reads (0.1 to 0.6 µs) | The tightest of up to 64 brackets `[sample, HvCallGetVpRegisters(VP 0 TSC), sample]`, paired at the bracket midpoint (p50 3.5 µs on bare metal, 6.2 µs on Azure) | TBD(whp) |
+| Capture anchor: VP 0 TSC paired with a host time sample within 100 µs, re-sampled a bounded number of times | Host `rdtsc` plus VP 0's `KVM_VCPU_TSC_OFFSET`, bracketed by two host `rdtsc` reads around the host clock reads; up to 16 attempts (0.06 to 0.4 µs) | The tightest of up to 64 brackets `[sample, HvCallGetVpRegisters(VP 0 TSC), sample]`, paired at the bracket midpoint (p50 3.5 µs on bare metal, 6.2 µs on Azure) | TBD(whp) |
 | Synchronized TSC set at one host instant | One `KVM_VCPU_TSC_OFFSET` value for every vCPU, `target(t) - (h0 + h1) / 2` from a host clock read `t` bracketed by host `rdtsc` reads `h0` and `h1` (Linux 5.16 or newer); no `IA32_TSC` writes, which Linux 6.6 can discard | Freeze partition time, write the target to every created VP, read back, and thaw at the first VP run (56 to 312 µs for 1 to 8 VPs) | Suspend partition time, write the target to every VP, read back, and resume explicitly with `WHvResumePartitionTime`; `TscVirtualOffset` is unusable (writes fail) |
 | Read-back before release | Every vCPU's `KVM_VCPU_TSC_OFFSET` equals the written value, and a host `rdtsc` bracket around VP 0's `IA32_TSC` shows no scaling | Every created VP's TSC equals the target while time is frozen | Every VP's TSC equals the target while time is suspended; live reads cannot verify 1 µs (a register read takes 9.5 to 21 µs) |
 | Live cross-vCPU skew after release at most 1 µs | Equal offsets: skew is the host's TSC skew, bounded by qualification. Measured at most 63 ns | Measured 0 warps; offsets within 516 ns on dual-socket bare metal and 195 ns on Azure, both bounded by the probe's round trip | Measured at most 70 ns over 60 s on prometheus28, 8370C, and 8573C hosts |
 | VP instantiation | All `C` VPs exist before the set | The created prefix exists before the set; no VP is created after it | All `C` VPs exist before the set |
 | Partition capabilities | Derived from CPUID with the hypervisor range masked: `hv1` and `kvm_clock` are false | Same | Same |
 | Unknown MSRs | #GP; the `MYSTERY_MSRS` stubs are TBD(profiles) | #GP from the hypervisor | #GP; the `MYSTERY_MSRS` stubs are TBD(profiles) |
-| Removed | `KVM_GET_CLOCK`/`KVM_SET_CLOCK`, kvmclock MSR state, leaf `0x15` synthesis, `KVM_SET_TSC_KHZ`, restore-time `IA32_TSC` writes | BSP-copy TSC alignment, exact-rate equality, leaf `0x15` synthesis | 1 GHz request and fallback, `RestoredTsc` and its RDTSC, RDTSCP, and `IA32_TSC` exits, leaf `0x15` synthesis |
+| Removed | `KVM_GET_CLOCK`/`KVM_SET_CLOCK` in the microVM downtime path, kvmclock MSR state, leaf `0x15` synthesis, `KVM_SET_TSC_KHZ`, restore-time `IA32_TSC` writes | BSP-copy TSC alignment, exact-rate equality, leaf `0x15` synthesis | 1 GHz request and fallback, `RestoredTsc` and its RDTSC, RDTSCP, and `IA32_TSC` exits, leaf `0x15` synthesis |
 
 **WHP decision gate: met.** Suspending partition time, writing the target,
 verifying the frozen values, and resuming kept every pair of vCPUs within
@@ -465,9 +465,10 @@ the guest and tests can tell the two paths apart.
 The restore anchor is the instant of the synchronized TSC set. On KVM and
 WHP the guest TSC runs from that instant (WHP resumes partition time right
 after the read-back); on MSHV it is frozen until the first VP runs. Either
-way, the guest monotonic advance across a restore lies in `[D, D + R]`,
-where `R` is the time from the restore anchor to the first restored
-instruction. Wall-clock repair absorbs `R` for `CLOCK_REALTIME`.
+way, the guest monotonic advance across a restore lies in `[D, D + R]`, up
+to the two anchors' pairing errors (each at most 100 µs), where `R` is the
+time from the restore anchor to the first restored instruction. Wall-clock
+repair absorbs `R` and the pairing errors for `CLOCK_REALTIME`.
 
 ## Restore algorithm
 
@@ -529,9 +530,11 @@ In the worker, with every VP stopped:
 
     (`E_TSC_TARGET_OVERFLOW` if it exceeds 64 bits). The backend writes
     `TSC_target` to every instantiated VP at that instant. Per-VP TSC values
-    from saved VP state are superseded and never applied afterwards. The
-    restore anchor's pairing is logged above 10 µs but not bounded: a pairing
-    error shifts every VP's TSC alike, by at most that amount.
+    from saved VP state are omitted from the VP restore and never applied. A
+    restore anchor that pairs a TSC read with host time (KVM's common offset)
+    is re-sampled a bounded number of times and fails with `E_TSC_ANCHOR` if
+    no pair is within 100 µs; a pairing error shifts every VP's TSC alike, by
+    at most that amount. A frozen write needs no such pairing.
 13. Read back: every instantiated VP holds the synchronized value as defined
     by its backend (`E_TSC_SYNC_READBACK`).
 14. Advance every VP's counting-mode LAPIC timer by `D` at `L`, and set every
@@ -564,8 +567,8 @@ state units are quiesced, capture:
    PIT channel 0 is not counting periodically (`E_LAPIC_PERIODIC`,
    `E_LAPIC_TSC_DEADLINE`, `E_PIT_ACTIVE`);
 2. takes the capture anchor: VP 0's TSC paired with a host time sample taken
-   within 10 µs of it (`E_TSC_ANCHOR`), plus the host identities
-   (`E_HOST_IDENTITY`); and
+   within 100 µs of it, keeping the tightest of a bounded number of samples
+   (`E_TSC_ANCHOR`), plus the host identities (`E_HOST_IDENTITY`); and
 3. records the declared rates, the CPU profile, the effective CPUID, and the
    process's generation counter.
 
@@ -786,17 +789,33 @@ partition-wide on every backend, so `C3` reads them on CPU 0 only.
 | `C10` | The time daemon is running and has recorded no violation; `/sys/kernel/rcu_stall_count` is 0; at boot, the state file is published and the daemon started | boot, capture, restore |
 | `C11` | Debug kernel only: `/proc/sys/kernel/soft_watchdog` is 1 and `/proc/sys/kernel/hung_task_timeout_secs` is nonzero | boot |
 | `C12` | A time sample within the [uncertainty bound](#uncertainty-bounds) is obtained, and the clock is stepped to host UTC | boot |
+| `K1` | Kernel integrity, not a clock property: the kernel's boot-time W+X audit logged no `Found insecure W+X mapping` record | boot |
 
 Capture and restore checks never wait. The boot `C7` check and the deferred
 restore `C7` check may poll for at most 200 ms, because a CPU switches to
-one-shot mode at its first tick. The CI conformance suite adds an exhaustive
-check on every CPU: every leaf `0x40000006..=0x400000ff`; no base
-`0x40000100..=0x4000ff00` (step `0x100`) carrying `KVMKVMKVM` or another
-hypervisor signature (the NVX kernel has no KVM guest support, so the boot
-check leaves this static property of the backend to CI); every `C3` MSR;
-writes of 0 and 1 to `0x40000118` and of 2 (which must fail); writes to every
-read-only identity MSR (which must fail); and reads of `IA32_TSC_ADJUST` and
-`IA32_TSC_DEADLINE` (which must fail).
+one-shot mode at its first tick.
+
+**Exhaustive check (CI only).** The CI conformance suite also runs
+`nvx-time exhaustive`, provided by the guest. It is a test tool: it reports
+and exits instead of powering off, and production boots never run it. Every
+check runs on every online CPU:
+
+| ID | Check |
+| --- | --- |
+| `X1` | Every leaf `0x40000006..=0x400000ff` returns all zeros or the Intel out-of-range result (the highest basic leaf's result for the same subleaf), as the [identity rules](#hypervisor-identity) require |
+| `X2` | No base `0x40000100..=0x4000ff00` (step `0x100`) carries `KVMKVMKVM` or another hypervisor signature; the NVX kernel has no KVM guest support, so the boot check leaves this static backend property to CI |
+| `X3` | Every `C3` MSR |
+| `X4` | `0x40000118` accepts writes of 0 and 1, each read back, and rejects 2; the check leaves it at 1 |
+| `X5` | Writes to every read-only identity MSR fail |
+| `X6` | Reads of `IA32_TSC_ADJUST` and `IA32_TSC_DEADLINE` fail |
+
+It prints one line per check and CPU, then a summary, and exits with status
+0 if every check passed and 1 otherwise:
+
+```text
+NVX-TIME-ABI-EXHAUSTIVE: v=1 check=<ID> cpu=<n> status=<pass|fail> detail="<escaped text>"
+NVX-TIME-ABI-EXHAUSTIVE: v=1 status=<ok|fail> cpus=<online> failures=<n>
+```
 
 On success the check prints one line to the console:
 
@@ -811,7 +830,8 @@ cannot lose it; its console cost (one port exit per byte) is part of the
 cold-boot cost the performance gate measures.
 
 On failure it prints `status=fail check=<ID> detail="<text>"` in the same
-format, emits a violation event with code `G_CONFORMANCE_<ID>`, and powers
+format, emits a violation event with code `G_CONFORMANCE_<ID>` (`G_KERNEL_WX`
+for `K1`), and powers
 off with status 193. The boot step of `C12` steps the clock before any
 workload starts and is not counted as a discontinuity. The only other line
 with this prefix is the non-fatal `phase=runtime status=uncertain` line of
@@ -1010,7 +1030,7 @@ code.
 | `E_SNAPSHOT_VERSION` | Manifest version is not 6; the snapshot must be recaptured | Restore |
 | `E_MANIFEST_TIME` | Time contract missing or malformed, `time_abi_version` not 1, or tolerance not 250 | Restore |
 | `E_BACKEND_MISMATCH` | Snapshot taken on another backend | Restore |
-| `E_PROFILE_UNKNOWN` | Profile ID not pinned in this OpenVMM | Cold boot, restore |
+| `E_PROFILE_UNKNOWN` | Profile ID not pinned in this OpenVMM, or a restore's explicit `--cpu-profile` names another profile than the snapshot's | Cold boot, restore |
 | `E_PROFILE_DIGEST` | Recorded, embedded, and pinned profile digests disagree, or the effective-CPUID digest is wrong | Restore |
 | `E_PROFILE_HOST_UNKNOWN` | `--cpu-profile auto` maps the host to no profile, or to profiles of more than one generation | Cold boot |
 | `E_PROFILE_TIME_BITS` | The profile is invalid or violates the CPU time bits | Cold boot, restore |
@@ -1028,7 +1048,7 @@ code.
 | `E_HOST_IDENTITY` | Host identity, boot identity, or clocks unavailable | Capture, restore |
 | `E_DOWNTIME_NEGATIVE` | Downtime below zero | Restore |
 | `E_DOWNTIME_EXCESSIVE` | Downtime above 30 days | Restore |
-| `E_TSC_ANCHOR` | Capture anchor unavailable or not paired within 10 µs | Capture |
+| `E_TSC_ANCHOR` | An anchor is unavailable, or no sample pairs within 100 µs after bounded re-sampling | Capture, restore |
 | `E_TSC_TARGET_OVERFLOW` | `TSC_target` exceeds 64 bits | Restore |
 | `E_TSC_SYNC_READBACK` | A VP does not hold the synchronized value | Restore |
 | `E_VP_LATE_CREATION` | A VP was instantiated after the synchronized set | Restore |
@@ -1045,7 +1065,7 @@ signals, and 255):
 
 | Status | Class | Guest codes |
 | ---: | --- | --- |
-| 193 | Conformance | `G_CONFORMANCE_C1` to `G_CONFORMANCE_C12` |
+| 193 | Conformance | `G_CONFORMANCE_C1` to `G_CONFORMANCE_C12`, `G_KERNEL_WX` |
 | 194 | Runtime violation | `G_TSC_UNSTABLE`, `G_CLOCKSOURCE_UNSTABLE`, `G_CLOCKSOURCE_SWITCH`, `G_CLOCKSOURCE_SKEW`, `G_TSC_WARP`, `G_TSC_ADJUST`, `G_RCU_STALL`, `G_RCU_STARVED`, `G_SOFT_LOCKUP`, `G_HARD_LOCKUP`, `G_HUNG_TASK`, `G_UNCHECKED_MSR`, `G_KMSG_OVERRUN` |
 | 195 | Restore repair | `G_REPAIR_PACKET`, `G_REPAIR_GENERATION`, `G_REPAIR_SAMPLE`, `G_REPAIR_CLOCK`, `G_REPAIR_SUPPRESSION` |
 
@@ -1201,9 +1221,12 @@ Removed from OpenVMM:
 - Leaf `0x15` synthesis (`tsc_frequency_cpuid_leaves`) on every backend.
 - Per-backend downtime paths (`advance_snapshot_time`), per-VP TSC
   advancement (`advance_tsc`), TSC-deadline advancement, periodic LAPIC
-  advancement, and wall-clock-only downtime (`calculate_snapshot_downtime`).
-- KVM: `KVM_GET_CLOCK`/`KVM_SET_CLOCK`, kvmclock MSR state, KVM CPUID leaves,
-  `KVM_SET_TSC_KHZ`, and restore-time `IA32_TSC` writes.
+  advancement, wall-clock-only downtime (`calculate_snapshot_downtime`), and
+  the per-VP TSC writes of saved VP state on restore.
+- KVM: the microVM downtime use of `KVM_GET_CLOCK`/`KVM_SET_CLOCK` (the
+  Hyper-V reference time source keeps them; it requires `hv1`, which the time
+  ABI never enables), kvmclock MSR state, KVM CPUID leaves, `KVM_SET_TSC_KHZ`,
+  and restore-time `IA32_TSC` writes.
 - MSHV: BSP-copy TSC alignment and exact rate equality.
 - WHP: the 1 GHz rate request and its silent fallback, and `RestoredTsc`
   with its RDTSC, RDTSCP, and `IA32_TSC` exits.
