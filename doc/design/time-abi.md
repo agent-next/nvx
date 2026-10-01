@@ -84,16 +84,35 @@ configures exactly these six leaves on every backend:
 sets only `FrequencyRegsAvailable` (bit 8). `0x40000004` recommends nothing
 and sets the spinlock retry count to "never notify".
 
-Every other leaf in `0x40000006..=0x400000ff` returns either all zeros or the
-vendor's architectural out-of-range result (on Intel, the result of the
-highest basic leaf for the same subleaf). OpenVMM programs explicit zero
-results for `0x40000006..=0x4000000f` and `0x40000080..=0x40000082`, which
-Linux and Hyper-V-aware software probe, so they read zero on every backend;
-KVM cannot list the whole range in its CPUID table. No leaf returns Hyper-V
-feature data, a `VS#1` interface signature at `0x40000081`, or any hypervisor
-signature. No base `0x40000100..=0x4000ff00` (step `0x100`) carries a KVM,
-Xen, VMware, or other hypervisor signature, so Linux selects only the Hyper-V
-platform.
+OpenVMM also programs explicit zero results for `0x40000006..=0x4000000f`
+and `0x40000080..=0x40000082`, so they read zero on every backend. The
+contract promises zeros only for these leaves: every other leaf in
+`0x40000006..=0x400000ff` returns either all zeros or the vendor's
+architectural out-of-range result (on Intel, the result of the highest basic
+leaf for the same subleaf). KVM returns that result for every leaf missing
+from its CPUID table, whose 256 entries cannot list the whole range.
+
+Every leaf beyond the identity leaves that Linux 6.18 reads with this
+identity is an explicit zero. Built as NVX builds it (`CONFIG_HYPERVISOR_GUEST`
+without `CONFIG_HYPERV`, `CONFIG_KVM_GUEST`, or Xen, ACRN, Jailhouse, and
+bhyve guest support), Linux probes only VMware and Hyper-V, and these are all
+its reads in the range:
+
+| Leaf | Reader | Condition |
+| --- | --- | --- |
+| `0x40000000` | `vmware_platform`, `ms_hyperv_platform`, `ms_hyperv_init_platform` | Always |
+| `0x40000003` to `0x40000005` | `ms_hyperv_platform`, `ms_hyperv_init_platform` | Always |
+| `0x40000081` | `ms_hyperv_msi_ext_dest_id` | x2APIC available without interrupt remapping |
+| `0x40000082` | `ms_hyperv_msi_ext_dest_id` | `0x40000081` EAX is `VS#1`: never |
+| `0x4000000a` | `ms_hyperv_init_platform` | Maximum leaf at least `0x4000000a`: never |
+| `0x4000000c` | `ms_hyperv_init_platform` | `HV_ISOLATION` in `0x40000003` EBX: never |
+| `0x40000010` | `vmware_select_hypercall` | VMware signature at `0x40000000`: never |
+
+The other explicit zeros serve Hyper-V-aware software that probes further.
+No leaf returns Hyper-V feature data, a `VS#1` interface signature at
+`0x40000081`, or any hypervisor signature. No base `0x40000100..=0x4000ff00`
+(step `0x100`) carries a KVM, Xen, VMware, or other hypervisor signature, so
+Linux selects only the Hyper-V platform.
 
 ### Synthetic MSRs
 
@@ -180,8 +199,9 @@ The guest must then be in this state:
 - `/proc/cpuinfo` flags on every CPU include `tsc`, `constant_tsc`,
   `nonstop_tsc`, `tsc_known_freq`, `tsc_reliable`, `rdtscp`, `hypervisor`,
   and `arat`, and exclude `tsc_deadline_timer` and `tsc_adjust`.
-- `current_clocksource` is `tsc`. `available_clocksource` contains `tsc` and
-  nothing other than `tsc`, `refined-jiffies`, and `jiffies`.
+- `current_clocksource` is `tsc`, and `available_clocksource` is `tsc`
+  alone: Linux lists `refined-jiffies` and `jiffies` only while the reading
+  CPU's tick is periodic, which ends at that CPU's first tick.
 - Ticks are tickless-idle with high-resolution timers. Every online CPU's
   tick device is `lapic` in one-shot mode from its first tick onward. No
   `pit` or `hpet` clock event device and no broadcast device exist.
@@ -202,8 +222,13 @@ Because the kernel no longer checks cross-vCPU TSC consistency, the
   from the physical rate `F_d` by up to the rate tolerance after a restore.
 - `HV_X64_MSR_TSC_INVARIANT_CONTROL` can be cleared after it is set; Hyper-V
   and KVM raise #GP instead.
-- CPUID `0x80000007` EDX[8] is set by the CPU profile from boot. It does not
-  depend on writes to `HV_X64_MSR_TSC_INVARIANT_CONTROL`.
+- On MSHV and WHP, CPUID `0x80000007` EDX[8] is set by the CPU profile from
+  boot; it does not wait for a write to `HV_X64_MSR_TSC_INVARIANT_CONTROL`.
+  KVM 6.3 and newer follow the TLFS and hide the bit while KVM's own copy of
+  the control is 0, so the KVM backend mirrors the guest-visible value into
+  KVM (see [Backend obligations](#backend-obligations)). Linux writes 1 in
+  `ms_hyperv_init_platform`, before `identify_boot_cpu` and the APs read the
+  bit, so the booted guest is identical on every backend.
 - `0x40000002` carries an NVX signature and the time ABI version, not a
   Hyper-V build number.
 - `0x40000005` reports the VP capacity in both EAX and EBX.
@@ -225,8 +250,8 @@ settled cell on the registered hosts.
 | Obligation | KVM | MSHV | WHP |
 | --- | --- | --- | --- |
 | Identity CPUID (exact leaves, out-of-range rule) | `KVM_SET_CPUID2` with the identity and explicit zero leaves; every KVM `0x4xxxxxxx` entry removed. Other leaves in the range return KVM's Intel out-of-range result | No synthetic processor features, so the hypervisor reports no `0x400000xx` leaves; CPUID intercept results (`always_override`) for the identity and explicit zero leaves, read back with `get_cpuid_values` at preflight | CPUID exits for the six identity leaves, served from OpenVMM's table; with synthetic features off, WHP returns zero natively for `0x40000006..=0x400000ff` and the bases from `0x40000100`, which preflight asserts |
-| Profile CPUID and time bits | `KVM_SET_CPUID2` with the effective CPUID | Processor feature banks derived from the profile (`hv_banks`), plus CPUID intercept results for leaves 1, 6, 7.0, `0xA`, and `0x80000007` | Processor feature banks derived from the profile (`hv_banks`), plus CPUID exits for leaves 1, 6, 7, `0xA`, `0x15`, `0x16`, and `0x80000007` |
-| Identity MSRs routed to OpenVMM | `KVM_CAP_X86_USER_SPACE_MSR` (`UNKNOWN`, `FILTER`) and `KVM_X86_SET_MSR_FILTER` denying reads and writes of `0x40000000..=0x400001ff`; the filter takes precedence over KVM's in-kernel Hyper-V MSRs | MSR-index intercepts (`READ_WRITE`) for `0x40000002`, `0x40000022`, `0x40000023`, and `0x40000118`. The hypervisor itself raises #GP for writes to the three read-only MSRs and for every other MSR in the range. Native synthetic MSRs are never enabled: they pre-empt the intercepts | `X64MsrExitBitmap` with `UnhandledMsrs` (capability `0x3f` on every host) and the offloaded APIC, no synthetic features and no `hv1_emulator`: the identity MSRs exit to OpenVMM, which raises #GP for every other MSR in the range |
+| Profile CPUID and time bits | `KVM_SET_CPUID2` with the effective CPUID. KVM 6.3 and newer hide invariant TSC while KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is 0, so the backend mirrors the guest-visible value, which core saves with the VM, into it with a host-initiated `KVM_SET_MSRS` after every accepted guest write and before a VP runs after a restore or reset; without it the guest loses `constant_tsc` and `nonstop_tsc` and boots about 160 ms slower | Processor feature banks derived from the profile (`hv_banks`), plus CPUID intercept results for leaves 1, 6, 7.0, `0xA`, and `0x80000007` | Processor feature banks derived from the profile (`hv_banks`), plus CPUID exits for leaves 1, 6, 7, `0xA`, `0x15`, `0x16`, and `0x80000007` |
+| Identity MSRs routed to OpenVMM | `KVM_CAP_X86_USER_SPACE_MSR` (`UNKNOWN`, `FILTER`) and `KVM_X86_SET_MSR_FILTER` denying reads and writes of `0x40000000..=0x400001ff`; the filter takes precedence over KVM's in-kernel Hyper-V MSRs. A Linux boot takes four MSR exits, all on the BSP, at any vCPU count | MSR-index intercepts (`READ_WRITE`) for `0x40000002`, `0x40000022`, `0x40000023`, and `0x40000118`. The hypervisor itself raises #GP for writes to the three read-only MSRs and for every other MSR in the range. Native synthetic MSRs are never enabled: they pre-empt the intercepts | `X64MsrExitBitmap` with `UnhandledMsrs` (capability `0x3f` on every host) and the offloaded APIC, no synthetic features and no `hv1_emulator`: the identity MSRs exit to OpenVMM, which raises #GP for every other MSR in the range |
 | Native rate `F_d` | `KVM_GET_TSC_KHZ` × 1000 on VP 0 (1 kHz granularity) | `ProcessorClockFrequency` partition property | `WHvCapabilityCodeProcessorClockFrequency` |
 | No TSC scaling | Never `KVM_SET_TSC_KHZ`; every vCPU reports the host rate | No frequency override | No `ProcessorClockFrequency` partition property; the 1 GHz request is removed |
 | LAPIC rate `L` | In-kernel LAPIC at 1 GHz; `KVM_CAP_X86_APIC_BUS_CYCLES_NS` never set | 200 MHz | Offloaded APIC at its fixed 200 MHz, verified at preflight (setting `InterruptClockFrequency` is not supported); the emulated APIC is not used |
@@ -241,6 +266,18 @@ settled cell on the registered hosts.
 | Partition capabilities | Derived from CPUID with the hypervisor range masked: `hv1` and `kvm_clock` are false | Same | Same |
 | Unknown MSRs | #GP; the `MYSTERY_MSRS` stubs are TBD(profiles) | #GP from the hypervisor | #GP; the `MYSTERY_MSRS` stubs are TBD(profiles) |
 | Removed | `KVM_GET_CLOCK`/`KVM_SET_CLOCK` in the microVM downtime path, kvmclock MSR state, leaf `0x15` synthesis, `KVM_SET_TSC_KHZ`, restore-time `IA32_TSC` writes | BSP-copy TSC alignment, exact-rate equality, leaf `0x15` synthesis | 1 GHz request and fallback, `RestoredTsc` and its RDTSC, RDTSCP, and `IA32_TSC` exits, leaf `0x15` synthesis |
+
+**KVM common offset.** Restoring each VP's `IA32_TSC` is unreliable on KVM.
+Linux 6.6 KVM, which the Azure KVM runners run, treats a host `IA32_TSC`
+write within about 1 s of the TSC timeline started at vCPU creation as a
+synchronization attempt and discards the written value, the first write of a
+restore included; every CI shell snapshot is taken within a second of boot.
+With the legacy restore path on `azure-kvm-5`, a restored guest's monotonic
+clock advanced 54.7 ms across a 512.5 ms host interval, losing 458 ms. Linux
+6.7 applies the heuristic only after a first user-space write
+(`user_set_tsc`). `KVM_VCPU_TSC_OFFSET` sets the offset exactly on every
+kernel from 5.16, so the backend never writes `IA32_TSC` and core omits the
+saved per-VP TSC values from the VP restore.
 
 **WHP decision gate: met.** Suspending partition time, writing the target,
 verifying the frozen values, and resuming kept every pair of vCPUs within
@@ -410,9 +447,10 @@ at most 1 µs, that is `F_s / 1,000,000` cycles. Linux no longer checks this
 3. **CI warp probe.** Conformance, restore-matrix, and soak runs execute the
    guest warp probe after boot and after every restore and fail above 1 µs.
 4. **Backend live skew.** Each backend shows that live skew stays within the
-   bound after release. The spikes measured at most 63 ns on KVM, at most
-   516 ns on MSHV (dual-socket bare metal, bounded by the probe's round
-   trip), and at most 70 ns on WHP.
+   bound after release. The spikes measured at most 63 ns of ping-pong
+   offset and 7.2 ns of backward step on KVM, at most 516 ns on MSHV
+   (dual-socket bare metal, bounded by the probe's round trip), and at most
+   70 ns on WHP.
 
 The guest warp probe (`nvx-time-probe warp`, built from
 `guest/common/nvx-time-probe.c` and installed as `/sbin/nvx-time-probe`)
@@ -468,7 +506,11 @@ after the read-back); on MSHV it is frozen until the first VP runs. Either
 way, the guest monotonic advance across a restore lies in `[D, D + R]`, up
 to the two anchors' pairing errors (each at most 100 µs), where `R` is the
 time from the restore anchor to the first restored instruction. Wall-clock
-repair absorbs `R` and the pairing errors for `CLOCK_REALTIME`.
+repair absorbs `R` and the pairing errors for `CLOCK_REALTIME`. The KVM spike
+kept guest `CLOCK_MONOTONIC` within −0.09 to +2.8 ms of the host interval
+across restores with 0 s and 30 s of downtime at 1 to 8 vCPUs; its positive
+part came from a host sample taken before the per-VP TSC save, which the
+paired capture anchor removes.
 
 ## Restore algorithm
 
@@ -782,7 +824,7 @@ partition-wide on every backend, so `C3` reads them on CPU 0 only.
 | `C3` | MSR `0x40000002` equals the CPU's VP index on every CPU; on CPU 0, `0x40000022` equals `F` with `floor(F / 1000)` equal to the kernel's `cpu MHz` in kHz, `0x40000023` equals 1,000,000,000 or 200,000,000, `0x40000118` equals 1, and reads of `0x40000000`, `0x40000001`, and `0x40000020` fail with `EIO` | boot; restore (CPU 0 `0x40000022` only) |
 | `C4` | The kernel log contains `Hypervisor detected: Microsoft Hyper-V`, `Hyper-V: privilege flags low 0x8860,`, `Hyper-V: LAPIC Timer Frequency: 0x989680` or `0x1e8480`, and `clocksource: Switched to clocksource tsc` as its last clocksource switch; it contains no record matching a watcher pattern other than `G_CLOCKSOURCE_SWITCH`, and none containing `Fast TSC calibration`, `Refined TSC clocksource calibration`, `kvm-clock`, or `APIC timer: using supplied frequency` | boot |
 | `C5` | `/proc/cpuinfo` flags as listed in [Clocksource, tick, and PIT](#clocksource-tick-and-pit) on every CPU | boot, restore (new CPUs) |
-| `C6` | `current_clocksource` is `tsc`; `available_clocksource` contains only `tsc`, `refined-jiffies`, and `jiffies` | boot, capture, restore |
+| `C6` | `current_clocksource` is `tsc`; `available_clocksource` lists `tsc` and no other clocksource except `refined-jiffies` and `jiffies`, which Linux lists only before the reading CPU's first tick (after boot it is `tsc` alone) | boot, capture, restore |
 | `C7` | `/proc/timer_list`: every online CPU's tick device is `lapic` with `hrtimer_interrupt` in one-shot mode; no `pit` or `hpet` device; no broadcast device | boot, capture, restore (deferred) |
 | `C8` | `/sys/bus/vmbus` and `/sys/devices/system/cpu/cpufreq/policy0` are absent; `rcu_cpu_stall_suppress` is 0 and `rcu_cpu_stall_timeout` is 21 | boot |
 | `C9` | `/proc/cmdline` contains none of `tsc_early_khz=`, `lapic_timer_hz=`, `notsc`, `nolapic`, `nolapic_timer`, `tsc=unstable`, `hpet=force`, or `clocksource=` with a value other than `tsc` | boot |
@@ -802,7 +844,7 @@ check runs on every online CPU:
 
 | ID | Check |
 | --- | --- |
-| `X1` | Every leaf `0x40000006..=0x400000ff` returns all zeros or the Intel out-of-range result (the highest basic leaf's result for the same subleaf), as the [identity rules](#hypervisor-identity) require |
+| `X1` | The explicit zero leaves are zero, and every other leaf in `0x40000006..=0x400000ff` returns all zeros or the Intel out-of-range result (the highest basic leaf's result for the same subleaf), as the [identity rules](#hypervisor-identity) require |
 | `X2` | No base `0x40000100..=0x4000ff00` (step `0x100`) carries `KVMKVMKVM` or another hypervisor signature; the NVX kernel has no KVM guest support, so the boot check leaves this static backend property to CI |
 | `X3` | Every `C3` MSR |
 | `X4` | `0x40000118` accepts writes of 0 and 1, each read back, and rejects 2; the check leaves it at 1 |
@@ -938,6 +980,10 @@ Steps 6, 7, and 8 run in one helper process. Repair failures emit a violation
 event and power off with status 195.
 
 ### RCU grace period release
+
+Stall suppression is required: on KVM, restores after 30 s of downtime
+without it report `rcu_preempt self-detected stall` at 1 and 8 vCPUs, because
+jiffies jump by `D`; with it, no stall appears at 1, 2, 4, or 8 vCPUs.
 
 Stall suppression may be released only after the grace period that was in
 flight at capture has ended, or the restored guest reports a false stall.
@@ -1107,8 +1153,8 @@ metrics, in their log and the job summary; an unknown generation fails
 qualification explicitly. Runner labels are not used and runners are not
 re-registered: per-PR CI captures and restores on the same runner, and
 same-generation cross-VM restore is validated by the fleet restore matrix
-(`p6-restore-matrix`) on the registered hosts. Routing CI jobs by generation
-labels is optional future work.
+(`p6-restore-matrix`) on the hosts our account can use. Routing CI jobs by
+generation labels is optional future work.
 
 ## Performance expectations and acceptance gate
 
@@ -1155,14 +1201,17 @@ and `0x40000118` save and restore; capabilities derivation (`hv1` and
 2 through 5; packet v4 and time-sample golden vectors and their guest-side
 parser; four-byte portb reads; and the generation counter.
 
-**Conformance.** The boot and restore checks pass on all 18 registered hosts
-at 1, 2, 4, and 8 vCPUs, plus the exhaustive CI check and the warp probe on
-every backend.
+**Conformance.** The boot and restore checks pass at 1, 2, 4, and 8 vCPUs on
+all 18 registered hosts, plus the exhaustive CI check and the warp probe on
+every backend. The fleet runs them on the hosts our SSH account can use,
+which for KVM are prometheus32 and `azure-kvm-5` and for MSHV prometheus30
+and `azure-azlinux-5`: the account cannot open `/dev/kvm` or `/dev/mshv` on
+the other KVM and MSHV runners, which only CI jobs exercise.
 
 **Restore matrix.** Every case runs with zero violations; rejected cases must
 fail with the listed code. Per-PR CI runs the same-host cases on one runner;
-the full matrix, including the cross-VM cases, runs on the registered hosts
-as the fleet restore matrix.
+the full matrix, including the cross-VM cases, runs on the hosts our account
+can use as the fleet restore matrix.
 
 | Case | Hosts | Expected |
 | --- | --- | --- |
@@ -1173,8 +1222,8 @@ as the fleet restore matrix.
 | Simulated rate beyond tolerance: `dest-rate-offset-ppm=+251` | One host per backend | `E_TSC_RATE_TOLERANCE` |
 | Downtime bounds: `downtime-add-s=2592001`; `force-utc-downtime` with `utc-offset-ms=-<n>`, `n` above the elapsed time | One host per backend | `E_DOWNTIME_EXCESSIVE`; `E_DOWNTIME_NEGATIVE` |
 | Sample uncertainty: `sample-delay-us=200`; then `sample-delay-us=3000` on restore and on cold boot | One host per backend | Restored, with `G_SAMPLE_UNCERTAIN` recorded and the guest running; `G_REPAIR_SAMPLE` (195); `G_CONFORMANCE_C12` (193) |
-| Across VMs of one generation | `azure-kvm-1` to `-2`; `azure-azlinux-3` to `-4`; `azure-windows-1` to `-2`; `azure-windows-3` to `-4` | Restored |
-| Across generations | `azure-windows-1` (8370C) to `-3` (8573C) | `E_CPU_GENERATION` |
+| Across VMs of one generation | `azure-windows-1` to `-2`; `azure-windows-3` to `-4`. KVM and MSHV have no usable pair of one generation, so the simulated host reboot covers their cross-host path | Restored |
+| Across generations | `azure-windows-1` (8370C) to `-3` (8573C); prometheus32 to `azure-kvm-5` (KVM); prometheus30 to `azure-azlinux-5` (MSHV) | `E_CPU_GENERATION` |
 | Host without invariant TSC at the host OS | `azure-azlinux-2` (out of CI rotation) | Qualified only if `H4` and `H6` pass; otherwise `nvx.py doctor` fails |
 | Across backends | prometheus32 (KVM) to prometheus30 (MSHV) | `E_BACKEND_MISMATCH` |
 | Pre-v1 snapshot | Any | `E_SNAPSHOT_VERSION` |
@@ -1184,11 +1233,11 @@ as the fleet restore matrix.
 No test reboots a host. The orchestrator asks the user before any real
 reboot.
 
-**Reliability.** Repeated snapshot scenarios on every registered host at 1,
-2, 4, and 8 vCPUs, with the warp probe and the watcher active, report no RCU,
-soft-lockup, hung-task, clocksource, or warp message. The CI debug-kernel
-variant runs the same-host cases with the soft-lockup and hung-task detectors
-enabled.
+**Reliability.** Repeated snapshot scenarios at 1, 2, 4, and 8 vCPUs on the
+hosts the fleet can use (see Conformance), with the warp probe and the
+watcher active, report no RCU, soft-lockup, hung-task, clocksource, or warp
+message. The CI debug-kernel variant runs the same-host cases with the
+soft-lockup and hung-task detectors enabled.
 
 **Performance.** The gate above, computed by the performance agent from the
 CI benchmark matrix.
@@ -1267,8 +1316,9 @@ Migration impact:
 - Hosts that fail qualification, such as `azure-azlinux-2`, cannot run
   microVMs until replaced.
 - Per-PR CI captures and restores on the same runner. Same-generation
-  cross-VM restore is validated by the fleet restore matrix on the
-  registered hosts, not in per-PR CI.
+  cross-VM restore is validated by the fleet restore matrix on WHP only; no
+  usable KVM or MSHV pair of one generation exists, so the simulated host
+  reboot covers those backends.
 - The `cold_start_clocksource` metric on KVM changes meaning (from
   `kvm-clock` to `tsc`). The change is accepted without an exemption; a gate
   failure on it is investigated as a regression.
