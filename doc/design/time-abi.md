@@ -268,8 +268,8 @@ settled cell on the registered hosts.
 | Invariant TSC exposed | CPUID bit. KVM hides it from a guest with `"Hv#1"` until KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is set, so OpenVMM writes 1 to it host-side at vCPU creation | Forced by the profile: Azure's nested MSHV does not pass the bit through, and without it each AP pays about 150 ms of calibration. Qualification measures the property instead (`H4`, `H6`) | Set by the CPUID override on every host: Azure WHP hosts cannot expose it through the feature banks (bank 1 lacks `TscInvariant`). There the guest TSCs stayed within 60 ns of each other at 8 vCPUs over 60 s and matched the declared rate against host QPC to 0.000 ppm (residual at most 0.07 µs) over 118 s; `H4` and `H6` measure both on every host |
 | No paravirtual or synthetic features | No KVM leaves; `KVM_CAP_ENFORCE_PV_FEATURE_CPUID`, so KVM's paravirtual MSRs raise #GP; KVM's in-kernel Hyper-V MSRs are unreachable behind the filter | No synthetic processor features | `--hv` stays rejected for the microVM |
 | Capture anchor: VP 0 TSC paired with a host time sample within 100 µs, from at most 64 samples | Host `rdtsc` plus VP 0's `KVM_VCPU_TSC_OFFSET`, bracketed by two host `rdtsc` reads around the host clock reads; up to 16 attempts (0.06 to 0.4 µs) | The tightest of up to 64 brackets `[sample, HvCallGetVpRegisters(VP 0 TSC), sample]`, paired at the bracket midpoint (p50 3.5 µs on bare metal, 6.2 µs on Azure) | The tightest of up to 64 bracketed reads of VP 0's TSC register, paired at the bracket midpoint (2.6 to 6.4 µs on bare metal, 5.4 to 9.7 µs on 8370C runners, 5.8 to 11 µs on 8573C runners) |
-| Synchronized TSC set at one host instant | One `KVM_VCPU_TSC_OFFSET` value for every vCPU, `target(t) - (h0 + h1) / 2` from a host clock read `t` bracketed by host `rdtsc` reads `h0` and `h1` (Linux 5.16 or newer); no `IA32_TSC` writes, which Linux 6.6 can discard | Freeze partition time, write the target to every created VP, read back, and resume partition time right after the read-back (56 to 312 µs for 1 to 8 VPs; equal on 20 of 20 restores) | Suspend partition time, write the target to every VP, read back, and resume explicitly with `WHvResumePartitionTime` before any VP runs. Writing while time runs would skew the VPs by the write latency, about 11 µs per write on bare metal and 25 µs nested; `TscVirtualOffset` is unusable (writes fail) |
-| Read-back before release | Every vCPU's `KVM_VCPU_TSC_OFFSET` equals the written value, and a host `rdtsc` bracket around VP 0's `IA32_TSC` shows no scaling | Every created VP's TSC equals the target while time is frozen | Every VP's TSC equals the target while time is suspended; live reads cannot verify 1 µs (a register read takes 9.5 to 21 µs) |
+| Synchronized TSC set at one host instant | One `KVM_VCPU_TSC_OFFSET` value for every vCPU, `target(t) - (h0 + h1) / 2` from a host clock read `t` bracketed by host `rdtsc` reads `h0` and `h1` (Linux 5.16 or newer); no `IA32_TSC` writes, which Linux 6.6 can discard | Freeze partition time, write the target to every created VP, read back, and clear `TimeFreeze` right after a successful read-back, inside the set rather than at the first VP run (56 to 312 µs for 1 to 8 VPs; equal on 20 of 20 restores) | Suspend partition time, write the target to every VP, read back, and resume with `WHvResumePartitionTime` right after a successful read-back, inside the set. Writing while time runs would skew the VPs by the write latency, about 11 µs per write on bare metal and 25 µs nested; `TscVirtualOffset` is unusable (writes fail) |
+| Read-back before any VP runs | Every vCPU's `KVM_VCPU_TSC_OFFSET` equals the written value, and a host `rdtsc` bracket around VP 0's `IA32_TSC` shows no scaling | Every created VP's TSC equals the target while time is frozen | Every VP's TSC equals the target while time is suspended; live reads cannot verify 1 µs (a register read takes 9.5 to 21 µs) |
 | Live cross-vCPU skew after release at most 1 µs | Equal offsets: skew is the host's TSC skew, bounded by qualification. Measured at most 63 ns | Measured 0 warps; offsets within 516 ns on dual-socket bare metal and 195 ns on Azure, both bounded by the probe's round trip | Measured at most 70 ns over 60 s on prometheus28, 8370C, and 8573C hosts |
 | VP instantiation | All `C` VPs exist before the set | Every instantiated VP is bound, which creates it, before the set; no VP is created after it | All `C` VPs exist before the set |
 | Partition capabilities, so that the identity leaves never enable the Hyper-V emulator or its saved-state elements | Derived from CPUID with the hypervisor range masked: `hv1` and `kvm_clock` are false | Same | Same |
@@ -584,8 +584,11 @@ the guest and tests can tell the two paths apart.
 
 The restore anchor is the instant of the synchronized TSC set, and the guest
 TSC runs from that instant on every backend: KVM never stops it, and MSHV and
-WHP resume partition time right after the read-back. The guest monotonic
-advance across a restore therefore lies in `[D, D + R]`, up
+WHP resume partition time right after a successful read-back, inside the
+synchronized set (see step 13 of the
+[restore algorithm](#restore-algorithm)). No backend defers the resume to the
+first VP run. The guest monotonic advance across a restore therefore lies in
+`[D, D + R]`, up
 to the two anchors' pairing errors (each at most 100 µs), where `R` is the
 time from the restore anchor to the first restored instruction; it falls
 short of `D + R` only by the frozen write (at most about 0.5 ms). Wall-clock
@@ -593,7 +596,9 @@ repair absorbs `R` and the pairing errors for `CLOCK_REALTIME`. The KVM spike
 kept guest `CLOCK_MONOTONIC` within −0.09 to +2.8 ms of the host interval
 across restores with 0 s and 30 s of downtime at 1 to 8 vCPUs; its positive
 part came from a host sample taken before the per-VP TSC save, which the
-paired capture anchor removes.
+paired capture anchor removes. MSHV measured −0.05 to −0.55 ms with the
+resume at the read-back, at parity with KVM, against −0.9 to −1.6 ms when the
+first VP run thawed time; warps and restore latency were unchanged.
 
 **Anchor pairing bound.** An anchor that pairs a TSC read with a host time
 sample (the capture anchor on every backend, and KVM's restore anchor)
@@ -677,7 +682,12 @@ In the worker, with every VP stopped:
     legacy clock entry points (`set_tsc_frequency_hz`,
     `advance_snapshot_time`) on a time ABI partition; KVM rejects both there.
 13. Read back: every instantiated VP holds the synchronized value as defined
-    by its backend (`E_TSC_SYNC_READBACK`).
+    by its backend (`E_TSC_SYNC_READBACK`). A backend that froze partition
+    time for the set resumes it right after a successful read-back, before
+    the synchronized set returns: MSHV clears `TimeFreeze`, and WHP calls
+    `WHvResumePartitionTime`; KVM's TSC never stops. Guest time therefore
+    runs from the restore anchor on every backend. A failed read-back leaves
+    time frozen and fails the restore.
 14. Advance every VP's counting-mode LAPIC timer by `D` at `L`, and set every
     VP's LAPIC state again, always after step 12 and even when no timer is
     armed: KVM derives its timer deadline from the guest TSC when the LAPIC
@@ -687,7 +697,9 @@ In the worker, with every VP stopped:
 16. Seal the time fields of the restore packet: `D`, its source, the rate
     deviation, `g`, and the test-hook flag.
 17. Start the state units, with host input gated when the restore requires an
-    acknowledgement; publish the readiness event; release the VPs.
+    acknowledgement; publish the readiness event; release the VPs. Partition
+    time has run since step 13, so releasing the VPs does not start it, and
+    no backend resumes time at the first VP run.
 
 The guest then repairs its clocks (see
 [Snapshot agent](#snapshot-agent)) before acknowledging a gated restore.
