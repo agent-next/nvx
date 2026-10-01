@@ -254,10 +254,10 @@ settled cell on the registered hosts.
 | Native rate `F_d` | `KVM_GET_TSC_KHZ` × 1000 on VP 0 (1 kHz granularity) | `ProcessorClockFrequency` partition property | `WHvCapabilityCodeProcessorClockFrequency` |
 | No TSC scaling | Never `KVM_SET_TSC_KHZ`; every vCPU reports the host rate | No frequency override | No `ProcessorClockFrequency` partition property; the 1 GHz request is removed |
 | LAPIC rate `L` | In-kernel LAPIC at 1 GHz; `KVM_CAP_X86_APIC_BUS_CYCLES_NS` never set | 200 MHz | Offloaded APIC at its fixed 200 MHz, verified at preflight (setting `InterruptClockFrequency` is not supported); the emulated APIC is not used |
-| TSC-deadline and `TSC_ADJUST` hidden | CPUID bits cleared; the MSR filter also denies `IA32_TSC_ADJUST` (`0x3b`) and `IA32_TSC_DEADLINE` (`0x6e0`), which KVM would otherwise serve, and OpenVMM raises #GP | Feature-bank bits `tsc_deadline_tmr_support`, `tsc_adjust_support`, and `a_count_m_count_support` cleared, and CPUID bits cleared | Feature-bank bits `TscDeadlineTmr`, `TscAdjust`, and `ACountMCount` cleared, and CPUID bits cleared; the hypervisor raises #GP for `IA32_TSC_ADJUST` |
+| TSC-deadline and `TSC_ADJUST` hidden; both MSRs raise #GP | CPUID bits cleared; the MSR filter also denies `IA32_TSC_ADJUST` (`0x3b`) and `IA32_TSC_DEADLINE` (`0x6e0`), which KVM would otherwise serve (reading 0 and ignoring writes to `0x6e0`), and OpenVMM raises #GP | Feature-bank bits `tsc_deadline_tmr_support`, `tsc_adjust_support`, and `a_count_m_count_support` cleared, and CPUID bits cleared; the hypervisor then raises #GP for reads and writes of both MSRs on every CPU | Feature-bank bits `TscDeadlineTmr`, `TscAdjust`, and `ACountMCount` cleared, and CPUID bits cleared; both MSRs exit to OpenVMM, which raises #GP on every CPU |
 | Invariant TSC exposed | CPUID bit. KVM hides it from a guest with `"Hv#1"` until KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is set, so OpenVMM writes 1 to it host-side at vCPU creation | Forced by the profile: Azure's nested MSHV does not pass the bit through, and without it each AP pays about 150 ms of calibration. Hosts without an invariant TSC fail qualification (`azure-azlinux-2`) | Set by the CPUID override: Azure WHP hosts cannot expose it through the feature banks (bank 1 lacks `TscInvariant`), so those hosts qualify on the warp probe and rate stability (the guest TSC matched the declared rate against host QPC within 0.001 ppm over 118 s) |
 | No paravirtual or synthetic features | No KVM leaves; `KVM_CAP_ENFORCE_PV_FEATURE_CPUID`, so KVM's paravirtual MSRs raise #GP; KVM's in-kernel Hyper-V MSRs are unreachable behind the filter | No synthetic processor features | `--hv` stays rejected for the microVM |
-| Capture anchor: VP 0 TSC paired with a host time sample within 100 µs, re-sampled a bounded number of times | Host `rdtsc` plus VP 0's `KVM_VCPU_TSC_OFFSET`, bracketed by two host `rdtsc` reads around the host clock reads; up to 16 attempts (0.06 to 0.4 µs) | The tightest of up to 64 brackets `[sample, HvCallGetVpRegisters(VP 0 TSC), sample]`, paired at the bracket midpoint (p50 3.5 µs on bare metal, 6.2 µs on Azure) | The tightest of up to 64 bracketed reads of VP 0's TSC register, paired at the bracket midpoint (2.6 to 6.4 µs on bare metal, 5.4 to 9.7 µs on 8370C runners, 5.8 to 11 µs on 8573C runners) |
+| Capture anchor: VP 0 TSC paired with a host time sample within 100 µs, from at most 64 samples | Host `rdtsc` plus VP 0's `KVM_VCPU_TSC_OFFSET`, bracketed by two host `rdtsc` reads around the host clock reads; up to 16 attempts (0.06 to 0.4 µs) | The tightest of up to 64 brackets `[sample, HvCallGetVpRegisters(VP 0 TSC), sample]`, paired at the bracket midpoint (p50 3.5 µs on bare metal, 6.2 µs on Azure) | The tightest of up to 64 bracketed reads of VP 0's TSC register, paired at the bracket midpoint (2.6 to 6.4 µs on bare metal, 5.4 to 9.7 µs on 8370C runners, 5.8 to 11 µs on 8573C runners) |
 | Synchronized TSC set at one host instant | One `KVM_VCPU_TSC_OFFSET` value for every vCPU, `target(t) - (h0 + h1) / 2` from a host clock read `t` bracketed by host `rdtsc` reads `h0` and `h1` (Linux 5.16 or newer); no `IA32_TSC` writes, which Linux 6.6 can discard | Freeze partition time, write the target to every created VP, read back, and resume partition time right after the read-back (56 to 312 µs for 1 to 8 VPs; equal on 20 of 20 restores) | Suspend partition time, write the target to every VP, read back, and resume explicitly with `WHvResumePartitionTime`; `TscVirtualOffset` is unusable (writes fail) |
 | Read-back before release | Every vCPU's `KVM_VCPU_TSC_OFFSET` equals the written value, and a host `rdtsc` bracket around VP 0's `IA32_TSC` shows no scaling | Every created VP's TSC equals the target while time is frozen | Every VP's TSC equals the target while time is suspended; live reads cannot verify 1 µs (a register read takes 9.5 to 21 µs) |
 | Live cross-vCPU skew after release at most 1 µs | Equal offsets: skew is the host's TSC skew, bounded by qualification. Measured at most 63 ns | Measured 0 warps; offsets within 516 ns on dual-socket bare metal and 195 ns on Azure, both bounded by the probe's round trip | Measured at most 70 ns over 60 s on prometheus28, 8370C, and 8573C hosts |
@@ -620,13 +620,15 @@ In the worker, with every VP stopped:
     `TSC_target` to every instantiated VP at that instant. Per-VP TSC values
     from saved VP state are omitted from the VP restore and never applied. A
     restore anchor that pairs a TSC read with host time (KVM's common offset)
-    is re-sampled a bounded number of times and fails with `E_TSC_ANCHOR` if
-    no pair is within 100 µs; a pairing error shifts every VP's TSC alike, by
-    at most that amount. A frozen write needs no such pairing.
+    takes at most 64 samples and fails with `E_TSC_ANCHOR` if no pair is
+    within 100 µs; a pairing error shifts every VP's TSC alike, by at most
+    that amount. A frozen write needs no such pairing. Core never calls the
+    legacy clock entry points (`set_tsc_frequency_hz`,
+    `advance_snapshot_time`) on a time ABI partition; KVM rejects both there.
 13. Read back: every instantiated VP holds the synchronized value as defined
     by its backend (`E_TSC_SYNC_READBACK`).
 14. Advance every VP's counting-mode LAPIC timer by `D` at `L`, and set every
-    VP's LAPIC state again after the synchronized set, even when no timer is
+    VP's LAPIC state again, always after step 12 and even when no timer is
     armed: KVM derives its timer deadline from the guest TSC when the LAPIC
     state is set.
 15. Advance VM time by `D` and the RTC's UTC by `D` (milliseconds). The PIT
@@ -654,7 +656,7 @@ state units are quiesced, capture:
    PIT channel 0 is not counting periodically (`E_LAPIC_PERIODIC`,
    `E_LAPIC_TSC_DEADLINE`, `E_PIT_ACTIVE`);
 2. takes the capture anchor: VP 0's TSC paired with a host time sample taken
-   within 100 µs of it, keeping the tightest of a bounded number of samples
+   within 100 µs of it, keeping the tightest of at most 64 samples
    (`E_TSC_ANCHOR`), plus the host identities (`E_HOST_IDENTITY`); and
 3. records the declared rates, the CPU profile, the effective CPUID, and the
    process's generation counter.
@@ -1152,7 +1154,7 @@ code.
 | `E_HOST_IDENTITY` | Host identity, boot identity, or clocks unavailable | Capture, restore |
 | `E_DOWNTIME_NEGATIVE` | Downtime below zero | Restore |
 | `E_DOWNTIME_EXCESSIVE` | Downtime above 30 days | Restore |
-| `E_TSC_ANCHOR` | An anchor is unavailable, or no sample pairs within 100 µs after bounded re-sampling | Capture, restore |
+| `E_TSC_ANCHOR` | An anchor is unavailable, or none of at most 64 samples pairs within 100 µs | Capture, restore |
 | `E_TSC_TARGET_OVERFLOW` | `TSC_target` exceeds 64 bits | Restore |
 | `E_TSC_SYNC_READBACK` | A VP does not hold the synchronized value | Restore |
 | `E_VP_LATE_CREATION` | A VP was instantiated after the synchronized set | Restore |
