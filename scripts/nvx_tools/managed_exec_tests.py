@@ -374,26 +374,23 @@ def run_managed_exec_configuration(
         except Exception as error:
             acceptance_error = error
         finally:
-            stopped = False
             try:
                 if started:
                     invoke("stop")
-                    stopped = True
             except Exception as error:
                 cleanup_errors.append(error)
             try:
                 persist_evidence()
             except Exception as error:
                 cleanup_errors.append(error)
-            if stopped:
-                try:
-                    invoke("deprovision")
-                except Exception as error:
-                    cleanup_errors.append(error)
-                try:
-                    persist_evidence()
-                except Exception as error:
-                    cleanup_errors.append(error)
+            try:
+                invoke("deprovision")
+            except Exception as error:
+                cleanup_errors.append(error)
+            try:
+                persist_evidence()
+            except Exception as error:
+                cleanup_errors.append(error)
         if acceptance_error is not None:
             if cleanup_errors:
                 raise RuntimeError(

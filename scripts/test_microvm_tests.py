@@ -135,6 +135,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         bad_pwd_output: bool = False,
         malformed_outcome: bool = False,
         outcome_mutation: str | None = None,
+        start_returncode: int = 0,
         stop_returncode: int = 0,
         default_environment: bytes = (
             b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
@@ -185,11 +186,22 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             if operation == "start":
                 state.mkdir(parents=True, exist_ok=True)
                 (state / "openvmm.log").write_text("bounded log\n", encoding="utf-8")
+                if start_returncode:
+                    return subprocess.CompletedProcess(
+                        command, start_returncode, b"", b"start failed"
+                    )
             if operation == "stop":
                 return subprocess.CompletedProcess(
                     command, stop_returncode, b"", b"stop failed"
                 )
             if operation == "deprovision":
+                if stop_returncode:
+                    return subprocess.CompletedProcess(
+                        command,
+                        1,
+                        b"",
+                        b"sandbox must be stopped before deprovision",
+                    )
                 shutil.rmtree(state)
             if operation != "exec":
                 return subprocess.CompletedProcess(command, 0, b"", b"")
@@ -483,17 +495,32 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
 
         self.assertIn("deprovision", [command[3] for command in commands])
 
-    def test_failed_stop_does_not_deprovision_running_sandbox(self):
+    def test_failed_start_deprovisions_safely_stopped_sandbox(self):
         with tempfile.TemporaryDirectory() as temporary:
             commands: list[list[str]] = []
-            with self.assertRaisesRegex(RuntimeError, "stop failed"):
+            with self.assertRaisesRegex(RuntimeError, "start failed"):
+                self._run_acceptance(
+                    Path(temporary),
+                    start_returncode=9,
+                    command_log=commands,
+                )
+
+        self.assertIn("deprovision", [command[3] for command in commands])
+
+    def test_failed_stop_attempts_guarded_deprovision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands: list[list[str]] = []
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "stop failed.*sandbox must be stopped before deprovision",
+            ):
                 self._run_acceptance(
                     Path(temporary),
                     stop_returncode=9,
                     command_log=commands,
                 )
 
-        self.assertNotIn("deprovision", [command[3] for command in commands])
+        self.assertIn("deprovision", [command[3] for command in commands])
 
 
 class GuestIdentityScriptTests(unittest.TestCase):
