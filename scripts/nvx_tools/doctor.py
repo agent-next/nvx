@@ -64,9 +64,10 @@ GUEST_VCPU_COUNTS = (8, 4, 2, 1)
 GUEST_MEMORY_MIB = 128
 # Qualification gates only on measured properties, alike on every backend:
 # the guest warp probe, the TSC rate stability, and the CPU profile. The host
-# OS's invariant-TSC flags and clocksource are recorded as evidence only;
-# Azure WHP hosts lack the flag while their guests measure tens of
-# nanoseconds of skew.
+# OS's invariant-TSC flags and clocksource are recorded as evidence only,
+# because they don't decide what a guest observes: Azure WHP hosts show the
+# CPUID bit but cannot offer invariant TSC to partitions, and their guests
+# measure tens of nanoseconds of skew.
 LINUX_INVARIANT_TSC_FLAGS = ("constant_tsc", "nonstop_tsc")
 CLOCKSOURCE_PATH = Path(
     "/sys/devices/system/clocksource/clocksource0/current_clocksource"
