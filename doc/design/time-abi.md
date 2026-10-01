@@ -8,8 +8,6 @@ MSHV, and WHP. It is authoritative for the `time-abi-v1` integration branches
 of `microsoft/nvx` and `nanvix/openvmm`. When implemented, it replaces the
 time rules in [Snapshot and restore](snapshot-and-restore.md#time-and-entropy)
 and the clock tokens in [Cold boot](cold-boot.md#effective-command-line).
-Entries marked `TBD(<agent>)` wait for that agent's backend implementation or
-measurements.
 
 Notation:
 
@@ -128,9 +126,9 @@ on every backend:
 | Any other MSR in the range | | #GP | #GP |
 
 `HV_X64_MSR_TSC_INVARIANT_CONTROL` is one partition-wide value. It is guest
-state: it is saved with the VM and restored with it. Linux writes 1 at boot
-with an unchecked `wrmsrq`, so this write must never fault on any backend.
-Clearing it after setting it is accepted.
+state: it is saved with the VM and restored with it. Linux writes 1 once at
+boot, on the BSP, with an unchecked `wrmsrq`, so this write must never fault
+on any backend. Clearing it after setting it is accepted.
 
 The CPU time bits hide two architectural timer MSRs, and every backend makes
 them raise #GP: `IA32_TSC_ADJUST` (`0x3b`) and `IA32_TSC_DEADLINE`
@@ -159,12 +157,13 @@ independent of any host's rate.
 
 Linux trusts the TSC because of `AccessTscInvariantControls`, not because of
 CPUID `0x80000007` EDX[8]; that bit only adds the `nonstop_tsc` flag and
-spares each AP a delay-loop calibration (about 150 ms per AP on Azure MSHV).
-The bit is policy, not a fingerprint feature: profiles set it even where a
-nested hypervisor hides it from host fingerprints (Azure's MSHV and WHP L1
-partitions), every backend exposes it (WHP through its CPUID override), and
-host qualification backs it with measured invariance (see
-[Host qualification](#host-qualification)).
+spares each AP a delay-loop calibration of about 150 ms (on Azure MSHV, an
+8-vCPU cold boot takes 1,385 ms without the bit and 299 ms with it). The time
+bits override the fingerprint: the bit is policy, not a fingerprint feature,
+so profiles set it even where a nested hypervisor hides it from host
+fingerprints (Azure's MSHV and WHP L1 partitions), every backend exposes it
+(WHP through its CPUID override), and host qualification backs it with
+measured invariance (see [Host qualification](#host-qualification)).
 
 ### Rates
 
@@ -249,22 +248,22 @@ settled cell on the registered hosts.
 
 | Obligation | KVM | MSHV | WHP |
 | --- | --- | --- | --- |
-| Identity CPUID (exact leaves, out-of-range rule) | `KVM_SET_CPUID2` with the identity and explicit zero leaves; every KVM `0x4xxxxxxx` entry removed. Other leaves in the range return KVM's Intel out-of-range result | No synthetic processor features, so the hypervisor reports no `0x400000xx` leaves; CPUID intercept results (`always_override`) for the identity and explicit zero leaves, read back with `get_cpuid_values` at preflight | CPUID exits for the six identity leaves, served from OpenVMM's table; with synthetic features off, WHP returns zero natively for `0x40000006..=0x400000ff` and the bases from `0x40000100`, which preflight asserts |
+| Identity CPUID (exact leaves, out-of-range rule) | `KVM_SET_CPUID2` with the identity and explicit zero leaves; every KVM `0x4xxxxxxx` entry removed. Other leaves in the range return KVM's Intel out-of-range result | No synthetic processor features, so the hypervisor reports no `0x400000xx` leaves; CPUID intercept results (`always_override`) for the identity and explicit zero leaves, read back with `get_cpuid_values` at preflight; programming them takes 43 to 62 µs | CPUID exits for the six identity leaves, served from OpenVMM's table; with synthetic features off, WHP returns zero natively for `0x40000006..=0x400000ff` and the bases from `0x40000100`, which preflight asserts |
 | Profile CPUID and time bits | `KVM_SET_CPUID2` with the effective CPUID. KVM 6.3 and newer hide invariant TSC while KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is 0, so the backend mirrors the guest-visible value, which core saves with the VM, into it with a host-initiated `KVM_SET_MSRS` after every accepted guest write and before a VP runs after a restore or reset; without it the guest loses `constant_tsc` and `nonstop_tsc` and boots about 160 ms slower | Processor feature banks derived from the profile (`hv_banks`), plus CPUID intercept results for leaves 1, 6, 7.0, `0xA`, and `0x80000007` | Processor feature banks derived from the profile (`hv_banks`), plus CPUID exits for leaves 1, 6, 7, `0xA`, `0x15`, `0x16`, and `0x80000007` |
-| Identity MSRs routed to OpenVMM | `KVM_CAP_X86_USER_SPACE_MSR` (`UNKNOWN`, `FILTER`) and `KVM_X86_SET_MSR_FILTER` denying reads and writes of `0x40000000..=0x400001ff`; the filter takes precedence over KVM's in-kernel Hyper-V MSRs. A Linux boot takes four MSR exits, all on the BSP, at any vCPU count | MSR-index intercepts (`READ_WRITE`) for `0x40000002`, `0x40000022`, `0x40000023`, and `0x40000118`. The hypervisor itself raises #GP for writes to the three read-only MSRs and for every other MSR in the range. Native synthetic MSRs are never enabled: they pre-empt the intercepts | `X64MsrExitBitmap` with `UnhandledMsrs` (capability `0x3f` on every host) and the offloaded APIC, no synthetic features and no `hv1_emulator`: the identity MSRs exit to OpenVMM, which raises #GP for every other MSR in the range |
+| Identity MSRs routed to OpenVMM | `KVM_CAP_X86_USER_SPACE_MSR` (`UNKNOWN`, `FILTER`) and `KVM_X86_SET_MSR_FILTER` denying reads and writes of `0x40000000..=0x400001ff`; the filter takes precedence over KVM's in-kernel Hyper-V MSRs. A Linux boot takes four MSR exits, all on the BSP, at any vCPU count | MSR-index intercepts (`HV_INTERCEPT_TYPE_X64_MSR_INDEX`, `READ_WRITE`) for `0x40000002`, `0x40000022`, `0x40000023`, and `0x40000118`. The hypervisor itself raises #GP for writes to the three read-only MSRs and for every other MSR in the range. Native synthetic MSRs are forbidden: they pre-empt the intercepts, and the native `HV_X64_MSR_TSC_FREQUENCY` returns the destination's rate instead of `F`. Verified on hypervisor builds 26100.30000 (bare metal) and 26100.9444 (Azure) | `X64MsrExitBitmap` with `UnhandledMsrs` (capability `0x3f` on every host) and the offloaded APIC, no synthetic features and no `hv1_emulator`: the identity MSRs exit to OpenVMM, which raises #GP for every other MSR in the range |
 | Native rate `F_d` | `KVM_GET_TSC_KHZ` × 1000 on VP 0 (1 kHz granularity) | `ProcessorClockFrequency` partition property | `WHvCapabilityCodeProcessorClockFrequency` |
 | No TSC scaling | Never `KVM_SET_TSC_KHZ`; every vCPU reports the host rate | No frequency override | No `ProcessorClockFrequency` partition property; the 1 GHz request is removed |
 | LAPIC rate `L` | In-kernel LAPIC at 1 GHz; `KVM_CAP_X86_APIC_BUS_CYCLES_NS` never set | 200 MHz | Offloaded APIC at its fixed 200 MHz, verified at preflight (setting `InterruptClockFrequency` is not supported); the emulated APIC is not used |
 | TSC-deadline and `TSC_ADJUST` hidden | CPUID bits cleared; the MSR filter also denies `IA32_TSC_ADJUST` (`0x3b`) and `IA32_TSC_DEADLINE` (`0x6e0`), which KVM would otherwise serve, and OpenVMM raises #GP | Feature-bank bits `tsc_deadline_tmr_support`, `tsc_adjust_support`, and `a_count_m_count_support` cleared, and CPUID bits cleared | Feature-bank bits `TscDeadlineTmr`, `TscAdjust`, and `ACountMCount` cleared, and CPUID bits cleared; the hypervisor raises #GP for `IA32_TSC_ADJUST` |
 | Invariant TSC exposed | CPUID bit. KVM hides it from a guest with `"Hv#1"` until KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is set, so OpenVMM writes 1 to it host-side at vCPU creation | Forced by the profile: Azure's nested MSHV does not pass the bit through, and without it each AP pays about 150 ms of calibration. Hosts without an invariant TSC fail qualification (`azure-azlinux-2`) | Set by the CPUID override: Azure WHP hosts cannot expose it through the feature banks (bank 1 lacks `TscInvariant`), so those hosts qualify on the warp probe and rate stability (the guest TSC matched the declared rate against host QPC within 0.001 ppm over 118 s) |
 | No paravirtual or synthetic features | No KVM leaves; `KVM_CAP_ENFORCE_PV_FEATURE_CPUID`, so KVM's paravirtual MSRs raise #GP; KVM's in-kernel Hyper-V MSRs are unreachable behind the filter | No synthetic processor features | `--hv` stays rejected for the microVM |
-| Capture anchor: VP 0 TSC paired with a host time sample within 100 µs, re-sampled a bounded number of times | Host `rdtsc` plus VP 0's `KVM_VCPU_TSC_OFFSET`, bracketed by two host `rdtsc` reads around the host clock reads; up to 16 attempts (0.06 to 0.4 µs) | The tightest of up to 64 brackets `[sample, HvCallGetVpRegisters(VP 0 TSC), sample]`, paired at the bracket midpoint (p50 3.5 µs on bare metal, 6.2 µs on Azure) | TBD(whp) |
-| Synchronized TSC set at one host instant | One `KVM_VCPU_TSC_OFFSET` value for every vCPU, `target(t) - (h0 + h1) / 2` from a host clock read `t` bracketed by host `rdtsc` reads `h0` and `h1` (Linux 5.16 or newer); no `IA32_TSC` writes, which Linux 6.6 can discard | Freeze partition time, write the target to every created VP, read back, and thaw at the first VP run (56 to 312 µs for 1 to 8 VPs) | Suspend partition time, write the target to every VP, read back, and resume explicitly with `WHvResumePartitionTime`; `TscVirtualOffset` is unusable (writes fail) |
+| Capture anchor: VP 0 TSC paired with a host time sample within 100 µs, re-sampled a bounded number of times | Host `rdtsc` plus VP 0's `KVM_VCPU_TSC_OFFSET`, bracketed by two host `rdtsc` reads around the host clock reads; up to 16 attempts (0.06 to 0.4 µs) | The tightest of up to 64 brackets `[sample, HvCallGetVpRegisters(VP 0 TSC), sample]`, paired at the bracket midpoint (p50 3.5 µs on bare metal, 6.2 µs on Azure) | The tightest of up to 64 bracketed reads of VP 0's TSC register, paired at the bracket midpoint (2.6 to 6.4 µs on bare metal, 5.4 to 9.7 µs on 8370C runners, 5.8 to 11 µs on 8573C runners) |
+| Synchronized TSC set at one host instant | One `KVM_VCPU_TSC_OFFSET` value for every vCPU, `target(t) - (h0 + h1) / 2` from a host clock read `t` bracketed by host `rdtsc` reads `h0` and `h1` (Linux 5.16 or newer); no `IA32_TSC` writes, which Linux 6.6 can discard | Freeze partition time, write the target to every created VP, read back, and resume partition time right after the read-back (56 to 312 µs for 1 to 8 VPs; equal on 20 of 20 restores) | Suspend partition time, write the target to every VP, read back, and resume explicitly with `WHvResumePartitionTime`; `TscVirtualOffset` is unusable (writes fail) |
 | Read-back before release | Every vCPU's `KVM_VCPU_TSC_OFFSET` equals the written value, and a host `rdtsc` bracket around VP 0's `IA32_TSC` shows no scaling | Every created VP's TSC equals the target while time is frozen | Every VP's TSC equals the target while time is suspended; live reads cannot verify 1 µs (a register read takes 9.5 to 21 µs) |
 | Live cross-vCPU skew after release at most 1 µs | Equal offsets: skew is the host's TSC skew, bounded by qualification. Measured at most 63 ns | Measured 0 warps; offsets within 516 ns on dual-socket bare metal and 195 ns on Azure, both bounded by the probe's round trip | Measured at most 70 ns over 60 s on prometheus28, 8370C, and 8573C hosts |
 | VP instantiation | All `C` VPs exist before the set | The created prefix exists before the set; no VP is created after it | All `C` VPs exist before the set |
 | Partition capabilities | Derived from CPUID with the hypervisor range masked: `hv1` and `kvm_clock` are false | Same | Same |
-| Unknown MSRs | #GP; the `MYSTERY_MSRS` stubs are TBD(profiles) | #GP from the hypervisor | #GP; the `MYSTERY_MSRS` stubs are TBD(profiles) |
+| Unknown MSRs | #GP, including the legacy L2-cache MSR stubs (see [CPU profiles](#cpu-profiles)) | #GP from the hypervisor | #GP, including the legacy L2-cache MSR stubs |
 | Removed | `KVM_GET_CLOCK`/`KVM_SET_CLOCK` in the microVM downtime path, kvmclock MSR state, leaf `0x15` synthesis, `KVM_SET_TSC_KHZ`, restore-time `IA32_TSC` writes | BSP-copy TSC alignment, exact-rate equality, leaf `0x15` synthesis | 1 GHz request and fallback, `RestoredTsc` and its RDTSC, RDTSCP, and `IA32_TSC` exits, leaf `0x15` synthesis |
 
 **KVM common offset.** Restoring each VP's `IA32_TSC` is unreliable on KVM.
@@ -340,6 +339,14 @@ profiles' derivation policy). `IA32_UCODE_REV` is not pinned in v1. The
 effective guest CPUID is a pure function of the profile, the VM topology,
 and the time ABI's identity leaves.
 
+Mitigation-relevant bits follow the hardware. A profile sets `ITS_NO`
+(`IA32_ARCH_CAPABILITIES` bit 62) or `BHI_CTRL` (`CPUID.7.2:EDX[4]`) only if
+every CPU of its generation is immune or has the control and every backend
+can present the value; MSHV cannot intercept `IA32_ARCH_CAPABILITIES`.
+Without `ITS_NO`, the hypervisor bit makes Linux enable its ITS mitigation.
+NVX keeps every such mitigation enabled, and the kernel must not leave its
+thunk pages writable and executable (boot check `K1`).
+
 **Selection.** A microVM always has a profile. A cold boot uses
 `--cpu-profile <id>`, or `auto` (the default), which selects the highest
 revision of the single profile whose generation covers the host's vendor,
@@ -380,7 +387,11 @@ bare-metal hosts (one per backend) and fifteen Azure hosts:
 | `intel.icelake-sp.v1` | 6/106 | Xeon Platinum 8370C runners | KVM, MSHV, WHP |
 | `intel.emeraldrapids.v1` | 6/207 | Xeon Platinum 8573C runners | MSHV, WHP (no KVM host exists) |
 
-The fate of the `MYSTERY_MSRS` stubs is TBD(profiles).
+No profile pins the legacy P6 L2-cache MSRs (`0x88..=0x8a`, `0x116`,
+`0x118..=0x11b`, and `0x11e`) that the KVM and WHP backends stub for Windows
+booting from the PCAT BIOS. A microVM boots its kernel directly and never
+probes them, so on a time ABI partition they raise #GP on every backend, as
+MSHV's hypervisor already does.
 
 ## TSC rate policy and LAPIC rate rule
 
@@ -442,15 +453,17 @@ at most 1 µs, that is `F_s / 1,000,000` cycles. Linux no longer checks this
 1. **VMM synchronized set.** Restore writes one target to every instantiated
    VP at one host instant and verifies it by read-back before any VP runs
    (`E_TSC_SYNC_READBACK`). The VMM introduces no skew of its own.
-2. **Host qualification.** `nvx.py doctor` and `validate-runner` run a host
-   TSC skew probe and a guest warp probe; a host above 1 µs is not qualified.
-3. **CI warp probe.** Conformance, restore-matrix, and soak runs execute the
-   guest warp probe after boot and after every restore and fail above 1 µs.
+2. **Host qualification.** `nvx.py doctor` runs a host TSC skew probe (`H5`)
+   and the guest warp probe (`H6`); a host above 1 µs is not qualified.
+3. **CI warp probe.** Every CI microVM boot and restore scenario, and the
+   conformance, restore-matrix, and soak runs, execute the guest warp probe
+   after boot and after every restore and fail above 1 µs.
 4. **Backend live skew.** Each backend shows that live skew stays within the
    bound after release. The spikes measured at most 63 ns of ping-pong
-   offset and 7.2 ns of backward step on KVM, at most 516 ns on MSHV
-   (dual-socket bare metal, bounded by the probe's round trip), and at most
-   70 ns on WHP.
+   offset and 7.2 ns of backward step on KVM; on MSHV, zero warps and an
+   equal read-back on 20 of 20 restores, with offsets of at most 516 ns on
+   dual-socket bare metal (bounded by the probe's round trip) and 195 ns on
+   Azure; and at most 70 ns on WHP.
 
 The guest warp probe (`nvx-time-probe warp`, built from
 `guest/common/nvx-time-probe.c` and installed as `/sbin/nvx-time-probe`)
@@ -464,7 +477,13 @@ pair:
   rounds, `t2 - (t1 + t3) / 2` at the round with the minimum round trip.
 
 Both must be at most 1,000 ns, and no pair may stall for more than 2 s.
-Cycle values convert to nanoseconds with `F`.
+Cycle values convert to nanoseconds with `F`. Each offset estimate is
+uncertain by half its pair's minimum round trip, which the probe reports
+(`max_uncertainty_ns`); a verdict counts only if every pair's uncertainty is
+below the bound (`conclusive=1`), and CI fails an inconclusive one. Round
+trips are about 0.25 µs within a socket and 1 µs across sockets, so 100 ms
+per pair gives more than 10,000 rounds and an uncertainty of at most about
+0.5 µs on dual-socket hosts.
 
 ## Downtime semantics and source selection
 
@@ -500,12 +519,13 @@ path, a UTC delta that differs from `D` by more than 1 s is logged as a host
 wall-clock step and does not change `D`. The packet reports the source, so
 the guest and tests can tell the two paths apart.
 
-The restore anchor is the instant of the synchronized TSC set. On KVM and
-WHP the guest TSC runs from that instant (WHP resumes partition time right
-after the read-back); on MSHV it is frozen until the first VP runs. Either
-way, the guest monotonic advance across a restore lies in `[D, D + R]`, up
+The restore anchor is the instant of the synchronized TSC set, and the guest
+TSC runs from that instant on every backend: KVM never stops it, and MSHV and
+WHP resume partition time right after the read-back. The guest monotonic
+advance across a restore therefore lies in `[D, D + R]`, up
 to the two anchors' pairing errors (each at most 100 µs), where `R` is the
-time from the restore anchor to the first restored instruction. Wall-clock
+time from the restore anchor to the first restored instruction; it falls
+short of `D + R` only by the frozen write (at most about 0.5 ms). Wall-clock
 repair absorbs `R` and the pairing errors for `CLOCK_REALTIME`. The KVM spike
 kept guest `CLOCK_MONOTONIC` within −0.09 to +2.8 ms of the host interval
 across restores with 0 s and 30 s of downtime at 1 to 8 vCPUs; its positive
@@ -588,8 +608,7 @@ In the worker, with every VP stopped:
 16. Seal the time fields of the restore packet: `D`, its source, the rate
     deviation, `g`, and the test-hook flag.
 17. Start the state units, with host input gated when the restore requires an
-    acknowledgement; publish the readiness event; release the VPs. On MSHV,
-    partition time thaws when the first VP runs.
+    acknowledgement; publish the readiness event; release the VPs.
 
 The guest then repairs its clocks (see
 [Snapshot agent](#snapshot-agent)) before acknowledging a gated restore.
@@ -759,9 +778,8 @@ theta = utc_ns - (t0 + t1) / 2      uncertainty epsilon = (t1 - t0) / 2
 
 The same bracket applies to `utc_ns` in the restore packet, around the first
 `0xa5` write. A sample costs one write and four reads. OpenVMM cannot observe
-a running VP's TSC on every backend, and frozen time on MSHV thaws at an
-unobservable instant, so the guest forms the UTC and TSC pair itself through
-this bracket; its `CLOCK_REALTIME` is derived from the TSC.
+a running VP's TSC on every backend, so the guest forms the UTC and TSC pair
+itself through this bracket; its `CLOCK_REALTIME` is derived from the TSC.
 
 ### Uncertainty bounds
 
@@ -787,11 +805,16 @@ difference:
 | KVM | `azure-kvm-5` (nested, Linux 6.6) | 3.8 to 4.1 µs / 4 to 9 µs | 75 µs |
 | MSHV | prometheus30 (bare metal) | 6.3 to 6.4 µs / 6.8 to 7.1 µs | 37 µs |
 | MSHV | `azure-azlinux-5` (nested) | 12.7 to 13.0 µs / 15 to 25 µs | 102 µs |
-| WHP | | TBD(whp) | |
+| WHP | prometheus28 (bare metal) | 20.7 to 21.3 µs / 29.4 to 30.5 µs | 52 µs |
+| WHP | `azure-windows-1` (8370C, nested) | 24.8 to 25.2 µs / 36.5 to 41.9 µs | 794 µs |
+| WHP | `azure-windows-3` (8573C, nested) | 30.5 to 30.8 µs / 46.0 to 46.4 µs | 251 µs |
 
 The second run of each boot overlaps the console's drain of the first run's
-output, and it has the higher KVM p99s. A sample above the 50 µs discipline
-bound is rare, and the poll retries it.
+output, and it has the higher KVM p99s. The WHP rows come from the WHP
+agent's probe (two runs of 2,000 samples). A sample above the 50 µs
+discipline bound is rare except on WHP, whose p99 approaches it; a poll then
+retries, and a poll whose three attempts all fail is skipped without harm
+(`G_SAMPLE_UNCERTAIN`).
 
 ### Generation counter and generation ID
 
@@ -1132,27 +1155,30 @@ failure by the status together with its `NVX-TIME-ABI-VIOLATION` event.
 
 ## Host qualification
 
-`nvx.py doctor --backend <backend>` qualifies a host interactively, and the
-`validate-runner` action runs the same checks before every CI job. Both print
-one `NVX-DOCTOR: check=<id> status=<pass|fail> detail=...` line per check and
-fail if any check fails. The time checks replace the `nonstop_tsc` check.
+`nvx.py doctor --backend <backend>` qualifies a host interactively by running
+every check. The `validate-runner` action runs `H1`, `H2`, and `H4` before
+every CI job and `H3` in microVM jobs, and every CI microVM boot and restore
+scenario runs the `H6` warp schedule; `H5` and `H7` run in `doctor` only.
+Both tools print one `NVX-DOCTOR: check=<id> status=<pass|fail> detail=...`
+line per check and fail if any check fails. The time checks replace the
+`nonstop_tsc` check.
 
 | ID | Check |
 | --- | --- |
 | `H1` | The backend device or API is present and usable |
-| `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, the generation name, and the profile that `auto` selects; an unmapped generation fails (`E_PROFILE_HOST_UNKNOWN`) |
+| `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, the generation name, and the profile that `auto` selects; an unmapped generation fails (`E_PROFILE_HOST_UNKNOWN`). The host's invariant TSC (`constant_tsc` and `nonstop_tsc` on Linux, the CPUID bit on Windows) is reported as evidence only |
 | `H3` | OpenVMM preflight in verification mode: profile support, identity routing, synchronized TSC set, no scaling, and both rates, without booting a guest |
-| `H4` | Host TSC rate stability: two 1 s measurements of the TSC against host monotonic time agree within 1 ppm and are within 100 ppm of `F_d`; on Linux the host clocksource is `tsc` (KVM rewrites per-vCPU TSC offsets on a host with an unstable TSC) |
+| `H4` | Host TSC rate stability: two 1 s measurements of the TSC against host monotonic time agree within 1 ppm and are within 100 ppm of `F_d`. The Linux host clocksource is reported as evidence only: MSHV roots and Azure KVM hosts run `hyperv_clocksource_tsc_page`, and KVM rewrites per-vCPU TSC offsets only on a host that marked its TSC unstable without that clocksource, which `H6` measures |
 | `H5` | Host cross-CPU TSC skew: a pinned-thread probe over all host CPU pairs, `max_abs_offset_ns <= 1000` |
-| `H6` | Guest warp probe: a microVM with the host's largest supported vCPU count up to 8 boots, passes the boot check, and reports `max_backward_ns` and `max_abs_offset_ns` at most 1,000 |
+| `H6` | Guest warp probe on an idle-inducing schedule: a microVM with the host's largest supported vCPU count up to 8 boots, passes the boot check, and runs the probe twice with every vCPU halted for 1 s between the runs (once with one vCPU); every run reports `max_backward_ns` and `max_abs_offset_ns` at most 1,000, no stall, and a conclusive verdict |
 | `H7` | Host UTC is synchronized: no `STA_UNSYNC` on Linux; a synchronized `w32tm` source on Windows |
 
-Qualification gates on these measured properties and on the profile's
-features. Hosts whose OS sees no invariant TSC (Azure WHP and nested MSHV
-partitions) still expose the CPUID invariant-TSC bit through the profile, so
-the warp probe (`H6`) and rate stability (`H4`) are the evidence for TSC
-invariance there; a host that fails them, such as `azure-azlinux-2`, is not
-qualified.
+Qualification gates alike on every backend, on measured properties only: the
+CPU profile (`H2` and `H3`), rate stability (`H4`), and the idle-scheduled
+warp probe (`H6`). Hosts whose OS sees no invariant TSC (Azure WHP and nested
+MSHV partitions) still expose the CPUID invariant-TSC bit through the
+profile, so `H4` and `H6` are the evidence for TSC invariance there; a host
+that fails them, such as `azure-azlinux-2`, is not qualified.
 
 Generation names used in logs, reports, and job summaries are `skylake-sp`
 (family 6, model 85), `icelake-sp` (6/106), and `emeraldrapids` (6/207).
