@@ -294,7 +294,6 @@ entropy=$runtime/restore-entropy
 # and LENGTH for each memory range.
 post_restore() {
     post_restore_pending=true
-    console_status "NVX-POST-RESTORE-STAGE: packet"
     [ "$#" -ge 4 ] || fail_closed "restore packet metadata is invalid"
     packet_flags=$1
     restore_online_count=$2
@@ -309,6 +308,17 @@ post_restore() {
         0 | 1 | 2 | 4 | 8) ;;
         *) fail_closed "restore packet has an invalid online CPU count" ;;
     esac
+    # A plain untiered restore, with no processors or memory to add, prints
+    # nothing, as before: each console byte is a port exit on its latency
+    # path.
+    if [ "$snapshot_tier" = legacy ] &&
+        [ "$restore_online_count" -eq 0 ] &&
+        [ "$restore_memory_range_count" -eq 0 ] &&
+        [ $((packet_flags & PACKET_MEMORY_TARGET)) -eq 0 ]; then
+        finish_restore "$packet_flags" quiet
+        return
+    fi
+    console_status "NVX-POST-RESTORE-STAGE: packet"
     if [ "$restore_online_count" -ne 0 ]; then
         activate_restore_processors "$restore_online_count"
     fi
@@ -383,9 +393,11 @@ post_restore() {
 
 # Restore steps 11 to 13: the restore checks, the acknowledgement when the
 # host gated its input, and the daemon's grace-period release, which runs off
-# the restore latency path.
+# the restore latency path. A second argument of "quiet" omits the stage and
+# completion lines of a plain untiered restore.
 finish_restore() {
-    console_status "NVX-POST-RESTORE-STAGE: acknowledge"
+    [ "${2:-}" = quiet ] ||
+        console_status "NVX-POST-RESTORE-STAGE: acknowledge"
     if [ $(($1 & PACKET_ACK_REQUIRED)) -ne 0 ]; then
         /sbin/nvx-time restore-finish --ack --new-cpus "$restore_new_cpus" ||
             fail_closed "failed to finish the restore"
@@ -394,7 +406,7 @@ finish_restore() {
             fail_closed "failed to finish the restore"
     fi
     post_restore_pending=false
-    echo "NVX-POST-RESTORE-OK: tier=$snapshot_tier"
+    [ "${2:-}" = quiet ] || echo "NVX-POST-RESTORE-OK: tier=$snapshot_tier"
 }
 trap cleanup EXIT
 trap 'exit 129' HUP

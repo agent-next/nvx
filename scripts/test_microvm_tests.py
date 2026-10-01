@@ -1028,6 +1028,79 @@ class MicrovmTests(unittest.TestCase):
                 "nvx-snapshot: synthetic restore failure; terminating the VM\n",
             )
 
+    def test_plain_untiered_restore_prints_nothing(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        snapshot = (
+            Path(__file__).parents[1] / "guest" / "common" / "nvx-snapshot"
+        ).read_text(encoding="utf-8")
+        helpers_start = snapshot.index("console_status() {")
+        helpers_end = snapshot.index("\n}\n\ncleanup()", helpers_start) + 3
+        restore_start = snapshot.index("post_restore() {")
+        restore_end = snapshot.index("\n}\n", snapshot.index("finish_restore() {")) + 3
+        functions = (
+            snapshot[helpers_start:helpers_end] + snapshot[restore_start:restore_end]
+        )
+        functions = functions.replace(">/dev/console", '>>"$console_log"')
+        functions = functions.replace("/sbin/nvx-exit", "nvx_exit")
+        functions = functions.replace("/sbin/nvx-time", "nvx_time")
+        generation_id = "0123456789abcdef0123456789abcdef"
+
+        def restore(flags: int) -> tuple[str, str, str]:
+            with tempfile.TemporaryDirectory() as temporary:
+                result = subprocess.run(
+                    [shell, "-s", "--", temporary],
+                    input=(
+                        "set -eu\n"
+                        'console_log="$1/console"\n'
+                        'calls="$1/nvx-time"\n'
+                        ': >"$console_log"\n'
+                        ': >"$calls"\n'
+                        "snapshot_tier=legacy\n"
+                        "PACKET_MEMORY_TARGET=2\n"
+                        "PACKET_ACK_REQUIRED=4\n"
+                        "restore_new_cpus=none\n"
+                        "post_restore_pending=false\n"
+                        "nvx_exit() { :; }\n"
+                        'nvx_time() { printf "%s\\n" "$*" >>"$calls"; }\n'
+                        'activate_restore_memory() { echo "memory $*"; }\n'
+                        f"{functions}\n"
+                        f"post_restore {flags} 0 0 {generation_id}\n"
+                        'echo "pending=$post_restore_pending"\n'
+                    ),
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                root = Path(temporary)
+                return (
+                    (root / "console").read_text(encoding="ascii"),
+                    result.stdout,
+                    (root / "nvx-time").read_text(encoding="ascii"),
+                )
+
+        # No processors or memory to add: no console bytes on the restore path.
+        self.assertEqual(
+            restore(0), ("", "pending=false\n", "restore-finish --new-cpus none\n")
+        )
+        self.assertEqual(
+            restore(4),
+            ("", "pending=false\n", "restore-finish --ack --new-cpus none\n"),
+        )
+        # A memory target keeps its stage and completion lines.
+        console, stdout, calls = restore(2)
+        self.assertEqual(
+            console,
+            "NVX-POST-RESTORE-STAGE: packet\nNVX-POST-RESTORE-STAGE: acknowledge\n",
+        )
+        self.assertEqual(
+            stdout, "memory 0\nNVX-POST-RESTORE-OK: tier=legacy\npending=false\n"
+        )
+        self.assertEqual(calls, "restore-finish --new-cpus none\n")
+
     def test_console_log_persists_buffered_and_completed_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
