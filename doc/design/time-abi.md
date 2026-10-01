@@ -669,12 +669,11 @@ In the worker, with every VP stopped:
 10. Restore every state unit while stopped: VM time, chipset and virtio
     devices, the time platform (`HV_X64_MSR_TSC_INVARIANT_CONTROL`), the
     partition, and every VP.
-11. Assert the saved timers: no armed periodic or TSC-deadline LAPIC timer on
-    any VP (`E_LAPIC_PERIODIC`, `E_LAPIC_TSC_DEADLINE`), and PIT channel 0 not
-    counting in a periodic mode (`E_PIT_ACTIVE`). Every instantiated VP was
-    bound before step 10 restored its state, and MSHV creates a VP only when
-    it is bound, so the instantiated set is complete. Freeze it; creating a
-    VP after this point is an internal error (`E_VP_LATE_CREATION`).
+11. Freeze the instantiated VP set. Every instantiated VP was bound before
+    step 10 restored its state, and MSHV creates a VP only when it is bound,
+    so the set is complete; creating a VP after this point is an internal
+    error (`E_VP_LATE_CREATION`). The PIT's restore in step 10 already
+    rejected a channel 0 counting in a periodic mode (`E_PIT_ACTIVE`).
 12. Synchronized TSC set. The backend takes the restore anchor (one host
     instant) and passes its host sample to the orchestrator, which selects
     the downtime source, computes `D` and checks its bounds, and returns
@@ -702,7 +701,9 @@ In the worker, with every VP stopped:
 14. Advance every VP's counting-mode LAPIC timer by `D` at `L`, and set every
     VP's LAPIC state again, always after step 12 and even when no timer is
     armed: KVM derives its timer deadline from the guest TSC when the LAPIC
-    state is set.
+    state is set. The same pass rejects an armed periodic or TSC-deadline
+    timer (`E_LAPIC_PERIODIC`, `E_LAPIC_TSC_DEADLINE`) before any VP runs,
+    so restore takes no separate pass over the VPs to check them.
 15. Advance VM time by `D` and the RTC's UTC by `D` (milliseconds). The PIT
     catches up from its saved VM-time cursor; it is idle.
 16. Seal the time fields of the restore packet: `D`, its source, the rate
@@ -1452,7 +1453,9 @@ Expected wins are tracked separately and do not relax the gate.
 
 **Attribution.** With `OPENVMM_STARTUP_PROFILE` set, OpenVMM's lifecycle
 profile records three exclusive time ABI restore phases:
-`restore.time_abi_clock` (restore steps 11 to 16), `restore.guest_resume`
+`restore.time_abi_clock` (restore steps 12 to 16, whose phases OpenVMM also
+logs as `time ABI restore clock` with `tsc_set_us`, `lapic_us`,
+`vm_time_us`, and `total_us`), `restore.guest_resume`
 (from the VP release to the guest's first selection of the restore packet),
 and, for a restore with `ACK_REQUIRED`, `restore.guest_repair` (from that
 selection to the arrival of the `0x605` acknowledgement). The
