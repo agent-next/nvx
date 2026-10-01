@@ -283,6 +283,17 @@ class InitramfsBuildConstants:
         "nvx-console-pending",
         "nvx-managed-agent",
     )
+    TIME_PROBE_NAME: Final = "nvx-time-probe"
+    TIME_PROBE_CFLAGS: Final = (
+        "-std=gnu11",
+        "-static",
+        "-O2",
+        "-pthread",
+        "-s",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    )
 
 
 class DockerBuildConstants:

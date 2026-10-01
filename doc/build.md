@@ -133,8 +133,12 @@ complete per-scenario logs under
 `build/test-results/microvm` by default.
 
 The Alpine initramfs includes the sandbox PID-1 bootstrap, its container namespace
-helpers, the static `nvx-device-io` benchmark helper, and the static
-`nvx-port-io` restore packet helper under `/sbin`. The matching kernel enables
+helpers, the static `nvx-device-io` benchmark helper, the static `nvx-port-io`
+restore packet helper, and the static `nvx-time-probe` guest time probe under
+`/sbin`. The probe measures TSC and clock read latency, reports the guest's
+clock, clocksource, TSC flags, and hypervisor identity, and runs the cross-vCPU
+warp test that the [time ABI](design/time-abi.md#cross-vcpu-skew-bound) uses to
+enforce its 1 µs skew bound. The matching kernel enables
 virtio-blk, compressed EROFS, overlayfs, ext4 scratch, memory cgroups, and
 cgroup BPF. The build fails if `olddefconfig` drops any required option. The
 APK manifest records the `blkid` and `util-linux` tools used by the bootstrap

@@ -5052,6 +5052,61 @@ class BuildTests(unittest.TestCase):
             debug.work.name, KernelBuildConstants.DEBUG_WORK_DIRECTORY_NAME
         )
 
+    def test_guest_files_build_time_probe_with_its_own_flags(self):
+        source = BuildConstants.REPO_ROOT / "guest" / "common" / "nvx-time-probe.c"
+        header = source.read_text(encoding="utf-8").splitlines()[:2]
+        self.assertEqual(
+            header,
+            [
+                "// Copyright (c) Microsoft Corporation.",
+                "// Licensed under the MIT License.",
+            ],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            work = Path(temporary) / "work"
+            for directory in (root / "sbin", root / "etc", work):
+                directory.mkdir(parents=True)
+            commands: list[list[str]] = []
+
+            def compile_helper(
+                command: list[str | os.PathLike[str]], **_kwargs: object
+            ) -> None:
+                commands.append([os.fspath(part) for part in command])
+                output = Path(command[command.index("-o") + 1])
+                output.write_bytes(f"static-elf {output.name}".encode())
+
+            with (
+                patch.object(build, "require_tool", return_value="cc"),
+                patch.object(build, "run_checked", side_effect=compile_helper),
+            ):
+                helpers = build._install_guest_files(
+                    build_config.InitramfsBuildConfig(work=work),
+                    root,
+                    guests.guest_descriptor("alpine"),
+                )
+
+        probe = InitramfsBuildConstants.TIME_PROBE_NAME
+        flags_by_source = {
+            Path(command[-1]).stem: command[1 : command.index("-o")]
+            for command in commands
+        }
+        self.assertEqual(
+            flags_by_source[probe], list(InitramfsBuildConstants.TIME_PROBE_CFLAGS)
+        )
+        self.assertIn("-pthread", flags_by_source[probe])
+        for name in InitramfsBuildConstants.STATIC_HELPERS:
+            with self.subTest(helper=name):
+                self.assertEqual(
+                    flags_by_source[name],
+                    list(InitramfsBuildConstants.STATIC_HELPER_CFLAGS),
+                )
+        self.assertEqual(helpers[probe]["source_sha256"], common.sha256_file(source))
+        self.assertEqual(
+            helpers[probe]["binary_sha256"],
+            hashlib.sha256(f"static-elf {probe}".encode()).hexdigest(),
+        )
+
     def test_docker_debug_kernel_target_exports_debug_artifacts(self):
         dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
             encoding="utf-8"
