@@ -261,7 +261,7 @@ settled cell on the registered hosts.
 | Synchronized TSC set at one host instant | One `KVM_VCPU_TSC_OFFSET` value for every vCPU, `target(t) - (h0 + h1) / 2` from a host clock read `t` bracketed by host `rdtsc` reads `h0` and `h1` (Linux 5.16 or newer); no `IA32_TSC` writes, which Linux 6.6 can discard | Freeze partition time, write the target to every created VP, read back, and resume partition time right after the read-back (56 to 312 µs for 1 to 8 VPs; equal on 20 of 20 restores) | Suspend partition time, write the target to every VP, read back, and resume explicitly with `WHvResumePartitionTime`; `TscVirtualOffset` is unusable (writes fail) |
 | Read-back before release | Every vCPU's `KVM_VCPU_TSC_OFFSET` equals the written value, and a host `rdtsc` bracket around VP 0's `IA32_TSC` shows no scaling | Every created VP's TSC equals the target while time is frozen | Every VP's TSC equals the target while time is suspended; live reads cannot verify 1 µs (a register read takes 9.5 to 21 µs) |
 | Live cross-vCPU skew after release at most 1 µs | Equal offsets: skew is the host's TSC skew, bounded by qualification. Measured at most 63 ns | Measured 0 warps; offsets within 516 ns on dual-socket bare metal and 195 ns on Azure, both bounded by the probe's round trip | Measured at most 70 ns over 60 s on prometheus28, 8370C, and 8573C hosts |
-| VP instantiation | All `C` VPs exist before the set | The created prefix exists before the set; no VP is created after it | All `C` VPs exist before the set |
+| VP instantiation | All `C` VPs exist before the set | Every instantiated VP is bound, which creates it, before the set; no VP is created after it | All `C` VPs exist before the set |
 | Partition capabilities | Derived from CPUID with the hypervisor range masked: `hv1` and `kvm_clock` are false | Same | Same |
 | Unknown MSRs | #GP, including the legacy L2-cache MSR stubs (see [CPU profiles](#cpu-profiles)) | #GP from the hypervisor | #GP, including the legacy L2-cache MSR stubs |
 | Removed | `KVM_GET_CLOCK`/`KVM_SET_CLOCK` in the microVM downtime path, kvmclock MSR state, leaf `0x15` synthesis, `KVM_SET_TSC_KHZ`, restore-time `IA32_TSC` writes | BSP-copy TSC alignment, exact-rate equality, leaf `0x15` synthesis | 1 GHz request and fallback, `RestoredTsc` and its RDTSC, RDTSCP, and `IA32_TSC` exits, leaf `0x15` synthesis |
@@ -341,6 +341,21 @@ host qualification measures them instead. Profiles also pin policy zeros
 profiles' derivation policy). The effective guest CPUID is a pure function of
 the profile, the VM topology, and the time ABI's identity leaves.
 
+**Effective CPUID.** The effective CPUID (`openvmm-effective-cpuid/v1`)
+lists exactly the governed leaves: every leaf and subleaf of the profile's
+`cpuid` table; the topology leaves `0xB` and `0x1F`, at the subleaves the
+VM's topology defines, when they are within the maximum basic leaf; and the
+identity leaves `0x40000000..=0x40000005` with the explicit zero leaves. Each
+entry holds the four registers and their masks; the per-VP fields hold VP 0's
+APIC identity, and the runtime-owned bits are unmasked. OpenVMM computes it,
+records it, and recomputes it on restore, so the record never depends on how
+a backend enumerates or caches CPUID, and one profile and topology give the
+same record on every backend. At preflight, before any VP runs, each backend
+reports VP 0's CPUID for exactly the governed leaves (KVM from the
+`KVM_SET_CPUID2` table it programmed, MSHV with `get_cpuid_values` on VP 0,
+WHP from VP 0's register view; an entry without a subleaf at subleaf 0), and
+OpenVMM compares the report with the effective CPUID under its masks.
+
 Informational fields:
 
 - The brand string (`0x80000002..=0x80000004`) is generic per generation:
@@ -361,10 +376,12 @@ Mitigation-relevant bits follow the hardware. A profile sets `ITS_NO`
 every CPU of its generation is immune or has the control and every backend
 can present the value; MSHV cannot intercept `IA32_ARCH_CAPABILITIES`. The
 v1 profiles clear both: MSHV and WHP cannot present `ITS_NO`, and no host
-available to the fleet exposes `BHI_CTRL`. Without `ITS_NO`, the hypervisor
-bit makes Linux enable its ITS mitigation. NVX keeps every such mitigation
-enabled, and the kernel must not leave its thunk pages writable and
-executable (boot check `K1`).
+available to the fleet exposes `BHI_CTRL`. MSHV cannot present `BHI_CTRL` at
+all: even on 8573C runners its feature banks have neither `bhi_dis` nor
+`bhi_no`, and leaf 7 reports a maximum subleaf of 0. Without `ITS_NO`, the
+hypervisor bit makes Linux enable its ITS mitigation. NVX keeps every such
+mitigation enabled, and the kernel must not leave its thunk pages writable
+and executable (boot check `K1`).
 
 **Selection.** A microVM always has a profile. A cold boot uses
 `--cpu-profile <id>`, or `auto` (the default), which selects the highest
@@ -396,6 +413,8 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
    `E_PROFILE_DIGEST`), and the recomputed effective CPUID equals the
    recorded one (`E_CPU_SURFACE`). The effective-CPUID record replaces the
    exact-equality CPU contract.
+5. The backend presents the effective CPUID: VP 0's CPUID for every governed
+   leaf equals it under its masks (`E_CPU_SURFACE`).
 
 The catalog has three profiles, derived from the fingerprints of three
 bare-metal hosts (one per backend) and fifteen Azure hosts:
@@ -558,6 +577,17 @@ across restores with 0 s and 30 s of downtime at 1 to 8 vCPUs; its positive
 part came from a host sample taken before the per-VP TSC save, which the
 paired capture anchor removes.
 
+**Anchor pairing bound.** An anchor that pairs a TSC read with a host time
+sample (the capture anchor on every backend, and KVM's restore anchor)
+brackets one with the other, and its pairing error is half the bracket. Every
+backend uses one bound, 100 µs (`MAX_ANCHOR_PAIRING_NS` in
+`virt::time_abi`): it keeps the tightest of at most 64 samples, never accepts
+a looser pair, and otherwise fails with `E_TSC_ANCHOR`. A nested hypercall
+round trip on Azure takes about 12 µs, so nested MSHV pairs at a median of
+6.2 µs and WHP on 8573C runners at up to 11 µs; a 10 µs bound would leave
+about 1.5× margin over the median and fail restores at random. Downtime needs
+only millisecond accuracy, so a 100 µs pairing error is negligible.
+
 ## Restore algorithm
 
 Restore runs these steps in order. Any failure rejects the restore before a
@@ -590,11 +620,13 @@ Before worker construction:
 In the worker, with every VP stopped:
 
 8. Create the partition with the profile CPUID, the identity leaves, and the
-   time platform declaring `F = F_s` and `L = L_s`. Preflight the backend:
-   profile support and effective CPUID (`E_PROFILE_UNSUPPORTED`,
-   `E_CPU_SURFACE`), identity routing (`E_IDENTITY_ROUTING`), the
-   synchronized-set primitive (`E_TSC_SYNC_UNSUPPORTED`), and no scaling
-   (`E_TSC_SCALING_ACTIVE`).
+   time platform declaring `F = F_s` and `L = L_s`. Preflight the backend
+   before any VP runs and before any VP state is restored: profile support
+   and effective CPUID (`E_PROFILE_UNSUPPORTED`, `E_CPU_SURFACE`), identity
+   routing (`E_IDENTITY_ROUTING`), the synchronized-set primitive
+   (`E_TSC_SYNC_UNSUPPORTED`), and no scaling (`E_TSC_SCALING_ACTIVE`).
+   MSHV's preflight writes `TimeFreeze` to probe the primitive and reads
+   VP 0's CPUID at its reset state.
 9. Read `F_d` and `L_d` and apply the
    [rate policy](#tsc-rate-policy-and-lapic-rate-rule)
    (`E_TSC_RATE_UNAVAILABLE`, `E_TSC_RATE_IMPLAUSIBLE`,
@@ -605,9 +637,10 @@ In the worker, with every VP stopped:
     partition, and every VP.
 11. Assert the saved timers: no armed periodic or TSC-deadline LAPIC timer on
     any VP (`E_LAPIC_PERIODIC`, `E_LAPIC_TSC_DEADLINE`), and PIT channel 0 not
-    counting in a periodic mode (`E_PIT_ACTIVE`). Freeze the instantiated VP
-    set; creating a VP after this point is an internal error
-    (`E_VP_LATE_CREATION`).
+    counting in a periodic mode (`E_PIT_ACTIVE`). Every instantiated VP was
+    bound before step 10 restored its state, and MSHV creates a VP only when
+    it is bound, so the instantiated set is complete. Freeze it; creating a
+    VP after this point is an internal error (`E_VP_LATE_CREATION`).
 12. Synchronized TSC set. The backend takes the restore anchor (one host
     instant) and passes its host sample to the orchestrator, which selects
     the downtime source, computes `D` and checks its bounds, and returns
@@ -640,6 +673,23 @@ In the worker, with every VP stopped:
 
 The guest then repairs its clocks (see
 [Snapshot agent](#snapshot-agent)) before acknowledging a gated restore.
+
+**Cold boot.** A cold boot runs the partition steps without a snapshot, in
+this order:
+
+1. Select the CPU profile (see [CPU profiles](#cpu-profiles)) and reject
+   `tsc_early_khz=` and `lapic_timer_hz=` in the command line
+   (`E_CMDLINE_CLOCK_TOKEN`); OpenVMM injects neither.
+2. Create the partition and preflight the backend as in step 8, before any
+   VP runs.
+3. Read `F_d` and `L_d`, check them (`E_TSC_RATE_UNAVAILABLE`,
+   `E_TSC_RATE_IMPLAUSIBLE`, `E_LAPIC_RATE_UNAVAILABLE`,
+   `E_LAPIC_RATE_MISMATCH`), and declare `F = F_d` and `L = L_d`.
+4. Set `g = 0`, start the state units, and release the VPs.
+
+A cold boot writes no TSC: every backend starts the VPs' TSCs together (the
+spikes measured at most 63 ns of skew), and skew enforcement points 2 to 4
+apply.
 
 ## Snapshot manifest
 
@@ -697,7 +747,7 @@ reused. It adds two required fields:
 | 1 | `id` | `string` | Profile ID |
 | 2 | `sha256` | `bytes` | Profile digest, 32 bytes |
 | 3 | `profile` | `bytes` | Canonical profile encoding, at most 1 MiB |
-| 4 | `effective_cpuid` | `bytes` | The effective guest CPUID in its canonical encoding, `openvmm-effective-cpuid/v1` (compact canonical JSON): the profile's pinned values, the topology fields, and the identity leaves |
+| 4 | `effective_cpuid` | `bytes` | The [effective CPUID](#cpu-profiles) in its canonical encoding, `openvmm-effective-cpuid/v1` (compact canonical JSON): every governed leaf with its values and masks |
 | 5 | `effective_cpuid_sha256` | `bytes` | Digest of `effective_cpuid`, 32 bytes |
 | 6 | `capture_cpu_signature` | `u32` | CPUID.1:EAX of the capture host, for diagnostics |
 
@@ -1125,11 +1175,13 @@ Workloads that need prompt notice of a step can also arm a `timerfd` with
 
 Codes are stable. OpenVMM errors put the code in brackets at the start of the
 message, for example `[E_TSC_RATE_TOLERANCE] destination TSC rate ...`, and
-the code survives error wrapping across the worker boundary. A rejected cold
-boot or restore exits the OpenVMM process with status 1, the existing
-fatal-error status; tests and orchestrators match the bracketed code. A
-rejected capture is rollback-safe: the guest continues, and OpenVMM logs the
-code.
+the code survives every error-wrapping layer, including the worker boundary:
+the process's fatal-error line leads with the first code in the chain,
+`fatal error: [E_TSC_RATE_TOLERANCE] <outermost context>`, followed by the
+full cause chain. A rejected cold boot or restore exits the OpenVMM process
+with status 1, the existing fatal-error status; tests and orchestrators match
+the bracketed code at the start of that line. A rejected capture is
+rollback-safe: the guest continues, and OpenVMM logs the code.
 
 | VMM code | Condition | Detected at |
 | --- | --- | --- |
@@ -1142,7 +1194,7 @@ code.
 | `E_PROFILE_TIME_BITS` | The profile is invalid or violates the CPU time bits | Cold boot, restore |
 | `E_CPU_GENERATION` | Host CPU vendor, family, model, or stepping not in the profile | Cold boot, restore |
 | `E_PROFILE_UNSUPPORTED` | Backend lacks a feature, limit, XSAVE layout, MSR value, or feature-bank bit of the profile, or the host is not qualified | Cold boot, restore |
-| `E_CPU_SURFACE` | Recomputed effective CPUID differs from the recorded one | Restore |
+| `E_CPU_SURFACE` | Recomputed effective CPUID differs from the recorded one, or VP 0's CPUID differs from the effective CPUID under its masks | Cold boot, restore |
 | `E_IDENTITY_ROUTING` | Backend cannot deliver the identity CPUID or MSRs | Cold boot, restore |
 | `E_TSC_SYNC_UNSUPPORTED` | Backend lacks the synchronized TSC set | Cold boot, restore |
 | `E_TSC_SCALING_ACTIVE` | The guest TSC would be scaled | Cold boot, restore |
