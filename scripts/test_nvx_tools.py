@@ -157,6 +157,7 @@ def _write_release_fixture(
                 *KernelBuildConstants.REQUIRED_VIRTIO_CONSOLE_CONFIG,
                 *KernelBuildConstants.REQUIRED_SHARED_STATUS_CONFIG,
                 *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
+                *KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
             )
         )
         + "\n",
@@ -3670,6 +3671,7 @@ class BuildTests(unittest.TestCase):
                         *KernelBuildConstants.REQUIRED_VIRTIO_CONSOLE_CONFIG,
                         *KernelBuildConstants.REQUIRED_SHARED_STATUS_CONFIG,
                         *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
+                        *KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
                     )
                 )
                 + "\n",
@@ -4717,6 +4719,39 @@ class BuildTests(unittest.TestCase):
                 KernelBuildConstants.REQUIRED_SHARED_STATUS_CONFIG[0],
             ):
                 build._assert_shared_status_kernel_config(config)
+
+    def test_checked_in_config_meets_time_abi_kernel_contract(self):
+        config = BuildConstants.REPO_ROOT / KernelBuildConstants.INPUT_CONFIG
+        build._assert_time_abi_kernel_config(config)
+        configured = config.read_text(encoding="utf-8").splitlines()
+        for removed in (
+            "CONFIG_CPU_FREQ=y",
+            "CONFIG_X86_INTEL_PSTATE=y",
+            "CONFIG_SCHED_MC_PRIO=y",
+            "CONFIG_HYPERV=y",
+        ):
+            with self.subTest(removed=removed):
+                self.assertNotIn(removed, configured)
+        self.assertFalse(
+            any(line.startswith("CONFIG_CPU_FREQ_") for line in configured)
+        )
+
+    def test_time_abi_kernel_config_requires_every_setting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / ".config"
+            for missing in KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG:
+                with self.subTest(missing=missing):
+                    config.write_text(
+                        "\n".join(
+                            setting
+                            for setting in KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG
+                            if setting != missing
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(common.ScriptError, missing):
+                        build._assert_time_abi_kernel_config(config)
 
 
 class SandboxTests(unittest.TestCase):

@@ -117,12 +117,21 @@ def _assert_shared_status_kernel_config(path: Path) -> None:
     )
 
 
+def _assert_time_abi_kernel_config(path: Path) -> None:
+    _assert_kernel_config(
+        path,
+        KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
+        "kernel configuration does not meet the NVX time ABI: ",
+    )
+
+
 def assert_required_kernel_config(path: Path) -> None:
     """Validate the generated configuration required by the NVX platform."""
     _assert_direct_boot_kernel_config(path)
     _assert_virtio_console_kernel_config(path)
     _assert_sandbox_kernel_config(path)
     _assert_shared_status_kernel_config(path)
+    _assert_time_abi_kernel_config(path)
 
 
 def _require_linux(workflow: str) -> None:

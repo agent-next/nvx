@@ -71,6 +71,12 @@ class KernelBuildConstants:
         "CONFIG_UNIX=y",
         "CONFIG_VIRTIO_BLK=y",
     )
+    REQUIRED_TIME_ABI_CONFIG: Final = (
+        "CONFIG_HYPERVISOR_GUEST=y",
+        "CONFIG_PARAVIRT=y",
+        "# CONFIG_HYPERV is not set",
+        "# CONFIG_CPU_FREQ is not set",
+    )
 
 
 class OpenVMMBuildConstants:

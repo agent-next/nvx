@@ -155,7 +155,12 @@ The native kernel build caches the verified and patched source under
 `.cache/linux`, uses `O=build/linux`, runs `olddefconfig`, exports the exact
 generated config as `build/vmlinux.config`, and fails if ACPI is enabled,
 PVH remains enabled, or the MP-table, APIC, IOAPIC, and command-line
-virtio-mmio requirements are missing. Changing an archive hash or patch
+virtio-mmio requirements are missing. It also enforces the time-ABI settings:
+`CONFIG_HYPERVISOR_GUEST` and `CONFIG_PARAVIRT` stay on, while `CONFIG_HYPERV`
+and `CONFIG_CPU_FREQ` stay off. Without cpufreq, `intel_pstate` cannot probe
+MSRs the microVM does not implement, so no `#GP` traces are printed with
+interrupts disabled during boot. `CONFIG_SCHED_MC_PRIO` is off as well because
+it selects both cpufreq and `intel_pstate`. Changing an archive hash or patch
 invalidates both source and object caches; changing the input configuration
 invalidates the object cache.
 
