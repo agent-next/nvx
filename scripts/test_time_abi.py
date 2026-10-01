@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -25,6 +26,9 @@ BOOT_LINE = (
 )
 KVM_BOOT = ["openvmm", "--hypervisor", "kvm", "--kernel", "vmlinux"]
 MSHV_RESTORE = ["openvmm", "--hypervisor", "mshv", "--restore-snapshot", "snap"]
+# OpenVMM's openvmm_entry fatal_error_message, after a guest prompt.
+FATAL_DETAIL = "[E_TSC_SYNC_UNSUPPORTED] failed to launch vm worker"
+FATAL = f"~ # fatal error: {FATAL_DETAIL}\r\n\r\nCaused by:\r\n".encode()
 
 
 def warp_output(
@@ -240,6 +244,22 @@ class MonitorTests(unittest.TestCase):
         monitor.feed(b"\n" + BOOT_LINE.encode())
         self.assertIsNotNone(monitor.boot)
 
+    def test_records_the_first_fatal_time_abi_error_for_exit_errors(self):
+        monitor = TimeAbiMonitor(KVM_BOOT)
+        monitor.feed(b"fatal error: failed to open the kernel\r\n")
+        self.assertIsNone(monitor.fatal)
+        self.assertEqual(str(monitor.exit_error(1)), "OpenVMM exited with status 1")
+        # A guest prompt without a newline can precede OpenVMM's line.
+        monitor.feed(FATAL + b"    0: [E_TSC_SYNC_UNSUPPORTED] no synchronized set\r\n")
+        monitor.feed(b"fatal error: [E_TEST_HOOK] later\r\n")
+        self.assertEqual(monitor.fatal, FATAL_DETAIL)
+        # The line only explains the exit; it never changes its classification.
+        monitor.check_exit(1)
+        self.assertEqual(
+            str(monitor.exit_error(1, "snapshot source", "during teardown")),
+            f"snapshot source exited with status 1 during teardown: {FATAL_DETAIL}",
+        )
+
 
 class WarpProbeTests(unittest.TestCase):
     def test_accepts_conclusive_passing_measurements(self):
@@ -445,6 +465,46 @@ class RunnerWiringTests(unittest.TestCase):
             self._measure([b"restoring\n"], 195, MSHV_RESTORE)
         with self.assertRaisesRegex(RuntimeError, "OpenVMM exited with status 1"):
             self._measure([b"restoring\n"], 1, MSHV_RESTORE)
+
+    def test_exit_errors_lead_with_openvmm_fatal_time_abi_code(self):
+        expected = f"exited with status 1: {re.escape(FATAL_DETAIL)}\n"
+        with self.assertRaisesRegex(RuntimeError, f"^OpenVMM {expected}"):
+            self._measure([b"restoring\n", FATAL], 1, MSHV_RESTORE)
+        interaction = FakeInteraction([b"booting\n", FATAL], 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                benchmark, "InteractiveProcess", return_value=interaction
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, f"^snapshot source {expected}"
+                ):
+                    benchmark.capture_snapshot(
+                        KVM_BOOT,
+                        Path(temporary) / "snapshot",
+                        backend="kvm",
+                        timeout=5,
+                    )
+            log_path = Path(temporary) / "process.log"
+            with patch.object(
+                openvmm_process,
+                "InteractiveProcess",
+                return_value=FakeInteraction([FATAL], 1),
+            ):
+                with openvmm_process.OpenvmmProcess(KVM_BOOT, log_path) as process:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        f"^OpenVMM exited with status 1 before .*: "
+                        f"{re.escape(FATAL_DETAIL)}\n",
+                    ):
+                        process.wait_for(b"NEVER", 1)
+                # An expected failure still returns its status and output.
+                with patch.object(
+                    openvmm_process,
+                    "InteractiveProcess",
+                    return_value=FakeInteraction([FATAL], 1),
+                ):
+                    with openvmm_process.OpenvmmProcess(KVM_BOOT, log_path) as process:
+                        self.assertEqual(process.wait(1).returncode, 1)
 
     def test_measure_once_classifies_a_power_off_during_teardown(self):
         interaction = FakeInteraction([benchmark.RESTORE_MARKER + b"\n"], 194)

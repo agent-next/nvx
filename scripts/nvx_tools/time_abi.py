@@ -15,6 +15,10 @@ from dataclasses import dataclass
 MARKER_PREFIX = "NVX-TIME-ABI: "
 VIOLATION_PREFIX = "NVX-TIME-ABI-VIOLATION: "
 REPORT_ONLY_PREFIX = "NVX-TIME-REPORT"
+# OpenVMM's exit message leads with the time ABI code that its error chain
+# carries: "fatal error: [E_CODE] <outermost context>".
+OPENVMM_FATAL_PREFIX = "fatal error: "
+OPENVMM_FATAL_CODE_PREFIX = f"{OPENVMM_FATAL_PREFIX}[E_"
 ABI_VERSION = "1"
 STATUS_CLASSES: Mapping[int, str] = {
     193: "conformance",
@@ -240,6 +244,7 @@ class TimeAbiMonitor:
         self.restores: list[dict[str, str]] = []
         self.uncertain: list[dict[str, str]] = []
         self.violation: str | None = None
+        self.fatal: str | None = None
         self.report_only = False
         self.guest_booted = False
         self._pending = bytearray()
@@ -265,6 +270,12 @@ class TimeAbiMonitor:
 
     def _line(self, line: str) -> None:
         line = _clean_line(line)
+        # A guest shell prompt without a newline can precede OpenVMM's line.
+        fatal = line.find(OPENVMM_FATAL_CODE_PREFIX)
+        if fatal >= 0:
+            if self.fatal is None:
+                self.fatal = line[fatal + len(OPENVMM_FATAL_PREFIX) :]
+            return
         if VIOLATION_PREFIX in line:
             try:
                 event = parse_violation(line)
@@ -312,6 +323,17 @@ class TimeAbiMonitor:
             return
         event = self.violation or "no NVX-TIME-ABI-VIOLATION event was observed"
         raise TimeAbiFailure(f"{description}: {event}")
+
+    def exit_error(
+        self, returncode: int | None, subject: str = "OpenVMM", when: str = ""
+    ) -> RuntimeError:
+        """Return the error for a failed exit, led by its time ABI code if any."""
+        message = f"{subject} exited with status {returncode}"
+        if when:
+            message += f" {when}"
+        if self.fatal is not None:
+            message += f": {self.fatal}"
+        return RuntimeError(message)
 
     def require_boot(
         self,

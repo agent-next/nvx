@@ -113,7 +113,7 @@ class OpenvmmProcess:
             self._monitor.check_exit(returncode)
         except TimeAbiFailure as error:
             return error
-        return RuntimeError(f"OpenVMM exited with status {returncode} before {before}")
+        return self._monitor.exit_error(returncode, when=f"before {before}")
 
     def wait_for_time_abi(self, phase: str, timeout: float) -> dict[str, str]:
         """Wait for a passing ``NVX-TIME-ABI`` marker of a conformance phase."""
