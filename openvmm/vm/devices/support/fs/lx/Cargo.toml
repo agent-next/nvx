@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "lx"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bitfield-struct.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+
+[lints]
+workspace = true

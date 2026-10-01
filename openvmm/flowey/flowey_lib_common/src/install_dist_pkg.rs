@@ -1,0 +1,287 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Globally install a package via `apt` on DEB-based Linux systems,
+//! or `dnf` on RPM-based ones.
+//!
+//! This is a temporary solution, and this file will be split in
+//! two in the future to have two flowey Nodes.
+//! GitHub issue: <https://github.com/microsoft/openvmm/issues/90>
+
+use flowey::node::prelude::*;
+use std::collections::BTreeSet;
+
+flowey_config! {
+    /// Config for the install_dist_pkg node.
+    pub struct Config {
+        /// Whether to prompt the user before installing packages
+        pub interactive: Option<bool>,
+        /// Whether to skip the `apt-update` step, and allow stale packages
+        pub skip_update: Option<bool>,
+    }
+}
+
+flowey_request! {
+    pub enum Request {
+        /// Install the specified package(s)
+        Install {
+            package_names: Vec<String>,
+            done: WriteVar<SideEffect>,
+        },
+    }
+}
+
+fn query_installed_packages(
+    rt: &mut RustRuntimeServices<'_>,
+    distro: FlowPlatformLinuxDistro,
+    packages_to_check: &BTreeSet<String>,
+) -> anyhow::Result<BTreeSet<String>> {
+    let output = match distro {
+        FlowPlatformLinuxDistro::Ubuntu => {
+            let fmt = "${binary:Package}\n";
+            flowey::shell_cmd!(rt, "dpkg-query -W -f={fmt} {packages_to_check...}")
+        }
+        FlowPlatformLinuxDistro::Fedora | FlowPlatformLinuxDistro::AzureLinux => {
+            let fmt = "%{NAME}\n";
+            flowey::shell_cmd!(rt, "rpm -q --queryformat={fmt} {packages_to_check...}")
+        }
+        FlowPlatformLinuxDistro::Arch => {
+            flowey::shell_cmd!(rt, "pacman -Qq {packages_to_check...}")
+        }
+        FlowPlatformLinuxDistro::Nix => {
+            anyhow::bail!("Nix environments cannot install packages")
+        }
+        FlowPlatformLinuxDistro::Unknown => anyhow::bail!("Unknown Linux distribution"),
+    }
+    .ignore_status()
+    .output()?;
+    let output = String::from_utf8(output.stdout)?;
+
+    let mut installed_packages = BTreeSet::new();
+    for ln in output.trim().lines() {
+        let package = match ln.split_once(':') {
+            Some((package, _arch)) => package,
+            None => ln,
+        };
+        let no_existing = installed_packages.insert(package.to_owned());
+        assert!(no_existing);
+    }
+
+    Ok(installed_packages)
+}
+
+fn update_packages(
+    rt: &mut RustRuntimeServices<'_>,
+    distro: FlowPlatformLinuxDistro,
+) -> anyhow::Result<()> {
+    match distro {
+        FlowPlatformLinuxDistro::Ubuntu => flowey::shell_cmd!(rt, "sudo apt-get update").run()?,
+        FlowPlatformLinuxDistro::Fedora => flowey::shell_cmd!(rt, "sudo dnf update").run()?,
+        // tdnf auto-refreshes metadata; no explicit update step needed
+        FlowPlatformLinuxDistro::AzureLinux => (),
+        // Running `pacman -Sy` without a full system update can break everything; do nothing
+        FlowPlatformLinuxDistro::Arch => (),
+        FlowPlatformLinuxDistro::Nix => {
+            anyhow::bail!("Nix environments cannot install packages")
+        }
+        FlowPlatformLinuxDistro::Unknown => anyhow::bail!("Unknown Linux distribution"),
+    }
+
+    Ok(())
+}
+
+fn install_packages(
+    rt: &mut RustRuntimeServices<'_>,
+    distro: FlowPlatformLinuxDistro,
+    packages: &BTreeSet<String>,
+    interactive: bool,
+) -> anyhow::Result<()> {
+    match distro {
+        FlowPlatformLinuxDistro::Ubuntu => {
+            let mut options = Vec::new();
+            if !interactive {
+                // auto accept
+                options.push("-y");
+                // Wait for dpkg locks to be released when running in CI
+                options.extend(["-o", "DPkg::Lock::Timeout=60"]);
+            }
+            flowey::shell_cmd!(rt, "sudo apt-get install {options...} {packages...}").run()?;
+        }
+        FlowPlatformLinuxDistro::Fedora => {
+            let auto_accept = (!interactive).then_some("-y");
+            flowey::shell_cmd!(rt, "sudo dnf install {auto_accept...} {packages...}").run()?;
+        }
+        FlowPlatformLinuxDistro::AzureLinux => {
+            let auto_accept = (!interactive).then_some("-y");
+            flowey::shell_cmd!(rt, "sudo tdnf install {auto_accept...} {packages...}").run()?;
+        }
+        FlowPlatformLinuxDistro::Arch => {
+            let auto_accept = (!interactive).then_some("--noconfirm");
+            flowey::shell_cmd!(rt, "sudo pacman -S {auto_accept...} {packages...}").run()?;
+        }
+        FlowPlatformLinuxDistro::Nix => {
+            anyhow::bail!("Nix environments cannot install packages")
+        }
+        FlowPlatformLinuxDistro::Unknown => anyhow::bail!("Unknown Linux distribution"),
+    }
+
+    Ok(())
+}
+
+new_flow_node_with_config!(struct Node);
+
+impl FlowNodeWithConfig for Node {
+    type Request = Request;
+    type Config = Config;
+
+    fn imports(_ctx: &mut ImportCtx<'_>) {}
+
+    fn emit(
+        config: Config,
+        requests: Vec<Self::Request>,
+        ctx: &mut NodeCtx<'_>,
+    ) -> anyhow::Result<()> {
+        let mut packages = BTreeSet::new();
+        let mut did_install = Vec::new();
+
+        for req in requests {
+            match req {
+                Request::Install {
+                    package_names,
+                    done,
+                } => {
+                    packages.extend(package_names);
+                    did_install.push(done);
+                }
+            }
+        }
+
+        let packages = packages;
+        let (skip_update, interactive) =
+            if matches!(ctx.backend(), FlowBackend::Ado | FlowBackend::Github) {
+                if config.interactive.is_some() {
+                    anyhow::bail!("can only use `interactive` config when using the Local backend");
+                }
+
+                if config.skip_update.is_some() {
+                    anyhow::bail!("can only use `skip_update` config when using the Local backend");
+                }
+
+                (false, false)
+            } else if matches!(ctx.backend(), FlowBackend::Local) {
+                (
+                    config
+                        .skip_update
+                        .ok_or(anyhow::anyhow!("missing config: skip_update",))?,
+                    config
+                        .interactive
+                        .ok_or(anyhow::anyhow!("missing config: interactive",))?,
+                )
+            } else {
+                anyhow::bail!("unsupported backend")
+            };
+
+        // -- end of req processing -- //
+
+        if did_install.is_empty() {
+            return Ok(());
+        }
+
+        // maybe a questionable design choice... but we'll allow non-linux
+        // platforms from taking a dep on this, and simply report that it was
+        // installed.
+        if !matches!(ctx.platform(), FlowPlatform::Linux(_)) {
+            ctx.emit_side_effect_step([], did_install);
+            return Ok(());
+        }
+
+        // Explicitly fail on installation requests in Nix environments.
+        if matches!(
+            ctx.platform(),
+            FlowPlatform::Linux(FlowPlatformLinuxDistro::Nix)
+        ) {
+            anyhow::bail!(
+                "Nix environments cannot install packages. Dependencies should be managed by Nix. Attempted to install {:?}",
+                packages
+            );
+        }
+
+        let distro = match ctx.platform() {
+            FlowPlatform::Linux(d) => d,
+            _ => unreachable!(),
+        };
+
+        let persistent_dir = ctx.persistent_dir();
+        let need_install =
+            ctx.emit_rust_stepv("checking if packages need to be installed", |ctx| {
+                let persistent_dir = persistent_dir.claim(ctx);
+                let packages = packages.clone();
+                move |rt| {
+                    // Provide the users an escape-hatch to run Linux flows on distributions that are not actively
+                    // supported at the moment.
+                    if matches!(rt.backend(), FlowBackend::Local) && distro == FlowPlatformLinuxDistro::Unknown {
+                        log::error!("This Linux distribution is not actively supported at the moment.");
+                        log::warn!("");
+                        log::warn!("================================================================================");
+                        log::warn!("You are running on an untested configuration, and may be required to manually");
+                        log::warn!("install certain packages in order to build.");
+                        log::warn!("");
+                        log::warn!("                             PROCEED WITH CAUTION");
+                        log::warn!("");
+                        log::warn!("================================================================================");
+
+                        if let Some(persistent_dir) = persistent_dir {
+                            let promptfile = rt.read(persistent_dir).join("unsupported_distro_prompt");
+
+                            if !promptfile.exists() {
+                                log::info!("Press [enter] to proceed, or [ctrl-c] to exit.");
+                                log::info!("This interactive prompt will only appear once.");
+                                let _ = std::io::stdin().read_line(&mut String::new());
+                                fs_err::write(promptfile, [])?;
+                            }
+                        }
+
+                        log::warn!("Proceeding anyways...");
+                        return Ok(false)
+                    }
+
+                    let packages_to_check = &packages;
+                    let installed_packages = query_installed_packages(rt, distro, packages_to_check)?;
+
+                    // the package manager won't re-install packages that are already
+                    // up-to-date, so this sort of coarse-grained signal should
+                    // be plenty sufficient.
+                    Ok(installed_packages != packages)
+                }
+            });
+
+        ctx.emit_rust_step("installing packages", move |ctx| {
+            let packages = packages.clone();
+            let need_install = need_install.claim(ctx);
+            did_install.claim(ctx);
+            move |rt| {
+                let need_install = rt.read(need_install);
+
+                if !need_install {
+                    return Ok(());
+                }
+                if !skip_update {
+                    // Retry on failure in CI
+                    let mut i = 0;
+                    while let Err(e) = update_packages(rt, distro) {
+                        i += 1;
+                        if i == 5 || interactive {
+                            return Err(e);
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
+                install_packages(rt, distro, &packages, interactive)?;
+
+                Ok(())
+            }
+        });
+
+        Ok(())
+    }
+}

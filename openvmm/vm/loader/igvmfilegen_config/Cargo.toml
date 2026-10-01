@@ -1,0 +1,20 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "igvmfilegen_config"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+igvm_defs.workspace = true
+page_table.workspace = true
+product_policy = { workspace = true, features = ["manifest"] }
+serde = { workspace = true, features = ["std", "derive"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

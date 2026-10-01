@@ -1,0 +1,15 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "watchdog_vmgs_format"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vmcore.workspace = true
+
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "guest_test_uefi"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+uefi = { workspace = true, features = ["alloc", "global_allocator"] }
+
+[lints]
+workspace = true

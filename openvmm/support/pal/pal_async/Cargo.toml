@@ -1,0 +1,58 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "pal_async"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# Enable executor_tests module for out-of-crate executor testing.
+tests = ["dep:tempfile"]
+
+[dependencies]
+loan_cell.workspace = true
+pal.workspace = true
+unix_socket.workspace = true
+pal_event.workspace = true
+pal_async_test.workspace = true
+
+async-channel.workspace = true
+async-task.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+slab.workspace = true
+smallbox.workspace = true
+socket2 = { workspace = true, features = ["all"] }
+tempfile = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring.workspace = true
+once_cell.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+cfg-if.workspace = true
+libc = { workspace = true, features = ["extra_traits"] }
+
+[target.'cfg(windows)'.dependencies]
+getrandom.workspace = true
+headervec.workspace = true
+once_cell.workspace = true
+unicycle.workspace = true
+zerocopy.workspace = true
+windows-result.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

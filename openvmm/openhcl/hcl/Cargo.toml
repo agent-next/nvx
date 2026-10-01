@@ -1,0 +1,43 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "hcl"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cvm_tracing.workspace = true
+hv1_structs.workspace = true
+hvdef.workspace = true
+pal.workspace = true
+memory_range.workspace = true
+sidecar_client.workspace = true
+tdcall = { workspace = true, features = ["tracing"] }
+x86defs.workspace = true
+inspect.workspace = true
+user_driver.workspace = true
+aarch64defs.workspace = true
+
+anyhow.workspace = true
+arrayvec.workspace = true
+bitvec = { workspace = true, features = ["std"] }
+parking_lot.workspace = true
+signal-hook.workspace = true
+thiserror.workspace = true
+tracelimit.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+fs-err.workspace = true
+libc.workspace = true
+nix = { workspace = true, features = ["ioctl"] }
+bitfield-struct.workspace = true
+safe_intrinsics.workspace = true
+open_enum.workspace = true
+getrandom.workspace = true
+
+[build-dependencies]
+build_rs_guest_arch.workspace = true
+
+[lints]
+workspace = true

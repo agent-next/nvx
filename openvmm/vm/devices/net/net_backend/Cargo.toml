@@ -1,0 +1,34 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "net_backend"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+net_backend_core.workspace = true
+net_backend_resources.workspace = true
+guestmem.workspace = true
+vm_resource.workspace = true
+memory_range = { workspace = true, features = ["inspect"] }
+vm_topology = { workspace = true, features = ["inspect"] }
+
+inspect.workspace = true
+mesh.workspace = true
+pal_async.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+futures-concurrency.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+inspect_counters.workspace = true
+
+[dev-dependencies]
+test_with_tracing.workspace = true
+
+[lints]
+workspace = true

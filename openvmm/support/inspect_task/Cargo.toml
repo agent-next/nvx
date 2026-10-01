@@ -1,0 +1,14 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "inspect_task"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+inspect.workspace = true
+pal_async.workspace = true
+
+[lints]
+workspace = true

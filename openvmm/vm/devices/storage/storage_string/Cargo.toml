@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "storage_string"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+inspect.workspace = true
+mesh_protobuf.workspace = true
+
+thiserror.workspace = true
+zerocopy.workspace = true
+[lints]
+workspace = true

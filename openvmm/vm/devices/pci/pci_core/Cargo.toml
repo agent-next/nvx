@@ -1,0 +1,26 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "pci_core"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chipset_device.workspace = true
+guestmem.workspace = true
+pal_event.workspace = true
+vmcore.workspace = true
+
+anyhow.workspace = true
+bitfield-struct.workspace = true
+inspect = { workspace = true, features = ["std"] }
+mesh.workspace = true
+open_enum.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracelimit.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+[lints]
+workspace = true

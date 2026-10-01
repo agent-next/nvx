@@ -1,0 +1,33 @@
+# File containing policy for file ownership
+
+# Reviewers for all files in the repository
+* @microsoft/openvmm-reviewers
+
+# Any CI changes require special approval
+/ci/ @microsoft/openvmm-ci-reviewers
+/.github/CODEOWNERS @microsoft/openvmm-maintainers
+/.github/labeler.yml @microsoft/openvmm-ci-reviewers
+/.github/scripts/ @microsoft/openvmm-ci-reviewers
+/.github/workflows/ @microsoft/openvmm-ci-reviewers
+
+# Areas with specific maintainers. In some cases, general maintainers can also approve.
+
+# VTL2 settings is an API consumed by various partner teams. VTL2 Settings
+# approvers evaluate for consistency and to help ensure no breaking changes
+/vm/devices/get/underhill_config/* @microsoft/openvmm-vtl2-settings-approvers
+
+# Vmbus
+/vm/devices/vmbus/ @microsoft/openvmm-reviewers @microsoft/openvmm-vmbus
+
+# Storage
+/vm/devices/storage @microsoft/openvmm-reviewers @microsoft/openvmm-storage
+
+# Cargo dependencies — external dependency changes in Cargo.lock are reviewed
+# by the dep-review GitHub Actions workflow (dep-review.yml) rather than via
+# CODEOWNERS, so that internal-only lockfile changes don't require a dependency
+# reviewer. See .github/workflows/dep-review.yml for details.
+#
+# Changes to the dep-review infrastructure itself require both CI and dependency reviewer approval.
+/.github/scripts/dep-review* @microsoft/openvmm-ci-reviewers @microsoft/openvmm-dependency-reviewers
+/.github/workflows/dep-review* @microsoft/openvmm-ci-reviewers @microsoft/openvmm-dependency-reviewers
+/.github/dep-policy.json @microsoft/openvmm-ci-reviewers @microsoft/openvmm-dependency-reviewers

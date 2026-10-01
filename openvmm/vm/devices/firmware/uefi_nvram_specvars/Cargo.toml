@@ -1,0 +1,22 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "uefi_nvram_specvars"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+guid.workspace = true
+ucs2.workspace = true
+uefi_specs.workspace = true
+
+thiserror.workspace = true
+zerocopy.workspace = true
+[dev-dependencies]
+
+[lints]
+workspace = true

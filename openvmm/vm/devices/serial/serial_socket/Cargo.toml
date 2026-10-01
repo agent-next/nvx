@@ -1,0 +1,37 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "serial_socket"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serial_core.workspace = true
+vm_resource.workspace = true
+
+inspect.workspace = true
+mesh = { workspace = true, features = ["socket2"] }
+unix_socket = { workspace = true, features = ["mesh"] }
+pal_async.workspace = true
+futures.workspace = true
+socket2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+pal.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+pal.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+getrandom.workspace = true
+pal_async_test.workspace = true
+test_with_tracing.workspace = true
+
+[lints]
+workspace = true

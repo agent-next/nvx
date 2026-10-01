@@ -1,0 +1,22 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "x86emu"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+x86defs.workspace = true
+
+iced-x86 = { workspace = true, features = ["std", "decoder", "instr_info"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+zerocopy.workspace = true
+iced-x86 = { workspace = true, features = ["code_asm"] }
+
+[lints]
+workspace = true

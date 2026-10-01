@@ -1,0 +1,13 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "linux_net_bindings"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["ioctl"] }
+
+[lints]
+workspace = true

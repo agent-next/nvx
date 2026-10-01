@@ -1,0 +1,22 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "tdcall"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+tracing = ["dep:tracing"]
+
+[dependencies]
+hvdef.workspace = true
+memory_range.workspace = true
+thiserror.workspace = true
+x86defs.workspace = true
+
+tracing = { workspace = true, optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "underhill_config"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+guid = { workspace = true, features = ["mesh", "inspect"] }
+inspect.workspace = true
+mesh.workspace = true
+vtl2_settings_proto.workspace = true
+
+prost.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror.workspace = true
+
+[lints]
+workspace = true

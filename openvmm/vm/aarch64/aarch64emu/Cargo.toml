@@ -1,0 +1,23 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "aarch64emu"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aarch64defs.workspace = true
+inspect.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+getrandom.workspace = true
+pal_async.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,37 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "pipette"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pipette_protocol.workspace = true
+
+mesh.workspace = true
+mesh_remote.workspace = true
+pal.workspace = true
+pal_async.workspace = true
+vmsocket.workspace = true
+
+anyhow.workspace = true
+fs-err.workspace = true
+futures.workspace = true
+futures-concurrency.workspace = true
+parking_lot.workspace = true
+socket2.workspace = true
+term.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+unicycle.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service.workspace = true
+windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_Security", "Win32_System_Shutdown", "Win32_System_Threading"] }
+
+[lints]
+workspace = true

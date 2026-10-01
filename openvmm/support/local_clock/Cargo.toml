@@ -1,0 +1,22 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "local_clock"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["jiff_exts", "inspect"]
+
+jiff_exts = ["dep:jiff"]
+inspect = ["dep:inspect"]
+
+[dependencies]
+inspect = { workspace = true, optional = true, features = ["std"] }
+
+parking_lot.workspace = true
+jiff = { workspace = true, optional = true }
+
+[lints]
+workspace = true

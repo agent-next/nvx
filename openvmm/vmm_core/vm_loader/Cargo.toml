@@ -1,0 +1,29 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vm_loader"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hvdef.workspace = true
+loader.workspace = true
+virt.workspace = true
+memory_range.workspace = true
+vm_topology.workspace = true
+guestmem.workspace = true
+
+range_map_vec.workspace = true
+
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+test_with_tracing.workspace = true
+
+[build-dependencies]
+build_rs_guest_arch.workspace = true
+
+[lints]
+workspace = true

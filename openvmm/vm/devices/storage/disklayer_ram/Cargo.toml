@@ -1,0 +1,34 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "disklayer_ram"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+disk_backend.workspace = true
+disk_backend_resources.workspace = true
+disk_layered.workspace = true
+guestmem.workspace = true
+scsi_buffers.workspace = true
+vm_resource.workspace = true
+
+inspect = { workspace = true, features = ["std"] }
+
+anyhow.workspace = true
+event-listener.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+inspect = { workspace = true, features = ["initiate"] }
+pal_async.workspace = true
+storage_tests.workspace = true
+test_with_tracing.workspace = true
+zerocopy.workspace = true
+
+[lints]
+workspace = true

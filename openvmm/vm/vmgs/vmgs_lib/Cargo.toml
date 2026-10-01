@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmgs_lib"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+crypto = { workspace = true, features = ["native", "vendored"] }
+disk_backend.workspace = true
+disk_vhd1.workspace = true
+futures.workspace = true
+vmgs_format.workspace = true
+vmgs = { workspace = true, features = ["encryption"] }
+
+[lints]
+workspace = true

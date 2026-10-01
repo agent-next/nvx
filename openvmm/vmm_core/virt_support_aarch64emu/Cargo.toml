@@ -1,0 +1,25 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "virt_support_aarch64emu"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aarch64defs.workspace = true
+guestmem.workspace = true
+hvdef.workspace = true
+vm_topology.workspace = true
+virt.workspace = true
+aarch64emu.workspace = true
+
+cvm_tracing.workspace = true
+thiserror.workspace = true
+tracelimit.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+[dev-dependencies]
+
+[lints]
+workspace = true

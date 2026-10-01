@@ -1,0 +1,18 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "flowey"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flowey_core.workspace = true
+
+anyhow.workspace = true
+fs-err.workspace = true
+log.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,33 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "mesh_protobuf"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+prost = ["dep:prost", "dep:prost-build"]
+socket2 = ["dep:socket2"]
+std = ["dep:heck", "dep:fs-err"]
+
+[dependencies]
+mesh_derive.workspace = true
+
+prost = { workspace = true, optional = true }
+thiserror.workspace = true
+
+fs-err = { workspace = true, optional = true }
+heck = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true }
+zerocopy.workspace = true
+[build-dependencies]
+prost-build = { workspace = true, optional = true }
+
+[dev-dependencies]
+expect-test.workspace = true
+prost-types.workspace = true
+
+[lints]
+workspace = true

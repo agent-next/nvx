@@ -1,0 +1,34 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmcore"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hvdef.workspace = true
+save_restore_derive.workspace = true
+vm_resource.workspace = true
+
+inspect = { workspace = true, features = ["defer", "std"] }
+loan_cell.workspace = true
+mesh.workspace = true
+pal_event = { workspace = true, features = ["mesh"] }
+pal_async.workspace = true
+tracelimit.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+futures-concurrency.workspace = true
+jiff.workspace = true
+linkme.workspace = true
+parking_lot.workspace = true
+slab.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+
+[lints]
+workspace = true

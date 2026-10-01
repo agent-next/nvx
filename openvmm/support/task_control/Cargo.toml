@@ -1,0 +1,20 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "task_control"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fast_select.workspace = true
+inspect = { workspace = true, features = ["defer", "std"] }
+pal_async.workspace = true
+
+parking_lot.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+
+[lints]
+workspace = true

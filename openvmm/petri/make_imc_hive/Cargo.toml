@@ -1,0 +1,15 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "make_imc_hive"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Wdk_System_OfflineRegistry", "Win32_Foundation", "Win32_Security", "Win32_System_Registry"] }
+
+anyhow.workspace = true
+
+[lints]
+workspace = true

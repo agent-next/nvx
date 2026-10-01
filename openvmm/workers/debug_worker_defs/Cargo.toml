@@ -1,0 +1,17 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "debug_worker_defs"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vmm_core_defs.workspace = true
+
+mesh.workspace = true
+mesh_worker.workspace = true
+vmsocket.workspace = true
+
+[lints]
+workspace = true

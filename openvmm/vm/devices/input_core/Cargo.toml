@@ -1,0 +1,17 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "input_core"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vm_resource.workspace = true
+
+mesh.workspace = true
+
+futures.workspace = true
+
+[lints]
+workspace = true

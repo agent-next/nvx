@@ -1,0 +1,19 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "kvm"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+kvm-bindings.workspace = true
+pal.workspace = true
+libc.workspace = true
+nix = { workspace = true, features = ["ioctl"] }
+parking_lot.workspace = true
+signal-hook.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

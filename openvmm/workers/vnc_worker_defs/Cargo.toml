@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vnc_worker_defs"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+framebuffer.workspace = true
+input_core.workspace = true
+video_core.workspace = true
+
+mesh.workspace = true
+mesh_worker.workspace = true
+
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+vmsocket.workspace = true
+
+[lints]
+workspace = true

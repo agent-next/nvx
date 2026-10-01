@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "generation_id"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+guestmem.workspace = true
+vmcore.workspace = true
+
+inspect = { workspace = true, features = ["std"] }
+mesh.workspace = true
+tracelimit.workspace = true
+
+getrandom.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

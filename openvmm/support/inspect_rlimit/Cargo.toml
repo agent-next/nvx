@@ -1,0 +1,17 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "inspect_rlimit"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+inspect = { workspace = true, features = ["std"] }
+
+cfg-if.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

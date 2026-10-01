@@ -1,0 +1,17 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "chipset_device"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mesh.workspace = true
+vmcore.workspace = true
+inspect.workspace = true
+tdisp.workspace = true
+zerocopy.workspace = true
+
+[lints]
+workspace = true

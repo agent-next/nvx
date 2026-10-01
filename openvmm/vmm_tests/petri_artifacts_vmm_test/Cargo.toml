@@ -1,0 +1,17 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "petri_artifacts_vmm_test"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+petri_artifacts_common.workspace = true
+petri_artifacts_core.workspace = true
+
+linkme.workspace = true
+serde = { workspace = true, features = ["std", "derive"] }
+
+[lints]
+workspace = true

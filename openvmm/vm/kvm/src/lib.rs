@@ -1,0 +1,2339 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+#![expect(missing_docs)]
+#![cfg(target_os = "linux")]
+// UNSAFETY: Calling KVM APIs and IOCTLs and dealing with the raw pointers
+// necessary for doing so.
+#![expect(unsafe_code)]
+
+pub use kvm_bindings::kvm_ioeventfd_flag_nr_datamatch;
+pub use kvm_bindings::kvm_ioeventfd_flag_nr_deassign;
+pub use kvm_bindings::*;
+use pal::unix::pthread::*;
+use parking_lot::RwLock;
+use std::fs::File;
+use std::io;
+use std::marker::PhantomData;
+use std::os::unix::prelude::*;
+use std::sync::Once;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use thiserror::Error;
+
+mod ioctl {
+    #[cfg(target_arch = "aarch64")]
+    use super::KvmArmRmiPopulate;
+    use kvm_bindings::*;
+    #[cfg(target_arch = "x86_64")]
+    use nix::errno::Errno;
+    use nix::ioctl_read;
+    use nix::ioctl_readwrite;
+    use nix::ioctl_readwrite_bad;
+    use nix::ioctl_write_int_bad;
+    use nix::ioctl_write_ptr;
+    use nix::request_code_none;
+    use nix::request_code_readwrite;
+    use std::mem::size_of;
+
+    const KVMIO: u8 = 0xae;
+
+    ioctl_write_int_bad!(kvm_create_vm, request_code_none!(KVMIO, 0x1));
+    ioctl_write_int_bad!(kvm_check_extension, request_code_none!(KVMIO, 0x03));
+    ioctl_write_int_bad!(kvm_get_vcpu_mmap_size, request_code_none!(KVMIO, 0x04));
+    #[cfg(target_arch = "x86_64")]
+    ioctl_readwrite!(kvm_get_supported_cpuid, KVMIO, 0x05, kvm_cpuid2);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_readwrite!(kvm_get_supported_hv_cpuid, KVMIO, 0xc1, kvm_cpuid2);
+    ioctl_write_int_bad!(kvm_create_vcpu, request_code_none!(KVMIO, 0x41));
+    ioctl_write_ptr!(
+        kvm_set_user_memory_region,
+        KVMIO,
+        0x46,
+        kvm_userspace_memory_region
+    );
+    ioctl_write_ptr!(
+        kvm_set_user_memory_region2,
+        KVMIO,
+        0x49,
+        kvm_userspace_memory_region2
+    );
+    ioctl_write_ptr!(kvm_irq_line, KVMIO, 0x61, kvm_irq_level);
+    ioctl_write_ptr!(kvm_set_gsi_routing, KVMIO, 0x6a, kvm_irq_routing);
+    ioctl_write_ptr!(kvm_irqfd, KVMIO, 0x76, kvm_irqfd);
+    ioctl_write_int_bad!(kvm_set_boot_cpu_id, request_code_none!(KVMIO, 0x78));
+    ioctl_write_ptr!(kvm_set_clock, KVMIO, 0x7b, kvm_clock_data);
+    ioctl_read!(kvm_get_clock, KVMIO, 0x7c, kvm_clock_data);
+    ioctl_write_int_bad!(kvm_run, request_code_none!(KVMIO, 0x80));
+    // Is *NOT* defined for arm64
+    #[cfg(not(target_arch = "aarch64"))]
+    ioctl_read!(kvm_get_regs, KVMIO, 0x81, kvm_regs);
+    // Is *NOT* defined for arm64
+    #[cfg(not(target_arch = "aarch64"))]
+    ioctl_write_ptr!(kvm_set_regs, KVMIO, 0x82, kvm_regs);
+    ioctl_read!(kvm_get_sregs, KVMIO, 0x83, kvm_sregs);
+    ioctl_write_ptr!(kvm_set_sregs, KVMIO, 0x84, kvm_sregs);
+    ioctl_readwrite!(kvm_translation, KVMIO, 0x85, kvm_translation);
+    ioctl_write_ptr!(kvm_interrupt, KVMIO, 0x86, kvm_interrupt);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_readwrite!(kvm_get_msrs, KVMIO, 0x88, kvm_msrs);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_set_msrs, KVMIO, 0x89, kvm_msrs);
+    ioctl_write_ptr!(kvm_set_signal_mask, KVMIO, 0x8b, kvm_signal_mask);
+    ioctl_read!(kvm_get_fpu, KVMIO, 0x8c, kvm_fpu);
+    ioctl_write_ptr!(kvm_set_fpu, KVMIO, 0x8d, kvm_fpu);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_read!(kvm_get_lapic, KVMIO, 0x8e, kvm_lapic_state);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_set_lapic, KVMIO, 0x8f, kvm_lapic_state);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_set_cpuid2, KVMIO, 0x90, kvm_cpuid2);
+    ioctl_read!(kvm_get_mp_state, KVMIO, 0x98, kvm_mp_state);
+    ioctl_write_ptr!(kvm_set_mp_state, KVMIO, 0x99, kvm_mp_state);
+    ioctl_read!(kvm_get_vcpu_events, KVMIO, 0x9f, kvm_vcpu_events);
+    ioctl_write_ptr!(kvm_set_vcpu_events, KVMIO, 0xa0, kvm_vcpu_events);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_read!(kvm_get_debugregs, KVMIO, 0xa1, kvm_debugregs);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_set_debugregs, KVMIO, 0xa2, kvm_debugregs);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_int_bad!(kvm_set_tsc_khz, request_code_none!(KVMIO, 0xa2));
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_int_bad!(kvm_get_tsc_khz, request_code_none!(KVMIO, 0xa3));
+    ioctl_write_ptr!(kvm_enable_cap, KVMIO, 0xa3, kvm_enable_cap);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_read!(kvm_get_xsave, KVMIO, 0xa4, kvm_xsave);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_set_xsave, KVMIO, 0xa5, kvm_xsave);
+    ioctl_write_ptr!(kvm_signal_msi, KVMIO, 0xa5, kvm_msi);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_read!(kvm_get_xcrs, KVMIO, 0xa6, kvm_xcrs);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_set_xcrs, KVMIO, 0xa7, kvm_xcrs);
+    ioctl_write_ptr!(kvm_get_reg, KVMIO, 0xab, kvm_one_reg);
+    ioctl_write_ptr!(kvm_set_reg, KVMIO, 0xac, kvm_one_reg);
+    #[cfg(target_arch = "aarch64")]
+    ioctl_write_ptr!(kvm_arm_vcpu_init, KVMIO, 0xae, kvm_vcpu_init);
+    #[cfg(target_arch = "aarch64")]
+    ioctl_read!(kvm_arm_preferred_target, KVMIO, 0xaf, kvm_vcpu_init);
+    ioctl_write_ptr!(kvm_ioeventfd, KVMIO, 0x79, kvm_ioeventfd);
+    ioctl_write_ptr!(kvm_set_guest_debug, KVMIO, 0x9b, kvm_guest_debug);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_x86_setup_mce, KVMIO, 0x9c, u64);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_read!(kvm_x86_get_mce_cap_supported, KVMIO, 0x9d, u64);
+    ioctl_write_ptr!(
+        kvm_set_memory_attributes,
+        KVMIO,
+        0xd2,
+        kvm_memory_attributes
+    );
+    ioctl_readwrite!(kvm_create_device, KVMIO, 0xe0, kvm_create_device);
+    ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_get_device_attr, KVMIO, 0xe2, kvm_device_attr);
+    ioctl_readwrite!(kvm_create_guest_memfd, KVMIO, 0xd4, kvm_create_guest_memfd);
+    #[cfg(target_arch = "aarch64")]
+    ioctl_readwrite_bad!(
+        kvm_arm_rmi_populate,
+        request_code_readwrite!(KVMIO, 0xd7, size_of::<KvmArmRmiPopulate>()),
+        KvmArmRmiPopulate
+    );
+    #[cfg(target_arch = "x86_64")]
+    ioctl_readwrite_bad!(
+        kvm_memory_encrypt_op,
+        request_code_readwrite!(KVMIO, 0xba, size_of::<libc::c_ulong>()),
+        kvm_sev_cmd
+    );
+    #[cfg(target_arch = "x86_64")]
+    /// # Safety
+    ///
+    /// `fd` must refer to a valid KVM VM file descriptor.
+    pub unsafe fn kvm_memory_encrypt_op_supported(fd: libc::c_int) -> nix::Result<()> {
+        // SAFETY: Calling the KVM_MEMORY_ENCRYPT_OP ioctl with a null argument is
+        // the documented availability probe for SEV support.
+        match unsafe {
+            libc::ioctl(
+                fd,
+                request_code_readwrite!(KVMIO, 0xba, size_of::<libc::c_ulong>()),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        } {
+            0 => Ok(()),
+            _ => Err(Errno::last()),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+const KVM_CAP_VM_TYPES_UAPI: u32 = 235;
+#[cfg(target_arch = "x86_64")]
+const KVM_CAP_EXIT_HYPERCALL_UAPI: u32 = 201;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_HC_MAP_GPA_RANGE_UAPI: u64 = 12;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_MAP_GPA_RANGE_ENCRYPTED_UAPI: u64 = 1 << 4;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_MAP_GPA_RANGE_DECRYPTED_UAPI: u64 = 0 << 4;
+#[cfg(target_arch = "x86_64")]
+const KVM_X86_SNP_VM_UAPI: libc::c_int = 4;
+
+pub const KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI: u64 = 1 << 3;
+
+#[cfg(target_arch = "aarch64")]
+pub const KVM_CAP_ARM_RMI_UAPI: u32 = 249;
+#[cfg(target_arch = "aarch64")]
+pub const KVM_ARM_RMI_POPULATE_FLAGS_MEASURE_UAPI: u32 = 1 << 0;
+#[cfg(target_arch = "aarch64")]
+const KVM_VM_TYPE_ARM_IPA_SIZE_MASK_UAPI: u64 = 0xff;
+#[cfg(target_arch = "aarch64")]
+const KVM_VM_TYPE_ARM_REALM_UAPI: u64 = 1 << 30;
+
+#[cfg(target_arch = "x86_64")]
+pub const KVM_SEV_SNP_PAGE_TYPE_NORMAL_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_NORMAL as u8;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_SEV_SNP_PAGE_TYPE_ZERO_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_ZERO as u8;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_SEV_SNP_PAGE_TYPE_UNMEASURED_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_UNMEASURED as u8;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_SEV_SNP_PAGE_TYPE_SECRETS_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_SECRETS as u8;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_SEV_SNP_PAGE_TYPE_CPUID_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_CPUID as u8;
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum VmType {
+    Default,
+    #[cfg(target_arch = "x86_64")]
+    Snp,
+    #[cfg(target_arch = "aarch64")]
+    Realm {
+        ipa_bits: u8,
+    },
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SevSnpPageType {
+    Normal,
+    Zero,
+    Unmeasured,
+    Secrets,
+    Cpuid,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SevSnpPageType {
+    pub const fn as_uapi(self) -> u8 {
+        match self {
+            SevSnpPageType::Normal => KVM_SEV_SNP_PAGE_TYPE_NORMAL_UAPI,
+            SevSnpPageType::Zero => KVM_SEV_SNP_PAGE_TYPE_ZERO_UAPI,
+            SevSnpPageType::Unmeasured => KVM_SEV_SNP_PAGE_TYPE_UNMEASURED_UAPI,
+            SevSnpPageType::Secrets => KVM_SEV_SNP_PAGE_TYPE_SECRETS_UAPI,
+            SevSnpPageType::Cpuid => KVM_SEV_SNP_PAGE_TYPE_CPUID_UAPI,
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+pub struct KvmArmRmiPopulate {
+    pub base: u64,
+    pub size: u64,
+    pub source_uaddr: u64,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("failed to open /dev/kvm")]
+    OpenKvm(#[source] io::Error),
+    #[error("SignalMsi")]
+    SignalMsi(#[source] nix::Error),
+    #[error("SetMemoryRegion")]
+    SetMemoryRegion(#[source] nix::Error),
+    #[error("SetMemoryAttributes")]
+    SetMemoryAttributes(#[source] nix::Error),
+    #[error("CreateGuestMemfd")]
+    CreateGuestMemfd(#[source] nix::Error),
+    #[error("CreateVm")]
+    CreateVm(#[source] nix::Error),
+    #[cfg(target_arch = "aarch64")]
+    #[error("ArmRmiPopulate")]
+    ArmRmiPopulate(#[source] nix::Error),
+    #[error("missing KVM capability: {0}")]
+    MissingCapability(&'static str),
+    #[error("unsupported KVM VM type: {0:?}")]
+    UnsupportedVmType(VmType),
+    #[cfg(target_arch = "x86_64")]
+    #[error("MemoryEncryptOp({command}, firmware_error={firmware_error:#x})")]
+    MemoryEncryptOp {
+        command: &'static str,
+        firmware_error: u32,
+        #[source]
+        source: nix::Error,
+    },
+    #[error("EnableCap({0})")]
+    EnableCap(&'static str, #[source] nix::Error),
+    #[error("CreateVCpu")]
+    CreateVCpu(#[source] nix::Error),
+    #[error("GetRegs")]
+    GetRegs(#[source] nix::Error),
+    #[error("GetSRegs")]
+    GetSRegs(#[source] nix::Error),
+    #[error("SetRegs")]
+    SetRegs(#[source] nix::Error),
+    #[error("SetSRegs")]
+    SetSRegs(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("GetTscFrequency")]
+    GetTscFrequency(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("SetTscFrequency")]
+    SetTscFrequency(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("GetTscOffset")]
+    GetTscOffset(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("SetTscOffset")]
+    SetTscOffset(#[source] nix::Error),
+    #[error("Run")]
+    Run(#[source] nix::Error),
+    #[error("RunMemoryFault(flags={flags:#x}, gpa={gpa:#x}, size={size:#x})")]
+    RunMemoryFault {
+        flags: u64,
+        gpa: u64,
+        size: u64,
+        #[source]
+        source: nix::Error,
+    },
+    #[error("GetVCpuMmapSize")]
+    GetVCpuMmapSize(#[source] nix::Error),
+    #[error("MmapVCpu")]
+    MmapVCpu(#[source] io::Error),
+    #[error("SetFpu")]
+    SetFpu(#[source] nix::Error),
+    #[error("GetSupportedCpuid")]
+    GetSupportedCpuid(#[source] nix::Error),
+    #[error("SetCpuid")]
+    SetCpuid(#[source] nix::Error),
+    #[error("Interrupt")]
+    Interrupt(#[source] nix::Error),
+    #[error("GetLApic")]
+    GetLApic(#[source] nix::Error),
+    #[error("SetLApic")]
+    SetLApic(#[source] nix::Error),
+    #[error("GetXsave")]
+    GetXsave(#[source] nix::Error),
+    #[error("SetXsave")]
+    SetXsave(#[source] nix::Error),
+    #[error("GetDebugRegs")]
+    GetDebugRegs(#[source] nix::Error),
+    #[error("SetDebugRegs")]
+    SetDebugRegs(#[source] nix::Error),
+    #[error("GetXcrs")]
+    GetXcrs(#[source] nix::Error),
+    #[error("SetXcrs")]
+    SetXcrs(#[source] nix::Error),
+    #[error("xsave is not enabled")]
+    XsaveNotEnabled,
+    #[error("SetGsiRouting")]
+    SetGsiRouting(#[source] nix::Error),
+    #[error("IrqLine")]
+    IrqLine(#[source] nix::Error),
+    #[error("GetMsrs")]
+    GetMsrs(#[source] nix::Error),
+    #[error("SetMsrs")]
+    SetMsrs(#[source] nix::Error),
+    #[error(
+        "MSR access only processed {completed} of {requested} entries (first failed MSR: {failed_msr:#x}, write={write})"
+    )]
+    IncompleteMsrs {
+        write: bool,
+        completed: usize,
+        requested: usize,
+        failed_msr: u32,
+    },
+    #[error("SetupMce")]
+    SetupMce(#[source] nix::Error),
+    #[error("GetMceCapSupported")]
+    GetMceCapSupported(#[source] nix::Error),
+    #[error("GetMpState")]
+    GetMpState(#[source] nix::Error),
+    #[error("SetMpState")]
+    SetMpState(#[source] nix::Error),
+    #[error("GetVcpuEvents")]
+    GetVcpuEvents(#[source] nix::Error),
+    #[error("SetVcpuEvents")]
+    SetVcpuEvents(#[source] nix::Error),
+    #[error("TranslateGva")]
+    TranslateGva(#[source] nix::Error),
+    #[error("unknown exit {0:#x}")]
+    UnknownExit(u32),
+    #[error("unknown Hyper-V exit {0:#x}")]
+    UnknownHvExit(u32),
+    #[error("ioeventfd")]
+    IoEventFd(#[source] nix::Error),
+    #[error("irqfd")]
+    IrqFd(#[source] nix::Error),
+    #[error("failed to set BSP")]
+    SetBsp(#[source] nix::Error),
+    #[error("CreateDevice")]
+    CreateDevice(#[source] nix::Error),
+    #[error("SetDeviceAttr")]
+    SetDeviceAttr(#[source] nix::Error),
+    #[error("GetDeviceAttr")]
+    GetDeviceAttr(#[source] nix::Error),
+    #[error("CheckExtension")]
+    CheckExtension(#[source] nix::Error),
+    #[error("GetClock")]
+    GetClock(#[source] nix::Error),
+    #[error("SetClock")]
+    SetClock(#[source] nix::Error),
+}
+
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug)]
+struct Vp {
+    vcpu: File,
+    run_data: VpPtr,
+    thread: RwLock<Option<Pthread>>,
+    _phantom: PhantomData<kvm_run>,
+}
+
+/// Send+Sync wrapper around the mapped kvm_run pointer.
+#[derive(Debug)]
+struct VpPtr {
+    ptr: *mut kvm_run,
+    len: usize,
+}
+
+// SAFETY: this type contains a pointer to mapped data. By itself this is
+// Send+Sync since it's just a raw pointer value with no methods, but in context
+// it must be carefully accessed only by one thread at a time. This is mediated
+// by `Vp`.
+unsafe impl Send for VpPtr {}
+// SAFETY: see above comment
+unsafe impl Sync for VpPtr {}
+
+/// An open file to `/dev/kvm`.
+#[derive(Debug)]
+pub struct Kvm(File);
+
+impl Kvm {
+    /// Opens `/dev/kvm`.
+    pub fn new() -> Result<Self> {
+        let kvm = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .map_err(Error::OpenKvm)?;
+
+        Ok(Self(kvm))
+    }
+
+    /// Returns the CPUID values that are supported by the hypervisor.
+    #[cfg(target_arch = "x86_64")]
+    pub fn supported_cpuid(&self) -> Result<Vec<kvm_cpuid_entry2>> {
+        const MAX_CPUID_ENTRIES: usize = 256;
+        let mut supported_cpuid = Cpuid {
+            cpuid: kvm_cpuid2 {
+                nent: MAX_CPUID_ENTRIES as u32,
+                ..Default::default()
+            },
+            entries: [Default::default(); MAX_CPUID_ENTRIES],
+        };
+
+        // TODO: We are not checking for KVM_CAP_EXT_CPUID first.
+        // SAFETY: We have allocated an array for the ioctl to write to and correctly specified its size in nent.
+        unsafe {
+            ioctl::kvm_get_supported_cpuid(self.as_fd().as_raw_fd(), &mut supported_cpuid.cpuid)
+                .map_err(Error::GetSupportedCpuid)?;
+        }
+
+        Ok(supported_cpuid.entries[..supported_cpuid.cpuid.nent as usize].to_vec())
+    }
+
+    /// Returns the set of `IA32_MCG_CAP` capability bits that KVM supports
+    /// setting via [`Processor::setup_mce`] on this host (e.g. `MCG_CMCI_P`,
+    /// `MCG_LMCE_P` on Intel).
+    #[cfg(target_arch = "x86_64")]
+    pub fn supported_mce_cap(&self) -> Result<u64> {
+        let mut cap: u64 = 0;
+        // SAFETY: passing a valid pointer to a u64 for the ioctl to fill in.
+        unsafe {
+            ioctl::kvm_x86_get_mce_cap_supported(self.as_fd().as_raw_fd(), &mut cap)
+                .map_err(Error::GetMceCapSupported)?;
+        }
+        Ok(cap)
+    }
+
+    /// Returns the VMSA feature bits supported by KVM for SEV guests.
+    #[cfg(target_arch = "x86_64")]
+    pub fn supported_sev_vmsa_features(&self) -> Result<u64> {
+        let mut value = 0u64;
+        let attr = kvm_device_attr {
+            group: KVM_X86_GRP_SEV,
+            attr: u64::from(KVM_X86_SEV_VMSA_FEATURES),
+            addr: std::ptr::from_mut(&mut value) as u64,
+            flags: 0,
+        };
+        // SAFETY: `attr.addr` points to `value` for the duration of the ioctl.
+        unsafe {
+            ioctl::kvm_get_device_attr(self.as_fd().as_raw_fd(), &attr)
+                .map_err(Error::GetDeviceAttr)?;
+        }
+        Ok(value)
+    }
+
+    /// Returns the Hyper-V CPUID values that KVM supports for guest
+    /// enlightenments, including nested virtualization features.
+    #[cfg(target_arch = "x86_64")]
+    pub fn supported_hv_cpuid(&self) -> Result<Vec<kvm_cpuid_entry2>> {
+        const MAX_CPUID_ENTRIES: usize = 256;
+        let mut supported_cpuid = Cpuid {
+            cpuid: kvm_cpuid2 {
+                nent: MAX_CPUID_ENTRIES as u32,
+                ..Default::default()
+            },
+            entries: [Default::default(); MAX_CPUID_ENTRIES],
+        };
+
+        // SAFETY: We have allocated an array for the ioctl to write to and correctly specified its size in nent.
+        unsafe {
+            ioctl::kvm_get_supported_hv_cpuid(self.as_fd().as_raw_fd(), &mut supported_cpuid.cpuid)
+                .map_err(Error::GetSupportedCpuid)?;
+        }
+
+        Ok(supported_cpuid.entries[..supported_cpuid.cpuid.nent as usize].to_vec())
+    }
+
+    pub fn check_extension(&self, extension: u32) -> nix::Result<libc::c_int> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe { ioctl::kvm_check_extension(self.as_fd().as_raw_fd(), extension as i32) }
+    }
+
+    pub fn new_vm(&self, vm_type: VmType) -> Result<Partition> {
+        let raw_vm_type = self.raw_vm_type(vm_type)?;
+        self.new_vm_with_type(raw_vm_type)
+    }
+
+    fn raw_vm_type(&self, vm_type: VmType) -> Result<libc::c_int> {
+        match vm_type {
+            VmType::Default => Ok(self.default_vm_type()),
+            #[cfg(target_arch = "x86_64")]
+            VmType::Snp => {
+                let supported_vm_types =
+                    self.check_extension(KVM_CAP_VM_TYPES_UAPI)
+                        .map_err(Error::CheckExtension)? as u64;
+                let raw_vm_type = KVM_X86_SNP_VM_UAPI;
+                let vm_type_bit = 1_u64
+                    .checked_shl(raw_vm_type as u32)
+                    .ok_or(Error::UnsupportedVmType(vm_type))?;
+                if supported_vm_types & vm_type_bit == 0 {
+                    return Err(Error::UnsupportedVmType(vm_type));
+                }
+                Ok(raw_vm_type)
+            }
+            #[cfg(target_arch = "aarch64")]
+            VmType::Realm { ipa_bits } => Ok((KVM_VM_TYPE_ARM_REALM_UAPI
+                | ((ipa_bits as u64) & KVM_VM_TYPE_ARM_IPA_SIZE_MASK_UAPI))
+                as libc::c_int),
+        }
+    }
+
+    fn default_vm_type(&self) -> libc::c_int {
+        // On ARM, can request memory isolation which we don't use.
+        // For that, include the `KVM_VM_TYPE_ARM_PROTECTED` flag.
+        // Use 0 as the fallback machine type, which implies 40bit
+        // IPA on ARM64, and on x86_64 is the only option.
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.check_extension(KVM_CAP_ARM_VM_IPA_SIZE).unwrap_or(0)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            0
+        }
+    }
+
+    fn new_vm_with_type(&self, vm_type: libc::c_int) -> Result<Partition> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        let vm = unsafe {
+            let fd =
+                ioctl::kvm_create_vm(self.as_fd().as_raw_fd(), vm_type).map_err(Error::CreateVm)?;
+            File::from_raw_fd(fd)
+        };
+
+        // TODO: We are not checking KVM_CAP_ENABLE_CAP_VM first.
+        // TODO: We are not calling KVM_CHECK_EXTENSION first.
+        // SAFETY: Calling IOCTLs as documented, with no special requirements.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            // Disable quirks to make KVM behave more architecturally correct.
+            // TODO: Investigate using KVM_CAP_DISABLE_QUIRKS2 instead.
+            ioctl::kvm_enable_cap(
+                vm.as_raw_fd(),
+                &kvm_enable_cap {
+                    cap: KVM_CAP_DISABLE_QUIRKS,
+                    args: [KVM_X86_QUIRK_LINT0_REENABLED.into(), 0, 0, 0],
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| Error::EnableCap("disable_quirks", err))?;
+        }
+
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        let mmap_size = unsafe {
+            ioctl::kvm_get_vcpu_mmap_size(self.as_fd().as_raw_fd(), 0)
+                .map_err(Error::GetVCpuMmapSize)? as usize
+        };
+
+        Ok(Partition {
+            vm,
+            vps: Vec::new(),
+            mmap_size,
+        })
+    }
+}
+
+impl AsFd for Kvm {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl From<File> for Kvm {
+    fn from(fd: File) -> Self {
+        Self(fd)
+    }
+}
+
+impl From<Kvm> for File {
+    fn from(kvm: Kvm) -> Self {
+        kvm.0
+    }
+}
+
+#[repr(C)]
+#[cfg(target_arch = "x86_64")]
+struct Cpuid {
+    cpuid: kvm_cpuid2,
+    entries: [kvm_cpuid_entry2; 256],
+}
+
+#[derive(Debug)]
+pub struct Partition {
+    vm: File,
+    vps: Vec<Option<Vp>>,
+    mmap_size: usize,
+}
+
+impl Partition {
+    #[cfg(target_arch = "x86_64")]
+    pub fn check_sev_snp_launch_extensions(&self) -> Result<()> {
+        // SAFETY: This is the documented KVM_MEMORY_ENCRYPT_OP availability
+        // probe, and does not pass any userspace data pointer to KVM.
+        unsafe { ioctl::kvm_memory_encrypt_op_supported(self.vm.as_raw_fd()) }.map_err(|err| {
+            Error::MemoryEncryptOp {
+                command: "KVM_MEMORY_ENCRYPT_OP(NULL)",
+                firmware_error: 0,
+                source: err,
+            }
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn enable_hypercall_exits(&self, hypercall_mask: u64) -> Result<()> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_enable_cap(
+                self.vm.as_raw_fd(),
+                &kvm_enable_cap {
+                    cap: KVM_CAP_EXIT_HYPERCALL_UAPI,
+                    args: [hypercall_mask, 0, 0, 0],
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| Error::EnableCap("exit_hypercall", err))?;
+        }
+        Ok(())
+    }
+
+    pub fn check_extension(&self, extension: u32) -> nix::Result<libc::c_int> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe { ioctl::kvm_check_extension(self.vm.as_raw_fd(), extension as i32) }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn arm_rmi_populate(&self, populate: &mut KvmArmRmiPopulate) -> Result<()> {
+        // SAFETY: `populate` points to a valid KVM_ARM_RMI_POPULATE argument for
+        // the duration of the ioctl. KVM may update it to report partial progress.
+        unsafe { ioctl::kvm_arm_rmi_populate(self.vm.as_raw_fd(), populate) }
+            .map_err(Error::ArmRmiPopulate)?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn sev_snp_init(&self, sev: BorrowedFd<'_>, vmsa_features: u64) -> Result<()> {
+        let mut init = kvm_sev_init {
+            vmsa_features,
+            ..Default::default()
+        };
+        let mut command = kvm_sev_cmd {
+            id: sev_cmd_id_KVM_SEV_INIT2,
+            data: std::ptr::from_mut(&mut init) as u64,
+            sev_fd: sev.as_raw_fd() as u32,
+            ..Default::default()
+        };
+
+        // SAFETY: `command` and its data pointer refer to stack-allocated C ABI
+        // structs that remain valid for the duration of the ioctl.
+        unsafe {
+            ioctl::kvm_memory_encrypt_op(self.vm.as_raw_fd(), &mut command).map_err(|err| {
+                Error::MemoryEncryptOp {
+                    command: "KVM_SEV_INIT2",
+                    firmware_error: command.error,
+                    source: err,
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn sev_snp_cmd<T>(
+        &self,
+        sev: BorrowedFd<'_>,
+        command_name: &'static str,
+        command_id: sev_cmd_id,
+        data: &mut T,
+    ) -> Result<()> {
+        let mut command = kvm_sev_cmd {
+            id: command_id,
+            data: std::ptr::from_mut(data) as u64,
+            sev_fd: sev.as_raw_fd() as u32,
+            ..Default::default()
+        };
+
+        loop {
+            // SAFETY: `command` and its data pointer refer to stack-allocated C ABI
+            // structs that remain valid for the duration of the ioctl.
+            match unsafe { ioctl::kvm_memory_encrypt_op(self.vm.as_raw_fd(), &mut command) } {
+                Ok(_) => break,
+                Err(nix::errno::Errno::EAGAIN) => {}
+                Err(err) => {
+                    return Err(Error::MemoryEncryptOp {
+                        command: command_name,
+                        firmware_error: command.error,
+                        source: err,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn sev_snp_launch_start(
+        &self,
+        sev: BorrowedFd<'_>,
+        data: &mut kvm_sev_snp_launch_start,
+    ) -> Result<()> {
+        self.sev_snp_cmd(
+            sev,
+            "KVM_SEV_SNP_LAUNCH_START",
+            sev_cmd_id_KVM_SEV_SNP_LAUNCH_START,
+            data,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn sev_snp_launch_update(
+        &self,
+        sev: BorrowedFd<'_>,
+        gfn_start: u64,
+        uaddr: u64,
+        len: u64,
+        page_type: SevSnpPageType,
+    ) -> Result<()> {
+        let mut update = kvm_sev_snp_launch_update {
+            gfn_start,
+            uaddr,
+            len,
+            type_: page_type.as_uapi(),
+            ..Default::default()
+        };
+
+        while update.len != 0 {
+            self.sev_snp_cmd(
+                sev,
+                "KVM_SEV_SNP_LAUNCH_UPDATE",
+                sev_cmd_id_KVM_SEV_SNP_LAUNCH_UPDATE,
+                &mut update,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn sev_snp_launch_finish(
+        &self,
+        sev: BorrowedFd<'_>,
+        data: &mut kvm_sev_snp_launch_finish,
+    ) -> Result<()> {
+        self.sev_snp_cmd(
+            sev,
+            "KVM_SEV_SNP_LAUNCH_FINISH",
+            sev_cmd_id_KVM_SEV_SNP_LAUNCH_FINISH,
+            data,
+        )
+    }
+
+    pub fn enable_split_irqchip(&self, lines: u32) -> Result<()> {
+        // TODO: We are not checking KVM_CAP_ENABLE_CAP_VM first.
+        // TODO: We are not calling KVM_CHECK_EXTENSION first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_enable_cap(
+                self.vm.as_raw_fd(),
+                &kvm_enable_cap {
+                    cap: KVM_CAP_SPLIT_IRQCHIP,
+                    args: [lines.into(), 0, 0, 0],
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| Error::EnableCap("split_irqchip", err))?;
+        }
+        Ok(())
+    }
+
+    /// Enable X2APIC IDs in interrupt and LAPIC APIs.
+    #[cfg(target_arch = "x86_64")]
+    pub fn enable_x2apic_api(&self) -> Result<()> {
+        let flags = KVM_X2APIC_API_USE_32BIT_IDS;
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_enable_cap(
+                self.vm.as_raw_fd(),
+                &kvm_enable_cap {
+                    cap: KVM_CAP_X2APIC_API,
+                    args: [flags.into(), 0, 0, 0],
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| Error::EnableCap("x2apic_api", err))?;
+        }
+        Ok(())
+    }
+
+    pub fn enable_unknown_msr_exits(&self) -> Result<()> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        // TODO: We are not checking KVM_CAP_ENABLE_CAP_VM first.
+        unsafe {
+            ioctl::kvm_enable_cap(
+                self.vm.as_raw_fd(),
+                &kvm_enable_cap {
+                    cap: KVM_CAP_X86_USER_SPACE_MSR,
+                    args: [KVM_MSR_EXIT_REASON_UNKNOWN.into(), 0, 0, 0],
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| Error::EnableCap("user_space_msr", err))?;
+        }
+        Ok(())
+    }
+
+    /// Set the VCPU index of the BSP. This must be called before any VCPUs are
+    /// created.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_bsp(&mut self, vcpu_idx: u32) -> Result<()> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_set_boot_cpu_id(self.vm.as_raw_fd(), vcpu_idx as i32)
+                .map_err(Error::SetBsp)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn add_vp(&mut self, vcpu_idx: u32) -> Result<()> {
+        // TODO: We are not checking KVM_CAP_NR_VCPUS or KVM_CAP_MAX_VCPUS first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        let vcpu = unsafe {
+            let fd = ioctl::kvm_create_vcpu(self.vm.as_raw_fd(), vcpu_idx as i32)
+                .map_err(Error::CreateVCpu)?;
+            File::from_raw_fd(fd)
+        };
+
+        // SAFETY: Calling mmap with a null pointer is valid, and vcpu is guaranteed to have a valid fd.
+        let ptr = unsafe {
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                self.mmap_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                vcpu.as_raw_fd(),
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                return Err(Error::MmapVCpu(io::Error::last_os_error()));
+            }
+            ptr
+        };
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Can request additional features like so:
+            let mut kvi = kvm_vcpu_init::default();
+            kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
+
+            if vcpu_idx > 0 {
+                kvi.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
+            }
+
+            let mut pref_target = kvm_vcpu_init::default();
+            // SAFETY: Calling IOCTL as documented, with no special requirements.
+            unsafe {
+                ioctl::kvm_arm_preferred_target(self.vm.as_raw_fd(), &mut pref_target)
+                    .map_err(Error::CreateVCpu)?
+            };
+
+            kvi.target = pref_target.target;
+            // SAFETY: Calling IOCTL as documented, with no special requirements.
+            unsafe { ioctl::kvm_arm_vcpu_init(vcpu.as_raw_fd(), &kvi).map_err(Error::CreateVCpu)? };
+        }
+
+        let vp = Vp {
+            vcpu,
+            run_data: VpPtr {
+                ptr: ptr.cast(),
+                len: self.mmap_size,
+            },
+            thread: RwLock::new(None),
+            _phantom: PhantomData,
+        };
+        if self.vps.len() <= vcpu_idx as usize {
+            self.vps.resize_with(vcpu_idx as usize + 1, || None);
+        }
+        assert!(self.vps[vcpu_idx as usize].replace(vp).is_none());
+
+        Ok(())
+    }
+
+    pub fn vp(&self, index: u32) -> Processor<'_> {
+        Processor(self, index)
+    }
+
+    pub fn request_msi(&self, msi: &kvm_msi) -> Result<()> {
+        // TODO: We are not checking KVM_CAP_SIGNAL_MSI first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_signal_msi(self.vm.as_raw_fd(), msi).map_err(Error::SignalMsi)?;
+        }
+        Ok(())
+    }
+
+    /// Sets or clears a userspace memory slot.
+    ///
+    /// # Safety
+    ///
+    /// If `size` is nonzero, `data..data + size` must be a valid userspace
+    /// mapping for KVM to access until the slot is changed or cleared. The
+    /// caller must also ensure that `addr` and `size` satisfy KVM's memory-slot
+    /// alignment and range requirements.
+    pub unsafe fn set_user_memory_region(
+        &self,
+        slot: u32,
+        data: *mut u8,
+        size: usize,
+        addr: u64,
+        readonly: bool,
+    ) -> Result<()> {
+        let region = kvm_userspace_memory_region {
+            slot,
+            flags: if readonly { KVM_MEM_READONLY } else { 0 },
+            guest_phys_addr: addr,
+            memory_size: size as u64,
+            userspace_addr: data as usize as u64,
+        };
+        // SAFETY: the caller guarantees that any non-empty userspace range
+        // remains valid for KVM while the slot references it.
+        unsafe {
+            ioctl::kvm_set_user_memory_region(self.vm.as_raw_fd(), &region)
+                .map_err(Error::SetMemoryRegion)?;
+        }
+        Ok(())
+    }
+
+    /// Sets or clears a userspace memory slot with optional guestmemfd backing.
+    ///
+    /// # Safety
+    ///
+    /// If `size` is nonzero, `data..data + size` must be a valid userspace
+    /// mapping for KVM to access until the slot is changed or cleared. The
+    /// caller must ensure that `addr`, `size`, and any `guestmemfd` offset
+    /// satisfy KVM's memory-slot alignment and range requirements. If
+    /// `guest_memfd` is supplied, the file must remain open and valid for as
+    /// long as KVM may reference the slot.
+    pub unsafe fn set_user_memory_region2(
+        &self,
+        slot: u32,
+        data: *mut u8,
+        size: usize,
+        addr: u64,
+        readonly: bool,
+        guest_memfd: Option<(&File, u64)>,
+    ) -> Result<()> {
+        let (guest_memfd, guest_memfd_offset, guest_memfd_flag) = guest_memfd
+            .map(|(file, offset)| (file.as_raw_fd() as u32, offset, KVM_MEM_GUEST_MEMFD))
+            .unwrap_or((0, 0, 0));
+        let region = kvm_userspace_memory_region2 {
+            slot,
+            flags: if readonly { KVM_MEM_READONLY } else { 0 } | guest_memfd_flag,
+            guest_phys_addr: addr,
+            memory_size: size as u64,
+            userspace_addr: data as usize as u64,
+            guest_memfd_offset,
+            guest_memfd,
+            ..Default::default()
+        };
+        // SAFETY: the caller guarantees that any non-empty userspace range and
+        // optional guestmemfd backing remain valid for KVM while the slot
+        // references them.
+        unsafe {
+            ioctl::kvm_set_user_memory_region2(self.vm.as_raw_fd(), &region)
+                .map_err(Error::SetMemoryRegion)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_guest_memfd(&self, size: u64) -> Result<File> {
+        let mut guest_memfd = kvm_create_guest_memfd {
+            size,
+            ..Default::default()
+        };
+        // SAFETY: `guest_memfd` is a valid C ABI struct for KVM to read.
+        let fd = unsafe {
+            ioctl::kvm_create_guest_memfd(self.vm.as_raw_fd(), &mut guest_memfd)
+                .map_err(Error::CreateGuestMemfd)?
+        };
+        // SAFETY: On success, KVM returns a new owned file descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub fn set_memory_attributes(&self, addr: u64, size: u64, attributes: u64) -> Result<()> {
+        let attr = kvm_memory_attributes {
+            address: addr,
+            size,
+            attributes,
+            ..Default::default()
+        };
+        // SAFETY: `attr` is a valid C ABI struct for KVM to read.
+        unsafe {
+            ioctl::kvm_set_memory_attributes(self.vm.as_raw_fd(), &attr)
+                .map_err(Error::SetMemoryAttributes)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_gsi_routes(&self, routes: &[(u32, RoutingEntry)]) -> Result<()> {
+        const MAX_ROUTES: usize = 2048;
+        assert!(routes.len() <= MAX_ROUTES);
+
+        #[repr(C)]
+        struct Routes {
+            header: kvm_irq_routing,
+            entries: [kvm_irq_routing_entry; MAX_ROUTES],
+        }
+
+        let mut kvm_routes = Routes {
+            header: Default::default(),
+            entries: [Default::default(); MAX_ROUTES],
+        };
+        for (i, route) in routes.iter().enumerate() {
+            let (type_, flags, u) = match route.1 {
+                RoutingEntry::Msi {
+                    address_lo,
+                    address_hi,
+                    data,
+                    devid,
+                } => {
+                    let (flags, anon) = if let Some(devid) = devid {
+                        (
+                            KVM_MSI_VALID_DEVID,
+                            kvm_irq_routing_msi__bindgen_ty_1 { devid },
+                        )
+                    } else {
+                        (0, Default::default())
+                    };
+                    (
+                        KVM_IRQ_ROUTING_MSI,
+                        flags,
+                        kvm_irq_routing_entry__bindgen_ty_1 {
+                            msi: kvm_irq_routing_msi {
+                                address_lo,
+                                address_hi,
+                                data,
+                                __bindgen_anon_1: anon,
+                            },
+                        },
+                    )
+                }
+                RoutingEntry::HvSint { vp, sint } => (
+                    KVM_IRQ_ROUTING_HV_SINT,
+                    0,
+                    kvm_irq_routing_entry__bindgen_ty_1 {
+                        hv_sint: kvm_irq_routing_hv_sint {
+                            vcpu: vp,
+                            sint: sint.into(),
+                        },
+                    },
+                ),
+                RoutingEntry::Irqchip { pin } => (
+                    KVM_IRQ_ROUTING_IRQCHIP,
+                    0,
+                    kvm_irq_routing_entry__bindgen_ty_1 {
+                        irqchip: kvm_irq_routing_irqchip { pin, irqchip: 0 },
+                    },
+                ),
+            };
+            kvm_routes.entries[i] = kvm_irq_routing_entry {
+                gsi: route.0,
+                type_,
+                flags,
+                pad: 0,
+                u,
+            };
+            kvm_routes.header.nr += 1;
+        }
+
+        // TODO: We are not checking KVM_CAP_IRQ_ROUTING first.
+        // SAFETY: Our Routes type puts the entries array immediately after the header in memory, as required.
+        unsafe {
+            ioctl::kvm_set_gsi_routing(self.vm.as_raw_fd(), &kvm_routes.header)
+                .map_err(Error::SetGsiRouting)?;
+        }
+        Ok(())
+    }
+
+    pub fn irqfd(&self, gsi: u32, event: RawFd, assign: bool) -> Result<()> {
+        // TODO: We are not checking KVM_CAP_IRQFD first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_irqfd(
+                self.vm.as_raw_fd(),
+                &kvm_irqfd {
+                    fd: event as u32,
+                    gsi,
+                    flags: if assign { 0 } else { KVM_IRQFD_FLAG_DEASSIGN },
+                    resamplefd: 0,
+                    pad: [0; 16],
+                },
+            )
+            .map_err(Error::IrqFd)
+            .map(drop)
+        }
+    }
+
+    pub fn irq_line(&self, gsi: u32, level: bool) -> Result<()> {
+        // TODO: We are not checking KVM_CAP_IRQCHIP first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_irq_line(
+                self.vm.as_raw_fd(),
+                &kvm_irq_level {
+                    __bindgen_anon_1: kvm_irq_level__bindgen_ty_1 { irq: gsi },
+                    level: level.into(),
+                },
+            )
+            .map_err(Error::IrqLine)?;
+        }
+        Ok(())
+    }
+
+    pub fn ioeventfd(
+        &self,
+        datamatch: u64,
+        addr: u64,
+        len: u32,
+        fd: i32,
+        flags: u32,
+    ) -> Result<()> {
+        // TODO: We are not checking KVM_CAP_IOEVENTFD first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_ioeventfd(
+                self.vm.as_raw_fd(),
+                &kvm_ioeventfd {
+                    datamatch,
+                    addr,
+                    len,
+                    fd,
+                    flags,
+                    ..Default::default()
+                },
+            )
+            .map_err(Error::IoEventFd)?;
+        };
+        Ok(())
+    }
+
+    pub fn create_device(&self, ty: u32, flags: u32) -> nix::Result<Device> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        // The reference: https://www.kernel.org/doc/html/latest/virt/kvm/api.html#kvm-create-device.
+        // The kernel checks on the input parameters and returns the appropriate
+        // error code.
+        unsafe {
+            let mut device = kvm_create_device {
+                type_: ty,
+                fd: 0,
+                flags,
+            };
+            ioctl::kvm_create_device(self.vm.as_raw_fd(), &mut device)?;
+            Ok(Device(File::from_raw_fd(device.fd as i32)))
+        }
+    }
+
+    /// Tests whether a device type can be created without actually creating it.
+    ///
+    /// Uses `KVM_CREATE_DEVICE_TEST` to probe support. Unlike
+    /// [`create_device`](Self::create_device), this does not wrap any fd.
+    pub fn test_create_device(&self, ty: u32) -> nix::Result<()> {
+        // SAFETY: With KVM_CREATE_DEVICE_TEST the kernel only checks
+        // whether the device type is supported and does not populate
+        // `device.fd`.
+        unsafe {
+            let mut device = kvm_create_device {
+                type_: ty,
+                fd: 0,
+                flags: KVM_CREATE_DEVICE_TEST,
+            };
+            ioctl::kvm_create_device(self.vm.as_raw_fd(), &mut device)?;
+        }
+        Ok(())
+    }
+
+    /// Gets the current kvmclock value.
+    pub fn get_clock_ns(&self) -> Result<kvm_clock_data> {
+        let mut clock = kvm_clock_data::default();
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_get_clock(self.vm.as_raw_fd(), &mut clock).map_err(Error::GetClock)?;
+        }
+        Ok(clock)
+    }
+
+    /// Sets the current kvmclock value.
+    pub fn set_clock_ns(&self, clock_ns: u64) -> Result<()> {
+        let clock = kvm_clock_data {
+            clock: clock_ns,
+            ..Default::default()
+        };
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_set_clock(self.vm.as_raw_fd(), &clock).map_err(Error::SetClock)?;
+        }
+        Ok(())
+    }
+}
+
+/// An in-kernel emulated device.
+pub struct Device(File);
+
+impl Device {
+    /// # Safety
+    ///
+    /// `addr` must point to the appropriate input for the attribute being
+    /// set.
+    pub unsafe fn set_device_attr<T>(
+        &self,
+        group: u32,
+        attr: u32,
+        addr: &T,
+        flags: u32,
+    ) -> nix::Result<()> {
+        // SAFETY: caller guaranteed.
+        unsafe {
+            ioctl::kvm_set_device_attr(
+                self.0.as_raw_fd(),
+                &kvm_device_attr {
+                    group,
+                    attr: attr as u64,
+                    addr: std::ptr::from_ref(addr) as u64,
+                    flags,
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum RoutingEntry {
+    Irqchip {
+        pin: u32,
+    },
+    Msi {
+        address_lo: u32,
+        address_hi: u32,
+        data: u32,
+        devid: Option<u32>,
+    },
+    HvSint {
+        vp: u32,
+        sint: u8,
+    },
+}
+
+pub struct Processor<'a>(&'a Partition, u32);
+
+impl<'a> Processor<'a> {
+    #[cfg(target_arch = "x86_64")]
+    pub fn tsc_frequency_hz(&self) -> Result<u64> {
+        // SAFETY: Calling the documented vCPU ioctl with no pointer argument.
+        let khz = unsafe { ioctl::kvm_get_tsc_khz(self.get().vcpu.as_raw_fd(), 0) }
+            .map_err(Error::GetTscFrequency)?;
+        if khz <= 0 {
+            return Err(Error::GetTscFrequency(nix::errno::Errno::EINVAL));
+        }
+        Ok(khz as u64 * 1000)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<()> {
+        let khz = frequency_hz
+            .checked_div(1000)
+            .and_then(|khz| libc::c_int::try_from(khz).ok())
+            .ok_or(Error::SetTscFrequency(nix::errno::Errno::EINVAL))?;
+        // SAFETY: Calling the documented vCPU ioctl with its integer value.
+        unsafe { ioctl::kvm_set_tsc_khz(self.get().vcpu.as_raw_fd(), khz) }
+            .map_err(Error::SetTscFrequency)?;
+        Ok(())
+    }
+
+    /// Gets the guest TSC offset, in guest TSC cycles.
+    #[cfg(target_arch = "x86_64")]
+    pub fn tsc_offset(&self) -> Result<u64> {
+        let mut offset = 0u64;
+        let attr = kvm_device_attr {
+            group: KVM_VCPU_TSC_CTRL,
+            attr: u64::from(KVM_VCPU_TSC_OFFSET),
+            addr: std::ptr::from_mut(&mut offset) as u64,
+            flags: 0,
+        };
+        // SAFETY: `attr.addr` points to `offset` for the duration of the ioctl.
+        unsafe {
+            ioctl::kvm_get_device_attr(self.get().vcpu.as_raw_fd(), &attr)
+                .map_err(Error::GetTscOffset)?;
+        }
+        Ok(offset)
+    }
+
+    /// Sets the guest TSC offset without KVM's TSC-write synchronization heuristic.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_tsc_offset(&self, offset: u64) -> Result<()> {
+        // SAFETY: `offset` is the u64 input required by KVM_VCPU_TSC_OFFSET.
+        unsafe {
+            self.set_device_attr(KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, &offset, 0)
+                .map_err(Error::SetTscOffset)?;
+        }
+        Ok(())
+    }
+
+    pub fn enable_synic(&self) -> Result<()> {
+        // TODO: We are not checking KVM_CAP_ENABLE_CAP_VM first.
+        // TODO: We are not calling KVM_CHECK_EXTENSION first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_enable_cap(
+                self.get().vcpu.as_raw_fd(),
+                &kvm_enable_cap {
+                    cap: KVM_CAP_HYPERV_SYNIC2,
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| Error::EnableCap("hyperv_synic2", err))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_cpuid(&self, entries: &[kvm_cpuid_entry2]) -> Result<()> {
+        const MAX_CPUID_ENTRIES: usize = 256;
+        assert!(entries.len() <= MAX_CPUID_ENTRIES);
+
+        let mut cpuid: Cpuid = Cpuid {
+            cpuid: Default::default(),
+            entries: [Default::default(); MAX_CPUID_ENTRIES],
+        };
+        for (i, e) in entries.iter().enumerate() {
+            cpuid.entries[i] = *e;
+            cpuid.cpuid.nent += 1;
+        }
+
+        // SAFETY: Our Cpuid type puts the entries array immediately after the header in memory, as required.
+        unsafe {
+            ioctl::kvm_set_cpuid2(self.get().vcpu.as_raw_fd(), &cpuid.cpuid)
+                .map_err(Error::SetCpuid)?;
+        }
+        Ok(())
+    }
+
+    fn get(&self) -> &'a Vp {
+        self.0.vps[self.1 as usize].as_ref().expect("vp exists")
+    }
+
+    /// Forces an exit to be returned from the next call to [`VpRunner::run`].
+    ///
+    /// Note that this does nothing if a [`VpRunner`] does not currently exist
+    /// for this VP, or if this is called from the same thread as the runner.
+    pub fn force_exit(&self) {
+        let vp = self.get();
+        let thread = vp.thread.read();
+        if let Some(thread) = *thread {
+            if thread != Pthread::current() {
+                thread
+                    .signal(libc::SIGRTMIN())
+                    .expect("thread cancel signal failed");
+            }
+        }
+    }
+
+    pub fn interrupt(&self, vector: u32) -> Result<()> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_interrupt(self.get().vcpu.as_raw_fd(), &kvm_interrupt { irq: vector })
+                .map_err(Error::Interrupt)?;
+        };
+        Ok(())
+    }
+
+    /// Very not structured way of setting the register. Could enjoy using an enum.
+    pub fn set_reg64(&self, reg_id: u64, value: u64) -> Result<()> {
+        let reg = kvm_one_reg {
+            id: reg_id,
+            addr: std::ptr::from_ref(&value) as u64,
+        };
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_set_reg(self.get().vcpu.as_raw_fd(), &reg).map_err(Error::SetRegs)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn set_regs(&self, regs: &kvm_regs) -> Result<()> {
+        // This IOCTL does not work on arm64.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_set_regs(self.get().vcpu.as_raw_fd(), regs).map_err(Error::SetRegs)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn set_sregs(&self, sregs: &kvm_sregs) -> Result<()> {
+        // This IOCTL does not work on arm64.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_set_sregs(self.get().vcpu.as_raw_fd(), sregs).map_err(Error::SetRegs)?;
+        }
+        Ok(())
+    }
+
+    /// Very not structured way of getting the register. Could enjoy using an enum.
+    pub fn get_reg64(&self, reg_id: u64) -> Result<u64> {
+        let mut value: u64 = 0;
+        let reg = kvm_one_reg {
+            id: reg_id,
+            addr: std::ptr::from_mut(&mut value) as u64,
+        };
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_get_reg(self.get().vcpu.as_raw_fd(), &reg).map_err(Error::GetRegs)?;
+        }
+
+        Ok(value)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn get_regs(&self) -> Result<kvm_regs> {
+        let mut regs = Default::default();
+        // This IOCTL does not work on arm64.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_get_regs(self.get().vcpu.as_raw_fd(), &mut regs).map_err(Error::GetRegs)?;
+        }
+        Ok(regs)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn get_sregs(&self) -> Result<kvm_sregs> {
+        let mut sregs = Default::default();
+        // This IOCTL does not work on arm64.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_get_sregs(self.get().vcpu.as_raw_fd(), &mut sregs)
+                .map_err(Error::GetSRegs)?;
+        }
+        Ok(sregs)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn get_msrs(&self, msrs: &[u32], values: &mut [u64]) -> Result<()> {
+        const MAX_MSR_ENTRIES: usize = 256;
+        assert_eq!(msrs.len(), values.len());
+        assert!(msrs.len() <= MAX_MSR_ENTRIES);
+
+        #[repr(C)]
+        struct Msrs {
+            header: kvm_msrs,
+            entries: [kvm_msr_entry; MAX_MSR_ENTRIES],
+        }
+        let mut input = Msrs {
+            header: kvm_msrs {
+                nmsrs: msrs.len() as u32,
+                ..Default::default()
+            },
+            entries: [Default::default(); MAX_MSR_ENTRIES],
+        };
+        for (i, msr) in msrs.iter().enumerate() {
+            input.entries[i] = kvm_msr_entry {
+                index: *msr,
+                reserved: 0,
+                data: 0,
+            };
+        }
+
+        // SAFETY: Our Msrs type puts the entries array immediately after the header in memory, as required.
+        let completed = unsafe {
+            ioctl::kvm_get_msrs(self.get().vcpu.as_raw_fd(), &mut input.header)
+                .map_err(Error::GetMsrs)?
+        } as usize;
+        assert!(completed <= msrs.len());
+        if completed < msrs.len() {
+            return Err(Error::IncompleteMsrs {
+                requested: msrs.len(),
+                completed,
+                failed_msr: msrs.get(completed).copied().unwrap(),
+                write: false,
+            });
+        }
+        for (v, e) in values.iter_mut().zip(&input.entries) {
+            *v = e.data;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_msrs(&self, msrs: &[(u32, u64)]) -> Result<()> {
+        const MAX_MSR_ENTRIES: usize = 256;
+        assert!(msrs.len() <= MAX_MSR_ENTRIES);
+
+        #[repr(C)]
+        struct Msrs {
+            header: kvm_msrs,
+            entries: [kvm_msr_entry; MAX_MSR_ENTRIES],
+        }
+        let mut input = Msrs {
+            header: kvm_msrs {
+                nmsrs: msrs.len() as u32,
+                ..Default::default()
+            },
+            entries: [Default::default(); MAX_MSR_ENTRIES],
+        };
+        for (i, msr) in msrs.iter().enumerate() {
+            input.entries[i] = kvm_msr_entry {
+                index: msr.0,
+                reserved: 0,
+                data: msr.1,
+            };
+        }
+
+        // SAFETY: Our Msrs type puts the entries array immediately after the header in memory, as required.
+        let completed = unsafe {
+            ioctl::kvm_set_msrs(self.get().vcpu.as_raw_fd(), &input.header)
+                .map_err(Error::SetMsrs)?
+        } as usize;
+        assert!(completed <= msrs.len());
+        if completed < msrs.len() {
+            return Err(Error::IncompleteMsrs {
+                requested: msrs.len(),
+                completed,
+                failed_msr: msrs.get(completed).copied().unwrap().0,
+                write: true,
+            });
+        }
+        Ok(())
+    }
+
+    /// Configures the vCPU's machine-check capability register
+    /// (`IA32_MCG_CAP`) via `KVM_X86_SETUP_MCE`.
+    ///
+    /// `mcg_cap` should only contain capability bits reported as supported by
+    /// [`Kvm::supported_mce_cap`] (plus the bank count in the low byte);
+    /// otherwise KVM returns `EINVAL`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn setup_mce(&self, mcg_cap: u64) -> Result<()> {
+        // SAFETY: passing a valid pointer to a u64 for the ioctl to read.
+        unsafe {
+            ioctl::kvm_x86_setup_mce(self.get().vcpu.as_raw_fd(), &mcg_cap)
+                .map_err(Error::SetupMce)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn get_lapic(&self, state: &mut [u8; 1024]) -> Result<()> {
+        assert_eq!(size_of_val(state), size_of::<kvm_lapic_state>());
+
+        // TODO: We are not checking KVM_CAP_IRQCHIP first.
+        // SAFETY: We have verified that our output buffer is the correct size.
+        unsafe {
+            ioctl::kvm_get_lapic(self.get().vcpu.as_raw_fd(), state.as_mut_ptr().cast())
+                .map_err(Error::GetLApic)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_lapic(&self, state: &[u8; 1024]) -> Result<()> {
+        assert_eq!(size_of_val(state), size_of::<kvm_lapic_state>());
+
+        // TODO: We are not checking KVM_CAP_IRQCHIP first.
+        // SAFETY: We have verified that our input buffer is the correct size.
+        unsafe {
+            ioctl::kvm_set_lapic(self.get().vcpu.as_raw_fd(), state.as_ptr().cast())
+                .map_err(Error::SetLApic)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn get_xsave(&self, state: &mut [u8; 4096]) -> Result<()> {
+        assert_eq!(size_of_val(state), size_of::<kvm_xsave>());
+
+        // TODO: We are not checking KVM_CAP_XSAVE2 first.
+        // SAFETY: We have verified that our output buffer is the correct size.
+        unsafe {
+            ioctl::kvm_get_xsave(self.get().vcpu.as_raw_fd(), state.as_mut_ptr().cast())
+                .map_err(Error::GetXsave)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_xsave(&self, state: &[u8; 4096]) -> Result<()> {
+        assert_eq!(size_of_val(state), size_of::<kvm_xsave>());
+
+        // TODO: We are not checking KVM_CAP_XSAVE2 first.
+        // SAFETY: We have verified that our input buffer is the correct size.
+        unsafe {
+            ioctl::kvm_set_xsave(self.get().vcpu.as_raw_fd(), state.as_ptr().cast())
+                .map_err(Error::SetXsave)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_debug_regs(&self, regs: &DebugRegisters) -> Result<()> {
+        let data = kvm_debugregs {
+            db: regs.db,
+            dr6: regs.dr6,
+            dr7: regs.dr7,
+            flags: 0,
+            reserved: [0; 9],
+        };
+
+        // TODO: We are not checking KVM_CAP_DEBUGREGS first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_set_debugregs(self.get().vcpu.as_raw_fd(), &data)
+                .map_err(Error::SetDebugRegs)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn get_debug_regs(&self) -> Result<DebugRegisters> {
+        let mut data = Default::default();
+
+        // TODO: We are not checking KVM_CAP_DEBUGREGS first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_get_debugregs(self.get().vcpu.as_raw_fd(), &mut data)
+                .map_err(Error::GetDebugRegs)?;
+        }
+
+        Ok(DebugRegisters {
+            db: data.db,
+            dr6: data.dr6,
+            dr7: data.dr7,
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_xcr0(&self, value: u64) -> Result<()> {
+        let mut data = kvm_xcrs {
+            nr_xcrs: 1,
+            ..Default::default()
+        };
+        data.xcrs[0] = kvm_xcr {
+            xcr: 0,
+            reserved: 0,
+            value,
+        };
+
+        // TODO: We are not checking KVM_CAP_XCRS first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_set_xcrs(self.get().vcpu.as_raw_fd(), &data).map_err(Error::GetXcrs)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn get_xcr0(&self) -> Result<u64> {
+        let mut data = Default::default();
+
+        // TODO: We are not checking KVM_CAP_XCRS first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_get_xcrs(self.get().vcpu.as_raw_fd(), &mut data).map_err(Error::SetXcrs)?;
+        }
+
+        if data.nr_xcrs < 1 {
+            return Err(Error::XsaveNotEnabled);
+        }
+        assert_eq!(data.nr_xcrs, 1);
+        assert_eq!(data.xcrs[0].xcr, 0);
+        Ok(data.xcrs[0].value)
+    }
+
+    pub fn set_mp_state(&self, state: u32) -> Result<()> {
+        let state = kvm_mp_state { mp_state: state };
+        // TODO: We are not checking KVM_CAP_MP_STATE first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_set_mp_state(self.get().vcpu.as_raw_fd(), &state)
+                .map_err(Error::SetMpState)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_mp_state(&self) -> Result<u32> {
+        let mut state = Default::default();
+        // TODO: We are not checking KVM_CAP_MP_STATE first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_get_mp_state(self.get().vcpu.as_raw_fd(), &mut state)
+                .map_err(Error::GetMpState)?;
+        }
+        Ok(state.mp_state)
+    }
+
+    pub fn set_vcpu_events(&self, events: &kvm_vcpu_events) -> Result<()> {
+        // TODO: We are not checking KVM_CAP_VCPU_EVENTS first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_set_vcpu_events(self.get().vcpu.as_raw_fd(), events)
+                .map_err(Error::SetVcpuEvents)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_vcpu_events(&self) -> Result<kvm_vcpu_events> {
+        let mut events = Default::default();
+        // TODO: We are not checking KVM_CAP_VCPU_EVENTS first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_get_vcpu_events(self.get().vcpu.as_raw_fd(), &mut events)
+                .map_err(Error::GetVcpuEvents)?;
+        }
+        Ok(events)
+    }
+
+    pub fn translate_gva(&self, gva: u64) -> Result<kvm_translation> {
+        let mut translation = kvm_translation {
+            linear_address: gva,
+            ..Default::default()
+        };
+
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_translation(self.get().vcpu.as_raw_fd(), &mut translation)
+                .map_err(Error::TranslateGva)?;
+        }
+
+        Ok(translation)
+    }
+
+    /// Sets the guest debugging state: `control` bits `KVM_GUESTDBG_*`, `db`
+    /// containing DR0 through DR3, and `dr7`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_guest_debug(&self, control: u32, db: [u64; 4], dr7: u64) -> Result<()> {
+        // N.B. Debug registers 4 through 6 are not used by KVM in this path.
+        let debug = kvm_guest_debug {
+            control,
+            pad: 0,
+            arch: kvm_guest_debug_arch {
+                debugreg: [db[0], db[1], db[2], db[3], 0, 0, 0, dr7],
+            },
+        };
+
+        // TODO: We are not checking KVM_CAP_SET_GUEST_DEBUG first.
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_set_guest_debug(self.get().vcpu.as_raw_fd(), &debug)
+                .map_err(Error::GetRegs)?;
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    ///
+    /// `addr` must point to the appropriate input for the attribute being
+    /// set.
+    pub unsafe fn set_device_attr<T>(
+        &self,
+        group: u32,
+        attr: u32,
+        addr: &T,
+        flags: u32,
+    ) -> nix::Result<libc::c_int> {
+        // SAFETY: caller guaranteed.
+        unsafe {
+            ioctl::kvm_set_device_attr(
+                self.get().vcpu.as_raw_fd(),
+                &kvm_device_attr {
+                    group,
+                    attr: attr as u64,
+                    addr: std::ptr::from_ref(addr) as u64,
+                    flags,
+                },
+            )
+        }
+    }
+
+    pub fn runner(&self) -> VpRunner<'a> {
+        // Ensure this thread is uniquely running the VP, and store the thread
+        // ID to support cancellation.
+        assert!(
+            self.get()
+                .thread
+                .write()
+                .replace(Pthread::current())
+                .is_none()
+        );
+
+        VpRunner {
+            partition: self.0,
+            idx: self.1,
+            pending_extint: None,
+            _not_send_sync: PhantomData,
+        }
+    }
+}
+
+pub struct VpRunner<'a> {
+    partition: &'a Partition,
+    idx: u32,
+    pending_extint: Option<u8>,
+    // This type stores the current thread in `partition` and removes it in
+    // `drop`, so don't allow sending or sharing this.
+    _not_send_sync: PhantomData<*const u8>,
+}
+
+impl Drop for VpRunner<'_> {
+    fn drop(&mut self) {
+        // The thread is no longer in use.
+        let thread = self.get().thread.write().take();
+        assert_eq!(thread, Some(Pthread::current()));
+    }
+}
+
+impl<'a> VpRunner<'a> {
+    fn get(&self) -> &'a Vp {
+        self.partition.vp(self.idx).get()
+    }
+
+    fn run_data(&mut self) -> &mut kvm_run {
+        let vp = self.get();
+        // SAFETY: there are no other references to this data right
+        // now since this thread is uniquely processing the VP, and
+        // the VP is not running (so the kernel is not mutating the
+        // structure either).
+        unsafe { &mut *vp.run_data.ptr }
+    }
+
+    #[cfg_attr(target_arch = "aarch64", expect(dead_code))]
+    fn run_data_slice(&mut self) -> &mut [u8] {
+        let vp = self.get();
+        // SAFETY: there are no other references to this data right
+        // now since this thread is uniquely processing the VP, and
+        // the VP is not running (so the kernel is not mutating the
+        // structure either).
+        unsafe { std::slice::from_raw_parts_mut(vp.run_data.ptr.cast::<u8>(), vp.run_data.len) }
+    }
+
+    /// Issues an IOCTL to run the VP.
+    fn run_vp_once(&mut self) -> Result<bool> {
+        CURRENT_KVM_RUN.with(|r| {
+            let vp = self.get();
+
+            // Clear immediate_exit before giving up exclusive ownership of the
+            // kvm_run structure.
+            self.run_data().immediate_exit = 0;
+
+            // Swap the kvm_run structure pointer in so the signal handler can set
+            // immediate_exit if the signal arrives just before the kvm_run ioctl.
+            match r.swap(vp.run_data.ptr as usize, Ordering::Relaxed) {
+                NO_KVM_RUN => {}
+                CANCEL_KVM_RUN => {
+                    // A cancel request signal arrived before the swap. Set
+                    // immediate_exit so that any pending exit gets completed,
+                    // and then the IOCTL returns before actually running the
+                    // VP.
+                    //
+                    // The kvm_run structure is now aliased, so don't call
+                    // `run_data()` to get it.
+                    //
+                    // SAFETY: the signal thread that might access the structure
+                    // will also use `set_immediate_exit`.
+                    unsafe { set_immediate_exit(vp.run_data.ptr) };
+                }
+                state => unreachable!("unexpected state {:#x}", state),
+            }
+
+            // SAFETY: Calling IOCTL as documented, with no special requirements.
+            let result = unsafe { ioctl::kvm_run(vp.vcpu.as_raw_fd(), 0) };
+            CURRENT_KVM_RUN.with(|r| r.store(NO_KVM_RUN, Ordering::Relaxed));
+            match result {
+                Ok(_) => Ok(true),
+                Err(err) => match err {
+                    nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN => Ok(false),
+                    _ if self.run_data().exit_reason == KVM_EXIT_MEMORY_FAULT => {
+                        // SAFETY: KVM reported KVM_EXIT_MEMORY_FAULT, so this is the active union field.
+                        let memory_fault = unsafe { self.run_data().__bindgen_anon_1.memory_fault };
+                        Err(Error::RunMemoryFault {
+                            flags: memory_fault.flags,
+                            gpa: memory_fault.gpa,
+                            size: memory_fault.size,
+                            source: err,
+                        })
+                    }
+                    _ => Err(Error::Run(err)),
+                },
+            }
+        })
+    }
+
+    /// Completes the current exit without running the VP further.
+    ///
+    /// This may generate more exits.
+    pub fn complete_exit(&mut self) -> Result<Exit<'_>, Error> {
+        CURRENT_KVM_RUN.with(|run| run.store(CANCEL_KVM_RUN, Ordering::Relaxed));
+        self.run()
+    }
+
+    /// Continues running the VP.
+    ///
+    /// Runs until an exit occurs or interrupted by a signal or a call to
+    /// [`Processor::force_exit`].
+    pub fn run(&mut self) -> Result<Exit<'_>, Error> {
+        if !self.run_vp_once()? {
+            return Ok(Exit::Interrupted);
+        }
+        // KVM accepted the run, so an extint queued while the interrupt window
+        // was open has now been injected before guest execution.
+        self.pending_extint = None;
+
+        let exit = match self.run_data().exit_reason {
+            #[cfg(target_arch = "x86_64")]
+            KVM_EXIT_DEBUG => {
+                // SAFETY: no other references to this data.
+                let debug = unsafe { &self.run_data().__bindgen_anon_1.debug };
+
+                Exit::Debug {
+                    exception: debug.arch.exception,
+                    pc: debug.arch.pc,
+                    dr6: debug.arch.dr6,
+                    dr7: debug.arch.dr7,
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            KVM_EXIT_IO => {
+                // SAFETY: this is the active union field.
+                let io = unsafe { self.run_data().__bindgen_anon_1.io };
+
+                let offset = io.data_offset as usize;
+                let data = &mut self.run_data_slice()
+                    [offset..offset + io.size as usize * io.count as usize];
+                if io.direction == KVM_EXIT_IO_IN as u8 {
+                    Exit::IoIn {
+                        port: io.port,
+                        size: io.size,
+                        data,
+                    }
+                } else {
+                    Exit::IoOut {
+                        port: io.port,
+                        size: io.size,
+                        data,
+                    }
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            KVM_EXIT_IRQ_WINDOW_OPEN => {
+                let rdata = self.run_data();
+                assert!(rdata.ready_for_interrupt_injection != 0);
+                rdata.request_interrupt_window = 0;
+                Exit::InterruptWindow
+            }
+            KVM_EXIT_MMIO => {
+                // SAFETY: this is the active union field.
+                let mmio = unsafe { &mut self.run_data().__bindgen_anon_1.mmio };
+                if mmio.is_write != 0 {
+                    Exit::MmioWrite {
+                        address: mmio.phys_addr,
+                        data: &mmio.data[0..mmio.len as usize],
+                    }
+                } else {
+                    mmio.data = [0; 8];
+                    Exit::MmioRead {
+                        address: mmio.phys_addr,
+                        data: &mut mmio.data[0..mmio.len as usize],
+                    }
+                }
+            }
+            KVM_EXIT_SHUTDOWN => Exit::Shutdown,
+            #[cfg(target_arch = "x86_64")]
+            KVM_EXIT_HYPERV => {
+                // SAFETY: this is the active union field.
+                let hyperv = unsafe { &mut self.run_data().__bindgen_anon_1.hyperv };
+                match hyperv.type_ {
+                    KVM_EXIT_HYPERV_HCALL => {
+                        // SAFETY: this is the active union field.
+                        let hcall = unsafe { &mut hyperv.u.hcall };
+                        Exit::HvHypercall {
+                            input: hcall.input,
+                            result: &mut hcall.result,
+                            params: hcall.params,
+                        }
+                    }
+                    KVM_EXIT_HYPERV_SYNIC => {
+                        // SAFETY: this is the active union field.
+                        let synic = unsafe { &hyperv.u.synic };
+                        Exit::SynicUpdate {
+                            msr: synic.msr,
+                            control: synic.control,
+                            siefp: synic.evt_page,
+                            simp: synic.msg_page,
+                        }
+                    }
+                    _ => return Err(Error::UnknownHvExit(hyperv.type_)),
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            KVM_EXIT_IOAPIC_EOI => {
+                // SAFETY: this is the active union field.
+                let eoi = unsafe { &mut self.run_data().__bindgen_anon_1.eoi };
+
+                Exit::Eoi { irq: eoi.vector }
+            }
+            KVM_EXIT_FAIL_ENTRY => {
+                // SAFETY: this is the active union field.
+                let fail_entry = unsafe { &self.run_data().__bindgen_anon_1.fail_entry };
+                Exit::FailEntry {
+                    hardware_entry_failure_reason: fail_entry.hardware_entry_failure_reason,
+                }
+            }
+            KVM_EXIT_INTERNAL_ERROR => {
+                // SAFETY: this is the active union field.
+                let internal = unsafe { &self.run_data().__bindgen_anon_1.internal };
+                if internal.suberror == KVM_INTERNAL_ERROR_EMULATION {
+                    // FUTURE: update bindings and get the instruction bytes when they are present.
+                    Exit::EmulationFailure {
+                        instruction_bytes: &[],
+                    }
+                } else {
+                    Exit::InternalError {
+                        error: internal.suberror,
+                        data: &internal.data[..internal.ndata as usize],
+                    }
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            KVM_EXIT_HYPERCALL => {
+                // SAFETY: this is the active union field.
+                let hypercall = unsafe { &mut self.run_data().__bindgen_anon_1.hypercall };
+                Exit::Hypercall {
+                    nr: hypercall.nr,
+                    args: hypercall.args,
+                    result: &mut hypercall.ret,
+                    // SAFETY: this is the active field for KVM_EXIT_HYPERCALL.
+                    flags: unsafe { hypercall.__bindgen_anon_1.flags },
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            KVM_EXIT_X86_WRMSR => {
+                // SAFETY: this is the active union field.
+                let msr = unsafe { &mut self.run_data().__bindgen_anon_1.msr };
+                msr.error = 0;
+                Exit::MsrWrite {
+                    index: msr.index,
+                    data: msr.data,
+                    error: &mut msr.error,
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            KVM_EXIT_X86_RDMSR => {
+                // SAFETY: this is the active union field.
+                let msr = unsafe { &mut self.run_data().__bindgen_anon_1.msr };
+                msr.data = 0;
+                msr.error = 0;
+                Exit::MsrRead {
+                    index: msr.index,
+                    data: &mut msr.data,
+                    error: &mut msr.error,
+                }
+            }
+            KVM_EXIT_SYSTEM_EVENT => {
+                // SAFETY: this is the active union field.
+                let system_event = unsafe { &self.run_data().__bindgen_anon_1.system_event };
+                Exit::SystemEvent {
+                    event_type: system_event.type_,
+                    // SAFETY: accessing the flags field of the union.
+                    event_flags: unsafe { system_event.__bindgen_anon_1.flags },
+                }
+            }
+            exit_reason => return Err(Error::UnknownExit(exit_reason)),
+        };
+        Ok(exit)
+    }
+
+    /// Request an exit when the interrupt window opens.
+    ///
+    /// Returns true if the window is already open (in which case the request is
+    /// not registered).
+    #[must_use]
+    pub fn check_or_request_interrupt_window(&mut self) -> bool {
+        let rdata = self.run_data();
+        if rdata.ready_for_interrupt_injection != 0 {
+            true
+        } else {
+            rdata.request_interrupt_window = 1;
+            false
+        }
+    }
+
+    /// Injects an extint interrupt.
+    ///
+    /// Caller must ensure that either it has received a
+    /// [`Exit::InterruptWindow`] exit, or that
+    /// [`Self::check_or_request_interrupt_window`] has returned `true`.
+    pub fn inject_extint_interrupt(&mut self, vector: u8) -> Result<()> {
+        self.partition.vp(self.idx).interrupt(vector.into())?;
+        self.pending_extint = Some(vector);
+        // Remember that there is a pending extint interrupt. KVM will update
+        // this field again after the VP runs.
+        self.run_data().ready_for_interrupt_injection = 0;
+        Ok(())
+    }
+
+    /// Returns an extint queued in KVM but not yet consumed by a successful run.
+    pub fn pending_extint(&self) -> Option<u8> {
+        self.pending_extint
+    }
+
+    /// Restores an extint that was queued but not injected at capture time.
+    pub fn restore_pending_extint(&mut self, vector: u8) -> Result<()> {
+        self.partition.vp(self.idx).interrupt(vector.into())?;
+        self.pending_extint = Some(vector);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum Exit<'a> {
+    Interrupted,
+    #[cfg(target_arch = "x86_64")]
+    InterruptWindow,
+    #[cfg(target_arch = "x86_64")]
+    IoIn {
+        port: u16,
+        size: u8,
+        data: &'a mut [u8],
+    },
+    #[cfg(target_arch = "x86_64")]
+    IoOut {
+        port: u16,
+        size: u8,
+        data: &'a [u8],
+    },
+    MmioRead {
+        address: u64,
+        data: &'a mut [u8],
+    },
+    MmioWrite {
+        address: u64,
+        data: &'a [u8],
+    },
+    #[cfg(target_arch = "x86_64")]
+    Hypercall {
+        nr: u64,
+        args: [u64; 6],
+        result: &'a mut u64,
+        flags: u64,
+    },
+    #[cfg(target_arch = "x86_64")]
+    MsrRead {
+        index: u32,
+        data: &'a mut u64,
+        error: &'a mut u8,
+    },
+    #[cfg(target_arch = "x86_64")]
+    MsrWrite {
+        index: u32,
+        data: u64,
+        error: &'a mut u8,
+    },
+    Shutdown,
+    FailEntry {
+        hardware_entry_failure_reason: u64,
+    },
+    InternalError {
+        error: u32,
+        data: &'a [u64],
+    },
+    EmulationFailure {
+        instruction_bytes: &'a [u8],
+    },
+    #[cfg(target_arch = "x86_64")]
+    SynicUpdate {
+        msr: u32,
+        control: u64,
+        siefp: u64,
+        simp: u64,
+    },
+    #[cfg(target_arch = "x86_64")]
+    HvHypercall {
+        input: u64,
+        result: &'a mut u64,
+        params: [u64; 2],
+    },
+    #[cfg(target_arch = "x86_64")]
+    Debug {
+        exception: u32,
+        pc: u64,
+        dr6: u64,
+        dr7: u64,
+    },
+    #[cfg(target_arch = "x86_64")]
+    Eoi {
+        irq: u8,
+    },
+    SystemEvent {
+        event_type: u32,
+        event_flags: u64,
+    },
+}
+
+/// Set up a signal used to cause KVM run_vp to return.
+pub fn init() {
+    static SIGNAL_HANDLER_INIT: Once = Once::new();
+    SIGNAL_HANDLER_INIT.call_once(|| {
+        let handler = || {
+            CURRENT_KVM_RUN.with(|run| {
+                // This interrupts the other code that accesses CURRENT_KVM_RUN, so a
+                // compare_exchange is not necessary.
+                let rdata = run.load(Ordering::Relaxed);
+                match rdata {
+                    NO_KVM_RUN => run.store(CANCEL_KVM_RUN, Ordering::Relaxed),
+                    CANCEL_KVM_RUN => {}
+                    _ => {
+                        // SAFETY: other concurrent accesses to the structure are via
+                        // `set_immediate_exit` or via atomic accesses in the kernel.
+                        unsafe { set_immediate_exit(rdata as *mut kvm_run) };
+                    }
+                }
+            })
+        };
+        // Ensure the thread local is initialized.
+        CURRENT_KVM_RUN.with(|value| {
+            std::hint::black_box(value);
+        });
+        // SAFETY: The signal handler does not perform any actions that are forbidden
+        // for signal handlers to perform, as it only performs thread-local and atomic
+        // reads and writes. We are guaranteed to not interrupt thread local initialization
+        // as we have ensured it is initialized above.
+        unsafe {
+            signal_hook::low_level::register(libc::SIGRTMIN(), handler).unwrap();
+        }
+    });
+}
+
+const NO_KVM_RUN: usize = 0;
+const CANCEL_KVM_RUN: usize = 1;
+
+thread_local! {
+    static CURRENT_KVM_RUN: AtomicUsize = const { AtomicUsize::new(NO_KVM_RUN) };
+}
+
+/// Sets `rdata.immediate_exit` to 1 without constructing a mutable reference.
+///
+/// This can be used when the kvm_run is aliased by the kernel or by other
+/// threads that might call this function.
+#[expect(clippy::missing_safety_doc)]
+unsafe fn set_immediate_exit(rdata: *mut kvm_run) {
+    // SAFETY: rdata may be aliased by the kernel right now, so it's
+    // not safe to construct a mutable reference to it. Use an
+    // atomic store to carefully write without requiring a mutable
+    // reference.
+    unsafe {
+        (*(std::ptr::addr_of!((*rdata).immediate_exit).cast::<AtomicU8>()))
+            .store(1, Ordering::Relaxed);
+    }
+}
+
+pub struct DebugRegisters {
+    /// DR0-3.
+    pub db: [u64; 4],
+    pub dr6: u64,
+    pub dr7: u64,
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sev_snp_page_type_values_match_kvm_uapi() {
+        assert_eq!(SevSnpPageType::Normal.as_uapi(), 1);
+        assert_eq!(SevSnpPageType::Zero.as_uapi(), 3);
+        assert_eq!(SevSnpPageType::Unmeasured.as_uapi(), 4);
+        assert_eq!(SevSnpPageType::Secrets.as_uapi(), 5);
+        assert_eq!(SevSnpPageType::Cpuid.as_uapi(), 6);
+    }
+
+    #[test]
+    fn sev_snp_launch_update_uses_expected_zero_page_shape() {
+        let update = kvm_sev_snp_launch_update {
+            gfn_start: 0x1234,
+            uaddr: 0,
+            len: 0x2000,
+            type_: SevSnpPageType::Zero.as_uapi(),
+            ..Default::default()
+        };
+
+        assert_eq!(update.gfn_start, 0x1234);
+        assert_eq!(update.uaddr, 0);
+        assert_eq!(update.len, 0x2000);
+        assert_eq!(update.type_, KVM_SEV_SNP_PAGE_TYPE_ZERO_UAPI);
+        assert_eq!(update.flags, 0);
+    }
+}

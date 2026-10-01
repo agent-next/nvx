@@ -1,0 +1,253 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Code to interact with the Windows thread pool.
+
+use std::ffi::c_void;
+use std::io;
+use std::os::windows::prelude::*;
+use std::ptr::null_mut;
+use std::time::Duration;
+use windows_sys::Win32::Foundation::FILETIME;
+use windows_sys::Win32::System::Threading::CancelThreadpoolIo;
+use windows_sys::Win32::System::Threading::CloseThreadpoolIo;
+use windows_sys::Win32::System::Threading::CloseThreadpoolTimer;
+use windows_sys::Win32::System::Threading::CloseThreadpoolWait;
+use windows_sys::Win32::System::Threading::CloseThreadpoolWork;
+use windows_sys::Win32::System::Threading::CreateThreadpoolIo;
+use windows_sys::Win32::System::Threading::CreateThreadpoolTimer;
+use windows_sys::Win32::System::Threading::CreateThreadpoolWait;
+use windows_sys::Win32::System::Threading::CreateThreadpoolWork;
+use windows_sys::Win32::System::Threading::PTP_IO;
+use windows_sys::Win32::System::Threading::PTP_TIMER;
+use windows_sys::Win32::System::Threading::PTP_TIMER_CALLBACK;
+use windows_sys::Win32::System::Threading::PTP_WAIT;
+use windows_sys::Win32::System::Threading::PTP_WAIT_CALLBACK;
+use windows_sys::Win32::System::Threading::PTP_WIN32_IO_CALLBACK;
+use windows_sys::Win32::System::Threading::PTP_WORK;
+use windows_sys::Win32::System::Threading::PTP_WORK_CALLBACK;
+use windows_sys::Win32::System::Threading::SetThreadpoolTimerEx;
+use windows_sys::Win32::System::Threading::SetThreadpoolWaitEx;
+use windows_sys::Win32::System::Threading::StartThreadpoolIo;
+use windows_sys::Win32::System::Threading::SubmitThreadpoolWork;
+
+/// Wrapper around a threadpool wait object (TP_WAIT).
+#[derive(Debug)]
+pub struct TpWait(PTP_WAIT);
+
+// SAFETY: the inner pointer is just a handle and can be safely used between
+// threads.
+unsafe impl Send for TpWait {}
+unsafe impl Sync for TpWait {}
+
+impl TpWait {
+    /// Creates a new TP_WAIT.
+    ///
+    /// # Safety
+    /// The caller must ensure it is safe to call `callback` with `context`
+    /// whenever the wait is set and satisfied.
+    pub unsafe fn new(callback: PTP_WAIT_CALLBACK, context: *mut c_void) -> io::Result<Self> {
+        // SAFETY: Caller ensured this is safe.
+        let wait = unsafe { CreateThreadpoolWait(callback, context, null_mut()) };
+        if wait == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(wait))
+        }
+    }
+
+    /// Sets the handle to wait for.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be valid.
+    pub unsafe fn set(&self, handle: RawHandle) {
+        // SAFETY: The caller ensures this is safe when creating the object in `new`.
+        unsafe {
+            SetThreadpoolWaitEx(self.0, handle, null_mut(), null_mut());
+        }
+    }
+
+    /// Cancels the current wait. Returns true if the wait was previously
+    /// active.
+    pub fn cancel(&self) -> bool {
+        // SAFETY: The caller ensures this is safe when creating the object in `new`.
+        unsafe { SetThreadpoolWaitEx(self.0, null_mut(), null_mut(), null_mut()) != 0 }
+    }
+
+    /// Retrieves a pointer to the `TP_WAIT` object.
+    pub fn as_ptr(&self) -> PTP_WAIT {
+        self.0
+    }
+}
+
+impl Drop for TpWait {
+    fn drop(&mut self) {
+        // SAFETY: the object is no longer in use.
+        unsafe {
+            CloseThreadpoolWait(self.0);
+        }
+    }
+}
+
+/// Wrapper around a threadpool IO object (TP_IO).
+#[derive(Debug)]
+pub struct TpIo(PTP_IO);
+
+// SAFETY: the inner pointer is just a handle and can be safely used between
+// threads.
+unsafe impl Send for TpIo {}
+unsafe impl Sync for TpIo {}
+
+impl TpIo {
+    /// Creates a new TP_IO for the file with `handle`.
+    ///
+    /// # Safety
+    /// The caller must ensure that `handle` can be safely associated with the
+    /// thread pool, and that it is safe to call `callback` with `context`
+    /// whenever an IO completes.
+    ///
+    /// Note: once `handle` is associated, the caller must ensure that
+    /// `start_io` is called each time before issuing an IO. Otherwise memory
+    /// corruption will occur.
+    pub unsafe fn new(
+        handle: RawHandle,
+        callback: PTP_WIN32_IO_CALLBACK,
+        context: *mut c_void,
+    ) -> io::Result<Self> {
+        // SAFETY: Caller ensured this is safe.
+        let io = unsafe { CreateThreadpoolIo(handle, callback, context, null_mut()) };
+        if io == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(io))
+        }
+    }
+
+    /// Notifies the threadpool that an IO is being started.
+    ///
+    /// Failure to call this before issuing an IO will cause memory corruption.
+    pub fn start_io(&self) {
+        // SAFETY: The caller ensures this is safe when creating the object in `new`.
+        unsafe { StartThreadpoolIo(self.0) };
+    }
+
+    /// Notifies the threadpool that a started IO will not complete through the
+    /// threadpool.
+    ///
+    /// # Safety
+    /// The caller must ensure that `start_io` has been called and no associated
+    /// IO will complete through the threadpool.
+    pub unsafe fn cancel_io(&self) {
+        // SAFETY: The caller ensures this is safe.
+        unsafe { CancelThreadpoolIo(self.0) };
+    }
+}
+
+impl Drop for TpIo {
+    fn drop(&mut self) {
+        // SAFETY: the object is no longer in use.
+        unsafe {
+            CloseThreadpoolIo(self.0);
+        }
+    }
+}
+
+/// Wrapper around a threadpool work object (TP_WORK).
+#[derive(Debug)]
+pub struct TpWork(PTP_WORK);
+
+// SAFETY: the inner pointer is just a handle and can be safely used between
+// threads.
+unsafe impl Sync for TpWork {}
+unsafe impl Send for TpWork {}
+
+impl TpWork {
+    /// Creates a new threadpool work item for the file with `handle`.
+    ///
+    /// # Safety
+    /// The caller must ensure that it is safe to call `callback` with `context`
+    /// whenever the work is submitted.
+    pub unsafe fn new(callback: PTP_WORK_CALLBACK, context: *mut c_void) -> io::Result<Self> {
+        let work = unsafe { CreateThreadpoolWork(callback, context, null_mut()) };
+        if work == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(TpWork(work))
+        }
+    }
+
+    /// Submits the work item. The callback will be called for each invocation.
+    pub fn submit(&self) {
+        // SAFETY: The caller ensures this is safe when creating the object in `new`.
+        unsafe {
+            SubmitThreadpoolWork(self.0);
+        }
+    }
+}
+
+impl Drop for TpWork {
+    fn drop(&mut self) {
+        // SAFETY: the object is no longer in use.
+        unsafe {
+            CloseThreadpoolWork(self.0);
+        }
+    }
+}
+
+/// Wrapper around a threadpool timer object (TP_TIMER).
+#[derive(Debug)]
+pub struct TpTimer(PTP_TIMER);
+
+// SAFETY: the inner pointer is just a handle and can be safely used between
+// threads.
+unsafe impl Sync for TpTimer {}
+unsafe impl Send for TpTimer {}
+
+impl TpTimer {
+    /// Creates a new timer.
+    ///
+    /// # Safety
+    /// The caller must ensure it is safe to call `callback` with `context`
+    /// whenever the timer expires.
+    pub unsafe fn new(callback: PTP_TIMER_CALLBACK, context: *mut c_void) -> io::Result<Self> {
+        // SAFETY: Caller ensured this is safe.
+        let timer = unsafe { CreateThreadpoolTimer(callback, context, null_mut()) };
+        if timer == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(timer))
+        }
+    }
+
+    /// Starts the timer or updates the timer's timeout.
+    ///
+    /// Returns `true` if the timer was already set.
+    pub fn set(&self, timeout: Duration) -> bool {
+        let due_time_100ns = -(timeout.as_nanos() / 100).try_into().unwrap_or(i64::MAX);
+        let due_time = FILETIME {
+            dwLowDateTime: due_time_100ns as u32,
+            dwHighDateTime: (due_time_100ns >> 32) as u32,
+        };
+        // SAFETY: The caller ensures this is safe when creating the object in `new`.
+        unsafe { SetThreadpoolTimerEx(self.0, &due_time, 0, 0) != 0 }
+    }
+
+    /// Cancels a timer.
+    ///
+    /// Returns `true` if the timer was previously set.
+    pub fn cancel(&self) -> bool {
+        // SAFETY: The caller ensures this is safe when creating the object in `new`.
+
+        unsafe { SetThreadpoolTimerEx(self.0, null_mut(), 0, 0) != 0 }
+    }
+}
+
+impl Drop for TpTimer {
+    fn drop(&mut self) {
+        // SAFETY: The object is no longer in use.
+        unsafe {
+            CloseThreadpoolTimer(self.0);
+        }
+    }
+}

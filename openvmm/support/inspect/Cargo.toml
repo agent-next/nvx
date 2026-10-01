@@ -1,0 +1,49 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "inspect"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["derive",  "defer", "initiate", "std"]
+derive = ["inspect_derive"]
+
+# TODO: Support no-alloc
+# alloc = []
+
+# Add inspect for some types in `std`.
+std = ["dep:parking_lot"]
+
+# Add support for initiating inspections.
+initiate = ["dep:mesh", "dep:base64", "dep:thiserror"]
+
+# Add support for deferring inspections.
+defer = ["dep:mesh"]
+
+# Enable derive for `std::fs::File`.
+filepath = ["dep:filepath", "std"]
+
+# Enable generating arbitrary values of types useful for fuzzing.
+arbitrary = ["dep:arbitrary", "std"]
+
+[dependencies]
+inspect_derive = { workspace = true, optional = true }
+mesh = { workspace = true, optional = true }
+
+arbitrary = { workspace = true, optional = true, features = ["derive"] }
+base64 = { workspace = true, optional = true }
+bitfield-struct.workspace = true
+filepath = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+
+[dev-dependencies]
+expect-test.workspace = true
+futures.workspace = true
+inspect_derive.workspace = true
+pal_async.workspace = true
+
+[lints]
+workspace = true

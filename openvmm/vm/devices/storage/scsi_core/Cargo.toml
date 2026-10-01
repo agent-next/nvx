@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "scsi_core"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+scsi_buffers.workspace = true
+scsi_defs.workspace = true
+vm_resource.workspace = true
+vmcore.workspace = true
+
+inspect.workspace = true
+mesh.workspace = true
+
+stackfuture.workspace = true
+
+[lints]
+workspace = true

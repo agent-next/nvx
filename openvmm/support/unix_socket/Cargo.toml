@@ -1,0 +1,26 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "unix_socket"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+mesh = ["dep:mesh_protobuf"]
+
+[target.'cfg(windows)'.dependencies]
+getrandom.workspace = true
+socket2.workspace = true
+mesh_protobuf = { workspace = true, optional = true }
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+socket2 = { workspace = true, features = ["all"] }
+test_with_tracing.workspace = true
+
+[lints]
+workspace = true

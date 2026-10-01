@@ -1,0 +1,28 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vga"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chipset_device.workspace = true
+framebuffer.workspace = true
+pci_core.workspace = true
+video_core.workspace = true
+guestmem.workspace = true
+vmcore.workspace = true
+memory_range.workspace = true
+
+inspect = { workspace = true, features = ["std"] }
+open_enum.workspace = true
+pal_async.workspace = true
+task_control.workspace = true
+
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+[lints]
+workspace = true

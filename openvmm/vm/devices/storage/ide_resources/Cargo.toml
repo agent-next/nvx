@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "ide_resources"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vm_resource.workspace = true
+
+inspect.workspace = true
+mesh.workspace = true
+
+[lints]
+workspace = true

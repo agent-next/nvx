@@ -1,0 +1,37 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "gdma"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gdma_defs.workspace = true
+gdma_resources.workspace = true
+net_backend.workspace = true
+net_backend_resources.workspace = true
+
+device_emulators.workspace = true
+pci_core.workspace = true
+pci_resources.workspace = true
+
+chipset_device.workspace = true
+guestmem.workspace = true
+vmcore.workspace = true
+vm_resource.workspace = true
+
+inspect.workspace = true
+task_control.workspace = true
+tracelimit.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+slab.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+[lints]
+workspace = true

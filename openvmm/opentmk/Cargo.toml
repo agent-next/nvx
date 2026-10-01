@@ -1,0 +1,27 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "opentmk"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hvdef.workspace = true
+log.workspace = true
+opentmk_protocol.workspace = true
+opentmk_core.workspace = true
+spin.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["alloc"] }
+nostd_spin_channel.workspace = true
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { workspace = true, features = ["alloc"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+
+[lints]
+workspace = true
+
+[build-dependencies]

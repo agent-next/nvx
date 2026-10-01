@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmm_core_defs"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+virt.workspace = true
+
+inspect.workspace = true
+mesh.workspace = true
+
+[lints]
+workspace = true

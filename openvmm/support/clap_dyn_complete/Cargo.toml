@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "clap_dyn_complete"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+futures.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

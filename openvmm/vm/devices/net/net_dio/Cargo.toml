@@ -1,0 +1,26 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "net_dio"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+net_backend.workspace = true
+net_backend_resources.workspace = true
+vmswitch.workspace = true
+
+vm_resource.workspace = true
+
+inspect.workspace = true
+guid = { workspace = true, features = ["getrandom"] }
+pal_async.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

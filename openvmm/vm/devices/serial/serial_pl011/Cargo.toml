@@ -1,0 +1,35 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "serial_pl011"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chipset_device.workspace = true
+chipset_device_resources.workspace = true
+serial_core.workspace = true
+serial_pl011_resources.workspace = true
+vmcore.workspace = true
+vm_resource.workspace = true
+
+inspect.workspace = true
+inspect_counters.workspace = true
+mesh.workspace = true
+open_enum.workspace = true
+
+async-trait.workspace = true
+bitfield-struct.workspace = true
+futures.workspace = true
+pal_async.workspace = true
+thiserror.workspace = true
+tracelimit.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+parking_lot.workspace = true
+test_with_tracing.workspace = true
+
+[lints]
+workspace = true

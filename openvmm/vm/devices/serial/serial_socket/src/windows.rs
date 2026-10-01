@@ -1,0 +1,295 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Windows named pipe serial backend.
+
+use futures::AsyncRead;
+use futures::AsyncWrite;
+use futures::FutureExt;
+use inspect::Inspect;
+use inspect::InspectMut;
+use mesh::MeshPayload;
+use pal::windows::pipe::PipeExt;
+use pal_async::driver::Driver;
+use pal_async::pipe::PolledPipe;
+use pal_async::windows::pipe::ListeningPipe;
+use serial_core::LocalPeerIdentity;
+use serial_core::SerialIo;
+use serial_core::resources::ResolveSerialBackendParams;
+use serial_core::resources::ResolvedSerialBackend;
+use std::fs::File;
+use std::io;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
+use std::task::ready;
+use vm_resource::ResolveResource;
+use vm_resource::Resource;
+use vm_resource::ResourceId;
+use vm_resource::declare_static_resolver;
+use vm_resource::kind::SerialBackendHandle;
+
+#[derive(Debug, MeshPayload)]
+pub struct OpenWindowsPipeSerialConfig {
+    pub pipe: Option<File>,
+}
+
+impl From<File> for OpenWindowsPipeSerialConfig {
+    fn from(pipe: File) -> Self {
+        Self { pipe: Some(pipe) }
+    }
+}
+
+#[derive(InspectMut)]
+pub struct WindowsPipeSerialBackend {
+    #[inspect(skip)]
+    driver: Box<dyn Driver>,
+    state: PipeState,
+    #[inspect(skip)]
+    peer_identity: Option<LocalPeerIdentity>,
+}
+
+enum PipeState {
+    Done,
+    Listening(ListeningPipe),
+    Connected(PolledPipe),
+}
+
+impl Inspect for PipeState {
+    fn inspect(&self, req: inspect::Request<'_>) {
+        req.value(match self {
+            PipeState::Done => "done",
+            PipeState::Listening(_) => "listening",
+            PipeState::Connected(_) => "connected",
+        })
+    }
+}
+
+impl ResourceId<SerialBackendHandle> for OpenWindowsPipeSerialConfig {
+    const ID: &'static str = "windows_named_pipe";
+}
+
+pub struct WindowsPipeSerialResolver;
+declare_static_resolver!(
+    WindowsPipeSerialResolver,
+    (SerialBackendHandle, OpenWindowsPipeSerialConfig)
+);
+
+impl ResolveResource<SerialBackendHandle, OpenWindowsPipeSerialConfig>
+    for WindowsPipeSerialResolver
+{
+    type Output = ResolvedSerialBackend;
+    type Error = io::Error;
+
+    fn resolve(
+        &self,
+        rsrc: OpenWindowsPipeSerialConfig,
+        input: ResolveSerialBackendParams<'_>,
+    ) -> Result<Self::Output, Self::Error> {
+        Ok(WindowsPipeSerialBackend::new(input.driver, rsrc)?.into())
+    }
+}
+
+impl WindowsPipeSerialBackend {
+    pub fn new(driver: Box<dyn Driver>, config: OpenWindowsPipeSerialConfig) -> io::Result<Self> {
+        let (state, peer_identity) = if let Some(file) = config.pipe {
+            if file.is_pipe_connected()? {
+                let peer_identity = Some(named_pipe_peer_identity(&file)?);
+                (
+                    PipeState::Connected(PolledPipe::new(&driver, file)?),
+                    peer_identity,
+                )
+            } else {
+                (
+                    PipeState::Listening(ListeningPipe::new(&driver, file)?),
+                    None,
+                )
+            }
+        } else {
+            (PipeState::Done, None)
+        };
+
+        Ok(Self {
+            driver,
+            state,
+            peer_identity,
+        })
+    }
+
+    pub fn into_config(self) -> OpenWindowsPipeSerialConfig {
+        let file = match self.state {
+            PipeState::Done => None,
+            PipeState::Listening(accept) => Some(accept.into_inner()),
+            PipeState::Connected(pipe) => Some(pipe.into_inner()),
+        };
+        OpenWindowsPipeSerialConfig { pipe: file }
+    }
+
+    fn disconnect(&mut self) -> io::Result<()> {
+        if !matches!(self.state, PipeState::Connected(_)) {
+            return Ok(());
+        }
+        if let PipeState::Connected(pipe) = std::mem::replace(&mut self.state, PipeState::Done) {
+            self.peer_identity = None;
+            let pipe = pipe.into_inner();
+            match pipe.disconnect_pipe() {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+            self.state = PipeState::Listening(ListeningPipe::new(&self.driver, pipe)?);
+        }
+        Ok(())
+    }
+}
+
+impl From<WindowsPipeSerialBackend> for Resource<SerialBackendHandle> {
+    fn from(value: WindowsPipeSerialBackend) -> Self {
+        Resource::new(value.into_config())
+    }
+}
+
+impl SerialIo for WindowsPipeSerialBackend {
+    fn is_connected(&self) -> bool {
+        matches!(self.state, PipeState::Connected(_))
+    }
+
+    fn poll_connect(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut self.state {
+            PipeState::Done => Poll::Pending,
+            PipeState::Listening(accept) => {
+                let file = ready!(accept.poll_unpin(cx));
+                let file = file?;
+                self.peer_identity = Some(named_pipe_peer_identity(&file)?);
+                self.state = PipeState::Done;
+                self.state = PipeState::Connected(PolledPipe::new(&self.driver, file)?);
+                Poll::Ready(Ok(()))
+            }
+            PipeState::Connected(_) => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut self.state {
+            PipeState::Done | PipeState::Listening(_) => Poll::Ready(Ok(())),
+            PipeState::Connected(pipe) => {
+                ready!(pipe.poll_closing(cx))?;
+                if let Err(err) = self.disconnect() {
+                    tracing::error!(
+                        error = &err as &dyn std::error::Error,
+                        "failed to prepare named pipe for reconnection"
+                    );
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    fn disconnect_current(&mut self) -> io::Result<()> {
+        self.disconnect()
+    }
+
+    fn local_peer_identity(&self) -> io::Result<Option<LocalPeerIdentity>> {
+        Ok(self.peer_identity.clone())
+    }
+}
+
+fn named_pipe_peer_identity(pipe: &File) -> io::Result<LocalPeerIdentity> {
+    let process_id = pal::windows::pipe::peer::client_process_id(pipe)?;
+    let sid = pal::windows::security::user_sid::process_user_sid(process_id)?;
+    let (bytes, length) = sid.to_fixed_bytes();
+    LocalPeerIdentity::windows_sid(bytes, length)
+}
+
+impl AsyncRead for WindowsPipeSerialBackend {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        match &mut self.state {
+            PipeState::Done | PipeState::Listening(_) => Poll::Ready(Ok(0)),
+            PipeState::Connected(pipe) => {
+                let r = ready!(Pin::new(pipe).poll_read(cx, buf));
+                if matches!(r, Ok(0)) {
+                    if let Err(err) = self.disconnect() {
+                        tracing::error!(
+                            error = &err as &dyn std::error::Error,
+                            "failed to prepare named pipe for reconnection"
+                        );
+                    }
+                }
+                Poll::Ready(r)
+            }
+        }
+    }
+}
+
+impl AsyncWrite for WindowsPipeSerialBackend {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match &mut self.state {
+            PipeState::Done | PipeState::Listening(_) => Poll::Ready(Ok(buf.len())),
+            PipeState::Connected(pipe) => {
+                let result = ready!(Pin::new(pipe).poll_write(cx, buf));
+                if result.is_err()
+                    && let Err(error) = self.disconnect()
+                {
+                    tracing::error!(
+                        error = &error as &dyn std::error::Error,
+                        "failed to prepare named pipe after a write failure"
+                    );
+                }
+                Poll::Ready(result)
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut self.state {
+            PipeState::Done | PipeState::Listening(_) => Poll::Ready(Ok(())),
+            PipeState::Connected(pipe) => {
+                let r = ready!(Pin::new(pipe).poll_flush(cx));
+                if matches!(&r, Err(err) if err.kind() == io::ErrorKind::BrokenPipe) {
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(r)
+            }
+        }
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut self.state {
+            PipeState::Done | PipeState::Listening(_) => Poll::Ready(Ok(())),
+            PipeState::Connected(pipe) => {
+                let r = ready!(Pin::new(pipe).poll_close(cx));
+                if matches!(&r, Err(err) if err.kind() == io::ErrorKind::BrokenPipe) {
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(r)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_pipe_reports_the_current_process_identity() {
+        let (server, _client) = pal::windows::pipe::bidirectional_pair(false).unwrap();
+        let actual = named_pipe_peer_identity(&server).unwrap();
+        let sid = pal::windows::security::user_sid::current_process_user_sid().unwrap();
+        let (bytes, length) = sid.to_fixed_bytes();
+        let expected = LocalPeerIdentity::windows_sid(bytes, length).unwrap();
+        assert_eq!(actual, expected);
+    }
+}

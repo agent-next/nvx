@@ -1,0 +1,27 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "watchdog_core"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cvm_tracing.workspace = true
+watchdog_vmgs_format.workspace = true
+
+vmcore.workspace = true
+vm_resource.workspace = true
+
+inspect.workspace = true
+mesh.workspace = true
+pal_async.workspace = true
+parking_lot.workspace = true
+
+async-trait.workspace = true
+bitfield-struct.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

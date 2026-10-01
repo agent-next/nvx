@@ -1,0 +1,636 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Loader glue code shared between both OpenVMM and Underhill.
+//!
+//! DEVNOTE: this organization isn't great, and should be reconsidered...
+
+#![expect(missing_docs)]
+#![forbid(unsafe_code)]
+
+use anyhow::Context;
+use guestmem::GuestMemory;
+use hvdef::HV_PAGE_SIZE;
+use hvdef::Vtl;
+use loader::importer::BootPageAcceptance;
+use loader::importer::GuestArch;
+use loader::importer::ImageLoad;
+use loader::importer::StartupMemoryType;
+use loader::importer::X86Register;
+use memory_range::MemoryRange;
+use range_map_vec::Entry;
+use range_map_vec::RangeMap;
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::mem::Discriminant;
+use virt::InitialPageImport;
+use virt::InitialPageImportType;
+use vm_topology::memory::MemoryLayout;
+
+pub mod initial_regs;
+
+#[derive(Debug)]
+pub struct InitialLoad<R> {
+    pub regs: Vec<R>,
+    pub page_imports: Vec<InitialPageImport>,
+}
+
+#[derive(Debug, Clone)]
+struct RangeInfo {
+    tag: &'static str,
+    acceptance: BootPageAcceptance,
+    import_order: usize,
+}
+
+#[derive(Debug)]
+struct OrderedPageImport {
+    import_order: usize,
+    page_import: InitialPageImport,
+}
+
+impl PartialEq for RangeInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.tag == other.tag && self.acceptance == other.acceptance
+    }
+}
+
+impl Eq for RangeInfo {}
+
+#[derive(Debug)]
+pub struct Loader<'a, R> {
+    gm: GuestMemory,
+    regs: HashMap<Discriminant<R>, R>,
+    mem_layout: &'a MemoryLayout,
+    page_imports: RangeMap<u64, RangeInfo>,
+    vp_context_imports: Vec<OrderedPageImport>,
+    next_page_import_order: usize,
+    max_vtl: Vtl,
+    vp_context_page: Option<u64>,
+    snp_vmsa_finalized: bool,
+}
+
+impl<R> Loader<'_, R> {
+    pub fn new(gm: GuestMemory, mem_layout: &MemoryLayout, max_vtl: Vtl) -> Loader<'_, R> {
+        Loader {
+            gm,
+            regs: HashMap::new(),
+            mem_layout,
+            page_imports: RangeMap::new(),
+            vp_context_imports: Vec::new(),
+            next_page_import_order: 0,
+            max_vtl,
+            vp_context_page: None,
+            snp_vmsa_finalized: false,
+        }
+    }
+
+    pub fn initial_regs(self) -> Vec<R> {
+        self.regs.into_values().collect()
+    }
+
+    /// Returns initial state with page imports coalesced in GPA order.
+    ///
+    /// VP-context markers require import-call ordering and must be collected
+    /// with [`Self::initial_regs_and_ordered_page_imports`].
+    pub fn initial_regs_and_page_imports(mut self) -> InitialLoad<R> {
+        assert!(
+            self.vp_context_imports.is_empty(),
+            "VP context imports require ordered page import collection"
+        );
+        // Merge adjacent ranges first to help cut down on the number of entries
+        // in the initial page import list. Since we load from an IGVM file,
+        // most ranges are a single 4K page which can be merged for easier
+        // viewing.
+        self.page_imports
+            .merge_adjacent(range_map_vec::u64_is_adjacent);
+
+        let page_imports = self
+            .page_imports
+            .into_vec()
+            .into_iter()
+            .map(|(start, end, info)| InitialPageImport {
+                range: MemoryRange::from_4k_gpn_range(start..(end + 1)),
+                import_type: boot_page_acceptance_to_import_type(info.acceptance),
+                tag: info.tag,
+            })
+            .collect::<Vec<_>>();
+        InitialLoad {
+            regs: self.regs.into_values().collect(),
+            page_imports,
+        }
+    }
+
+    /// Returns the initial register state and page imports in import-call order.
+    pub fn initial_regs_and_ordered_page_imports(self) -> InitialLoad<R> {
+        let mut page_imports = self
+            .page_imports
+            .into_vec()
+            .into_iter()
+            .map(|(start, end, info)| OrderedPageImport {
+                import_order: info.import_order,
+                page_import: InitialPageImport {
+                    range: MemoryRange::from_4k_gpn_range(start..(end + 1)),
+                    import_type: boot_page_acceptance_to_import_type(info.acceptance),
+                    tag: info.tag,
+                },
+            })
+            .chain(self.vp_context_imports)
+            .collect::<Vec<_>>();
+        page_imports.sort_by_key(|import| import.import_order);
+        let page_imports = page_imports
+            .into_iter()
+            .map(|import| import.page_import)
+            .collect();
+
+        InitialLoad {
+            regs: self.regs.into_values().collect(),
+            page_imports,
+        }
+    }
+
+    /// Track a new imported page range with a given acceptance.
+    pub fn accept_new_range(
+        &mut self,
+        page_base: u64,
+        page_count: u64,
+        tag: &'static str,
+        acceptance: BootPageAcceptance,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(page_count != 0, "{tag} has an empty page range");
+        let page_end_exclusive = page_base
+            .checked_add(page_count)
+            .ok_or_else(|| anyhow::anyhow!("{tag} page range overflows"))?;
+        let page_end = page_end_exclusive - 1;
+        match self.page_imports.entry(page_base..=page_end) {
+            Entry::Overlapping(entry) => {
+                let (overlap_start, overlap_end, ref overlap_info) = *entry.get();
+                Err(anyhow::anyhow!(
+                    "{} at {} ({:?}) overlaps {} at {}",
+                    tag,
+                    MemoryRange::from_4k_gpn_range(page_base..page_end_exclusive),
+                    acceptance,
+                    overlap_info.tag,
+                    MemoryRange::from_4k_gpn_range(overlap_start..overlap_end + 1),
+                ))
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(RangeInfo {
+                    tag,
+                    acceptance,
+                    import_order: self.next_page_import_order,
+                });
+                self.next_page_import_order += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Records an ordered SNP VP-context launch import without treating its GPA
+    /// as ordinary guest memory.
+    ///
+    /// Multiple VP contexts may intentionally use the same GPA because the VP
+    /// index, rather than the GPA, distinguishes those launch directives.
+    pub fn record_vp_context_import(
+        &mut self,
+        page_base: u64,
+        tag: &'static str,
+    ) -> anyhow::Result<()> {
+        let page_end = page_base
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("{tag} page range overflows"))?;
+        let range_start = page_base
+            .checked_mul(HV_PAGE_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("{tag} page range overflows"))?;
+        let range_end = page_end
+            .checked_mul(HV_PAGE_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("{tag} page range overflows"))?;
+        self.vp_context_imports.push(OrderedPageImport {
+            import_order: self.next_page_import_order,
+            page_import: InitialPageImport {
+                range: MemoryRange::new(range_start..range_end),
+                import_type: InitialPageImportType::VpContext,
+                tag,
+            },
+        });
+        self.next_page_import_order += 1;
+        Ok(())
+    }
+}
+
+impl<R: Debug + GuestArch> ImageLoad<R> for Loader<'_, R> {
+    fn isolation_config(&self) -> loader::importer::IsolationConfig {
+        // For now, all OpenVMM VMs are non-isolated.
+        loader::importer::IsolationConfig {
+            paravisor_present: false,
+            isolation_type: loader::importer::IsolationType::None,
+            shared_gpa_boundary_bits: None,
+        }
+    }
+
+    fn import_pages(
+        &mut self,
+        page_base: u64,
+        page_count: u64,
+        debug_tag: &'static str,
+        acceptance: BootPageAcceptance,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        tracing::trace!(
+            page_base,
+            page_count,
+            import_len = page_count.checked_mul(HV_PAGE_SIZE),
+            data_len = data.len(),
+            ?acceptance,
+            "importing pages"
+        );
+
+        // Track imported ranges for duplicate imports.
+        self.accept_new_range(page_base, page_count, debug_tag, acceptance)?;
+
+        // Page count must be larger or equal to data.
+        let size_bytes_u64 = page_count
+            .checked_mul(HV_PAGE_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("{debug_tag} byte length overflows"))?;
+        let size_bytes = usize::try_from(size_bytes_u64)
+            .map_err(|_| anyhow::anyhow!("{debug_tag} byte length does not fit in usize"))?;
+        let base_addr = page_base
+            .checked_mul(HV_PAGE_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("{debug_tag} base address overflows"))?;
+        base_addr
+            .checked_add(size_bytes_u64)
+            .ok_or_else(|| anyhow::anyhow!("{debug_tag} end address overflows"))?;
+        if size_bytes < data.len() {
+            anyhow::bail!(
+                "data {:x} larger than supplied page count {:x}",
+                data.len(),
+                page_count
+            );
+        }
+
+        // Write the contained data.
+        self.gm
+            .write_at(base_addr, data)
+            .context("unable to import data")?;
+
+        // Remaining bytes must be zeroed.
+        let remaining = size_bytes - data.len();
+        let remaining_base = base_addr
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("{debug_tag} data end address overflows"))?;
+        self.gm
+            .fill_at(remaining_base, 0, remaining)
+            .context("unable to zero remaining import")
+    }
+
+    fn import_vp_register(&mut self, register: R) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.snp_vmsa_finalized,
+            "register imported after SNP VMSA was finalized"
+        );
+        let entry = self.regs.entry(std::mem::discriminant(&register));
+        match entry {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                anyhow::bail!("duplicate register import {:?}", register)
+            }
+            std::collections::hash_map::Entry::Vacant(ve) => ve.insert(register),
+        };
+
+        Ok(())
+    }
+
+    fn verify_startup_memory_available(
+        &mut self,
+        page_base: u64,
+        page_count: u64,
+        memory_type: StartupMemoryType,
+    ) -> anyhow::Result<()> {
+        // Allow Vtl2ProtectableRam only if VTL2 is enabled.
+        if self.max_vtl == Vtl::Vtl2 {
+            match memory_type {
+                StartupMemoryType::Ram => {}
+                StartupMemoryType::Vtl2ProtectableRam => {
+                    // TODO: Should enable VTl2 memory protections on this region? Or do we allow VTL2 memory protections
+                    //       on the whole address space when VTL memory protections work?
+                    tracing::warn!(page_base, page_count, "vtl2 protectable ram requested");
+                }
+            }
+        } else if memory_type != StartupMemoryType::Ram {
+            anyhow::bail!("memory type {memory_type:?} not available");
+        }
+
+        let mut memory_found = false;
+
+        anyhow::ensure!(page_count != 0, "required memory range is empty");
+        let base_address = page_base
+            .checked_mul(HV_PAGE_SIZE)
+            .context("required memory base address overflows")?;
+        let size = page_count
+            .checked_mul(HV_PAGE_SIZE)
+            .context("required memory byte length overflows")?;
+        let end_address = base_address
+            .checked_add(size)
+            .and_then(|end| end.checked_sub(1))
+            .context("required memory end address overflows")?;
+        let end_exclusive = end_address
+            .checked_add(1)
+            .context("required memory end address overflows")?;
+
+        for range in self.mem_layout.ram() {
+            if base_address >= range.range.start() && base_address < range.range.end() {
+                // Today, the memory layout only describes normal ram and mmio.
+                // Thus the memory request must live completely within a single
+                // range, since any gaps are mmio.
+                if end_exclusive > range.range.end() {
+                    anyhow::bail!(
+                        "requested memory at base {:#x} and end {:#x} is not covered fully by the corresponding range {:?}",
+                        base_address,
+                        end_address,
+                        range
+                    );
+                }
+
+                memory_found = true;
+            }
+        }
+
+        // TODO: It seems very weird to check both ram and this vtl2 range.
+        // seems like vtl2 absolute addr should maybe carve the vtl2 range out
+        // of mem_layout? but that has its own issues
+        //
+        // Memory might be described as a VTL2 specific range. Only check this
+        // if we haven't found the range, and this is for VTL2.
+        if !memory_found && memory_type == StartupMemoryType::Vtl2ProtectableRam {
+            if let Some(range) = self.mem_layout.vtl2_range() {
+                if base_address >= range.start() && end_exclusive <= range.end() {
+                    memory_found = true;
+                } else {
+                    anyhow::bail!(
+                        "startup vtl2 memory at base {:#x} and end {:#x} is not covered fully by vtl2 specific ram range {:?}",
+                        base_address,
+                        end_address,
+                        range
+                    );
+                }
+            }
+        }
+
+        if memory_found {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "no valid memory range available for memory at base {:#x} end {:#x}",
+                base_address,
+                end_address
+            ))
+        }
+    }
+
+    fn set_vp_context_page(&mut self, page_base: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.vp_context_page.is_none(),
+            "VP context page was already set"
+        );
+        self.accept_new_range(page_base, 1, "snp-vmsa", BootPageAcceptance::VpContext)?;
+        self.gm
+            .fill_at(page_base * HV_PAGE_SIZE, 0, HV_PAGE_SIZE as usize)
+            .context("unable to zero VP context page")?;
+        self.vp_context_page = Some(page_base);
+        Ok(())
+    }
+
+    fn create_parameter_area(
+        &mut self,
+        _page_base: u64,
+        _page_count: u32,
+        _debug_tag: &str,
+    ) -> anyhow::Result<loader::importer::ParameterAreaIndex> {
+        unimplemented!()
+    }
+
+    fn create_parameter_area_with_data(
+        &mut self,
+        _page_base: u64,
+        _page_count: u32,
+        _debug_tag: &str,
+        _initial_data: &[u8],
+    ) -> anyhow::Result<loader::importer::ParameterAreaIndex> {
+        unimplemented!()
+    }
+
+    fn import_parameter(
+        &mut self,
+        _parameter_area: loader::importer::ParameterAreaIndex,
+        _byte_offset: u32,
+        _parameter_type: loader::importer::IgvmParameterType,
+    ) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+
+    fn relocation_region(
+        &mut self,
+        _gpa: u64,
+        _size_bytes: u64,
+        _relocation_alignment: u64,
+        _minimum_relocation_gpa: u64,
+        _maximum_relocation_gpa: u64,
+        _apply_rip_offset: bool,
+        _apply_gdtr_offset: bool,
+        _vp_index: u16,
+    ) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+
+    fn page_table_relocation(
+        &mut self,
+        _page_table_gpa: u64,
+        _size_pages: u64,
+        _used_pages: u64,
+        _vp_index: u16,
+    ) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+
+    fn set_imported_regions_config_page(&mut self, _page_base: u64) {
+        unimplemented!()
+    }
+}
+
+impl Loader<'_, X86Register> {
+    /// Finalizes the loader-provided SNP VMSA at the configured VP context page.
+    /// TODO: Remove this SNP-specific path from the generic loader if direct
+    /// boot moves to loading only IGVM files.
+    pub fn finalize_snp_vmsa(
+        &mut self,
+        caps: &virt::x86::X86PartitionCapabilities,
+        bsp: &vm_topology::processor::x86::X86VpInfo,
+        config: virt::x86::snp::SnpVmsaConfig,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.snp_vmsa_finalized, "SNP VMSA was already finalized");
+        let page_base = self
+            .vp_context_page
+            .ok_or_else(|| anyhow::anyhow!("SNP VP context page was not configured"))?;
+        let regs = self.regs.values().copied().collect::<Vec<_>>();
+        let initial = initial_regs::x86_initial_regs(&regs, caps, bsp);
+        let vmsa = virt::x86::snp::vmsa_from_initial_regs(&initial, config);
+        self.gm
+            .write_plain(page_base * HV_PAGE_SIZE, &vmsa)
+            .context("unable to write SNP VMSA")?;
+        self.snp_vmsa_finalized = true;
+        Ok(())
+    }
+}
+
+fn boot_page_acceptance_to_import_type(acceptance: BootPageAcceptance) -> InitialPageImportType {
+    match acceptance {
+        BootPageAcceptance::Exclusive => InitialPageImportType::Normal,
+        BootPageAcceptance::ExclusiveUnmeasured => InitialPageImportType::NormalUnmeasured,
+        BootPageAcceptance::Shared => InitialPageImportType::Shared,
+        BootPageAcceptance::VpContext => InitialPageImportType::VpContext,
+        BootPageAcceptance::SecretsPage => InitialPageImportType::Secrets,
+        BootPageAcceptance::CpuidPage => InitialPageImportType::Cpuid,
+        BootPageAcceptance::CpuidExtendedStatePage => InitialPageImportType::CpuidExtendedState,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loader::importer::X86Register;
+    use test_with_tracing::test;
+
+    fn test_memory_layout() -> MemoryLayout {
+        MemoryLayout::new(0x10000, &[], &[], &[], None).unwrap()
+    }
+
+    #[test]
+    fn initial_regs_and_page_imports_preserve_import_metadata() {
+        let gm = GuestMemory::allocate(0x10000);
+        let mem_layout = test_memory_layout();
+        let mut loader = Loader::<X86Register>::new(gm, &mem_layout, Vtl::Vtl0);
+
+        loader
+            .import_pages(
+                1,
+                2,
+                "test-pages",
+                BootPageAcceptance::ExclusiveUnmeasured,
+                &[1, 2, 3, 4],
+            )
+            .unwrap();
+        loader
+            .import_vp_register(X86Register::Rip(0x100000))
+            .unwrap();
+
+        let InitialLoad {
+            regs: initial_regs,
+            page_imports,
+        } = loader.initial_regs_and_page_imports();
+
+        assert_eq!(initial_regs, vec![X86Register::Rip(0x100000)]);
+        assert_eq!(
+            page_imports,
+            vec![InitialPageImport {
+                range: MemoryRange::from_4k_gpn_range(1..3),
+                import_type: InitialPageImportType::NormalUnmeasured,
+                tag: "test-pages",
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_register_import_returns_error() {
+        let gm = GuestMemory::allocate(0x10000);
+        let mem_layout = test_memory_layout();
+        let mut loader = Loader::<X86Register>::new(gm, &mem_layout, Vtl::Vtl0);
+
+        loader
+            .import_vp_register(X86Register::Rip(0x100000))
+            .unwrap();
+        let err = loader
+            .import_vp_register(X86Register::Rip(0x200000))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("duplicate register import"));
+    }
+
+    #[test]
+    fn register_import_after_snp_vmsa_finalization_returns_error() {
+        let gm = GuestMemory::allocate(0x10000);
+        let mem_layout = test_memory_layout();
+        let mut loader = Loader::<X86Register>::new(gm, &mem_layout, Vtl::Vtl0);
+        loader.snp_vmsa_finalized = true;
+
+        let err = loader
+            .import_vp_register(X86Register::Rip(0x100000))
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("register imported after SNP VMSA was finalized")
+        );
+    }
+
+    #[test]
+    fn invalid_page_import_ranges_return_errors() {
+        let gm = GuestMemory::allocate(0x10000);
+        let mem_layout = test_memory_layout();
+        let mut loader = Loader::<X86Register>::new(gm, &mem_layout, Vtl::Vtl0);
+
+        let err = loader
+            .accept_new_range(1, 0, "empty", BootPageAcceptance::Exclusive)
+            .unwrap_err();
+        assert!(err.to_string().contains("empty page range"));
+
+        let err = loader
+            .accept_new_range(u64::MAX, 2, "overflow", BootPageAcceptance::Exclusive)
+            .unwrap_err();
+        assert!(err.to_string().contains("page range overflows"));
+    }
+
+    #[test]
+    fn ordered_page_imports_preserve_call_order() {
+        let gm = GuestMemory::allocate(0x10000);
+        let mem_layout = test_memory_layout();
+        let mut loader = Loader::<X86Register>::new(gm, &mem_layout, Vtl::Vtl0);
+
+        loader
+            .import_pages(2, 1, "first", BootPageAcceptance::Exclusive, &[1])
+            .unwrap();
+        loader
+            .accept_new_range(0, 1, "second", BootPageAcceptance::Exclusive)
+            .unwrap();
+        loader
+            .record_vp_context_import(0x000f_ffff_ffff, "vmsa-0")
+            .unwrap();
+        loader
+            .record_vp_context_import(0x000f_ffff_ffff, "vmsa-1")
+            .unwrap();
+
+        let page_imports = loader.initial_regs_and_ordered_page_imports().page_imports;
+        assert_eq!(
+            page_imports.iter().map(|page| page.tag).collect::<Vec<_>>(),
+            ["first", "second", "vmsa-0", "vmsa-1"]
+        );
+        assert_eq!(page_imports[0].range.start(), 0x2000);
+        assert_eq!(page_imports[1].range.start(), 0);
+        assert_eq!(
+            page_imports[2].import_type,
+            InitialPageImportType::VpContext
+        );
+        assert_eq!(page_imports[2].range, page_imports[3].range);
+    }
+
+    #[test]
+    #[should_panic(expected = "VP context imports require ordered page import collection")]
+    fn unordered_page_imports_reject_vp_contexts() {
+        let gm = GuestMemory::allocate(0x10000);
+        let mem_layout = test_memory_layout();
+        let mut loader = Loader::<X86Register>::new(gm, &mem_layout, Vtl::Vtl0);
+
+        loader
+            .record_vp_context_import(0x000f_ffff_ffff, "vmsa")
+            .unwrap();
+
+        let _ = loader.initial_regs_and_page_imports();
+    }
+}

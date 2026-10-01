@@ -1,0 +1,40 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "loader"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aarch64defs.workspace = true
+igvm.workspace = true
+loader_defs.workspace = true
+product_policy.workspace = true
+memory_range.workspace = true
+page_table = {workspace = true, features = ["tracing"] }
+hvdef.workspace = true
+vm_topology.workspace = true
+uefi_specs.workspace = true
+x86defs.workspace = true
+
+guid.workspace = true
+
+anyhow.workspace = true
+bitfield-struct.workspace = true
+crc32fast.workspace = true
+object = { workspace = true, features = ["elf", "std", "read_core"] }
+open_enum.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+test_with_tracing.workspace = true
+
+[build-dependencies]
+build_rs_guest_arch.workspace = true
+
+[lints]
+workspace = true

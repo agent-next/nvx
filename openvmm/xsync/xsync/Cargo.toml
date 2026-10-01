@@ -1,0 +1,25 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "xsync"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cargo_toml.workspace = true
+cargo-lock.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+dunce.workspace = true
+fs-err.workspace = true
+log.workspace = true
+pathdiff.workspace = true
+semver.workspace = true
+serde = { workspace = true, features = ["std"] }
+toml_edit = { workspace = true, features = ["serde"] }
+
+ci_logger.workspace = true
+
+[lints]
+workspace = true

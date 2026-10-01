@@ -1,0 +1,22 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "test_igvm_agent_lib"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+crypto = { workspace = true, features = ["test_helpers"] }
+getrandom.workspace = true
+get_resources.workspace = true
+inspect = { workspace = true, features = ["derive"] }
+openhcl_attestation_protocol.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+
+[lints]
+workspace = true

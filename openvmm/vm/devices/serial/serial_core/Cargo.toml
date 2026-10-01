@@ -1,0 +1,23 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "serial_core"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+inspect.workspace = true
+vm_resource.workspace = true
+
+mesh.workspace = true
+
+futures.workspace = true
+pal_async.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+test_with_tracing.workspace = true
+
+[lints]
+workspace = true

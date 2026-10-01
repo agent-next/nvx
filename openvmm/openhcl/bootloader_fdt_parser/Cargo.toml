@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "bootloader_fdt_parser"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fdt.workspace = true
+inspect.workspace = true
+loader_defs = { workspace = true, features = ["inspect"] }
+memory_range = { workspace = true, features = ["inspect"] }
+vm_topology = { workspace = true, features = ["inspect"] }
+
+anyhow.workspace = true
+fs-err.workspace = true
+igvm_defs.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "mdbook-openvmm-shim"
+edition = "2024"
+
+[package.metadata.xtask.house-rules]
+# emits a binary, where kebab-case is more natural
+allow-dash-in-name = true
+excluded-from-workspace = true

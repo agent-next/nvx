@@ -1,0 +1,67 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+#![cfg_attr(all(target_os = "linux", target_env = "gnu"), no_main)]
+#![expect(missing_docs)]
+
+use arbitrary::Arbitrary;
+use arbitrary::Unstructured;
+use chipset::battery::BATTERY_MMIO_REGION_BASE_ADDRESS_X64;
+use chipset::battery::BatteryDevice;
+use chipset::battery::BatteryRuntimeDeps;
+use chipset_resources::battery::HostBatteryUpdate;
+use vmcore::line_interrupt::LineInterrupt;
+use xtask_fuzz::fuzz_eprintln;
+use xtask_fuzz::fuzz_target;
+
+/// An action the fuzzer can take in each iteration of the main loop.
+#[derive(Arbitrary, Debug)]
+enum FuzzAction {
+    /// Dispatch a chipset MMIO/PIO/PCI/poll event picked by `FuzzChipset`.
+    ChipsetEvent,
+    /// Push a new `HostBatteryUpdate` through the host->device channel.
+    BatteryUpdate(HostBatteryUpdate),
+}
+
+fn do_fuzz(u: &mut Unstructured<'_>) -> arbitrary::Result<()> {
+    // create battery dependencies
+    let (tx, rx) = mesh::channel::<HostBatteryUpdate>();
+    tx.send(u.arbitrary::<HostBatteryUpdate>()?);
+    let notify_interrupt = LineInterrupt::detached();
+
+    // create battery device, then add it to chipset
+    let battery = BatteryDevice::new(
+        BatteryRuntimeDeps {
+            battery_status_recv: rx,
+            notify_interrupt,
+        },
+        BATTERY_MMIO_REGION_BASE_ADDRESS_X64,
+    );
+    let mut chipset = chipset_device_fuzz::FuzzChipset::default();
+    chipset.device_builder("battery").add(|_| battery).unwrap();
+
+    while !u.is_empty() {
+        match u.arbitrary::<FuzzAction>()? {
+            FuzzAction::ChipsetEvent => {
+                let action = chipset.get_arbitrary_action(u)?;
+                fuzz_eprintln!("{:x?}", action);
+                chipset.exec_action(action).unwrap();
+            }
+            FuzzAction::BatteryUpdate(update) => {
+                fuzz_eprintln!("battery update: {:x?}", update);
+                tx.send(update);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fuzz_target!(|input: &[u8]| -> libfuzzer_sys::Corpus {
+    xtask_fuzz::init_tracing_if_repro();
+    if do_fuzz(&mut Unstructured::new(input)).is_err() {
+        libfuzzer_sys::Corpus::Reject
+    } else {
+        libfuzzer_sys::Corpus::Keep
+    }
+});

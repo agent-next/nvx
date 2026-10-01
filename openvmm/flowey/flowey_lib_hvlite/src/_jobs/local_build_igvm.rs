@@ -1,0 +1,352 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! A local-only job that supports the `cargo xflowey build-igvm` CLI
+
+use flowey::node::prelude::*;
+use std::collections::BTreeSet;
+
+use crate::build_openhcl_boot::OpenhclBootOutput;
+use crate::build_openhcl_igvm_from_recipe::IgvmManifestPath;
+use crate::build_openhcl_igvm_from_recipe::OpenhclIgvmEndorsements;
+use crate::build_openhcl_igvm_from_recipe::OpenhclIgvmRecipe;
+use crate::build_openhcl_igvm_from_recipe::OpenhclIgvmRecipeDetails;
+use crate::build_openhcl_igvm_from_recipe::OpenhclIgvmRecipeDetailsLocalOnly;
+use crate::build_openhcl_igvm_from_recipe::OpenhclIgvmRecipeType;
+use crate::build_openhcl_igvm_from_recipe::OpenhclKernelPackage;
+use crate::build_openhcl_igvm_from_recipe::Vtl0KernelType;
+use crate::build_openhcl_initrd::OpenhclInitrdExtraParams;
+use crate::build_openvmm_hcl::MaxTraceLevel;
+use crate::build_openvmm_hcl::OpenvmmHclBuildProfile;
+use crate::build_openvmm_hcl::OpenvmmHclFeature;
+use crate::build_openvmm_hcl::OpenvmmHclOutput;
+use crate::common::CommonArch;
+use crate::common::CommonTriple;
+
+#[derive(Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Customizations {
+    pub build_label: Option<String>,
+    pub custom_directory: Vec<PathBuf>,
+    pub custom_kernel: Option<PathBuf>,
+    pub custom_layer: Vec<PathBuf>,
+    pub custom_openhcl_boot: Option<PathBuf>,
+    pub custom_openvmm_hcl: Option<PathBuf>,
+    pub custom_sidecar: Option<PathBuf>,
+    pub custom_vtl0_kernel: Option<PathBuf>,
+    pub custom_extra_rootfs: Vec<PathBuf>,
+    pub confidential_debug: bool,
+    pub disable_secure_avic: bool,
+    pub enable_product_policy: bool,
+    pub override_arch: Option<CommonArch>,
+    pub override_kernel_pkg: Option<OpenhclKernelPackage>,
+    pub override_manifest: Option<PathBuf>,
+    pub override_openvmm_hcl_feature: Vec<String>,
+    pub override_max_trace_level: Option<MaxTraceLevel>,
+    pub with_debuginfo: bool,
+    pub with_mi_secure: bool,
+    pub with_perf_tools: bool,
+    pub with_sidecar: bool,
+}
+
+flowey_request! {
+    pub struct Params {
+        pub artifact_dir: ReadVar<PathBuf>,
+        pub done: WriteVar<SideEffect>,
+
+        pub base_recipe: OpenhclIgvmRecipe,
+        pub release: bool,
+        pub release_cfg: bool,
+
+        pub customizations: Customizations,
+    }
+}
+
+new_simple_flow_node!(struct Node);
+
+impl SimpleFlowNode for Node {
+    type Request = Params;
+
+    fn imports(ctx: &mut ImportCtx<'_>) {
+        ctx.import::<crate::build_openhcl_igvm_from_recipe::Node>();
+    }
+
+    fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
+        let Params {
+            artifact_dir,
+            done,
+
+            base_recipe,
+            release,
+            release_cfg,
+
+            customizations,
+        } = request;
+
+        let has_customizations = customizations != Customizations::default();
+
+        let Customizations {
+            build_label,
+            custom_directory,
+            custom_kernel,
+            custom_layer,
+            override_manifest,
+            custom_openhcl_boot,
+            custom_openvmm_hcl,
+            custom_sidecar,
+            custom_vtl0_kernel,
+            override_arch,
+            override_kernel_pkg,
+            override_openvmm_hcl_feature,
+            override_max_trace_level,
+            confidential_debug,
+            disable_secure_avic,
+            enable_product_policy,
+            with_debuginfo,
+            with_mi_secure,
+            with_perf_tools,
+            with_sidecar,
+            custom_extra_rootfs,
+        } = customizations;
+
+        if release_cfg && !release {
+            log::warn!(
+                "You are building a debug binary with a release configuration.\n\
+                The produced binary likely will not function properly due to memory restrictions."
+            )
+        }
+
+        if disable_secure_avic && (release_cfg || release) {
+            anyhow::bail!("--disable-secure-avic cannot be used with release builds.");
+        }
+
+        let build_profile = if release {
+            OpenvmmHclBuildProfile::OpenvmmHclShip
+        } else {
+            OpenvmmHclBuildProfile::Debug
+        };
+
+        let recipe_details = {
+            let mut recipe_details = base_recipe.recipe_details(release_cfg);
+
+            let OpenhclIgvmRecipeDetails {
+                local_only,
+                igvm_manifest,
+                openhcl_kernel_package,
+                openvmm_hcl_features,
+                target,
+                vtl0_kernel_type,
+                with_uefi,
+                with_interactive,
+                with_sidecar: with_sidecar_details,
+                max_trace_level,
+            } = &mut recipe_details;
+
+            if custom_kernel.is_some() {
+                *with_uefi = true
+            }
+
+            if with_sidecar || custom_sidecar.is_some() {
+                *with_sidecar_details = true;
+            }
+
+            assert!(local_only.is_none());
+            *local_only = Some(OpenhclIgvmRecipeDetailsLocalOnly {
+                // ensure binary remains un-sripped if perf tooling was also
+                // requested
+                openvmm_hcl_no_strip: with_perf_tools || with_debuginfo,
+                openhcl_initrd_extra_params: Some(OpenhclInitrdExtraParams {
+                    extra_initrd_layers: custom_layer
+                        .into_iter()
+                        .map(|p| p.absolute())
+                        .collect::<Result<_, _>>()?,
+                    extra_initrd_directories: custom_directory
+                        .into_iter()
+                        .map(|p| p.absolute())
+                        .collect::<Result<_, _>>()?,
+                }),
+                custom_openvmm_hcl: custom_openvmm_hcl.map(|p| p.absolute()).transpose()?,
+                custom_openhcl_boot: custom_openhcl_boot.map(|p| p.absolute()).transpose()?,
+                custom_kernel: custom_kernel.map(|p| p.absolute()).transpose()?,
+                custom_sidecar: custom_sidecar.map(|p| p.absolute()).transpose()?,
+                custom_extra_rootfs: custom_extra_rootfs
+                    .into_iter()
+                    .map(|p| p.absolute())
+                    .collect::<Result<_, _>>()?,
+            });
+
+            if let Some(p) = override_manifest {
+                *igvm_manifest = IgvmManifestPath::LocalOnlyCustom(p.absolute()?);
+            }
+
+            if let Some(override_kernel_pkg) = override_kernel_pkg {
+                *openhcl_kernel_package = override_kernel_pkg;
+            }
+
+            if !override_openvmm_hcl_feature.is_empty() {
+                *openvmm_hcl_features = override_openvmm_hcl_feature
+                    .into_iter()
+                    .map(OpenvmmHclFeature::LocalOnlyCustom)
+                    .collect()
+            }
+
+            if with_mi_secure {
+                openvmm_hcl_features.insert(OpenvmmHclFeature::MiSecure);
+            }
+
+            if enable_product_policy {
+                openvmm_hcl_features.insert(OpenvmmHclFeature::ProductPolicy);
+            }
+
+            if let Some(arch) = override_arch {
+                *target = match arch {
+                    CommonArch::X86_64 => CommonTriple::X86_64_LINUX_MUSL,
+                    CommonArch::Aarch64 => CommonTriple::AARCH64_LINUX_MUSL,
+                };
+            }
+
+            if let Some(lvl) = override_max_trace_level {
+                *max_trace_level = lvl;
+            }
+
+            if let Some(p) = custom_vtl0_kernel {
+                *vtl0_kernel_type = Some(Vtl0KernelType::LocalOnlyCustom(p.absolute()?))
+            }
+
+            // Debug configurations already include --interactive by default
+            // on x86 for busybox, gdbserver, and perf (aarch64 is currently
+            // broken and always disabled by default to allow the shell to
+            // work with ohcldiag-dev. see #1234).
+            *with_interactive |= with_perf_tools;
+
+            if *with_interactive && target.common_arch()? == CommonArch::Aarch64 {
+                log::warn!(
+                    "Please note that using perf tools on ARM currently breaks ohcldiag-dev shell"
+                );
+            }
+
+            recipe_details
+        };
+
+        let build_label = if let Some(label) = build_label {
+            label
+        } else {
+            let base = match &recipe_details.igvm_manifest {
+                IgvmManifestPath::InTree(_) => base_recipe.non_production_tag(),
+                IgvmManifestPath::LocalOnlyCustom(path) => path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .strip_suffix(".json")
+                    .unwrap()
+                    .to_string(),
+            };
+
+            if has_customizations {
+                format!("{base}-custom")
+            } else {
+                base
+            }
+        };
+
+        let (openhcl_igvm, write_openhcl_igvm) = ctx.new_var();
+        let (openhcl_igvm_extras, write_openhcl_igvm_extras) = ctx.new_var();
+
+        ctx.req(crate::build_openhcl_igvm_from_recipe::Request {
+            build_profile,
+            release_cfg,
+            recipe: OpenhclIgvmRecipeType::LocalOnlyCustom(recipe_details),
+            custom_target: None,
+            extra_features: BTreeSet::new(),
+            disable_secure_avic,
+            confidential_debug,
+            openhcl_igvm: write_openhcl_igvm,
+            openhcl_igvm_extras: write_openhcl_igvm_extras,
+        });
+
+        ctx.emit_rust_step("copy to output directory", |ctx| {
+            done.claim(ctx);
+            claim_vars!(ctx, (artifact_dir, openhcl_igvm, openhcl_igvm_extras));
+            move |rt| {
+                read_vars!(rt, (artifact_dir, openhcl_igvm, openhcl_igvm_extras));
+
+                let output_dir = artifact_dir
+                    .join(match build_profile {
+                        OpenvmmHclBuildProfile::Debug => "debug",
+                        OpenvmmHclBuildProfile::Release => "release",
+                        OpenvmmHclBuildProfile::OpenvmmHclShip => "ship",
+                    })
+                    .join(&build_label);
+                fs_err::create_dir_all(&output_dir)?;
+
+                let OpenvmmHclOutput { bin, dbg } = openhcl_igvm_extras.openvmm_hcl;
+                fs_err::copy(bin, output_dir.join("openvmm_hcl"))?;
+                if let Some(dbg) = dbg {
+                    fs_err::copy(dbg, output_dir.join("openvmm_hcl.dbg"))?;
+                }
+
+                let OpenhclBootOutput { bin, dbg } = openhcl_igvm_extras.openhcl_boot;
+                fs_err::copy(bin, output_dir.join("openhcl_boot"))?;
+                fs_err::copy(dbg, output_dir.join("openhcl_boot.dbg"))?;
+
+                if let Some(built_sidecar) = openhcl_igvm_extras.sidecar {
+                    let crate::build_sidecar::SidecarOutput { bin, dbg } = built_sidecar;
+                    fs_err::copy(bin, output_dir.join("sidecar"))?;
+                    fs_err::copy(dbg, output_dir.join("sidecar.dbg"))?;
+                }
+
+                let igvm_bin = openhcl_igvm.igvm_bin();
+                fs_err::copy(
+                    igvm_bin,
+                    output_dir.join(format!("openhcl-{build_label}.bin")),
+                )?;
+                if let Some(igvm_map) = openhcl_igvm_extras.igvm_map {
+                    fs_err::copy(
+                        igvm_map,
+                        output_dir.join(format!("openhcl-{build_label}.bin.map")),
+                    )?;
+                }
+                if let Some(OpenhclIgvmEndorsements::X64 {
+                    igvm_tdx_json,
+                    igvm_snp_json,
+                    igvm_vbs_json,
+                    igvm_snp_idblock,
+                    igvm_tdx_corim,
+                    igvm_snp_corim,
+                    igvm_vbs_corim,
+                }) = openhcl_igvm.endorsements()
+                {
+                    if let Some(igvm_tdx_json) = igvm_tdx_json {
+                        fs_err::copy(igvm_tdx_json, output_dir.join("openhcl-tdx.json"))?;
+                    }
+                    if let Some(igvm_snp_json) = igvm_snp_json {
+                        fs_err::copy(igvm_snp_json, output_dir.join("openhcl-snp.json"))?;
+                    }
+                    if let Some(igvm_vbs_json) = igvm_vbs_json {
+                        fs_err::copy(igvm_vbs_json, output_dir.join("openhcl-vbs.json"))?;
+                    }
+                    if let Some(igvm_snp_idblock) = igvm_snp_idblock {
+                        fs_err::copy(igvm_snp_idblock, output_dir.join("openhcl-snp.idblock"))?;
+                    }
+                    if let Some(igvm_tdx_corim) = igvm_tdx_corim {
+                        fs_err::copy(igvm_tdx_corim, output_dir.join("openhcl-tdx.cbor"))?;
+                    }
+                    if let Some(igvm_snp_corim) = igvm_snp_corim {
+                        fs_err::copy(igvm_snp_corim, output_dir.join("openhcl-snp.cbor"))?;
+                    }
+                    if let Some(igvm_vbs_corim) = igvm_vbs_corim {
+                        fs_err::copy(igvm_vbs_corim, output_dir.join("openhcl-vbs.cbor"))?;
+                    }
+                }
+                for e in fs_err::read_dir(output_dir)? {
+                    let e = e?;
+                    log::info!("{}", e.path().display());
+                }
+
+                Ok(())
+            }
+        });
+
+        Ok(())
+    }
+}

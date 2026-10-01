@@ -1,0 +1,30 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmgs_broker"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+
+encryption = ["vmgs/encryption"]
+
+[dependencies]
+vmgs_format.workspace = true
+vmgs_resources.workspace = true
+vmgs = { workspace = true, features = ["inspect", "save_restore", "mesh"] }
+vm_resource.workspace = true
+vmcore.workspace = true
+
+inspect = { workspace = true, features = ["defer"] }
+mesh.workspace = true
+pal_async.workspace = true
+
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

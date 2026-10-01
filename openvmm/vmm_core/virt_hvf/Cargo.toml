@@ -1,0 +1,34 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "virt_hvf"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+aarch64defs.workspace = true
+hvdef.workspace = true
+hv1_emulator.workspace = true
+hv1_hypercall.workspace = true
+virt.workspace = true
+virt_support_gic.workspace = true
+guestmem.workspace = true
+vmcore.workspace = true
+vm_topology.workspace = true
+memory_range.workspace = true
+
+inspect = { workspace = true, features = ["std"] }
+open_enum.workspace = true
+tracelimit.workspace = true
+
+anyhow.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+build_rs_guest_arch.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,46 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "tpm_device"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# Without this feature, the crate is a no-op. Disable it by default
+# to avoid requiring a TPM crypto backend on Windows.
+tpm = ["dep:ms-tpm-20-ref", "dep:ms-tcg-tpm-sys"]
+
+[dependencies]
+tpm_lib.workspace = true
+tpm_protocol.workspace = true
+tpm_resources.workspace = true
+ms-tpm-20-ref = { optional = true, workspace = true }
+ms-tcg-tpm-sys = { optional = true, workspace = true }
+
+chipset_device.workspace = true
+chipset_device_resources.workspace = true
+cvm_tracing.workspace = true
+guestmem.workspace = true
+vmcore.workspace = true
+vm_resource.workspace = true
+
+crypto.workspace = true
+guid = { workspace = true, features = ["inspect"] }
+inspect = { workspace = true, features = ["std"] }
+mesh.workspace = true
+open_enum.workspace = true
+pal_async.workspace = true
+
+async-trait.workspace = true
+getrandom.workspace = true
+parking_lot.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+tracelimit.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+base64.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vtl2_settings_proto"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pbjson.workspace = true
+pbjson-types.workspace = true
+prost.workspace = true
+serde = { workspace = true, features = ["std"] }
+
+[build-dependencies]
+prost-build.workspace = true
+pbjson-build.workspace = true
+
+[lints]
+workspace = true

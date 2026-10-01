@@ -1,0 +1,4161 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+/// Hyper-V VM management
+#[cfg(windows)]
+pub mod hyperv;
+mod microvm;
+/// OpenVMM VM management
+pub mod openvmm;
+/// QEMU full machine emulation management
+pub mod qemu;
+pub mod vtl2_settings;
+
+use crate::PetriLogSource;
+use crate::PetriTestParams;
+use crate::ShutdownKind;
+use crate::disk_image::AgentImage;
+use crate::disk_image::SECTOR_SIZE;
+use crate::openhcl_diag::OpenHclDiagHandler;
+use crate::test::PetriPostTestHook;
+use crate::vtl2_settings::ControllerType;
+use crate::vtl2_settings::Vtl2LunBuilder;
+use crate::vtl2_settings::Vtl2StorageBackingDeviceBuilder;
+use crate::vtl2_settings::Vtl2StorageControllerBuilder;
+use anyhow::Context;
+use async_trait::async_trait;
+use futures::FutureExt as _;
+use get_resources::ged::FirmwareEvent;
+use guid::Guid;
+use mesh::CancelContext;
+use openvmm_defs::config::Vtl2BaseAddressType;
+use openvmm_defs::microvm::MachineProfile;
+use pal_async::DefaultDriver;
+use pal_async::task::Spawn;
+use pal_async::task::Task;
+use pal_async::timer::PolledTimer;
+use petri_artifacts_common::tags::GuestQuirks;
+use petri_artifacts_common::tags::GuestQuirksInner;
+use petri_artifacts_common::tags::InitialRebootCondition;
+use petri_artifacts_common::tags::IsOpenhclIgvm;
+use petri_artifacts_common::tags::IsTestVmgs;
+use petri_artifacts_common::tags::MachineArch;
+use petri_artifacts_common::tags::OsFlavor;
+use petri_artifacts_core::ArtifactResolver;
+use petri_artifacts_core::ArtifactSource;
+use petri_artifacts_core::ResolvedArtifact;
+use petri_artifacts_core::ResolvedArtifactSource;
+use petri_artifacts_core::ResolvedOptionalArtifact;
+use pipette_client::PipetteClient;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::fmt::Debug;
+use std::hash::Hash;
+use std::hash::Hasher;
+use std::io::Write;
+use std::panic::AssertUnwindSafe;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::TempPath;
+use vmgs_resources::GuestStateEncryptionPolicy;
+use vtl2_settings_proto::StorageController;
+use vtl2_settings_proto::Vtl2Settings;
+
+/// The set of artifacts and resources needed to instantiate a
+/// [`PetriVmBuilder`].
+pub struct PetriVmArtifacts<T: PetriVmmBackend> {
+    /// Artifacts needed to launch the host VMM used for the test
+    pub backend: T,
+    /// Firmware and/or OS to load into the VM and associated settings
+    pub firmware: Firmware,
+    /// The architecture of the VM
+    pub arch: MachineArch,
+    /// Agent to run in the guest
+    pub agent_image: Option<AgentImage>,
+    /// Agent to run in OpenHCL
+    pub openhcl_agent_image: Option<AgentImage>,
+    /// Raw pipette binary path (for embedding in initrd via CPIO append)
+    pub pipette_binary: Option<ResolvedArtifact>,
+}
+
+impl<T: PetriVmmBackend> PetriVmArtifacts<T> {
+    /// Resolves the artifacts needed to instantiate a [`PetriVmBuilder`].
+    ///
+    /// Returns `None` if the supplied configuration is not supported on this platform.
+    pub fn new(
+        resolver: &ArtifactResolver<'_>,
+        firmware: Firmware,
+        arch: MachineArch,
+        with_vtl0_pipette: bool,
+    ) -> Option<Self> {
+        if !(T::SUPPORTS_CPU_EMULATION || arch == MachineArch::host())
+            || !T::check_compat(&firmware, arch)
+        {
+            return None;
+        }
+
+        let pipette_binary = if with_vtl0_pipette {
+            Some(Self::resolve_pipette_binary(
+                resolver,
+                firmware.os_flavor(),
+                arch,
+            ))
+        } else {
+            None
+        };
+
+        Some(Self {
+            backend: T::new(resolver, arch),
+            arch,
+            agent_image: Some(if with_vtl0_pipette {
+                AgentImage::new(firmware.os_flavor()).with_pipette(resolver, arch)
+            } else {
+                AgentImage::new(firmware.os_flavor())
+            }),
+            openhcl_agent_image: if firmware.is_openhcl() {
+                Some(AgentImage::new(OsFlavor::Linux).with_pipette(resolver, arch))
+            } else {
+                None
+            },
+            pipette_binary,
+            firmware,
+        })
+    }
+
+    fn resolve_pipette_binary(
+        resolver: &ArtifactResolver<'_>,
+        os_flavor: OsFlavor,
+        arch: MachineArch,
+    ) -> ResolvedArtifact {
+        use petri_artifacts_common::artifacts as common_artifacts;
+        match (os_flavor, arch) {
+            (OsFlavor::Linux, MachineArch::X86_64) => resolver
+                .require(common_artifacts::PIPETTE_LINUX_X64_MUSL)
+                .erase(),
+            (OsFlavor::Linux, MachineArch::Aarch64) => resolver
+                .require(common_artifacts::PIPETTE_LINUX_AARCH64_MUSL)
+                .erase(),
+            (OsFlavor::Windows, MachineArch::X86_64) => resolver
+                .require(common_artifacts::PIPETTE_WINDOWS_X64)
+                .erase(),
+            (OsFlavor::Windows, MachineArch::Aarch64) => resolver
+                .require(common_artifacts::PIPETTE_WINDOWS_AARCH64)
+                .erase(),
+            (OsFlavor::FreeBsd | OsFlavor::Uefi, _) => {
+                panic!("No pipette binary for this OS flavor")
+            }
+        }
+    }
+}
+
+/// Petri VM builder
+pub struct PetriVmBuilder<T: PetriVmmBackend> {
+    /// Artifacts needed to launch the host VMM used for the test
+    backend: T,
+    /// VM configuration
+    config: PetriVmConfig,
+    /// Function to modify the VMM-specific configuration
+    modify_vmm_config: Option<ModifyFn<T::VmmConfig>>,
+    /// VMM-agnostic resources
+    resources: PetriVmResources,
+
+    // VMM-specific quirks for the configured firmware
+    guest_quirks: GuestQuirksInner,
+    vmm_quirks: VmmQuirks,
+
+    // Test-specific boot behavior expectations.
+    // Defaults to expected behavior for firmware configuration.
+    expected_boot_event: Option<FirmwareEvent>,
+    override_expect_reset: bool,
+
+    // Config that is used to modify the `PetriVmConfig` before it is passed
+    // to the VMM backend.
+    /// Agent to run in the guest
+    agent_image: Option<AgentImage>,
+    /// Agent to run in OpenHCL
+    openhcl_agent_image: Option<AgentImage>,
+    /// The boot device type for the VM
+    boot_device_type: BootDeviceType,
+    /// Override for the PCIe root port the boot NVMe controller is placed on
+    /// when [`BootDeviceType::PcieNvme`] is used. Defaults to `s0rc0rp0`.
+    pcie_boot_port: Option<String>,
+
+    // Minimal mode: skip default devices, serial, save/restore.
+    minimal_mode: bool,
+    // Raw pipette binary path (for CPIO embedding in initrd).
+    pipette_binary: Option<ResolvedArtifact>,
+    // Enable serial output even in minimal mode (for diagnostics).
+    enable_serial: bool,
+    // Enable periodic framebuffer screenshots.
+    enable_screenshots: bool,
+    // Use virtio vsock instead of VMBus-based hvsocket for guest communication.
+    use_virtio_vsock: bool,
+    // Use the Linux kernel vhost-vsock backend with this guest CID.
+    #[cfg(target_os = "linux")]
+    vhost_vsock_guest_cid: Option<u32>,
+    // Disable VMBus entirely (no vmbus server, no vmbus storage controllers).
+    no_vmbus: bool,
+    // Disable the hypervisor (HV#1) enlightenments. Implies `no_vmbus`.
+    no_hv: bool,
+    // Capture the VM's inspect output on test failure.
+    capture_inspect_on_failure: bool,
+}
+
+/// How long to wait on a single inspect before giving up on it.
+const INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl<T: PetriVmmBackend> Debug for PetriVmBuilder<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PetriVmBuilder")
+            .field("backend", &self.backend)
+            .field("config", &self.config)
+            .field("modify_vmm_config", &self.modify_vmm_config.is_some())
+            .field("resources", &self.resources)
+            .field("guest_quirks", &self.guest_quirks)
+            .field("vmm_quirks", &self.vmm_quirks)
+            .field("expected_boot_event", &self.expected_boot_event)
+            .field("override_expect_reset", &self.override_expect_reset)
+            .field("agent_image", &self.agent_image)
+            .field("openhcl_agent_image", &self.openhcl_agent_image)
+            .field("boot_device_type", &self.boot_device_type)
+            .field("pcie_boot_port", &self.pcie_boot_port)
+            .field("minimal_mode", &self.minimal_mode)
+            .field("enable_serial", &self.enable_serial)
+            .field("enable_screenshots", &self.enable_screenshots)
+            .field("use_virtio_vsock", &self.use_virtio_vsock)
+            .field("no_vmbus", &self.no_vmbus)
+            .field("no_hv", &self.no_hv)
+            .finish()
+    }
+}
+
+/// Petri VM configuration
+#[derive(Debug)]
+pub struct PetriVmConfig {
+    /// The name of the VM
+    pub name: String,
+    /// The architecture of the VM
+    pub arch: MachineArch,
+    /// The guest-visible machine contract.
+    pub machine_profile: MachineProfile,
+    /// Log levels for the host VMM process.
+    pub host_log_levels: Option<OpenvmmLogConfig>,
+    /// Firmware and/or OS to load into the VM and associated settings
+    pub firmware: Firmware,
+    /// Whether to enable guest hibernation support.
+    pub hibernation_enabled: bool,
+    /// Whether to expose an IPMI KCS interface to the guest.
+    pub ipmi_enabled: bool,
+    /// The amount of memory, in bytes, to assign to the VM
+    pub memory: MemoryConfig,
+    /// The processor topology for the VM
+    pub proc_topology: ProcessorTopology,
+    /// VM guest state
+    pub vmgs: PetriVmgsResource,
+    /// TPM configuration
+    pub tpm: Option<TpmConfig>,
+    /// Storage controllers and associated disks
+    pub vmbus_storage_controllers: HashMap<Guid, VmbusStorageController>,
+    /// PCIe NVMe drives.
+    pub pcie_nvme_drives: Vec<PcieNvmeDrive>,
+    /// PCIe virtio-blk drives.
+    pub pcie_virtio_blk_drives: Vec<PcieVirtioBlkDrive>,
+    /// Physical NVMe devices to attach
+    pub physical_nvme_devices: HashMap<Guid, PhysicalNvmeDevice>,
+}
+
+/// PCIe NVMe drive configuration.
+#[derive(Debug)]
+pub struct PcieNvmeDrive {
+    /// PCIe root port name (e.g. "s0rc0rp0").
+    pub port_name: String,
+    /// NVMe namespace ID.
+    pub nsid: u32,
+    /// The drive to attach.
+    pub drive: Drive,
+}
+
+/// PCIe virtio-blk drive configuration.
+#[derive(Debug)]
+pub struct PcieVirtioBlkDrive {
+    /// PCIe root port name (e.g. "s0rc0rp0").
+    pub port_name: String,
+    /// The drive to attach.
+    pub drive: Drive,
+}
+
+/// Physical NVMe device to assign to a VM.
+/// Only used in closed-source HyperV tests
+#[derive(Debug, Clone)]
+pub struct PhysicalNvmeDevice {
+    /// The VTL to assign the physical NVMe device to.
+    pub target_vtl: Vtl,
+    /// NVMe namespace ID.
+    pub nsid: u32,
+    /// Namespace size in MiB
+    pub namespace_size_mib: u64,
+}
+
+/// Static properties about the VM for convenience during contruction and
+/// runtime of a VMM backend
+pub struct PetriVmProperties {
+    /// Whether this VM uses OpenHCL
+    pub is_openhcl: bool,
+    /// Whether this VM is isolated
+    pub is_isolated: bool,
+    /// Whether this VM uses the PCAT BIOS
+    pub is_pcat: bool,
+    /// Whether this VM boots with linux direct
+    pub is_linux_direct: bool,
+    /// Whether this VM is using pipette in VTL0
+    pub using_vtl0_pipette: bool,
+    /// Whether this VM is using VPCI
+    pub using_vpci: bool,
+    /// The OS flavor of the guest in the VM
+    pub os_flavor: OsFlavor,
+    /// Minimal mode: skip default devices, serial, save/restore
+    pub minimal_mode: bool,
+    /// Pipette embeds in initrd as PID 1 (non-OpenHCL Linux direct boot)
+    pub uses_pipette_as_init: bool,
+    /// Enable serial output even in minimal mode
+    pub enable_serial: bool,
+    /// Whether the VM has a CIDATA agent disk attached
+    pub has_agent_disk: bool,
+    /// Use virtio vsock instead of VMBus-based hvsocket
+    pub use_virtio_vsock: bool,
+    /// Linux kernel vhost-vsock guest CID, when that backend is enabled.
+    #[cfg(target_os = "linux")]
+    pub vhost_vsock_guest_cid: Option<u32>,
+    /// VMBus is entirely disabled
+    pub no_vmbus: bool,
+    /// The hypervisor (HV#1) enlightenments are entirely disabled
+    pub no_hv: bool,
+}
+
+/// VM configuration that can be changed after the VM is created
+pub struct PetriVmRuntimeConfig {
+    /// VTL2 settings
+    pub vtl2_settings: Option<Vtl2Settings>,
+    /// IDE controllers and associated disks
+    pub ide_controllers: Option<[[Option<Drive>; 2]; 2]>,
+    /// Storage controllers and associated disks
+    pub vmbus_storage_controllers: HashMap<Guid, VmbusStorageController>,
+}
+
+/// Resources used by a Petri VM during contruction and runtime
+#[derive(Debug)]
+pub struct PetriVmResources {
+    /// Driver to use for async tasks during VM construction and runtime
+    pub driver: DefaultDriver,
+    /// Log source
+    pub log_source: PetriLogSource,
+    /// Pre-built initrd with pipette already injected (skips runtime injection).
+    pub prebuilt_initrd: Option<PetriInitrd>,
+}
+
+/// Trait for VMM-specific contruction and runtime resources
+#[async_trait]
+pub trait PetriVmmBackend: Debug {
+    /// VMM-specific configuration
+    type VmmConfig;
+
+    /// Runtime object
+    type VmRuntime: PetriVmRuntime;
+
+    /// Whether the backend supports VMBus.
+    const SUPPORTS_VMBUS: bool;
+
+    /// Whether the backend supports full CPU emulation
+    ///
+    /// If this is false, then tests are silently skipped if the host
+    /// architecture does not match the guest architecture.
+    const SUPPORTS_CPU_EMULATION: bool = false;
+
+    /// Check whether the combination of guest firmware, guest architecture, and
+    /// internally determined host properties is supported by the backend.
+    ///
+    /// Any combinations that return false will be silently skipped. This should
+    /// not be used to skip configurations that are never valid (for example,
+    /// PCAT AARCH64 should always result in an error), and only be used if the
+    /// configuration is sometimes valid (for example, OpenVMM + OpenHCL is only
+    /// valid on Windows X64 hosts).
+    fn check_compat(firmware: &Firmware, arch: MachineArch) -> bool;
+
+    /// Select backend specific quirks guest and vmm quirks.
+    fn quirks(firmware: &Firmware) -> (GuestQuirksInner, VmmQuirks);
+
+    /// Get the default servicing flags (based on what this backend supports)
+    fn default_servicing_flags() -> OpenHclServicingFlags;
+
+    /// Create a disk for guest crash dumps, and a post-test hook to open the disk
+    /// to allow for reading the dumps.
+    fn create_guest_dump_disk() -> anyhow::Result<
+        Option<(
+            Arc<TempPath>,
+            Box<dyn FnOnce() -> anyhow::Result<Box<dyn fatfs::ReadWriteSeek>>>,
+        )>,
+    >;
+
+    /// Generate an rdinit script that does the necessary configuration to
+    /// launch pipette for linux direct
+    fn build_custom_init_script(pipette_path: &str) -> Option<String>;
+
+    /// Resolve any artifacts needed to use this backend
+    ///
+    /// The architecture here is that of the guest, which may or may not be the
+    /// same as the host.
+    fn new(resolver: &ArtifactResolver<'_>, arch: MachineArch) -> Self;
+
+    /// Create and start VM from the generic config using the VMM backend
+    async fn run(
+        self,
+        config: PetriVmConfig,
+        modify_vmm_config: Option<ModifyFn<Self::VmmConfig>>,
+        resources: &PetriVmResources,
+        properties: PetriVmProperties,
+    ) -> anyhow::Result<(Self::VmRuntime, PetriVmRuntimeConfig)>;
+}
+
+// IDE is only ever offered to VTL0
+pub(crate) const PETRI_IDE_BOOT_CONTROLLER_NUMBER: u32 = 0;
+pub(crate) const PETRI_IDE_BOOT_LUN: u8 = 0;
+pub(crate) const PETRI_IDE_BOOT_CONTROLLER: Guid =
+    guid::guid!("ca56751f-e643-4bef-bf54-f73678e8b7b5");
+
+// SCSI luns used for both VTL0 and VTL2
+pub(crate) const PETRI_SCSI_BOOT_LUN: u32 = 0;
+pub(crate) const PETRI_SCSI_PIPETTE_LUN: u32 = 1;
+pub(crate) const PETRI_SCSI_CRASH_LUN: u32 = 2;
+/// VTL0 SCSI controller instance guid used by Petri
+pub(crate) const PETRI_SCSI_VTL0_CONTROLLER: Guid =
+    guid::guid!("27b553e8-8b39-411b-a55f-839971a7884f");
+/// VTL2 SCSI controller instance guid used by Petri
+pub(crate) const PETRI_SCSI_VTL2_CONTROLLER: Guid =
+    guid::guid!("766e96f8-2ceb-437e-afe3-a93169e48a7c");
+/// SCSI controller instance guid offered to VTL0 by VTL2
+pub(crate) const PETRI_SCSI_VTL0_VIA_VTL2_CONTROLLER: Guid =
+    guid::guid!("6c474f47-ed39-49e6-bbb9-142177a1da6e");
+
+/// The namespace ID used by Petri for the boot disk
+pub(crate) const PETRI_NVME_BOOT_NSID: u32 = 37;
+/// VTL0 NVMe controller instance guid used by Petri
+pub(crate) const PETRI_NVME_BOOT_VTL0_CONTROLLER: Guid =
+    guid::guid!("e23a04e2-90f5-4852-bc9d-e7ac691b756c");
+/// VTL2 NVMe controller instance guid used by Petri
+pub(crate) const PETRI_NVME_BOOT_VTL2_CONTROLLER: Guid =
+    guid::guid!("92bc8346-718b-449a-8751-edbf3dcd27e4");
+
+/// PCIe root port used by Petri for the agent/cidata disk (no-vmbus mode)
+pub(crate) const PETRI_PCIE_NVME_AGENT_PORT: &str = "s0rc0rp1";
+/// NVMe namespace ID used by Petri for the agent/cidata disk (no-vmbus mode)
+pub(crate) const PETRI_PCIE_NVME_AGENT_NSID: u32 = 1;
+
+/// A constructed Petri VM
+pub struct PetriVm<T: PetriVmmBackend> {
+    resources: PetriVmResources,
+    runtime: PetriVmRuntimeGuard<T::VmRuntime>,
+    watchdog_tasks: Vec<Task<()>>,
+    openhcl_diag_handler: Option<OpenHclDiagHandler>,
+
+    arch: MachineArch,
+    guest_quirks: GuestQuirksInner,
+    vmm_quirks: VmmQuirks,
+    expected_boot_event: Option<FirmwareEvent>,
+
+    config: PetriVmRuntimeConfig,
+}
+
+/// Wrapper around the VMM backend's runtime that captures inspect state if the
+/// VM is dropped without being torn down, which is what happens when a test
+/// fails partway through.
+struct PetriVmRuntimeGuard<T: PetriVmRuntime> {
+    runtime: Option<T>,
+    driver: DefaultDriver,
+    log_source: PetriLogSource,
+    capture_inspect_on_drop: bool,
+}
+
+impl<T: PetriVmRuntime> PetriVmRuntimeGuard<T> {
+    fn take_for_teardown(&mut self) -> T {
+        self.runtime.take().expect("runtime has already been taken")
+    }
+}
+
+impl<T: PetriVmRuntime> std::ops::Deref for PetriVmRuntimeGuard<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.runtime
+            .as_ref()
+            .expect("runtime has already been taken")
+    }
+}
+
+impl<T: PetriVmRuntime> std::ops::DerefMut for PetriVmRuntimeGuard<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.runtime
+            .as_mut()
+            .expect("runtime has already been taken")
+    }
+}
+
+impl<T: PetriVmRuntime> Drop for PetriVmRuntimeGuard<T> {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        if !self.capture_inspect_on_drop {
+            return;
+        }
+        let inspector = runtime.inspector();
+        let openhcl_diag_handler = runtime.openhcl_diag();
+        if inspector.is_none() && openhcl_diag_handler.is_none() {
+            return;
+        }
+        let log_source = self.log_source.clone();
+
+        let capture = async move {
+            let vmm = async {
+                if let Some(inspector) = &inspector {
+                    collect_inspect("vmm", inspector.inspect(""), &log_source, "failure").await;
+                }
+            };
+            let openhcl = async {
+                if let Some(diag) = &openhcl_diag_handler {
+                    collect_inspect(
+                        "openhcl",
+                        diag.inspect("", None, None),
+                        &log_source,
+                        "failure",
+                    )
+                    .await;
+                }
+            };
+            futures::future::join(vmm, openhcl).await;
+            drop(runtime);
+        };
+
+        // `SimpleTest::new_async` joins the test body with the task pool, so
+        // the pool keeps polling detached tasks until they complete. This
+        // finishes before the post-test hooks run.
+        self.driver
+            .spawn("petri-inspect-on-drop", async move {
+                // A panic here would propagate out of the task pool and replace
+                // the failure the test is already reporting.
+                if let Err(e) = AssertUnwindSafe(capture).catch_unwind().await {
+                    tracing::error!(?e, "panicked while collecting inspect state");
+                }
+            })
+            .detach();
+    }
+}
+
+impl<T: PetriVmmBackend> PetriVmBuilder<T> {
+    /// Create a new VM configuration.
+    pub fn new(
+        params: PetriTestParams<'_>,
+        artifacts: PetriVmArtifacts<T>,
+        driver: &DefaultDriver,
+    ) -> anyhow::Result<Self> {
+        Ok(
+            Self::minimal(params.test_name, params.log_source, artifacts, driver)?
+                .clear_minimal_mode()
+                .with_serial_output()
+                .with_capture_inspect_on_failure()
+                .add_petri_scsi_controllers()
+                .add_guest_crash_disk(params.post_test_hooks),
+        )
+    }
+
+    /// Create a minimal VM builder with only the bare minimum device set.
+    ///
+    /// Unlike [`new()`](Self::new), this constructor:
+    /// - Does not add default VMBus devices (shutdown IC, KVP, etc.)
+    /// - Does not add serial ports
+    /// - Does not add SCSI controllers or crash dump disks
+    /// - Does not verify save/restore on boot
+    ///
+    /// Use builder methods to opt in to specific devices. Intended for
+    /// performance tests where minimal overhead is critical.
+    pub fn minimal(
+        test_name: &str,
+        log_source: &PetriLogSource,
+        artifacts: PetriVmArtifacts<T>,
+        driver: &DefaultDriver,
+    ) -> anyhow::Result<Self> {
+        let (guest_quirks, vmm_quirks) = T::quirks(&artifacts.firmware);
+        let expected_boot_event = artifacts.firmware.expected_boot_event();
+        let boot_device_type = match artifacts.firmware {
+            Firmware::LinuxDirect { .. } => BootDeviceType::None,
+            Firmware::OpenhclLinuxDirect { .. } => BootDeviceType::None,
+            Firmware::Pcat { .. } => BootDeviceType::Ide,
+            Firmware::OpenhclPcat { .. } => BootDeviceType::IdeViaScsi,
+            Firmware::Uefi {
+                guest: UefiGuest::None,
+                ..
+            }
+            | Firmware::OpenhclUefi {
+                guest: UefiGuest::None,
+                ..
+            } => BootDeviceType::None,
+            Firmware::Uefi { .. } | Firmware::OpenhclUefi { .. } => BootDeviceType::Scsi,
+        };
+
+        Ok(Self {
+            backend: artifacts.backend,
+            config: PetriVmConfig {
+                name: make_vm_safe_name(test_name),
+                arch: artifacts.arch,
+                machine_profile: MachineProfile::Standard,
+                host_log_levels: None,
+                firmware: artifacts.firmware,
+                hibernation_enabled: false,
+                ipmi_enabled: false,
+                memory: Default::default(),
+                proc_topology: Default::default(),
+
+                vmgs: PetriVmgsResource::Ephemeral,
+                tpm: None,
+                vmbus_storage_controllers: HashMap::new(),
+                pcie_nvme_drives: Vec::new(),
+                pcie_virtio_blk_drives: Vec::new(),
+                physical_nvme_devices: HashMap::new(),
+            },
+            modify_vmm_config: None,
+            resources: PetriVmResources {
+                driver: driver.clone(),
+                log_source: log_source.clone(),
+                prebuilt_initrd: None,
+            },
+
+            guest_quirks,
+            vmm_quirks,
+            expected_boot_event,
+            override_expect_reset: false,
+
+            agent_image: artifacts.agent_image,
+            openhcl_agent_image: artifacts.openhcl_agent_image,
+            boot_device_type,
+            pcie_boot_port: None,
+
+            minimal_mode: true,
+            pipette_binary: artifacts.pipette_binary,
+            enable_serial: false,
+            enable_screenshots: true,
+            use_virtio_vsock: false,
+            #[cfg(target_os = "linux")]
+            vhost_vsock_guest_cid: None,
+            no_vmbus: !T::SUPPORTS_VMBUS,
+            no_hv: false,
+            capture_inspect_on_failure: false,
+        })
+    }
+
+    fn clear_minimal_mode(mut self) -> Self {
+        self.minimal_mode = false;
+        self
+    }
+
+    fn with_capture_inspect_on_failure(mut self) -> Self {
+        self.capture_inspect_on_failure = true;
+        self
+    }
+
+    /// Whether this builder is in minimal mode.
+    pub fn is_minimal(&self) -> bool {
+        self.minimal_mode
+    }
+
+    /// Supply a pre-built Linux-direct initrd.
+    ///
+    /// When set, the builder skips the runtime gzip decompress/inject/
+    /// recompress cycle, using this initrd directly. Use
+    /// [`prepare_initrd`](Self::prepare_initrd) to build the initrd
+    /// ahead of time.
+    pub fn with_prebuilt_initrd(mut self, initrd: PetriInitrd) -> Self {
+        self.resources.prebuilt_initrd = Some(initrd);
+        self
+    }
+
+    /// Pre-build the modified initrd with pipette injected.
+    ///
+    /// Reads the original initrd from the firmware artifacts, injects
+    /// the pipette binary via CPIO, and writes the result to a temp file.
+    /// Returns a [`PetriInitrd`] struct that contains a `TempFile` that
+    /// must not be dropped until after the VM boots.
+    ///
+    /// Call this once before timing, then pass the path to
+    /// [`with_prebuilt_initrd`](Self::with_prebuilt_initrd) for each
+    /// iteration.
+    pub fn prepare_initrd(&self) -> anyhow::Result<PetriInitrd> {
+        self.prepare_custom_initrd(T::build_custom_init_script)
+    }
+
+    /// Prepare an initrd with a custom script
+    pub fn prepare_custom_initrd(
+        &self,
+        build_custom_init_script: impl FnOnce(&str) -> Option<String>,
+    ) -> anyhow::Result<PetriInitrd> {
+        const PIPETTE_PATH: &str = "pipette";
+        const INIT_SCRIPT_NAME: &str = "custom-init.sh";
+
+        let initrd_path = self
+            .config
+            .firmware
+            .linux_direct_initrd()
+            .context("prepare_initrd requires Linux direct boot with initrd")?;
+        let pipette_path = self
+            .pipette_binary
+            .as_ref()
+            .context("prepare_initrd requires a pipette binary")?;
+
+        let initrd_gz = std::fs::read(initrd_path)
+            .with_context(|| format!("failed to read initrd at {}", initrd_path.display()))?;
+        let pipette_data = std::fs::read(pipette_path.get()).with_context(|| {
+            format!(
+                "failed to read pipette binary at {}",
+                pipette_path.get().display()
+            )
+        })?;
+
+        let merged_gz =
+            initrd_cpio::inject_into_initrd(&initrd_gz, PIPETTE_PATH, &pipette_data, 0o100755)
+                .context("failed to inject pipette into initrd")?;
+
+        let (merged_gz, rdinit) = if let Some(file_data) = build_custom_init_script(PIPETTE_PATH) {
+            (
+                initrd_cpio::inject_into_initrd(
+                    &merged_gz,
+                    INIT_SCRIPT_NAME,
+                    file_data.as_bytes(),
+                    0o100755, // regular file, rwxr-xr-x
+                )
+                .context("failed to inject init script into initrd")?,
+                format!("/{INIT_SCRIPT_NAME}"),
+            )
+        } else {
+            (merged_gz, format!("/{PIPETTE_PATH}"))
+        };
+
+        let mut tmp = tempfile::NamedTempFile::new()
+            .context("failed to create temp file for pre-built initrd")?;
+        tmp.write_all(&merged_gz)
+            .context("failed to write pre-built initrd")?;
+
+        Ok(PetriInitrd {
+            path: TempOrPersistentPath::Temp(Arc::new(tmp.into_temp_path())),
+            rdinit_param: rdinit,
+        })
+    }
+
+    /// Build a copy of the Linux-direct initrd with one file injected as the
+    /// guest's `rdinit=` program.
+    pub fn prepare_initrd_with_file(
+        &self,
+        path: &str,
+        data: &[u8],
+        mode: u32,
+    ) -> anyhow::Result<PetriInitrd> {
+        let initrd_path = self
+            .config
+            .firmware
+            .linux_direct_initrd()
+            .context("initrd injection requires Linux direct boot with initrd")?;
+        let initrd_gz = std::fs::read(initrd_path)
+            .with_context(|| format!("failed to read initrd at {}", initrd_path.display()))?;
+        let merged_gz = initrd_cpio::inject_into_initrd(&initrd_gz, path, data, mode)
+            .with_context(|| format!("failed to inject {path} into initrd"))?;
+
+        let mut tmp = tempfile::NamedTempFile::new()
+            .context("failed to create temp file for modified initrd")?;
+        tmp.write_all(&merged_gz)
+            .context("failed to write modified initrd")?;
+
+        Ok(PetriInitrd {
+            path: TempOrPersistentPath::Temp(Arc::new(tmp.into_temp_path())),
+            rdinit_param: format!("/{path}"),
+        })
+    }
+
+    /// Enable serial port output even in minimal mode.
+    ///
+    /// Useful for diagnostics — the serial device overhead is negligible;
+    /// the cost comes from kernel console output, which is controlled via
+    /// the kernel cmdline (`quiet loglevel=0`).
+    ///
+    /// Note: this currently only affects LinuxDirect boot (kernel cmdline
+    /// and emulated serial backends). UEFI paths are unaffected.
+    pub fn with_serial_output(mut self) -> Self {
+        self.enable_serial = true;
+        self
+    }
+
+    /// Disable serial port output.
+    ///
+    /// Suppresses serial device creation, eliminating the `[uefi]` / `[openhcl]`
+    /// log lines. Useful for performance tests where serial noise is unwanted.
+    pub fn without_serial_output(mut self) -> Self {
+        self.enable_serial = false;
+        self
+    }
+
+    /// Disable periodic framebuffer screenshots.
+    ///
+    /// Suppresses the watchdog task that takes screenshots every 2 seconds,
+    /// eliminating the "No change in framebuffer" debug log lines.
+    pub fn without_screenshots(mut self) -> Self {
+        self.enable_screenshots = false;
+        self
+    }
+
+    /// Use virtio vsock instead of VMBus-based hvsocket for guest communication.
+    /// The virtio-vsock device will use PCIe, so a PCIe root topology must be
+    /// configured.
+    ///
+    /// When enabled, a virtio-vsock device is added to the VM. This device uses
+    /// the same Unix socket relay path that hvsocket would otherwise use, so
+    /// pipette will connect using this.
+    ///
+    /// For Linux direct boot, this also adjusts the kernel command line to
+    /// blacklist hv_sock instead of virtio_vsock.
+    pub fn with_virtio_vsock(mut self) -> Self {
+        self.use_virtio_vsock = true;
+        #[cfg(target_os = "linux")]
+        {
+            self.vhost_vsock_guest_cid = None;
+        }
+        self
+    }
+
+    /// Use the Linux kernel vhost-vsock backend for guest communication.
+    ///
+    /// The host connects directly to the guest's `AF_VSOCK` listener at
+    /// `guest_cid`. The OpenVMM backend automatically uses shared guest memory,
+    /// which is required by kernel vhost.
+    #[cfg(target_os = "linux")]
+    pub fn with_vhost_vsock(mut self, guest_cid: u32) -> Self {
+        assert!(
+            (3..u32::MAX).contains(&guest_cid),
+            "vhost-vsock guest CID must be between 3 and {}",
+            u32::MAX - 1
+        );
+        self.use_virtio_vsock = true;
+        self.vhost_vsock_guest_cid = Some(guest_cid);
+        self
+    }
+
+    /// Disable VMBus entirely.
+    ///
+    /// This removes all VMBus storage controllers. For Linux guests,
+    /// virtio-vsock is used for pipette communication. For Windows guests,
+    /// the caller must also configure TCP pipette transport via
+    /// `modify_backend(|b| b.with_tcp_pipette_nic(port, mac_address))`. The
+    /// guest must boot from a non-VMBus device (e.g. PCIe NVMe).
+    pub fn with_no_vmbus(mut self) -> Self {
+        self.no_vmbus = true;
+        if self.config.firmware.os_flavor() != OsFlavor::Windows {
+            self.use_virtio_vsock = true;
+        }
+        self.config.vmbus_storage_controllers.clear();
+        self
+    }
+
+    /// Disable the hypervisor (HV#1) enlightenments.
+    ///
+    /// This also disables VMBus, since VMBus depends on the hypervisor. On
+    /// aarch64 UEFI this causes the loader to pass the generic SEC platform
+    /// type to the firmware. This mode is not supported on x86_64 UEFI.
+    pub fn with_no_hv(mut self) -> Self {
+        self.no_hv = true;
+        self.with_no_vmbus()
+    }
+
+    fn add_petri_scsi_controllers(self) -> Self {
+        let builder = self.add_vmbus_storage_controller(
+            &PETRI_SCSI_VTL0_CONTROLLER,
+            Vtl::Vtl0,
+            VmbusStorageType::Scsi,
+        );
+
+        if builder.is_openhcl() {
+            builder.add_vmbus_storage_controller(
+                &PETRI_SCSI_VTL2_CONTROLLER,
+                Vtl::Vtl2,
+                VmbusStorageType::Scsi,
+            )
+        } else {
+            builder
+        }
+    }
+
+    fn add_guest_crash_disk(self, post_test_hooks: &mut Vec<PetriPostTestHook>) -> Self {
+        let logger = self.resources.log_source.clone();
+        let (disk, disk_hook) = matches!(
+            self.config.firmware.os_flavor(),
+            OsFlavor::Windows | OsFlavor::Linux
+        )
+        .then(|| T::create_guest_dump_disk().expect("failed to create guest dump disk"))
+        .flatten()
+        .unzip();
+
+        if let Some(disk_hook) = disk_hook {
+            post_test_hooks.push(PetriPostTestHook::new(
+                "extract guest crash dumps".into(),
+                move |test_passed| {
+                    if test_passed {
+                        return Ok(());
+                    }
+                    let mut disk = disk_hook()?;
+                    let gpt = gptman::GPT::read_from(&mut disk, SECTOR_SIZE)?;
+                    let partition = fscommon::StreamSlice::new(
+                        &mut disk,
+                        gpt[1].starting_lba * SECTOR_SIZE,
+                        gpt[1].ending_lba * SECTOR_SIZE,
+                    )?;
+                    let fs = fatfs::FileSystem::new(partition, fatfs::FsOptions::new())?;
+                    for entry in fs.root_dir().iter() {
+                        let Ok(entry) = entry else {
+                            tracing::warn!(?entry, "failed to read entry in guest crash dump disk");
+                            continue;
+                        };
+                        if !entry.is_file() {
+                            tracing::warn!(
+                                ?entry,
+                                "skipping non-file entry in guest crash dump disk"
+                            );
+                            continue;
+                        }
+                        logger.write_attachment(&entry.file_name(), entry.to_file())?;
+                    }
+                    Ok(())
+                },
+            ));
+        }
+
+        if let Some(disk) = disk {
+            self.add_vmbus_drive(
+                Drive::new(Some(Disk::Temporary(disk)), false),
+                &PETRI_SCSI_VTL0_CONTROLLER,
+                Some(PETRI_SCSI_CRASH_LUN),
+            )
+        } else {
+            self
+        }
+    }
+
+    fn add_agent_disks(self) -> Self {
+        self.add_agent_disk_inner(Vtl::Vtl0)
+            .add_agent_disk_inner(Vtl::Vtl2)
+    }
+
+    fn add_agent_disk_inner(mut self, target_vtl: Vtl) -> Self {
+        let (agent_image, controller_id) = match target_vtl {
+            Vtl::Vtl0 => (self.agent_image.as_ref(), PETRI_SCSI_VTL0_CONTROLLER),
+            Vtl::Vtl1 => panic!("no VTL1 agent disk"),
+            Vtl::Vtl2 => (
+                self.openhcl_agent_image.as_ref(),
+                PETRI_SCSI_VTL2_CONTROLLER,
+            ),
+        };
+
+        // When using pipette-as-init, the VTL0 agent disk is only needed
+        // if it carries extra files (pipette itself is in the initrd).
+        if target_vtl == Vtl::Vtl0
+            && self.uses_pipette_as_init()
+            && !agent_image.is_some_and(|i| i.has_extras())
+        {
+            return self;
+        }
+
+        let Some(agent_disk) = agent_image.and_then(|i| {
+            i.build(crate::disk_image::ImageType::Vhd)
+                .expect("failed to build agent image")
+        }) else {
+            return self;
+        };
+
+        // When VMBus is disabled, route the agent disk through PCIe NVMe
+        // instead of VMBus SCSI.
+        if self.no_vmbus {
+            self.config.pcie_nvme_drives.push(PcieNvmeDrive {
+                port_name: PETRI_PCIE_NVME_AGENT_PORT.into(),
+                nsid: PETRI_PCIE_NVME_AGENT_NSID,
+                drive: Drive::new(
+                    Some(Disk::Temporary(Arc::new(agent_disk.into_temp_path()))),
+                    false,
+                ),
+            });
+            return self;
+        }
+
+        // Ensure the storage controller exists (minimal mode doesn't
+        // add controllers upfront).
+        if !self
+            .config
+            .vmbus_storage_controllers
+            .contains_key(&controller_id)
+        {
+            self = self.add_vmbus_storage_controller(
+                &controller_id,
+                target_vtl,
+                VmbusStorageType::Scsi,
+            );
+        }
+
+        self.add_vmbus_drive(
+            Drive::new(
+                Some(Disk::Temporary(Arc::new(agent_disk.into_temp_path()))),
+                false,
+            ),
+            &controller_id,
+            Some(PETRI_SCSI_PIPETTE_LUN),
+        )
+    }
+
+    fn add_boot_disk(mut self) -> Self {
+        if self.boot_device_type.requires_vtl2() && !self.is_openhcl() {
+            panic!("boot device type {:?} requires vtl2", self.boot_device_type);
+        }
+
+        if self.no_vmbus && self.boot_device_type.requires_vmbus() {
+            panic!(
+                "boot device type {:?} requires vmbus, but vmbus is disabled; \
+                 use with_boot_device_type(BootDeviceType::PcieNvme) or similar",
+                self.boot_device_type
+            );
+        }
+
+        if self.boot_device_type.requires_uefi_vpci_boot() {
+            self.config
+                .firmware
+                .uefi_config_mut()
+                .expect("UEFI vPCI boot support requires UEFI firmware")
+                .enable_vpci_boot = true;
+        }
+
+        if let Some(boot_drive) = self.config.firmware.boot_drive() {
+            match self.boot_device_type {
+                BootDeviceType::None => unreachable!(),
+                BootDeviceType::Ide => self.add_ide_drive(
+                    boot_drive,
+                    PETRI_IDE_BOOT_CONTROLLER_NUMBER,
+                    PETRI_IDE_BOOT_LUN,
+                ),
+                BootDeviceType::IdeViaScsi => self
+                    .add_vmbus_drive(
+                        boot_drive,
+                        &PETRI_SCSI_VTL2_CONTROLLER,
+                        Some(PETRI_SCSI_BOOT_LUN),
+                    )
+                    .add_vtl2_storage_controller(
+                        Vtl2StorageControllerBuilder::new(ControllerType::Ide)
+                            .with_instance_id(PETRI_IDE_BOOT_CONTROLLER)
+                            .add_lun(
+                                Vtl2LunBuilder::disk()
+                                    .with_channel(PETRI_IDE_BOOT_CONTROLLER_NUMBER)
+                                    .with_location(PETRI_IDE_BOOT_LUN as u32)
+                                    .with_physical_device(Vtl2StorageBackingDeviceBuilder::new(
+                                        ControllerType::Scsi,
+                                        PETRI_SCSI_VTL2_CONTROLLER,
+                                        PETRI_SCSI_BOOT_LUN,
+                                    )),
+                            )
+                            .build(),
+                    ),
+                BootDeviceType::IdeViaNvme => todo!(),
+                BootDeviceType::Scsi => self.add_vmbus_drive(
+                    boot_drive,
+                    &PETRI_SCSI_VTL0_CONTROLLER,
+                    Some(PETRI_SCSI_BOOT_LUN),
+                ),
+                BootDeviceType::ScsiViaScsi => self
+                    .add_vmbus_drive(
+                        boot_drive,
+                        &PETRI_SCSI_VTL2_CONTROLLER,
+                        Some(PETRI_SCSI_BOOT_LUN),
+                    )
+                    .add_vtl2_storage_controller(
+                        Vtl2StorageControllerBuilder::new(ControllerType::Scsi)
+                            .with_instance_id(PETRI_SCSI_VTL0_VIA_VTL2_CONTROLLER)
+                            .add_lun(
+                                Vtl2LunBuilder::disk()
+                                    .with_location(PETRI_SCSI_BOOT_LUN)
+                                    .with_physical_device(Vtl2StorageBackingDeviceBuilder::new(
+                                        ControllerType::Scsi,
+                                        PETRI_SCSI_VTL2_CONTROLLER,
+                                        PETRI_SCSI_BOOT_LUN,
+                                    )),
+                            )
+                            .build(),
+                    ),
+                BootDeviceType::ScsiViaNvme => self
+                    .add_vmbus_storage_controller(
+                        &PETRI_NVME_BOOT_VTL2_CONTROLLER,
+                        Vtl::Vtl2,
+                        VmbusStorageType::Nvme,
+                    )
+                    .add_vmbus_drive(
+                        boot_drive,
+                        &PETRI_NVME_BOOT_VTL2_CONTROLLER,
+                        Some(PETRI_NVME_BOOT_NSID),
+                    )
+                    .add_vtl2_storage_controller(
+                        Vtl2StorageControllerBuilder::new(ControllerType::Scsi)
+                            .with_instance_id(PETRI_SCSI_VTL0_VIA_VTL2_CONTROLLER)
+                            .add_lun(
+                                Vtl2LunBuilder::disk()
+                                    .with_location(PETRI_SCSI_BOOT_LUN)
+                                    .with_physical_device(Vtl2StorageBackingDeviceBuilder::new(
+                                        ControllerType::Nvme,
+                                        PETRI_NVME_BOOT_VTL2_CONTROLLER,
+                                        PETRI_NVME_BOOT_NSID,
+                                    )),
+                            )
+                            .build(),
+                    ),
+                BootDeviceType::Nvme => self
+                    .add_vmbus_storage_controller(
+                        &PETRI_NVME_BOOT_VTL0_CONTROLLER,
+                        Vtl::Vtl0,
+                        VmbusStorageType::Nvme,
+                    )
+                    .add_vmbus_drive(
+                        boot_drive,
+                        &PETRI_NVME_BOOT_VTL0_CONTROLLER,
+                        Some(PETRI_NVME_BOOT_NSID),
+                    ),
+                BootDeviceType::NvmeViaScsi => todo!(),
+                BootDeviceType::NvmeViaNvme => todo!(),
+                BootDeviceType::PcieNvme => {
+                    let port_name = self
+                        .pcie_boot_port
+                        .clone()
+                        .unwrap_or_else(|| "s0rc0rp0".into());
+                    self.config.pcie_nvme_drives.push(PcieNvmeDrive {
+                        port_name,
+                        nsid: 1,
+                        drive: boot_drive,
+                    });
+                    self
+                }
+                BootDeviceType::PcieVirtioBlk => {
+                    self.config.pcie_virtio_blk_drives.push(PcieVirtioBlkDrive {
+                        port_name: "s0rc0rp0".into(),
+                        drive: boot_drive,
+                    });
+                    self
+                }
+            }
+        } else {
+            self
+        }
+    }
+
+    /// Whether the VTL0 agent disk will actually be added.
+    ///
+    /// False when using pipette-as-init with no extra files (pipette is
+    /// in the initrd, so the CIDATA disk isn't needed).
+    fn has_agent_disk(&self) -> bool {
+        if self.uses_pipette_as_init() {
+            self.agent_image.as_ref().is_some_and(|i| i.has_extras())
+        } else {
+            self.agent_image.is_some()
+        }
+    }
+
+    /// Get properties about the vm for convenience
+    pub fn properties(&self) -> PetriVmProperties {
+        PetriVmProperties {
+            is_openhcl: self.config.firmware.is_openhcl(),
+            is_isolated: self.config.firmware.isolation().is_some(),
+            is_pcat: self.config.firmware.is_pcat(),
+            is_linux_direct: self.config.firmware.is_linux_direct(),
+            using_vtl0_pipette: self.using_vtl0_pipette(),
+            using_vpci: self.boot_device_type.requires_vpci_boot(),
+            os_flavor: self.config.firmware.os_flavor(),
+            minimal_mode: self.minimal_mode,
+            uses_pipette_as_init: self.uses_pipette_as_init(),
+            enable_serial: self.enable_serial,
+            has_agent_disk: self.has_agent_disk(),
+            use_virtio_vsock: self.use_virtio_vsock,
+            #[cfg(target_os = "linux")]
+            vhost_vsock_guest_cid: self.vhost_vsock_guest_cid,
+            no_vmbus: self.no_vmbus,
+            no_hv: self.no_hv,
+        }
+    }
+
+    /// Returns the kernel and initrd paths for a direct-boot Linux VM.
+    pub fn linux_direct_boot_files(&self) -> Option<(&Path, &Path)> {
+        match &self.config.firmware {
+            Firmware::LinuxDirect { kernel, initrd } => {
+                Some((kernel.get(), initrd.as_ref()?.get()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether pipette will run as PID 1 init in the initrd.
+    ///
+    /// True for non-OpenHCL Linux direct boot when a pipette binary is
+    /// available. Pipette is injected into the initrd via CPIO and set
+    /// as `rdinit=/pipette`.
+    fn uses_pipette_as_init(&self) -> bool {
+        self.config.firmware.is_linux_direct()
+            && !self.config.firmware.is_openhcl()
+            && microvm::uses_pipette_as_init(self.config.machine_profile)
+            && self.pipette_binary.is_some()
+    }
+
+    /// Whether this VM is using pipette in VTL0
+    pub fn using_vtl0_pipette(&self) -> bool {
+        self.uses_pipette_as_init()
+            || self
+                .agent_image
+                .as_ref()
+                .is_some_and(|x| x.contains_pipette())
+    }
+
+    /// Build and run the VM, then wait for the VM to emit the expected boot
+    /// event (if configured). Does not configure and start pipette. Should
+    /// only be used for testing platforms that pipette does not support.
+    pub async fn run_without_agent(self) -> anyhow::Result<PetriVm<T>> {
+        self.run_core().await
+    }
+
+    /// Build and run the VM, then wait for the VM to emit the expected boot
+    /// event (if configured). Launches pipette and returns a client to it.
+    pub async fn run(self) -> anyhow::Result<(PetriVm<T>, PipetteClient)> {
+        assert!(self.using_vtl0_pipette());
+
+        let mut vm = self.run_core().await?;
+        let client = vm.wait_for_agent().await?;
+        Ok((vm, client))
+    }
+
+    async fn run_core(mut self) -> anyhow::Result<PetriVm<T>> {
+        // Add the boot disk now to allow the test to modify the boot type
+        // Add the agent disks now to allow the test to add custom files
+        self = self.add_boot_disk().add_agent_disks();
+
+        // Auto-prepare the initrd with pipette injected if needed.
+        // This centralizes the injection logic so backends only ever
+        // receive a prebuilt_initrd path.
+        if self.uses_pipette_as_init() && self.resources.prebuilt_initrd.is_none() {
+            self.resources.prebuilt_initrd = Some(self.prepare_initrd()?);
+        }
+
+        tracing::debug!(builder = ?self);
+
+        let arch = self.config.arch;
+        let expect_reset = self.expect_reset();
+        let properties = self.properties();
+
+        let (mut runtime, config) = self
+            .backend
+            .run(
+                self.config,
+                self.modify_vmm_config,
+                &self.resources,
+                properties,
+            )
+            .await?;
+        let openhcl_diag_handler = runtime.openhcl_diag();
+        let watchdog_tasks =
+            Self::start_watchdog_tasks(&self.resources, &mut runtime, self.enable_screenshots)?;
+
+        let mut vm = PetriVm {
+            runtime: PetriVmRuntimeGuard {
+                runtime: Some(runtime),
+                driver: self.resources.driver.clone(),
+                log_source: self.resources.log_source.clone(),
+                capture_inspect_on_drop: self.capture_inspect_on_failure,
+            },
+            resources: self.resources,
+            watchdog_tasks,
+            openhcl_diag_handler,
+
+            arch,
+            guest_quirks: self.guest_quirks,
+            vmm_quirks: self.vmm_quirks,
+            expected_boot_event: self.expected_boot_event,
+
+            config,
+        };
+
+        if expect_reset {
+            vm.wait_for_reset_core().await?;
+        }
+
+        vm.wait_for_expected_boot_event().await?;
+
+        Ok(vm)
+    }
+
+    fn expect_reset(&self) -> bool {
+        self.override_expect_reset
+            || matches!(
+                (
+                    self.guest_quirks.initial_reboot,
+                    self.expected_boot_event,
+                    &self.config.firmware,
+                    &self.config.tpm,
+                ),
+                (
+                    Some(InitialRebootCondition::Always),
+                    Some(FirmwareEvent::BootSuccess | FirmwareEvent::BootAttempt),
+                    _,
+                    _,
+                ) | (
+                    Some(InitialRebootCondition::WithTpm),
+                    Some(FirmwareEvent::BootSuccess | FirmwareEvent::BootAttempt),
+                    _,
+                    Some(_),
+                )
+            )
+    }
+
+    fn start_watchdog_tasks(
+        resources: &PetriVmResources,
+        runtime: &mut T::VmRuntime,
+        enable_screenshots: bool,
+    ) -> anyhow::Result<Vec<Task<()>>> {
+        let mut tasks = Vec::new();
+
+        {
+            const TIMEOUT_DURATION_MINUTES: u64 = 10;
+            const TIMER_DURATION: Duration = Duration::from_secs(TIMEOUT_DURATION_MINUTES * 60);
+
+            // The panic unwinds out of the task pool, which drops the VM and
+            // triggers the same inspect capture as any other failure.
+            let driver = resources.driver.clone();
+            tasks.push(resources.driver.spawn("timer-watchdog", async move {
+                PolledTimer::new(&driver).sleep(TIMER_DURATION).await;
+                tracing::error!(
+                    "Test timeout reached after {TIMEOUT_DURATION_MINUTES} minutes, aborting."
+                );
+                panic!("Test timed out");
+            }));
+        }
+
+        if enable_screenshots {
+            if let Some(mut framebuffer_access) = runtime.take_framebuffer_access() {
+                let mut timer = PolledTimer::new(&resources.driver);
+                let log_source = resources.log_source.clone();
+
+                tasks.push(
+                    resources
+                        .driver
+                        .spawn("petri-watchdog-screenshot", async move {
+                            let mut image = Vec::new();
+                            let mut last_image = Vec::new();
+                            loop {
+                                timer.sleep(Duration::from_secs(2)).await;
+                                tracing::trace!("Taking screenshot.");
+
+                                let VmScreenshotMeta {
+                                    color,
+                                    width,
+                                    height,
+                                } = match framebuffer_access.screenshot(&mut image).await {
+                                    Ok(Some(meta)) => meta,
+                                    Ok(None) => {
+                                        tracing::debug!("VM off, skipping screenshot.");
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(?e, "Failed to take screenshot");
+                                        continue;
+                                    }
+                                };
+
+                                if image == last_image {
+                                    tracing::debug!(
+                                        "No change in framebuffer, skipping screenshot."
+                                    );
+                                    continue;
+                                }
+
+                                let r = log_source.create_attachment("screenshot.png").and_then(
+                                    |mut f| {
+                                        image::write_buffer_with_format(
+                                            &mut f,
+                                            &image,
+                                            width.into(),
+                                            height.into(),
+                                            color,
+                                            image::ImageFormat::Png,
+                                        )
+                                        .map_err(Into::into)
+                                    },
+                                );
+
+                                if let Err(e) = r {
+                                    tracing::error!(?e, "Failed to save screenshot");
+                                } else {
+                                    tracing::info!("Screenshot saved.");
+                                }
+
+                                std::mem::swap(&mut image, &mut last_image);
+                            }
+                        }),
+                );
+            }
+        }
+
+        Ok(tasks)
+    }
+
+    /// Configure the test to expect a boot failure from the VM.
+    /// Useful for negative tests.
+    pub fn with_expect_boot_failure(mut self) -> Self {
+        self.expected_boot_event = Some(FirmwareEvent::BootFailed);
+        self
+    }
+
+    /// Configure the test to not expect any boot event.
+    /// Useful for tests that do not boot a VTL0 guest.
+    pub fn with_expect_no_boot_event(mut self) -> Self {
+        self.expected_boot_event = None;
+        self
+    }
+
+    /// Allow the VM to reset once at the beginning of the test. Should only be
+    /// used if you are using a special VM configuration that causes the guest
+    /// to reboot when it usually wouldn't.
+    pub fn with_expect_reset(mut self) -> Self {
+        self.override_expect_reset = true;
+        self
+    }
+
+    /// Set the VM to enable secure boot and inject the templates per OS flavor.
+    pub fn with_secure_boot(mut self) -> Self {
+        self.config
+            .firmware
+            .uefi_config_mut()
+            .expect("Secure boot is only supported for UEFI firmware.")
+            .secure_boot_enabled = true;
+
+        match self.os_flavor() {
+            OsFlavor::Windows => self.with_windows_secure_boot_template(),
+            OsFlavor::Linux => self.with_uefi_ca_secure_boot_template(),
+            _ => panic!(
+                "Secure boot unsupported for OS flavor {:?}",
+                self.os_flavor()
+            ),
+        }
+    }
+
+    /// Inject Windows secure boot templates into the VM's UEFI.
+    pub fn with_windows_secure_boot_template(mut self) -> Self {
+        self.config
+            .firmware
+            .uefi_config_mut()
+            .expect("Secure boot is only supported for UEFI firmware.")
+            .secure_boot_template = Some(SecureBootTemplate::MicrosoftWindows);
+        self
+    }
+
+    /// Inject UEFI CA secure boot templates into the VM's UEFI.
+    pub fn with_uefi_ca_secure_boot_template(mut self) -> Self {
+        self.config
+            .firmware
+            .uefi_config_mut()
+            .expect("Secure boot is only supported for UEFI firmware.")
+            .secure_boot_template = Some(SecureBootTemplate::MicrosoftUefiCertificateAuthority);
+        self
+    }
+
+    /// Apply a custom UEFI variable delta encoded as JSON.
+    pub fn with_custom_uefi_json(mut self, json: impl Into<Vec<u8>>) -> Self {
+        self.config
+            .firmware
+            .uefi_config_mut()
+            .expect("Custom UEFI variables are only supported for UEFI firmware.")
+            .custom_uefi_json = Some(json.into());
+        self
+    }
+
+    /// Set the VM to use the specified processor topology.
+    pub fn with_processor_topology(mut self, topology: ProcessorTopology) -> Self {
+        self.config.proc_topology = topology;
+        self
+    }
+
+    /// Set the VM to use the specified memory config.
+    pub fn with_memory(mut self, memory: MemoryConfig) -> Self {
+        self.config.memory = memory;
+        self
+    }
+
+    /// Sets a custom OpenHCL IGVM VTL2 address type. This controls the behavior
+    /// of where VTL2 is placed in address space, and also the total size of memory
+    /// allocated for VTL2. VTL2 start will fail if `address_type` is specified
+    /// and leads to the loader allocating less memory than what is in the IGVM file.
+    pub fn with_vtl2_base_address_type(mut self, address_type: Vtl2BaseAddressType) -> Self {
+        self.config
+            .firmware
+            .openhcl_config_mut()
+            .expect("OpenHCL firmware is required to set custom VTL2 address type.")
+            .vtl2_base_address_type = Some(address_type);
+        self
+    }
+
+    /// Sets a custom OpenHCL IGVM file to use.
+    pub fn with_custom_openhcl(mut self, artifact: ResolvedArtifact<impl IsOpenhclIgvm>) -> Self {
+        match &mut self.config.firmware {
+            Firmware::OpenhclLinuxDirect { igvm_path, .. }
+            | Firmware::OpenhclPcat { igvm_path, .. }
+            | Firmware::OpenhclUefi { igvm_path, .. } => {
+                *igvm_path = artifact.erase();
+            }
+            Firmware::LinuxDirect { .. } | Firmware::Uefi { .. } | Firmware::Pcat { .. } => {
+                panic!("Custom OpenHCL is only supported for OpenHCL firmware.")
+            }
+        }
+        self
+    }
+
+    /// Append additional command line arguments to pass to the paravisor.
+    pub fn with_openhcl_command_line(mut self, additional_command_line: &str) -> Self {
+        append_cmdline(
+            &mut self
+                .config
+                .firmware
+                .openhcl_config_mut()
+                .expect("OpenHCL command line is only supported for OpenHCL firmware.")
+                .custom_command_line,
+            additional_command_line,
+        );
+        self
+    }
+
+    /// Configure whether OpenHCL enables MANA keepalive at boot.
+    pub fn with_mana_keepalive(mut self, enable: bool) -> Self {
+        self.config
+            .firmware
+            .openhcl_config_mut()
+            .expect("MANA keepalive is only supported for OpenHCL firmware.")
+            .enable_mana_keepalive = enable;
+        self
+    }
+
+    /// Enable confidential filtering, even if the VM is not confidential.
+    pub fn with_confidential_filtering(self) -> Self {
+        if !self.config.firmware.is_openhcl() {
+            panic!("Confidential filtering is only supported for OpenHCL");
+        }
+        self.with_openhcl_command_line(&format!(
+            "{}=1 {}=0",
+            underhill_confidentiality::OPENHCL_CONFIDENTIAL_ENV_VAR_NAME,
+            underhill_confidentiality::OPENHCL_CONFIDENTIAL_DEBUG_ENV_VAR_NAME
+        ))
+    }
+
+    /// Sets the command line parameters passed to OpenHCL related to logging.
+    pub fn with_openhcl_log_levels(mut self, levels: OpenvmmLogConfig) -> Self {
+        self.config
+            .firmware
+            .openhcl_config_mut()
+            .expect("OpenHCL firmware is required to set custom OpenHCL log levels.")
+            .log_levels = levels;
+        self
+    }
+
+    /// Sets the log levels for the host OpenVMM process.
+    /// DEVNOTE: In the future, this could be generalized for both HyperV and OpenVMM.
+    /// For now, this is only implemented for OpenVMM.
+    pub fn with_host_log_levels(mut self, levels: OpenvmmLogConfig) -> Self {
+        if let OpenvmmLogConfig::Custom(ref custom_levels) = levels {
+            for key in custom_levels.keys() {
+                if !["OPENVMM_LOG", "OPENVMM_SHOW_SPANS"].contains(&key.as_str()) {
+                    panic!("Unsupported OpenVMM log level key: {}", key);
+                }
+            }
+        }
+
+        self.config.host_log_levels = Some(levels.clone());
+        self
+    }
+
+    /// Adds a file to the VM's pipette agent image.
+    pub fn with_agent_file(mut self, name: &str, artifact: ResolvedArtifact) -> Self {
+        self.agent_image
+            .as_mut()
+            .expect("no guest pipette")
+            .add_file(name, artifact);
+        self
+    }
+
+    /// Adds a file to the paravisor's pipette agent image.
+    pub fn with_openhcl_agent_file(mut self, name: &str, artifact: ResolvedArtifact) -> Self {
+        self.openhcl_agent_image
+            .as_mut()
+            .expect("no openhcl pipette")
+            .add_file(name, artifact);
+        self
+    }
+
+    /// Sets whether UEFI frontpage is enabled.
+    pub fn with_uefi_frontpage(mut self, enable: bool) -> Self {
+        self.config
+            .firmware
+            .uefi_config_mut()
+            .expect("UEFI frontpage is only supported for UEFI firmware.")
+            .disable_frontpage = !enable;
+        self
+    }
+
+    /// Sets the UEFI diagnostics log level filter.
+    ///
+    /// By default only ERROR and WARN level entries are forwarded to the
+    /// host tracing infrastructure. Use this to also surface INFO (or all)
+    /// entries when a test needs to observe them.
+    pub fn with_efi_diagnostics_log_level(mut self, level: EfiDiagnosticsLogLevel) -> Self {
+        self.config
+            .firmware
+            .uefi_config_mut()
+            .expect("EFI diagnostics log level is only supported for UEFI firmware.")
+            .efi_diagnostics_log_level = level;
+        self
+    }
+
+    /// Sets the per-period rate-limit override for UEFI diagnostics emission.
+    ///
+    /// - Not called: use the built-in defaults.
+    /// - `0`: disable rate limiting entirely (emit every entry).
+    /// - `n > 0`: use `n` as the per-period limit.
+    pub fn with_efi_diagnostics_rate_limit(mut self, limit: u32) -> Self {
+        self.config
+            .firmware
+            .uefi_config_mut()
+            .expect("EFI diagnostics rate limit is only supported for UEFI firmware.")
+            .efi_diagnostics_rate_limit = Some(limit);
+        self
+    }
+
+    /// Sets whether UEFI should always attempt a default boot.
+    pub fn with_default_boot_always_attempt(mut self, enable: bool) -> Self {
+        self.config
+            .firmware
+            .uefi_config_mut()
+            .expect("Default boot always attempt is only supported for UEFI firmware.")
+            .default_boot_always_attempt = enable;
+        self
+    }
+
+    /// Force UEFI to bounce-buffer all DMA traffic.
+    pub fn with_uefi_force_dma_bounce(mut self, enable: bool) -> Self {
+        self.config
+            .firmware
+            .uefi_config_mut()
+            .expect("force DMA bounce is only supported for UEFI firmware.")
+            .force_dma_bounce = enable;
+        self
+    }
+
+    /// Run the VM with Enable VMBus relay enabled
+    pub fn with_vmbus_redirect(mut self, enable: bool) -> Self {
+        self.config
+            .firmware
+            .openhcl_config_mut()
+            .expect("VMBus redirection is only supported for OpenHCL firmware.")
+            .vmbus_redirect = enable;
+        self
+    }
+
+    /// Enable guest hibernation support.
+    ///
+    /// Applies to any firmware type: for OpenHCL this sets the DPS
+    /// `enable_hibernation` flag; for OpenVMM UEFI/PCAT firmware it enables the
+    /// firmware's hibernation support.
+    pub fn with_hibernation_enabled(mut self, enable: bool) -> Self {
+        self.config.hibernation_enabled = enable;
+        self
+    }
+
+    /// Enable the IPMI KCS interface for an OpenHCL UEFI VM.
+    pub fn with_ipmi(mut self, enable: bool) -> Self {
+        self.config.ipmi_enabled = enable;
+        self
+    }
+
+    /// Specify the guest state lifetime for the VM
+    pub fn with_guest_state_lifetime(
+        mut self,
+        guest_state_lifetime: PetriGuestStateLifetime,
+    ) -> Self {
+        let disk = match self.config.vmgs {
+            PetriVmgsResource::Disk(disk)
+            | PetriVmgsResource::ReprovisionOnFailure(disk)
+            | PetriVmgsResource::Reprovision(disk) => disk,
+            PetriVmgsResource::Ephemeral => PetriVmgsDisk::default(),
+        };
+        self.config.vmgs = match guest_state_lifetime {
+            PetriGuestStateLifetime::Disk => PetriVmgsResource::Disk(disk),
+            PetriGuestStateLifetime::ReprovisionOnFailure => {
+                PetriVmgsResource::ReprovisionOnFailure(disk)
+            }
+            PetriGuestStateLifetime::Reprovision => PetriVmgsResource::Reprovision(disk),
+            PetriGuestStateLifetime::Ephemeral => {
+                if !matches!(disk.disk, Disk::Memory(_)) {
+                    panic!("attempted to use ephemeral guest state after specifying backing vmgs")
+                }
+                PetriVmgsResource::Ephemeral
+            }
+        };
+        self
+    }
+
+    /// Specify the guest state encryption policy for the VM
+    pub fn with_guest_state_encryption(mut self, policy: GuestStateEncryptionPolicy) -> Self {
+        match &mut self.config.vmgs {
+            PetriVmgsResource::Disk(vmgs)
+            | PetriVmgsResource::ReprovisionOnFailure(vmgs)
+            | PetriVmgsResource::Reprovision(vmgs) => {
+                vmgs.encryption_policy = policy;
+            }
+            PetriVmgsResource::Ephemeral => {
+                panic!("attempted to encrypt ephemeral guest state")
+            }
+        }
+        self
+    }
+
+    /// Use the specified backing VMGS file
+    pub fn with_initial_vmgs(self, disk: ResolvedArtifact<impl IsTestVmgs>) -> Self {
+        self.with_backing_vmgs(Disk::Differencing(DiskPath::Local(disk.into())))
+    }
+
+    /// Use the specified backing VMGS file
+    pub fn with_persistent_vmgs(self, disk: impl AsRef<Path>) -> Self {
+        self.with_backing_vmgs(Disk::Persistent(disk.as_ref().to_path_buf()))
+    }
+
+    fn with_backing_vmgs(mut self, disk: Disk) -> Self {
+        match &mut self.config.vmgs {
+            PetriVmgsResource::Disk(vmgs)
+            | PetriVmgsResource::ReprovisionOnFailure(vmgs)
+            | PetriVmgsResource::Reprovision(vmgs) => {
+                if !matches!(vmgs.disk, Disk::Memory(_)) {
+                    panic!("already specified a backing vmgs file");
+                }
+                vmgs.disk = disk;
+            }
+            PetriVmgsResource::Ephemeral => {
+                panic!("attempted to specify a backing vmgs with ephemeral guest state")
+            }
+        }
+        self
+    }
+
+    /// Set the boot device type for the VM.
+    ///
+    /// This overrides the default, which is determined by the firmware type.
+    pub fn with_boot_device_type(mut self, boot: BootDeviceType) -> Self {
+        self.boot_device_type = boot;
+        self
+    }
+
+    /// Override the PCIe root port that the boot NVMe controller is placed on
+    /// when using [`BootDeviceType::PcieNvme`].
+    ///
+    /// The named port must exist in the PCIe topology added via the backend's
+    /// `with_pcie_root_topology`. Defaults to `s0rc0rp0`.
+    pub fn with_pcie_boot_port(mut self, port_name: &str) -> Self {
+        self.pcie_boot_port = Some(port_name.to_string());
+        self
+    }
+
+    /// Enable the TPM for the VM.
+    pub fn with_tpm(mut self, enable: bool) -> Self {
+        if enable {
+            self.config.tpm.get_or_insert_default();
+        } else {
+            self.config.tpm = None;
+        }
+        self
+    }
+
+    /// Enable or disable the TPM state persistence for the VM.
+    pub fn with_tpm_state_persistence(mut self, tpm_state_persistence: bool) -> Self {
+        self.config
+            .tpm
+            .as_mut()
+            .expect("TPM persistence requires a TPM")
+            .no_persistent_secrets = !tpm_state_persistence;
+        self
+    }
+
+    /// Set the hardware sealing policy for the VM's TPM.
+    pub fn with_hardware_sealing_policy(mut self, policy: PetriHardwareSealingPolicy) -> Self {
+        self.config
+            .tpm
+            .as_mut()
+            .expect("hardware sealing policy requires a TPM")
+            .hardware_sealing_policy = policy;
+        self
+    }
+
+    /// Select which TPM reference implementation version the VM's TPM runs.
+    pub fn with_tpm_version(mut self, version: PetriTpmVersion) -> Self {
+        self.config
+            .tpm
+            .as_mut()
+            .expect("TPM version requires a TPM")
+            .version = version;
+        self
+    }
+
+    /// Add custom VTL 2 settings.
+    // TODO: At some point we want to replace uses of this with nicer with_disk,
+    // with_nic, etc. methods.
+    pub fn with_custom_vtl2_settings(
+        mut self,
+        f: impl FnOnce(&mut Vtl2Settings) + 'static + Send + Sync,
+    ) -> Self {
+        f(self
+            .config
+            .firmware
+            .vtl2_settings()
+            .expect("Custom VTL 2 settings are only supported with OpenHCL"));
+        self
+    }
+
+    /// Add a storage controller to VTL2
+    pub fn add_vtl2_storage_controller(self, controller: StorageController) -> Self {
+        self.with_custom_vtl2_settings(move |v| {
+            v.dynamic
+                .as_mut()
+                .unwrap()
+                .storage_controllers
+                .push(controller)
+        })
+    }
+
+    /// Add an additional SCSI controller to the VM.
+    pub fn add_vmbus_storage_controller(
+        mut self,
+        id: &Guid,
+        target_vtl: Vtl,
+        controller_type: VmbusStorageType,
+    ) -> Self {
+        if self
+            .config
+            .vmbus_storage_controllers
+            .insert(
+                *id,
+                VmbusStorageController::new(target_vtl, controller_type),
+            )
+            .is_some()
+        {
+            panic!("storage controller {id} already existed");
+        }
+        self
+    }
+
+    /// Add a VMBus disk drive to the VM
+    pub fn add_vmbus_drive(
+        mut self,
+        drive: Drive,
+        controller_id: &Guid,
+        controller_location: Option<u32>,
+    ) -> Self {
+        let controller = self
+            .config
+            .vmbus_storage_controllers
+            .get_mut(controller_id)
+            .unwrap_or_else(|| panic!("storage controller {controller_id} does not exist"));
+
+        _ = controller.set_drive(controller_location, drive, false);
+
+        self
+    }
+
+    /// Add a VMBus disk drive to the VM
+    pub fn add_ide_drive(
+        mut self,
+        drive: Drive,
+        controller_number: u32,
+        controller_location: u8,
+    ) -> Self {
+        self.config
+            .firmware
+            .ide_controllers_mut()
+            .expect("Host IDE requires PCAT with no HCL")[controller_number as usize]
+            [controller_location as usize] = Some(drive);
+
+        self
+    }
+
+    /// Add a physical NVMe device to the VM
+    pub fn add_physical_nvme_device(mut self, vsid: Guid, device: PhysicalNvmeDevice) -> Self {
+        if self
+            .config
+            .physical_nvme_devices
+            .insert(vsid, device)
+            .is_some()
+        {
+            panic!("physical NVMe device {vsid} already existed");
+        }
+        self
+    }
+
+    /// Get VM's guest OS flavor
+    pub fn os_flavor(&self) -> OsFlavor {
+        self.config.firmware.os_flavor()
+    }
+
+    /// Get whether the VM will use OpenHCL
+    pub fn is_openhcl(&self) -> bool {
+        self.config.firmware.is_openhcl()
+    }
+
+    /// Get the isolation type of the VM
+    pub fn isolation(&self) -> Option<IsolationType> {
+        self.config.firmware.isolation()
+    }
+
+    /// Get the machine architecture
+    pub fn arch(&self) -> MachineArch {
+        self.config.arch
+    }
+
+    /// Get the log source for creating additional log files.
+    pub fn log_source(&self) -> &PetriLogSource {
+        &self.resources.log_source
+    }
+
+    /// Get the default OpenHCL servicing flags for this config
+    pub fn default_servicing_flags(&self) -> OpenHclServicingFlags {
+        T::default_servicing_flags()
+    }
+
+    /// Get the backend-specific config builder
+    pub fn modify_backend(
+        mut self,
+        f: impl FnOnce(T::VmmConfig) -> T::VmmConfig + 'static + Send,
+    ) -> Self {
+        if self.modify_vmm_config.is_some() {
+            panic!("only one modify_backend allowed");
+        }
+        self.modify_vmm_config = Some(ModifyFn(Box::new(f)));
+        self
+    }
+}
+
+impl<T: PetriVmmBackend> PetriVm<T> {
+    /// Immediately tear down the VM.
+    pub async fn teardown(mut self) -> anyhow::Result<()> {
+        tracing::info!("Tearing down VM...");
+        self.runtime.take_for_teardown().teardown().await
+    }
+
+    /// Wait for the VM to halt, returning the reason for the halt.
+    pub async fn wait_for_halt(&mut self) -> anyhow::Result<PetriHaltReasonDetail> {
+        tracing::info!("Waiting for VM to halt...");
+        let halt_reason = self.runtime.wait_for_halt(false).await?;
+        tracing::info!("VM halted: {halt_reason:?}. Cancelling watchdogs...");
+        futures::future::join_all(self.watchdog_tasks.drain(..).map(|t| t.cancel())).await;
+        Ok(halt_reason)
+    }
+
+    /// Wait for the VM to cleanly shutdown.
+    pub async fn wait_for_clean_shutdown(&mut self) -> anyhow::Result<()> {
+        let halt_reason = self.wait_for_halt().await?;
+        if halt_reason.reason != PetriHaltReason::PowerOff {
+            anyhow::bail!("Expected PowerOff, got {halt_reason:?}");
+        }
+        tracing::info!("VM was cleanly powered off and torn down.");
+        Ok(())
+    }
+
+    /// Wait for the VM to halt, returning the reason for the halt,
+    /// and tear down the VM.
+    pub async fn wait_for_teardown(mut self) -> anyhow::Result<PetriHaltReasonDetail> {
+        let halt_reason = self.wait_for_halt().await?;
+        self.teardown().await?;
+        Ok(halt_reason)
+    }
+
+    /// Wait for the VM to cleanly shutdown and tear down the VM.
+    pub async fn wait_for_clean_teardown(mut self) -> anyhow::Result<()> {
+        self.wait_for_clean_shutdown().await?;
+        self.teardown().await
+    }
+
+    /// Wait for the VM to reset. Does not wait for pipette.
+    pub async fn wait_for_reset_no_agent(&mut self) -> anyhow::Result<()> {
+        self.wait_for_reset_core().await?;
+        self.wait_for_expected_boot_event().await?;
+        Ok(())
+    }
+
+    /// Wait for the VM to reset and pipette to connect.
+    pub async fn wait_for_reset(&mut self) -> anyhow::Result<PipetteClient> {
+        self.wait_for_reset_no_agent().await?;
+        self.wait_for_agent().await
+    }
+
+    async fn wait_for_reset_core(&mut self) -> anyhow::Result<()> {
+        tracing::info!("Waiting for VM to reset...");
+        let halt_reason = self.runtime.wait_for_halt(true).await?;
+        if halt_reason.reason != PetriHaltReason::Reset {
+            anyhow::bail!("Expected reset, got {halt_reason:?}");
+        }
+        tracing::info!("VM reset.");
+        Ok(())
+    }
+
+    /// Invoke Inspect on the running OpenHCL instance.
+    ///
+    /// IMPORTANT: As mentioned in the Guide, inspect output is *not* guaranteed
+    /// to be stable. Use this to test that components in OpenHCL are working as
+    /// you would expect. But, if you are adding a test simply to verify that
+    /// the inspect output as some other tool depends on it, then that is
+    /// incorrect.
+    ///
+    /// - `timeout` is enforced on the client side
+    /// - `path` and `depth` are passed to the [`inspect::Inspect`] machinery.
+    pub async fn inspect_openhcl(
+        &self,
+        path: impl Into<String>,
+        depth: Option<usize>,
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<inspect::Node> {
+        self.openhcl_diag()?
+            .inspect(path.into().as_str(), depth, timeout)
+            .await
+    }
+
+    /// Invoke Update (Inspect protocol) on the running OpenHCL instance.
+    ///
+    /// IMPORTANT: As mentioned in the Guide, inspect output is *not* guaranteed
+    /// to be stable. Use this to test that components in OpenHCL are working as
+    /// you would expect. But, if you are adding a test simply to verify that
+    /// the inspect output as some other tool depends on it, then that is
+    /// incorrect.
+    ///
+    /// - `path` and `value` are passed to the [`inspect::Inspect`] machinery.
+    pub async fn inspect_update_openhcl(
+        &self,
+        path: impl Into<String>,
+        value: impl Into<String>,
+    ) -> anyhow::Result<inspect::Value> {
+        self.openhcl_diag()?
+            .inspect_update(path.into(), value.into())
+            .await
+    }
+
+    /// Test that we are able to inspect OpenHCL.
+    pub async fn test_inspect_openhcl(&mut self) -> anyhow::Result<()> {
+        self.inspect_openhcl("", None, None).await.map(|_| ())
+    }
+
+    /// Invoke Inspect on the running VMM process itself (e.g. OpenVMM),
+    /// returning the inspect tree rooted at `path` (pass `""` for the whole
+    /// tree).
+    ///
+    /// Only backends that expose an inspect interface (currently OpenVMM)
+    /// support this; other backends return an error.
+    ///
+    /// IMPORTANT: As mentioned in the Guide, inspect output is *not* guaranteed
+    /// to be stable. Use this to verify that components are working as you
+    /// expect, not to assert on output that some other tool depends on.
+    pub async fn inspect_vmm(&self, path: &str) -> anyhow::Result<inspect::Node> {
+        use anyhow::Context;
+
+        let inspector = self
+            .runtime
+            .inspector()
+            .context("this VMM backend does not support inspect")?;
+        inspector.inspect(path).await
+    }
+
+    /// Wait for VTL 2 to report that it is ready to respond to commands.
+    /// Will fail if the VM is not running OpenHCL.
+    ///
+    /// This should only be necessary if you're doing something manual. All
+    /// Petri-provided methods will wait for VTL 2 to be ready automatically.
+    pub async fn wait_for_vtl2_ready(&mut self) -> anyhow::Result<()> {
+        self.openhcl_diag()?.wait_for_vtl2().await
+    }
+
+    /// Get the kmsg stream from OpenHCL.
+    pub async fn kmsg(&self) -> anyhow::Result<diag_client::kmsg_stream::KmsgStream> {
+        self.openhcl_diag()?.kmsg().await
+    }
+
+    /// Gets a live core dump of the OpenHCL process specified by 'name' and
+    /// writes it to 'path'
+    pub async fn openhcl_core_dump(&self, name: &str, path: &Path) -> anyhow::Result<()> {
+        self.openhcl_diag()?.core_dump(name, path).await
+    }
+
+    /// Crashes the specified openhcl process
+    pub async fn openhcl_crash(&self, name: &str) -> anyhow::Result<()> {
+        self.openhcl_diag()?.crash(name).await
+    }
+
+    /// Wait for a connection from a pipette agent running in the guest.
+    /// Useful if you've rebooted the vm or are otherwise expecting a fresh connection.
+    async fn wait_for_agent(&mut self) -> anyhow::Result<PipetteClient> {
+        // As a workaround for #2470 (where the guest crashes when the pipette
+        // connection timeout expires due to a vmbus bug), wait for the shutdown
+        // IC to come online first so that we probably won't time out when
+        // connecting to the agent.
+        // TODO: remove this once the bug is fixed, since it shouldn't be
+        // necessary and a guest could in theory support pipette and not the IC
+        //
+        // This is a no-op when the shutdown IC is not configured (e.g.,
+        // no VMBus or minimal mode).
+        self.runtime.wait_for_enlightened_shutdown_ready().await?;
+        self.runtime.wait_for_agent(false).await
+    }
+
+    /// Wait for a connection from a pipette agent running in VTL 2.
+    /// Useful if you've reset VTL 2 or are otherwise expecting a fresh connection.
+    /// Will fail if the VM is not running OpenHCL.
+    pub async fn wait_for_vtl2_agent(&mut self) -> anyhow::Result<PipetteClient> {
+        // VTL 2's pipette doesn't auto launch, only launch it on demand
+        self.launch_vtl2_pipette().await?;
+        self.runtime.wait_for_agent(true).await
+    }
+
+    /// Waits for an event emitted by the firmware about its boot status, and
+    /// verifies that it is the expected success value.
+    ///
+    /// * Linux Direct guests do not emit a boot event, so this method immediately returns Ok.
+    /// * PCAT guests may not emit an event depending on the PCAT version, this
+    ///   method is best effort for them.
+    async fn wait_for_expected_boot_event(&mut self) -> anyhow::Result<()> {
+        if let Some(expected_event) = self.expected_boot_event {
+            let event = self.wait_for_boot_event().await?;
+
+            anyhow::ensure!(
+                event == expected_event,
+                "Did not receive expected boot event"
+            );
+        } else {
+            tracing::warn!("Boot event not emitted for configured firmware or manually ignored.");
+        }
+
+        Ok(())
+    }
+
+    /// Waits for an event emitted by the firmware about its boot status, and
+    /// returns that status.
+    async fn wait_for_boot_event(&mut self) -> anyhow::Result<FirmwareEvent> {
+        tracing::info!("Waiting for boot event...");
+        let boot_event = loop {
+            if let Some(event) = self
+                .runtime
+                .wait_for_boot_event(self.vmm_quirks.flaky_boot)
+                .await?
+            {
+                break event;
+            }
+
+            tracing::error!("Did not get boot event in required time, resetting...");
+            if let Some(inspector) = self.runtime.inspector() {
+                collect_inspect(
+                    "vmm",
+                    Box::pin(async move { inspector.inspect("").await }),
+                    &self.resources.log_source,
+                    "timeout",
+                )
+                .await;
+            }
+
+            self.runtime.reset().await?;
+        };
+        tracing::info!("Got boot event: {boot_event:?}");
+        Ok(boot_event)
+    }
+
+    /// Wait for the Hyper-V shutdown IC to be ready and use it to instruct
+    /// the guest to shutdown.
+    pub async fn send_enlightened_shutdown(&mut self, kind: ShutdownKind) -> anyhow::Result<()> {
+        tracing::info!("Waiting for enlightened shutdown to be ready");
+        self.runtime.wait_for_enlightened_shutdown_ready().await?;
+
+        // all guests used in testing have been observed to intermittently
+        // drop shutdown requests if they are sent too soon after the shutdown
+        // ic comes online. give them a little extra time.
+        // TODO: use a different method of determining whether the VM has booted
+        // or debug and fix the shutdown IC.
+        let mut wait_time = Duration::from_secs(10);
+
+        // some guests need even more time
+        if let Some(duration) = self.guest_quirks.hyperv_shutdown_ic_sleep {
+            wait_time += duration;
+        }
+
+        tracing::info!(
+            "Shutdown IC reported ready, waiting for an extra {}s",
+            wait_time.as_secs()
+        );
+        PolledTimer::new(&self.resources.driver)
+            .sleep(wait_time)
+            .await;
+
+        tracing::info!("Sending enlightened shutdown command");
+        self.runtime.send_enlightened_shutdown(kind).await
+    }
+
+    /// Instruct the OpenHCL to restart the VTL2 paravisor. Will fail if the VM
+    /// is not running OpenHCL. Will also fail if the VM is not running.
+    pub async fn restart_openhcl(
+        &mut self,
+        new_openhcl: ResolvedArtifact<impl IsOpenhclIgvm>,
+        flags: OpenHclServicingFlags,
+    ) -> anyhow::Result<()> {
+        self.runtime
+            .restart_openhcl(&new_openhcl.erase(), flags)
+            .await
+    }
+
+    /// Update the command line parameter of the running VM that will apply on next boot.
+    /// Will fail if the VM is not using IGVM load mode.
+    pub async fn update_command_line(&mut self, command_line: &str) -> anyhow::Result<()> {
+        self.runtime.update_command_line(command_line).await
+    }
+
+    /// Hot-add a PCIe device to a named port at runtime.
+    pub async fn add_pcie_device(
+        &mut self,
+        port_name: String,
+        resource: vm_resource::Resource<vm_resource::kind::PciDeviceHandleKind>,
+    ) -> anyhow::Result<()> {
+        self.runtime.add_pcie_device(port_name, resource).await
+    }
+
+    /// Hot-remove a PCIe device from a named port at runtime.
+    pub async fn remove_pcie_device(&mut self, port_name: String) -> anyhow::Result<()> {
+        self.runtime.remove_pcie_device(port_name).await
+    }
+
+    /// Instruct the OpenHCL to save the state of the VTL2 paravisor. Will fail if the VM
+    /// is not running OpenHCL. Will also fail if the VM is not running or if this is called twice in succession
+    pub async fn save_openhcl(
+        &mut self,
+        new_openhcl: ResolvedArtifact<impl IsOpenhclIgvm>,
+        flags: OpenHclServicingFlags,
+    ) -> anyhow::Result<()> {
+        self.runtime.save_openhcl(&new_openhcl.erase(), flags).await
+    }
+
+    /// Instruct the OpenHCL to restore the state of the VTL2 paravisor. Will fail if the VM
+    /// is not running OpenHCL. Will also fail if the VM is running or if this is called without prior save
+    pub async fn restore_openhcl(&mut self) -> anyhow::Result<()> {
+        self.runtime.restore_openhcl().await
+    }
+
+    /// Get VM's guest OS flavor
+    pub fn arch(&self) -> MachineArch {
+        self.arch
+    }
+
+    /// Get the inner runtime backend to make backend-specific calls
+    pub fn backend(&mut self) -> &mut T::VmRuntime {
+        &mut self.runtime
+    }
+
+    async fn launch_vtl2_pipette(&self) -> anyhow::Result<()> {
+        tracing::debug!("Launching VTL 2 pipette...");
+
+        // Start pipette through DiagClient
+        let res = self
+            .openhcl_diag()?
+            .run_vtl2_command("sh", &["-c", "mkdir /cidata && mount LABEL=cidata /cidata"])
+            .await?;
+
+        if !res.exit_status.success() {
+            anyhow::bail!("Failed to mount VTL 2 pipette drive: {:?}", res);
+        }
+
+        let res = self
+            .openhcl_diag()?
+            .run_detached_vtl2_command("sh", &["-c", "/cidata/pipette 2>&1 | logger &"])
+            .await?;
+
+        if !res.success() {
+            anyhow::bail!("Failed to spawn VTL 2 pipette: {:?}", res);
+        }
+
+        Ok(())
+    }
+
+    fn openhcl_diag(&self) -> anyhow::Result<&OpenHclDiagHandler> {
+        if let Some(ohd) = self.openhcl_diag_handler.as_ref() {
+            Ok(ohd)
+        } else {
+            anyhow::bail!("VM is not configured with OpenHCL")
+        }
+    }
+
+    /// Get the path to the VM's guest state file
+    pub async fn get_guest_state_file(&self) -> anyhow::Result<Option<PathBuf>> {
+        self.runtime.get_guest_state_file().await
+    }
+
+    /// Modify OpenHCL VTL2 settings.
+    pub async fn modify_vtl2_settings(
+        &mut self,
+        f: impl FnOnce(&mut Vtl2Settings),
+    ) -> anyhow::Result<()> {
+        if self.openhcl_diag_handler.is_none() {
+            panic!("Custom VTL 2 settings are only supported with OpenHCL");
+        }
+        f(self
+            .config
+            .vtl2_settings
+            .get_or_insert_with(default_vtl2_settings));
+        self.runtime
+            .set_vtl2_settings(self.config.vtl2_settings.as_ref().unwrap())
+            .await
+    }
+
+    /// Get the list of storage controllers added to this VM
+    pub fn get_vmbus_storage_controllers(&self) -> &HashMap<Guid, VmbusStorageController> {
+        &self.config.vmbus_storage_controllers
+    }
+
+    /// Add or modify a VMBus disk drive
+    pub async fn set_vmbus_drive(
+        &mut self,
+        drive: Drive,
+        controller_id: &Guid,
+        controller_location: Option<u32>,
+    ) -> anyhow::Result<()> {
+        let controller = self
+            .config
+            .vmbus_storage_controllers
+            .get_mut(controller_id)
+            .unwrap_or_else(|| panic!("storage controller {controller_id} does not exist"));
+
+        let controller_location = controller.set_drive(controller_location, drive, true);
+        let disk = controller.drives.get(&controller_location).unwrap();
+
+        self.runtime
+            .set_vmbus_drive(disk, controller_id, controller_location)
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// A running VM that tests can interact with.
+#[async_trait]
+pub trait PetriVmRuntime: Send + Sync + 'static {
+    /// Interface for inspecting the VM
+    type VmInspector: PetriVmInspector;
+    /// Interface for accessing the framebuffer
+    type VmFramebufferAccess: PetriVmFramebufferAccess;
+
+    /// Cleanly tear down the VM immediately.
+    async fn teardown(self) -> anyhow::Result<()>;
+    /// Wait for the VM to halt, returning the reason for the halt. The VM
+    /// should automatically restart the VM on reset if `allow_reset` is true.
+    async fn wait_for_halt(&mut self, allow_reset: bool) -> anyhow::Result<PetriHaltReasonDetail>;
+    /// Wait for a connection from a pipette agent
+    async fn wait_for_agent(&mut self, set_high_vtl: bool) -> anyhow::Result<PipetteClient>;
+    /// Get an OpenHCL diagnostics handler for the VM
+    fn openhcl_diag(&self) -> Option<OpenHclDiagHandler>;
+    /// Waits for an event emitted by the firmware about its boot status, and
+    /// returns that status. Returns `None` if `timeout` elapsed first.
+    async fn wait_for_boot_event(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<Option<FirmwareEvent>>;
+    /// Waits for the Hyper-V shutdown IC to be ready
+    // TODO: return a receiver that will be closed when it is no longer ready.
+    async fn wait_for_enlightened_shutdown_ready(&mut self) -> anyhow::Result<()>;
+    /// Instruct the guest to shutdown via the Hyper-V shutdown IC.
+    async fn send_enlightened_shutdown(&mut self, kind: ShutdownKind) -> anyhow::Result<()>;
+    /// Instruct the OpenHCL to restart the VTL2 paravisor. Will fail if the VM
+    /// is not running OpenHCL. Will also fail if the VM is not running.
+    async fn restart_openhcl(
+        &mut self,
+        new_openhcl: &ResolvedArtifact,
+        flags: OpenHclServicingFlags,
+    ) -> anyhow::Result<()>;
+    /// Instruct the OpenHCL to save the state of the VTL2 paravisor. Will fail if the VM
+    /// is not running OpenHCL. Will also fail if the VM is not running or if this is called twice in succession
+    /// without a call to `restore_openhcl`.
+    async fn save_openhcl(
+        &mut self,
+        new_openhcl: &ResolvedArtifact,
+        flags: OpenHclServicingFlags,
+    ) -> anyhow::Result<()>;
+    /// Instruct the OpenHCL to restore the state of the VTL2 paravisor. Will fail if the VM
+    /// is not running OpenHCL. Will also fail if the VM is running or if this is called without prior save.
+    async fn restore_openhcl(&mut self) -> anyhow::Result<()>;
+    /// Update the command line parameter of the running VM that will apply on next boot.
+    /// Will fail if the VM is not using IGVM load mode.
+    async fn update_command_line(&mut self, command_line: &str) -> anyhow::Result<()>;
+    /// If the backend supports it, get an inspect interface
+    fn inspector(&self) -> Option<Self::VmInspector> {
+        None
+    }
+    /// If the backend supports it, take the screenshot interface
+    /// (subsequent calls may return None).
+    fn take_framebuffer_access(&mut self) -> Option<Self::VmFramebufferAccess> {
+        None
+    }
+    /// Issue a hard reset to the VM
+    async fn reset(&mut self) -> anyhow::Result<()>;
+    /// Get the path to the VM's guest state file
+    async fn get_guest_state_file(&self) -> anyhow::Result<Option<PathBuf>> {
+        Ok(None)
+    }
+    /// Set the OpenHCL VTL2 settings
+    async fn set_vtl2_settings(&mut self, settings: &Vtl2Settings) -> anyhow::Result<()>;
+    /// Add or modify a VMBus disk drive
+    async fn set_vmbus_drive(
+        &mut self,
+        disk: &Drive,
+        controller_id: &Guid,
+        controller_location: u32,
+    ) -> anyhow::Result<()>;
+    /// Hot-add a PCIe device to a named port at runtime.
+    async fn add_pcie_device(
+        &mut self,
+        port_name: String,
+        resource: vm_resource::Resource<vm_resource::kind::PciDeviceHandleKind>,
+    ) -> anyhow::Result<()> {
+        let _ = (port_name, resource);
+        anyhow::bail!("PCIe hotplug not supported by this backend")
+    }
+    /// Hot-remove a PCIe device from a named port at runtime.
+    async fn remove_pcie_device(&mut self, port_name: String) -> anyhow::Result<()> {
+        let _ = port_name;
+        anyhow::bail!("PCIe hotplug not supported by this backend")
+    }
+}
+
+/// Interface for getting information about the state of the VM
+#[async_trait]
+pub trait PetriVmInspector: Send + Sync + 'static {
+    /// Get information about the state of the VM at the given inspect `path`.
+    /// Pass `""` to inspect the entire tree.
+    async fn inspect(&self, path: &str) -> anyhow::Result<inspect::Node>;
+}
+
+/// Use this for the associated type if not supported
+pub struct NoPetriVmInspector;
+#[async_trait]
+impl PetriVmInspector for NoPetriVmInspector {
+    async fn inspect(&self, _path: &str) -> anyhow::Result<inspect::Node> {
+        unreachable!()
+    }
+}
+
+/// Raw VM screenshot
+pub struct VmScreenshotMeta {
+    /// color encoding used by the image
+    pub color: image::ExtendedColorType,
+    /// x dimension
+    pub width: u16,
+    /// y dimension
+    pub height: u16,
+}
+
+/// Interface for getting screenshots of the VM
+#[async_trait]
+pub trait PetriVmFramebufferAccess: Send + 'static {
+    /// Populates the provided buffer with a screenshot of the VM,
+    /// returning the dimensions and color type.
+    async fn screenshot(&mut self, image: &mut Vec<u8>)
+    -> anyhow::Result<Option<VmScreenshotMeta>>;
+}
+
+/// Use this for the associated type if not supported
+pub struct NoPetriVmFramebufferAccess;
+#[async_trait]
+impl PetriVmFramebufferAccess for NoPetriVmFramebufferAccess {
+    async fn screenshot(
+        &mut self,
+        _image: &mut Vec<u8>,
+    ) -> anyhow::Result<Option<VmScreenshotMeta>> {
+        unreachable!()
+    }
+}
+
+/// Common processor topology information for the VM.
+#[derive(Debug)]
+pub struct ProcessorTopology {
+    /// The number of virtual processors.
+    pub vp_count: u32,
+    /// Whether SMT (hyperthreading) is enabled.
+    pub enable_smt: Option<bool>,
+    /// The number of virtual processors per socket.
+    pub vps_per_socket: Option<u32>,
+    /// The APIC configuration (x86-64 only).
+    pub apic_mode: Option<ApicMode>,
+}
+
+impl Default for ProcessorTopology {
+    fn default() -> Self {
+        Self {
+            vp_count: 2,
+            enable_smt: None,
+            vps_per_socket: None,
+            apic_mode: None,
+        }
+    }
+}
+
+impl ProcessorTopology {
+    /// A large number of VPs
+    pub fn heavy() -> Self {
+        Self {
+            vp_count: 16,
+            vps_per_socket: Some(8),
+            ..Default::default()
+        }
+    }
+
+    /// A very large number of VPs
+    pub fn very_heavy() -> Self {
+        Self {
+            vp_count: 32,
+            vps_per_socket: Some(16),
+            ..Default::default()
+        }
+    }
+}
+
+/// The APIC mode for the VM.
+#[derive(Debug, Clone, Copy)]
+pub enum ApicMode {
+    /// xAPIC mode only.
+    Xapic,
+    /// x2APIC mode supported but not enabled at boot.
+    X2apicSupported,
+    /// x2APIC mode enabled at boot.
+    X2apicEnabled,
+}
+
+/// Common memory configuration information for the VM.
+#[derive(Debug)]
+pub struct MemoryConfig {
+    /// Specifies the amount of memory, in bytes, to assign to the
+    /// virtual machine.
+    pub startup_bytes: u64,
+    /// Specifies the minimum and maximum amount of dynamic memory, in bytes.
+    ///
+    /// Dynamic memory will be disabled if this is `None`.
+    pub dynamic_memory_range: Option<(u64, u64)>,
+    /// Per-NUMA-node memory sizes. When set, RAM is distributed across
+    /// vNUMA nodes instead of assigning all RAM to node 0.
+    pub numa_mem_sizes: Option<Vec<u64>>,
+    /// Whether to back guest RAM with private anonymous memory rather than a
+    /// shared (file/memfd-backed) memory section.
+    ///
+    /// - `None` (the default) uses private memory whenever the configuration
+    ///   allows it, falling back to shared memory otherwise. Private anonymous
+    ///   memory is cheaper to set up and eligible for Transparent Huge Pages,
+    ///   so it is preferred for performance; this lets each VM get the best
+    ///   backing for its firmware without the test having to know the details.
+    /// - `Some(true)` explicitly requires private memory. This is an error if
+    ///   the configuration is incompatible with private memory (OpenHCL, which
+    ///   shares VTL0 RAM with VTL2 via a remote mapper, and PCAT/Gen1, which
+    ///   relies on x86 legacy support, both require shared memory), rather than
+    ///   silently downgrading to shared.
+    /// - `Some(false)` explicitly requires shared memory, for tests that need
+    ///   the guest RAM backing to be shareable with another process, such as
+    ///   vhost-user backends.
+    ///
+    /// Only applies to the OpenVMM backend; ignored by Hyper-V.
+    pub private_memory: Option<bool>,
+    /// Mark guest RAM as eligible for Transparent Huge Pages (THP),
+    /// improving performance for large allocations.
+    ///
+    /// Defaults to `true`. Applies to private anonymous guest RAM and to
+    /// shared memfd-backed RAM, on Linux (via `madvise`) and on Windows (via
+    /// soft large pages). It has no effect on explicit hugetlb/large-page
+    /// backings (see
+    /// [`with_hugepages`](crate::openvmm::PetriVmConfigOpenVmm::with_hugepages)),
+    /// which are already huge.
+    ///
+    /// Only applies to the OpenVMM backend; ignored by Hyper-V.
+    pub transparent_hugepages: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            startup_bytes: 4 * 1024 * 1024 * 1024, // 4 GiB
+            dynamic_memory_range: None,
+            numa_mem_sizes: None,
+            private_memory: None,
+            transparent_hugepages: true,
+        }
+    }
+}
+
+/// UEFI firmware configuration
+#[derive(Debug)]
+pub struct UefiConfig {
+    /// Enable secure boot
+    pub secure_boot_enabled: bool,
+    /// Secure boot template
+    pub secure_boot_template: Option<SecureBootTemplate>,
+    /// Custom UEFI variable delta JSON
+    pub custom_uefi_json: Option<Vec<u8>>,
+    /// Disable the UEFI frontpage which will cause the VM to shutdown instead when unable to boot.
+    pub disable_frontpage: bool,
+    /// Always attempt a default boot
+    pub default_boot_always_attempt: bool,
+    /// Enable vPCI boot (for NVMe)
+    pub enable_vpci_boot: bool,
+    /// Force UEFI to bounce-buffer all DMA traffic
+    pub force_dma_bounce: bool,
+    /// EFI diagnostics log level filter
+    pub efi_diagnostics_log_level: EfiDiagnosticsLogLevel,
+    /// Per-period rate-limit override for EFI diagnostics emission.
+    /// See [`PetriVmBuilder::with_efi_diagnostics_rate_limit()`] for more information.
+    pub efi_diagnostics_rate_limit: Option<u32>,
+}
+
+impl Default for UefiConfig {
+    fn default() -> Self {
+        Self {
+            secure_boot_enabled: false,
+            secure_boot_template: None,
+            custom_uefi_json: None,
+            disable_frontpage: true,
+            default_boot_always_attempt: false,
+            enable_vpci_boot: false,
+            force_dma_bounce: false,
+            efi_diagnostics_log_level: EfiDiagnosticsLogLevel::Default,
+            efi_diagnostics_rate_limit: None,
+        }
+    }
+}
+
+/// EFI diagnostics log level filter.
+///
+/// Controls which UEFI diagnostics log entries are forwarded to the host
+/// tracing infrastructure (and thus visible via kmsg / test output).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EfiDiagnosticsLogLevel {
+    /// Default log level (ERROR and WARN only).
+    #[default]
+    Default,
+    /// Include INFO logs (ERROR, WARN, and INFO).
+    Info,
+    /// All log levels.
+    Full,
+}
+
+/// Control the logging configuration of OpenVMM/OpenHCL.
+#[derive(Debug, Clone)]
+pub enum OpenvmmLogConfig {
+    /// Use the default log levels used by petri tests. This will forward
+    /// `OPENVMM_LOG` and `OPENVMM_SHOW_SPANS` from the environment if they are
+    /// set, otherwise it will use `debug` and `true` respectively
+    TestDefault,
+    /// Use the built-in default log levels of OpenHCL/OpenVMM (e.g. don't pass
+    /// OPENVMM_LOG or OPENVMM_SHOW_SPANS)
+    BuiltInDefault,
+    /// Use the provided custom log levels, specified as key/value pairs. At this time,
+    /// simply uses the already-defined environment variables (e.g.
+    /// `OPENVMM_LOG=info,disk_nvme=debug OPENVMM_SHOW_SPANS=true`)
+    ///
+    /// See the Guide and source code for configuring these logs.
+    /// - For the host VMM: see `enable_tracing` in `tracing_init.rs` for details on
+    ///   the accepted keys and values.
+    /// - For OpenHCL, see `init_tracing_backend` in `openhcl/src/logging/mod.rs` for details on
+    ///   the accepted keys and values.
+    Custom(BTreeMap<String, String>),
+}
+
+/// OpenHCL configuration
+#[derive(Debug)]
+pub struct OpenHclConfig {
+    /// Whether to enable VMBus redirection
+    pub vmbus_redirect: bool,
+    /// Whether to enable MANA keepalive at boot.
+    pub enable_mana_keepalive: bool,
+    /// Test-specified command-line parameters to append to the petri generated
+    /// command line and pass to OpenHCL. VM backends should use
+    /// [`OpenHclConfig::command_line()`] rather than reading this directly.
+    pub custom_command_line: Option<String>,
+    /// Command line parameters that control OpenHCL logging behavior. Separate
+    /// from `command_line` so that petri can decide to use default log
+    /// levels.
+    pub log_levels: OpenvmmLogConfig,
+    /// How to place VTL2 in address space. If `None`, the backend VMM
+    /// will decide on default behavior.
+    pub vtl2_base_address_type: Option<Vtl2BaseAddressType>,
+    /// VTL2 settings
+    pub vtl2_settings: Option<Vtl2Settings>,
+}
+
+impl OpenHclConfig {
+    /// Returns the command line to pass to OpenHCL based on these parameters. Aggregates
+    /// the command line and log levels.
+    pub fn command_line(&self) -> String {
+        let mut cmdline = self.custom_command_line.clone();
+
+        if self.enable_mana_keepalive {
+            append_cmdline(&mut cmdline, "OPENHCL_MANA_KEEP_ALIVE=host,privatepool");
+        }
+
+        match &self.log_levels {
+            OpenvmmLogConfig::TestDefault => {
+                let default_log_levels = {
+                    // Forward OPENVMM_LOG and OPENVMM_SHOW_SPANS to OpenHCL if they're set.
+                    let openhcl_tracing = if let Ok(x) =
+                        std::env::var("OPENVMM_LOG").or_else(|_| std::env::var("HVLITE_LOG"))
+                    {
+                        format!("OPENVMM_LOG={x}")
+                    } else {
+                        "OPENVMM_LOG=debug".to_owned()
+                    };
+                    let openhcl_show_spans = if let Ok(x) = std::env::var("OPENVMM_SHOW_SPANS") {
+                        format!("OPENVMM_SHOW_SPANS={x}")
+                    } else {
+                        "OPENVMM_SHOW_SPANS=true".to_owned()
+                    };
+                    format!("{openhcl_tracing} {openhcl_show_spans}")
+                };
+                append_cmdline(&mut cmdline, &default_log_levels);
+            }
+            OpenvmmLogConfig::BuiltInDefault => {
+                // do nothing, use whatever the built-in default is
+            }
+            OpenvmmLogConfig::Custom(levels) => {
+                levels.iter().for_each(|(key, value)| {
+                    append_cmdline(&mut cmdline, format!("{key}={value}"));
+                });
+            }
+        }
+
+        cmdline.unwrap_or_default()
+    }
+}
+
+impl Default for OpenHclConfig {
+    fn default() -> Self {
+        Self {
+            vmbus_redirect: false,
+            enable_mana_keepalive: true,
+            custom_command_line: None,
+            log_levels: OpenvmmLogConfig::TestDefault,
+            vtl2_base_address_type: None,
+            vtl2_settings: None,
+        }
+    }
+}
+
+/// TPM configuration
+#[derive(Debug)]
+pub struct TpmConfig {
+    /// Use ephemeral TPM state (do not persist to VMGS)
+    pub no_persistent_secrets: bool,
+    /// Hardware sealing policy for sealed secrets
+    pub hardware_sealing_policy: PetriHardwareSealingPolicy,
+    /// TPM reference implementation version
+    pub version: PetriTpmVersion,
+}
+
+impl Default for TpmConfig {
+    fn default() -> Self {
+        Self {
+            no_persistent_secrets: true,
+            hardware_sealing_policy: PetriHardwareSealingPolicy::Default,
+            version: PetriTpmVersion::default(),
+        }
+    }
+}
+
+/// TPM reference implementation version used by the test infrastructure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PetriTpmVersion {
+    /// TPM reference implementation version 1.38
+    V138,
+    /// TPM reference implementation version 1.85
+    #[default]
+    V185,
+}
+
+impl From<PetriTpmVersion> for tpm_resources::TpmVersion {
+    fn from(version: PetriTpmVersion) -> Self {
+        match version {
+            PetriTpmVersion::V138 => tpm_resources::TpmVersion::V138,
+            PetriTpmVersion::V185 => tpm_resources::TpmVersion::V185,
+        }
+    }
+}
+
+impl From<PetriTpmVersion> for get_resources::ged::GedTpmVersion {
+    fn from(version: PetriTpmVersion) -> Self {
+        match version {
+            PetriTpmVersion::V138 => get_resources::ged::GedTpmVersion::V138,
+            PetriTpmVersion::V185 => get_resources::ged::GedTpmVersion::V185,
+        }
+    }
+}
+
+/// Hardware sealing policy used by the test infrastructure.
+///
+/// Maps to Hyper-V `Set-GuestStateEncryptionPolicy` values and
+/// underhill's `HardwareSealingPolicy`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PetriHardwareSealingPolicy {
+    /// No explicit policy — the backend picks its default.
+    #[default]
+    Default,
+    /// Derive the hardware sealing key from measurement hash.
+    HashPolicy,
+    /// Derive the hardware sealing key from signer information.
+    SignerPolicy,
+}
+
+/// Firmware to load into the test VM.
+// TODO: remove the guests from the firmware enum so that we don't pass them
+// to the VMM backend after we have already used them generically.
+#[derive(Debug)]
+pub enum Firmware {
+    /// Boot Linux directly, without any firmware.
+    LinuxDirect {
+        /// The kernel to boot.
+        kernel: ResolvedArtifact,
+        /// The optional initrd to use.
+        initrd: Option<ResolvedArtifact>,
+    },
+    /// Boot Linux directly, without any firmware, with OpenHCL in VTL2.
+    OpenhclLinuxDirect {
+        /// The path to the IGVM file to use.
+        igvm_path: ResolvedArtifact,
+        /// OpenHCL configuration
+        openhcl_config: OpenHclConfig,
+    },
+    /// Boot a PCAT-based VM.
+    Pcat {
+        /// The guest OS the VM will boot into.
+        guest: PcatGuest,
+        /// The firmware to use.
+        bios_firmware: ResolvedOptionalArtifact,
+        /// The SVGA firmware to use.
+        svga_firmware: ResolvedOptionalArtifact,
+        /// IDE controllers and associated disks
+        ide_controllers: [[Option<Drive>; 2]; 2],
+    },
+    /// Boot a PCAT-based VM with OpenHCL in VTL2.
+    OpenhclPcat {
+        /// The guest OS the VM will boot into.
+        guest: PcatGuest,
+        /// The path to the IGVM file to use.
+        igvm_path: ResolvedArtifact,
+        /// The firmware to use.
+        bios_firmware: ResolvedOptionalArtifact,
+        /// The SVGA firmware to use.
+        svga_firmware: ResolvedOptionalArtifact,
+        /// OpenHCL configuration
+        openhcl_config: OpenHclConfig,
+    },
+    /// Boot a UEFI-based VM.
+    Uefi {
+        /// The guest OS the VM will boot into.
+        guest: UefiGuest,
+        /// The firmware to use.
+        uefi_firmware: ResolvedArtifact,
+        /// UEFI configuration
+        uefi_config: UefiConfig,
+    },
+    /// Boot a UEFI-based VM with OpenHCL in VTL2.
+    OpenhclUefi {
+        /// The guest OS the VM will boot into.
+        guest: UefiGuest,
+        /// The isolation type of the VM.
+        isolation: Option<IsolationType>,
+        /// The path to the IGVM file to use.
+        igvm_path: ResolvedArtifact,
+        /// UEFI configuration
+        uefi_config: UefiConfig,
+        /// OpenHCL configuration
+        openhcl_config: OpenHclConfig,
+    },
+}
+
+/// The boot device type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum BootDeviceType {
+    /// Don't initialize a boot device.
+    None,
+    /// Boot from IDE.
+    Ide,
+    /// Boot from IDE via SCSI to VTL2.
+    IdeViaScsi,
+    /// Boot from IDE via NVME to VTL2.
+    IdeViaNvme,
+    /// Boot from SCSI.
+    Scsi,
+    /// Boot from SCSI via SCSI to VTL2.
+    ScsiViaScsi,
+    /// Boot from SCSI via NVME to VTL2.
+    ScsiViaNvme,
+    /// Boot from NVMe.
+    Nvme,
+    /// Boot from NVMe via SCSI to VTL2.
+    NvmeViaScsi,
+    /// Boot from NVMe via NVMe to VTL2.
+    NvmeViaNvme,
+    /// Boot from NVMe attached to a PCIe root port.
+    PcieNvme,
+    /// Boot from virtio-blk attached to a PCIe root port.
+    PcieVirtioBlk,
+}
+
+impl BootDeviceType {
+    fn requires_vtl2(&self) -> bool {
+        match self {
+            BootDeviceType::None
+            | BootDeviceType::Ide
+            | BootDeviceType::Scsi
+            | BootDeviceType::Nvme
+            | BootDeviceType::PcieNvme
+            | BootDeviceType::PcieVirtioBlk => false,
+            BootDeviceType::IdeViaScsi
+            | BootDeviceType::IdeViaNvme
+            | BootDeviceType::ScsiViaScsi
+            | BootDeviceType::ScsiViaNvme
+            | BootDeviceType::NvmeViaScsi
+            | BootDeviceType::NvmeViaNvme => true,
+        }
+    }
+
+    fn requires_vpci_boot(&self) -> bool {
+        matches!(
+            self,
+            BootDeviceType::Nvme | BootDeviceType::NvmeViaScsi | BootDeviceType::NvmeViaNvme
+        )
+    }
+
+    /// Whether UEFI must enable its vPCI boot support.
+    ///
+    /// The firmware also uses this flag to enable NVMe boot from emulated PCIe.
+    fn requires_uefi_vpci_boot(&self) -> bool {
+        self.requires_vpci_boot() || matches!(self, BootDeviceType::PcieNvme)
+    }
+
+    fn requires_vmbus(&self) -> bool {
+        match self {
+            BootDeviceType::None
+            | BootDeviceType::Ide
+            | BootDeviceType::PcieNvme
+            | BootDeviceType::PcieVirtioBlk => false,
+            BootDeviceType::IdeViaScsi
+            | BootDeviceType::IdeViaNvme
+            | BootDeviceType::Scsi
+            | BootDeviceType::ScsiViaScsi
+            | BootDeviceType::ScsiViaNvme
+            | BootDeviceType::Nvme
+            | BootDeviceType::NvmeViaScsi
+            | BootDeviceType::NvmeViaNvme => true,
+        }
+    }
+}
+
+impl Firmware {
+    /// Constructs a standard [`Firmware::LinuxDirect`] configuration.
+    pub fn linux_direct(resolver: &ArtifactResolver<'_>, arch: MachineArch) -> Self {
+        use petri_artifacts_vmm_test::artifacts::loadable::*;
+        match arch {
+            MachineArch::X86_64 => Firmware::LinuxDirect {
+                kernel: resolver.require(LINUX_DIRECT_TEST_KERNEL_X64).erase(),
+                initrd: Some(resolver.require(LINUX_DIRECT_TEST_INITRD_X64).erase()),
+            },
+            MachineArch::Aarch64 => Firmware::LinuxDirect {
+                kernel: resolver.require(LINUX_DIRECT_TEST_KERNEL_AARCH64).erase(),
+                initrd: Some(resolver.require(LINUX_DIRECT_TEST_INITRD_AARCH64).erase()),
+            },
+        }
+    }
+
+    /// Constructs a [`Firmware::LinuxDirect`] configuration that uses a
+    /// compressed bzImage kernel instead of an uncompressed ELF.
+    ///
+    /// This is x86_64-only, as bzImage is an x86-specific format.
+    pub fn linux_direct_bzimage(resolver: &ArtifactResolver<'_>) -> Self {
+        use petri_artifacts_vmm_test::artifacts::loadable::*;
+        Firmware::LinuxDirect {
+            kernel: resolver.require(LINUX_DIRECT_TEST_BZIMAGE_X64).erase(),
+            initrd: Some(resolver.require(LINUX_DIRECT_TEST_INITRD_X64).erase()),
+        }
+    }
+
+    /// Constructs a standard [`Firmware::OpenhclLinuxDirect`] configuration.
+    pub fn openhcl_linux_direct(resolver: &ArtifactResolver<'_>, arch: MachineArch) -> Self {
+        use petri_artifacts_vmm_test::artifacts::openhcl_igvm::*;
+        match arch {
+            MachineArch::X86_64 => Firmware::OpenhclLinuxDirect {
+                igvm_path: resolver.require(LATEST_LINUX_DIRECT_TEST_X64).erase(),
+                openhcl_config: Default::default(),
+            },
+            MachineArch::Aarch64 => todo!("Linux direct not yet supported on aarch64"),
+        }
+    }
+
+    /// Constructs a standard [`Firmware::Pcat`] configuration.
+    pub fn pcat(resolver: &ArtifactResolver<'_>, guest: PcatGuest) -> Self {
+        use petri_artifacts_vmm_test::artifacts::loadable::*;
+        Firmware::Pcat {
+            guest,
+            bios_firmware: resolver.try_require(PCAT_FIRMWARE_X64).erase(),
+            svga_firmware: resolver.try_require(SVGA_FIRMWARE_X64).erase(),
+            ide_controllers: [[None, None], [None, None]],
+        }
+    }
+
+    /// Constructs a standard [`Firmware::OpenhclPcat`] configuration.
+    pub fn openhcl_pcat(resolver: &ArtifactResolver<'_>, guest: PcatGuest) -> Self {
+        use petri_artifacts_vmm_test::artifacts::loadable::*;
+        use petri_artifacts_vmm_test::artifacts::openhcl_igvm::*;
+        Firmware::OpenhclPcat {
+            guest,
+            igvm_path: resolver.require(LATEST_STANDARD_X64).erase(),
+            bios_firmware: resolver.try_require(PCAT_FIRMWARE_X64).erase(),
+            svga_firmware: resolver.try_require(SVGA_FIRMWARE_X64).erase(),
+            openhcl_config: OpenHclConfig {
+                // VMBUS redirect is necessary for IDE to be provided by VTL2
+                vmbus_redirect: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Constructs a standard [`Firmware::Uefi`] configuration.
+    pub fn uefi(resolver: &ArtifactResolver<'_>, arch: MachineArch, guest: UefiGuest) -> Self {
+        use petri_artifacts_vmm_test::artifacts::loadable::*;
+        let uefi_firmware = match arch {
+            MachineArch::X86_64 => resolver.require(UEFI_FIRMWARE_X64).erase(),
+            MachineArch::Aarch64 => resolver.require(UEFI_FIRMWARE_AARCH64).erase(),
+        };
+        Firmware::Uefi {
+            guest,
+            uefi_firmware,
+            uefi_config: Default::default(),
+        }
+    }
+
+    /// Constructs a standard [`Firmware::OpenhclUefi`] configuration.
+    pub fn openhcl_uefi(
+        resolver: &ArtifactResolver<'_>,
+        arch: MachineArch,
+        guest: UefiGuest,
+        isolation: Option<IsolationType>,
+    ) -> Self {
+        use petri_artifacts_vmm_test::artifacts::openhcl_igvm::*;
+        let igvm_path = match arch {
+            MachineArch::X86_64 if isolation.is_some() => resolver.require(LATEST_CVM_X64).erase(),
+            MachineArch::X86_64 => resolver.require(LATEST_STANDARD_X64).erase(),
+            MachineArch::Aarch64 => resolver.require(LATEST_STANDARD_AARCH64).erase(),
+        };
+        Firmware::OpenhclUefi {
+            guest,
+            isolation,
+            igvm_path,
+            uefi_config: Default::default(),
+            openhcl_config: Default::default(),
+        }
+    }
+
+    fn is_openhcl(&self) -> bool {
+        match self {
+            Firmware::OpenhclLinuxDirect { .. }
+            | Firmware::OpenhclUefi { .. }
+            | Firmware::OpenhclPcat { .. } => true,
+            Firmware::LinuxDirect { .. } | Firmware::Pcat { .. } | Firmware::Uefi { .. } => false,
+        }
+    }
+
+    fn isolation(&self) -> Option<IsolationType> {
+        match self {
+            Firmware::OpenhclUefi { isolation, .. } => *isolation,
+            Firmware::LinuxDirect { .. }
+            | Firmware::Pcat { .. }
+            | Firmware::Uefi { .. }
+            | Firmware::OpenhclLinuxDirect { .. }
+            | Firmware::OpenhclPcat { .. } => None,
+        }
+    }
+
+    fn is_linux_direct(&self) -> bool {
+        match self {
+            Firmware::LinuxDirect { .. } | Firmware::OpenhclLinuxDirect { .. } => true,
+            Firmware::Pcat { .. }
+            | Firmware::Uefi { .. }
+            | Firmware::OpenhclUefi { .. }
+            | Firmware::OpenhclPcat { .. } => false,
+        }
+    }
+
+    /// Get the initrd path for Linux direct boot firmware.
+    pub fn linux_direct_initrd(&self) -> Option<&Path> {
+        match self {
+            Firmware::LinuxDirect { initrd, .. } => initrd.as_ref().map(|initrd| initrd.get()),
+            _ => None,
+        }
+    }
+
+    fn is_pcat(&self) -> bool {
+        match self {
+            Firmware::Pcat { .. } | Firmware::OpenhclPcat { .. } => true,
+            Firmware::Uefi { .. }
+            | Firmware::OpenhclUefi { .. }
+            | Firmware::LinuxDirect { .. }
+            | Firmware::OpenhclLinuxDirect { .. } => false,
+        }
+    }
+
+    fn os_flavor(&self) -> OsFlavor {
+        match self {
+            Firmware::LinuxDirect { .. } | Firmware::OpenhclLinuxDirect { .. } => OsFlavor::Linux,
+            Firmware::Uefi {
+                guest: UefiGuest::GuestTestUefi { .. } | UefiGuest::None,
+                ..
+            }
+            | Firmware::OpenhclUefi {
+                guest: UefiGuest::GuestTestUefi { .. } | UefiGuest::None,
+                ..
+            } => OsFlavor::Uefi,
+            Firmware::Pcat {
+                guest: PcatGuest::Vhd(cfg),
+                ..
+            }
+            | Firmware::OpenhclPcat {
+                guest: PcatGuest::Vhd(cfg),
+                ..
+            }
+            | Firmware::Uefi {
+                guest: UefiGuest::Vhd(cfg),
+                ..
+            }
+            | Firmware::OpenhclUefi {
+                guest: UefiGuest::Vhd(cfg),
+                ..
+            } => cfg.os_flavor,
+            Firmware::Pcat {
+                guest: PcatGuest::Iso(cfg),
+                ..
+            }
+            | Firmware::OpenhclPcat {
+                guest: PcatGuest::Iso(cfg),
+                ..
+            } => cfg.os_flavor,
+        }
+    }
+
+    fn quirks(&self) -> GuestQuirks {
+        match self {
+            Firmware::Pcat {
+                guest: PcatGuest::Vhd(cfg),
+                ..
+            }
+            | Firmware::Uefi {
+                guest: UefiGuest::Vhd(cfg),
+                ..
+            }
+            | Firmware::OpenhclUefi {
+                guest: UefiGuest::Vhd(cfg),
+                ..
+            } => cfg.quirks.clone(),
+            Firmware::Pcat {
+                guest: PcatGuest::Iso(cfg),
+                ..
+            } => cfg.quirks.clone(),
+            _ => Default::default(),
+        }
+    }
+
+    fn expected_boot_event(&self) -> Option<FirmwareEvent> {
+        match self {
+            Firmware::LinuxDirect { .. }
+            | Firmware::OpenhclLinuxDirect { .. }
+            | Firmware::Uefi {
+                guest: UefiGuest::GuestTestUefi(_),
+                ..
+            }
+            | Firmware::OpenhclUefi {
+                guest: UefiGuest::GuestTestUefi(_),
+                ..
+            } => None,
+            Firmware::Pcat { .. } | Firmware::OpenhclPcat { .. } => {
+                // TODO: Handle older PCAT versions that don't fire the event
+                Some(FirmwareEvent::BootAttempt)
+            }
+            Firmware::Uefi {
+                guest: UefiGuest::None,
+                ..
+            }
+            | Firmware::OpenhclUefi {
+                guest: UefiGuest::None,
+                ..
+            } => Some(FirmwareEvent::NoBootDevice),
+            Firmware::Uefi { .. } | Firmware::OpenhclUefi { .. } => {
+                Some(FirmwareEvent::BootSuccess)
+            }
+        }
+    }
+
+    fn openhcl_config(&self) -> Option<&OpenHclConfig> {
+        match self {
+            Firmware::OpenhclLinuxDirect { openhcl_config, .. }
+            | Firmware::OpenhclUefi { openhcl_config, .. }
+            | Firmware::OpenhclPcat { openhcl_config, .. } => Some(openhcl_config),
+            Firmware::LinuxDirect { .. } | Firmware::Pcat { .. } | Firmware::Uefi { .. } => None,
+        }
+    }
+
+    fn openhcl_config_mut(&mut self) -> Option<&mut OpenHclConfig> {
+        match self {
+            Firmware::OpenhclLinuxDirect { openhcl_config, .. }
+            | Firmware::OpenhclUefi { openhcl_config, .. }
+            | Firmware::OpenhclPcat { openhcl_config, .. } => Some(openhcl_config),
+            Firmware::LinuxDirect { .. } | Firmware::Pcat { .. } | Firmware::Uefi { .. } => None,
+        }
+    }
+
+    #[cfg_attr(not(windows), expect(dead_code))]
+    fn openhcl_firmware(&self) -> Option<&Path> {
+        match self {
+            Firmware::OpenhclLinuxDirect { igvm_path, .. }
+            | Firmware::OpenhclUefi { igvm_path, .. }
+            | Firmware::OpenhclPcat { igvm_path, .. } => Some(igvm_path.get()),
+            Firmware::LinuxDirect { .. } | Firmware::Pcat { .. } | Firmware::Uefi { .. } => None,
+        }
+    }
+
+    fn into_runtime_config(
+        self,
+        vmbus_storage_controllers: HashMap<Guid, VmbusStorageController>,
+    ) -> PetriVmRuntimeConfig {
+        match self {
+            Firmware::OpenhclLinuxDirect { openhcl_config, .. }
+            | Firmware::OpenhclUefi { openhcl_config, .. }
+            | Firmware::OpenhclPcat { openhcl_config, .. } => PetriVmRuntimeConfig {
+                vtl2_settings: Some(
+                    openhcl_config
+                        .vtl2_settings
+                        .unwrap_or_else(default_vtl2_settings),
+                ),
+                ide_controllers: None,
+                vmbus_storage_controllers,
+            },
+            Firmware::Pcat {
+                ide_controllers, ..
+            } => PetriVmRuntimeConfig {
+                vtl2_settings: None,
+                ide_controllers: Some(ide_controllers),
+                vmbus_storage_controllers,
+            },
+            Firmware::LinuxDirect { .. } | Firmware::Uefi { .. } => PetriVmRuntimeConfig {
+                vtl2_settings: None,
+                ide_controllers: None,
+                vmbus_storage_controllers,
+            },
+        }
+    }
+
+    fn uefi_config(&self) -> Option<&UefiConfig> {
+        match self {
+            Firmware::Uefi { uefi_config, .. } | Firmware::OpenhclUefi { uefi_config, .. } => {
+                Some(uefi_config)
+            }
+            Firmware::LinuxDirect { .. }
+            | Firmware::OpenhclLinuxDirect { .. }
+            | Firmware::Pcat { .. }
+            | Firmware::OpenhclPcat { .. } => None,
+        }
+    }
+
+    fn uefi_config_mut(&mut self) -> Option<&mut UefiConfig> {
+        match self {
+            Firmware::Uefi { uefi_config, .. } | Firmware::OpenhclUefi { uefi_config, .. } => {
+                Some(uefi_config)
+            }
+            Firmware::LinuxDirect { .. }
+            | Firmware::OpenhclLinuxDirect { .. }
+            | Firmware::Pcat { .. }
+            | Firmware::OpenhclPcat { .. } => None,
+        }
+    }
+
+    fn boot_drive(&self) -> Option<Drive> {
+        match self {
+            Firmware::LinuxDirect { .. } | Firmware::OpenhclLinuxDirect { .. } => None,
+            Firmware::Pcat { guest, .. } | Firmware::OpenhclPcat { guest, .. } => {
+                Some((guest.disk_path(), guest.is_dvd()))
+            }
+            Firmware::Uefi { guest, .. } | Firmware::OpenhclUefi { guest, .. } => {
+                guest.disk_path().map(|dp| (dp, false))
+            }
+        }
+        .map(|(disk_path, is_dvd)| Drive::new(Some(Disk::Differencing(disk_path)), is_dvd))
+    }
+
+    fn vtl2_settings(&mut self) -> Option<&mut Vtl2Settings> {
+        self.openhcl_config_mut()
+            .map(|c| c.vtl2_settings.get_or_insert_with(default_vtl2_settings))
+    }
+
+    fn ide_controllers(&self) -> Option<&[[Option<Drive>; 2]; 2]> {
+        match self {
+            Firmware::Pcat {
+                ide_controllers, ..
+            } => Some(ide_controllers),
+            _ => None,
+        }
+    }
+
+    fn ide_controllers_mut(&mut self) -> Option<&mut [[Option<Drive>; 2]; 2]> {
+        match self {
+            Firmware::Pcat {
+                ide_controllers, ..
+            } => Some(ide_controllers),
+            _ => None,
+        }
+    }
+}
+
+/// The guest the VM will boot into. A boot drive with the chosen setup
+/// will be automatically configured.
+#[derive(Debug)]
+pub enum PcatGuest {
+    /// Mount a VHD as the boot drive.
+    Vhd(BootImageConfig<boot_image_type::Vhd>),
+    /// Mount an ISO as the CD/DVD drive.
+    Iso(BootImageConfig<boot_image_type::Iso>),
+}
+
+impl PcatGuest {
+    fn disk_path(&self) -> DiskPath {
+        match self {
+            PcatGuest::Vhd(disk) => disk.disk_path(),
+            PcatGuest::Iso(disk) => disk.disk_path(),
+        }
+    }
+
+    fn is_dvd(&self) -> bool {
+        matches!(self, Self::Iso(_))
+    }
+}
+
+/// The guest the VM will boot into. A boot drive with the chosen setup
+/// will be automatically configured.
+#[derive(Debug)]
+pub enum UefiGuest {
+    /// Mount a VHD as the boot drive.
+    Vhd(BootImageConfig<boot_image_type::Vhd>),
+    /// The UEFI test image produced by our guest-test infrastructure.
+    GuestTestUefi(ResolvedArtifact),
+    /// No guest, just the firmware.
+    None,
+}
+
+impl UefiGuest {
+    /// Construct a standard [`UefiGuest::GuestTestUefi`] configuration.
+    pub fn guest_test_uefi(resolver: &ArtifactResolver<'_>, arch: MachineArch) -> Self {
+        use petri_artifacts_vmm_test::artifacts::test_vhd::*;
+        let artifact = match arch {
+            MachineArch::X86_64 => resolver.require(GUEST_TEST_UEFI_X64).erase(),
+            MachineArch::Aarch64 => resolver.require(GUEST_TEST_UEFI_AARCH64).erase(),
+        };
+        UefiGuest::GuestTestUefi(artifact)
+    }
+
+    fn disk_path(&self) -> Option<DiskPath> {
+        match self {
+            UefiGuest::Vhd(vhd) => Some(vhd.disk_path()),
+            UefiGuest::GuestTestUefi(p) => Some(DiskPath::Local(p.get().to_path_buf())),
+            UefiGuest::None => None,
+        }
+    }
+}
+
+/// Type-tags for [`BootImageConfig`](super::BootImageConfig)
+pub mod boot_image_type {
+    mod private {
+        pub trait Sealed {}
+        impl Sealed for super::Vhd {}
+        impl Sealed for super::Iso {}
+    }
+
+    /// Private trait use to seal the set of artifact types BootImageType
+    /// supports.
+    pub trait BootImageType: private::Sealed {}
+
+    /// BootImageConfig for a VHD file
+    #[derive(Debug)]
+    pub enum Vhd {}
+
+    /// BootImageConfig for an ISO file
+    #[derive(Debug)]
+    pub enum Iso {}
+
+    impl BootImageType for Vhd {}
+    impl BootImageType for Iso {}
+}
+
+/// Configuration information for the boot drive of the VM.
+#[derive(Debug)]
+pub struct BootImageConfig<T: boot_image_type::BootImageType> {
+    /// Artifact source corresponding to the boot media (local or remote).
+    artifact: ResolvedArtifactSource,
+    /// The OS flavor.
+    os_flavor: OsFlavor,
+    /// Any quirks needed to boot the guest.
+    ///
+    /// Most guests should not need any quirks, and can use `Default`.
+    quirks: GuestQuirks,
+    /// Marker denoting what type of media `artifact` corresponds to
+    _type: core::marker::PhantomData<T>,
+}
+
+impl<T: boot_image_type::BootImageType> BootImageConfig<T> {
+    /// Get a [`DiskPath`] from the artifact source.
+    fn disk_path(&self) -> DiskPath {
+        match self.artifact.get() {
+            ArtifactSource::Local(p) => DiskPath::Local(p.clone()),
+            ArtifactSource::Remote { url } => DiskPath::Remote { url: url.clone() },
+        }
+    }
+}
+
+impl BootImageConfig<boot_image_type::Vhd> {
+    /// Create a new BootImageConfig from a VHD artifact source
+    pub fn from_vhd<A>(artifact: ResolvedArtifactSource<A>) -> Self
+    where
+        A: petri_artifacts_common::tags::IsTestVhd,
+    {
+        BootImageConfig {
+            artifact: artifact.erase(),
+            os_flavor: A::OS_FLAVOR,
+            quirks: A::quirks(),
+            _type: std::marker::PhantomData,
+        }
+    }
+}
+
+impl BootImageConfig<boot_image_type::Iso> {
+    /// Create a new BootImageConfig from an ISO artifact source
+    pub fn from_iso<A>(artifact: ResolvedArtifactSource<A>) -> Self
+    where
+        A: petri_artifacts_common::tags::IsTestIso,
+    {
+        BootImageConfig {
+            artifact: artifact.erase(),
+            os_flavor: A::OS_FLAVOR,
+            quirks: A::quirks(),
+            _type: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Isolation type
+#[derive(Debug, Clone, Copy)]
+pub enum IsolationType {
+    /// VBS
+    Vbs,
+    /// SNP
+    Snp,
+    /// TDX
+    Tdx,
+}
+
+/// Flags controlling servicing behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenHclServicingFlags {
+    /// Preserve DMA memory for NVMe devices if supported.
+    /// Defaults to `true`.
+    pub enable_nvme_keepalive: bool,
+    /// Preserve DMA memory for MANA devices if supported.
+    pub enable_mana_keepalive: bool,
+    /// Skip any logic that the vmm may have to ignore servicing updates if the supplied igvm file version is not different than the one currently running.
+    pub override_version_checks: bool,
+    /// Hint to the OpenHCL runtime how much time to wait when stopping / saving the OpenHCL.
+    pub stop_timeout_hint_secs: Option<u16>,
+}
+
+/// Where a disk image is located.
+#[derive(Debug, Clone)]
+pub enum DiskPath {
+    /// A local file path.
+    Local(PathBuf),
+    /// A remote URL (fetched on demand via HTTP Range requests).
+    Remote {
+        /// The URL where the disk can be fetched.
+        url: String,
+    },
+}
+
+impl From<PathBuf> for DiskPath {
+    fn from(path: PathBuf) -> Self {
+        DiskPath::Local(path)
+    }
+}
+
+/// Petri disk
+#[derive(Debug, Clone)]
+pub enum Disk {
+    /// Memory backed with specified size
+    Memory(u64),
+    /// Memory differencing disk backed by a VHD (local or remote)
+    Differencing(DiskPath),
+    /// Persistent VHD
+    Persistent(PathBuf),
+    /// Disk backed by a temporary VHD
+    Temporary(Arc<TempPath>),
+}
+
+/// A path that can be either temporary or persistent
+#[derive(Debug, Clone)]
+pub enum TempOrPersistentPath {
+    /// Temporary path
+    Temp(Arc<TempPath>),
+    /// Persistent path
+    Persistent(PathBuf),
+}
+
+impl AsRef<Path> for TempOrPersistentPath {
+    fn as_ref(&self) -> &Path {
+        match self {
+            TempOrPersistentPath::Temp(temp_path) => temp_path.as_ref(),
+            TempOrPersistentPath::Persistent(path_buf) => path_buf.as_ref(),
+        }
+    }
+}
+
+/// Petri initrd
+#[derive(Debug, Clone)]
+pub struct PetriInitrd {
+    /// Where the initrd is located on the host system.
+    pub path: TempOrPersistentPath,
+    /// Path to use with `rdinit=` kernel command line parameter.
+    pub rdinit_param: String,
+}
+
+/// Petri VMGS disk
+#[derive(Debug, Clone)]
+pub struct PetriVmgsDisk {
+    /// Backing disk
+    pub disk: Disk,
+    /// Guest state encryption policy
+    pub encryption_policy: GuestStateEncryptionPolicy,
+}
+
+impl Default for PetriVmgsDisk {
+    fn default() -> Self {
+        PetriVmgsDisk {
+            disk: Disk::Memory(vmgs_format::VMGS_DEFAULT_CAPACITY),
+            // TODO: make this strict once we can set it in OpenHCL on Hyper-V
+            encryption_policy: GuestStateEncryptionPolicy::None(false),
+        }
+    }
+}
+
+/// Petri VM guest state resource
+#[derive(Debug, Clone)]
+pub enum PetriVmgsResource {
+    /// Use disk to store guest state
+    Disk(PetriVmgsDisk),
+    /// Use disk to store guest state, reformatting if corrupted.
+    ReprovisionOnFailure(PetriVmgsDisk),
+    /// Format and use disk to store guest state
+    Reprovision(PetriVmgsDisk),
+    /// Store guest state in memory
+    Ephemeral,
+}
+
+impl PetriVmgsResource {
+    /// get the inner vmgs disk if one exists
+    pub fn vmgs(&self) -> Option<&PetriVmgsDisk> {
+        match self {
+            PetriVmgsResource::Disk(vmgs)
+            | PetriVmgsResource::ReprovisionOnFailure(vmgs)
+            | PetriVmgsResource::Reprovision(vmgs) => Some(vmgs),
+            PetriVmgsResource::Ephemeral => None,
+        }
+    }
+
+    /// get the inner disk if one exists
+    pub fn disk(&self) -> Option<&Disk> {
+        self.vmgs().map(|vmgs| &vmgs.disk)
+    }
+
+    /// get the encryption policy of the vmgs
+    pub fn encryption_policy(&self) -> Option<GuestStateEncryptionPolicy> {
+        self.vmgs().map(|vmgs| vmgs.encryption_policy)
+    }
+}
+
+/// Petri VM guest state lifetime
+#[derive(Debug, Clone, Copy)]
+pub enum PetriGuestStateLifetime {
+    /// Use a differencing disk backed by a blank, tempory VMGS file
+    /// or other artifact if one is provided
+    Disk,
+    /// Same as default, except reformat the backing disk if corrupted
+    ReprovisionOnFailure,
+    /// Same as default, except reformat the backing disk
+    Reprovision,
+    /// Store guest state in memory (no backing disk)
+    Ephemeral,
+}
+
+/// UEFI secure boot template
+#[derive(Debug, Clone, Copy)]
+pub enum SecureBootTemplate {
+    /// The Microsoft Windows template.
+    MicrosoftWindows,
+    /// The Microsoft UEFI certificate authority template.
+    MicrosoftUefiCertificateAuthority,
+}
+
+/// Quirks to workaround certain bugs that only manifest when using a
+/// particular VMM, and do not depend on which guest is running.
+#[derive(Default, Debug, Clone)]
+pub struct VmmQuirks {
+    /// Automatically reset the VM if we did not recieve a boot event in the
+    /// specified amount of time.
+    pub flaky_boot: Option<Duration>,
+}
+
+/// Creates a VM-safe name that respects platform limitations.
+///
+/// Hyper-V limits VM names to 100 characters. For names that exceed this limit,
+/// this function truncates to 96 characters and appends a 4-character hash
+/// to ensure uniqueness while staying within the limit.
+fn make_vm_safe_name(name: &str) -> String {
+    const MAX_VM_NAME_LENGTH: usize = 100;
+    const HASH_LENGTH: usize = 4;
+    const MAX_PREFIX_LENGTH: usize = MAX_VM_NAME_LENGTH - HASH_LENGTH;
+
+    if name.len() <= MAX_VM_NAME_LENGTH {
+        name.to_owned()
+    } else {
+        // Create a hash of the full name for uniqueness
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Format hash as a 4-character hex string
+        let hash_suffix = format!("{:04x}", hash & 0xFFFF);
+
+        // Truncate the name and append the hash
+        let truncated = &name[..MAX_PREFIX_LENGTH];
+        tracing::debug!(
+            "VM name too long ({}), truncating '{}' to '{}{}'",
+            name.len(),
+            name,
+            truncated,
+            hash_suffix
+        );
+
+        format!("{}{}", truncated, hash_suffix)
+    }
+}
+
+/// The reason that the VM halted
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PetriHaltReason {
+    /// The vm powered off
+    PowerOff,
+    /// The vm reset
+    Reset,
+    /// The vm hibernated
+    Hibernate,
+    /// The vm triple faulted
+    TripleFault,
+    /// The vm halted for some other reason
+    Other,
+}
+
+impl PetriHaltReason {
+    /// Construct a halt reason with detailed debug info
+    pub fn with_detail(self, detail: String) -> PetriHaltReasonDetail {
+        PetriHaltReasonDetail {
+            reason: self,
+            detail,
+        }
+    }
+}
+
+/// The reason that the VM halted, with optional addition debug details
+#[derive(Debug, Clone)]
+pub struct PetriHaltReasonDetail {
+    /// The reason for the halt
+    pub reason: PetriHaltReason,
+    /// More details about the halt
+    pub detail: String,
+}
+
+fn append_cmdline(cmd: &mut Option<String>, add_cmd: impl AsRef<str>) {
+    if let Some(cmd) = cmd.as_mut() {
+        cmd.push(' ');
+        cmd.push_str(add_cmd.as_ref());
+    } else {
+        *cmd = Some(add_cmd.as_ref().to_string());
+    }
+}
+
+async fn collect_inspect(
+    name: &'static str,
+    inspect: impl Future<Output = anyhow::Result<inspect::Node>>,
+    log_source: &PetriLogSource,
+    prefix: &str,
+) {
+    let node = match CancelContext::new()
+        .with_timeout(INSPECT_TIMEOUT)
+        .until_cancelled(inspect)
+        .await
+    {
+        Ok(Ok(node)) => node,
+        Ok(Err(e)) => {
+            tracing::warn!(name, ?e, "failed to collect inspect state");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(name, "timed out collecting inspect state");
+            return;
+        }
+    };
+
+    if let Err(e) = log_source.write_attachment(
+        &format!("{prefix}_inspect_{name}.log"),
+        format!("{node:#}").as_bytes(),
+    ) {
+        tracing::error!(name, ?e, "failed to save inspect log");
+    }
+}
+
+/// Wrapper for modification functions with stubbed out debug impl
+pub struct ModifyFn<T>(pub Box<dyn FnOnce(T) -> T + Send>);
+
+impl<T> Debug for ModifyFn<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "_")
+    }
+}
+
+/// Default VTL 2 settings used by petri
+fn default_vtl2_settings() -> Vtl2Settings {
+    Vtl2Settings {
+        version: vtl2_settings_proto::vtl2_settings_base::Version::V1.into(),
+        fixed: None,
+        dynamic: Some(Default::default()),
+        namespace_settings: Default::default(),
+    }
+}
+
+/// Virtual trust level
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Vtl {
+    /// VTL 0
+    Vtl0 = 0,
+    /// VTL 1
+    Vtl1 = 1,
+    /// VTL 2
+    Vtl2 = 2,
+}
+
+/// The VMBus storage device type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum VmbusStorageType {
+    /// SCSI
+    Scsi,
+    /// NVMe
+    Nvme,
+    /// Virtio block device
+    VirtioBlk,
+}
+
+/// VM disk drive
+#[derive(Debug, Clone)]
+pub struct Drive {
+    /// Backing disk
+    pub disk: Option<Disk>,
+    /// Whether this is a DVD
+    pub is_dvd: bool,
+}
+
+impl Drive {
+    /// Create a new disk
+    pub fn new(disk: Option<Disk>, is_dvd: bool) -> Self {
+        Self { disk, is_dvd }
+    }
+}
+
+/// VMBus storage controller
+#[derive(Debug, Clone)]
+pub struct VmbusStorageController {
+    /// The VTL to assign the storage controller to
+    pub target_vtl: Vtl,
+    /// The storage device type
+    pub controller_type: VmbusStorageType,
+    /// Drives (with any inserted disks) attached to this storage controller
+    pub drives: HashMap<u32, Drive>,
+}
+
+impl VmbusStorageController {
+    /// Create a new storage controller
+    pub fn new(target_vtl: Vtl, controller_type: VmbusStorageType) -> Self {
+        Self {
+            target_vtl,
+            controller_type,
+            drives: HashMap::new(),
+        }
+    }
+
+    /// Add a disk to the storage controller
+    pub fn set_drive(
+        &mut self,
+        lun: Option<u32>,
+        drive: Drive,
+        allow_modify_existing: bool,
+    ) -> u32 {
+        let lun = lun.unwrap_or_else(|| {
+            // find the first available lun
+            let mut lun = None;
+            for x in 0..u8::MAX as u32 {
+                if !self.drives.contains_key(&x) {
+                    lun = Some(x);
+                    break;
+                }
+            }
+            lun.expect("all locations on this controller are in use")
+        });
+
+        if self.drives.insert(lun, drive).is_some() && !allow_modify_existing {
+            panic!("a disk with lun {lun} already existed on this controller");
+        }
+
+        lun
+    }
+}
+
+/// Returns the cache directory for lazy-fetched disk artifacts.
+pub(crate) fn petri_disk_cache_dir() -> String {
+    if let Ok(dir) = std::env::var("PETRI_CACHE_DIR") {
+        return dir;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/Library/Caches/petri");
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            return format!("{local}\\petri\\cache");
+        }
+    }
+
+    // Linux / fallback: XDG
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        return format!("{xdg}/petri");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return format!("{home}/.cache/petri");
+    }
+
+    ".cache/petri".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BootDeviceType;
+    use crate::Drive;
+    use crate::VmbusStorageController;
+    use crate::VmbusStorageType;
+    use crate::Vtl;
+
+    #[derive(Clone, Copy)]
+    enum TestInspectBehavior {
+        Success,
+        Error,
+        Panic,
+    }
+
+    #[derive(Clone)]
+    struct TestInspector(TestInspectBehavior);
+
+    #[async_trait::async_trait]
+    impl PetriVmInspector for TestInspector {
+        async fn inspect(&self, _path: &str) -> anyhow::Result<inspect::Node> {
+            match self.0 {
+                TestInspectBehavior::Success => Ok(inspect::Node::Unevaluated),
+                TestInspectBehavior::Error => anyhow::bail!("inspect failed"),
+                TestInspectBehavior::Panic => panic!("inspect panicked"),
+            }
+        }
+    }
+
+    struct TestFramebuffer;
+
+    #[async_trait::async_trait]
+    impl PetriVmFramebufferAccess for TestFramebuffer {
+        async fn screenshot(
+            &mut self,
+            _image: &mut Vec<u8>,
+        ) -> anyhow::Result<Option<VmScreenshotMeta>> {
+            unreachable!()
+        }
+    }
+
+    struct TestRuntime(TestInspectBehavior);
+
+    #[async_trait::async_trait]
+    impl PetriVmRuntime for TestRuntime {
+        type VmInspector = TestInspector;
+        type VmFramebufferAccess = TestFramebuffer;
+
+        async fn teardown(self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn wait_for_halt(
+            &mut self,
+            _allow_reset: bool,
+        ) -> anyhow::Result<PetriHaltReasonDetail> {
+            unreachable!()
+        }
+
+        async fn wait_for_agent(&mut self, _set_high_vtl: bool) -> anyhow::Result<PipetteClient> {
+            unreachable!()
+        }
+
+        fn openhcl_diag(&self) -> Option<OpenHclDiagHandler> {
+            None
+        }
+
+        async fn wait_for_boot_event(
+            &mut self,
+            _timeout: Option<Duration>,
+        ) -> anyhow::Result<Option<FirmwareEvent>> {
+            unreachable!()
+        }
+
+        async fn wait_for_enlightened_shutdown_ready(&mut self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        async fn send_enlightened_shutdown(&mut self, _kind: ShutdownKind) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        async fn restart_openhcl(
+            &mut self,
+            _new_openhcl: &ResolvedArtifact,
+            _flags: OpenHclServicingFlags,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        async fn save_openhcl(
+            &mut self,
+            _new_openhcl: &ResolvedArtifact,
+            _flags: OpenHclServicingFlags,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        async fn restore_openhcl(&mut self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        async fn update_command_line(&mut self, _command_line: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        fn inspector(&self) -> Option<Self::VmInspector> {
+            Some(TestInspector(self.0))
+        }
+
+        async fn reset(&mut self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        async fn set_vtl2_settings(&mut self, _settings: &Vtl2Settings) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        async fn set_vmbus_drive(
+            &mut self,
+            _disk: &Drive,
+            _controller_id: &Guid,
+            _controller_location: u32,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    fn test_runtime_guard(
+        driver: DefaultDriver,
+        log_source: &PetriLogSource,
+        behavior: TestInspectBehavior,
+    ) -> PetriVmRuntimeGuard<TestRuntime> {
+        PetriVmRuntimeGuard {
+            runtime: Some(TestRuntime(behavior)),
+            driver,
+            log_source: log_source.clone(),
+            capture_inspect_on_drop: true,
+        }
+    }
+
+    fn run_failed_test(
+        log_source: &PetriLogSource,
+        behavior: TestInspectBehavior,
+    ) -> anyhow::Result<()> {
+        let pool = pal_async::DefaultPool::new();
+        let driver = pool.driver();
+        drop(test_runtime_guard(driver.clone(), log_source, behavior));
+        drop(driver);
+        pool.run();
+        anyhow::bail!("original test failure")
+    }
+
+    fn inspect_attachment_count(log_source: &PetriLogSource) -> usize {
+        fs_err::read_dir(log_source.output_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("failure_inspect_vmm")
+            })
+            .count()
+    }
+
+    #[test]
+    fn test_runtime_guard_failure_capture() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_source = crate::tracing::try_init_tracing(
+            temp_dir.path(),
+            tracing::level_filters::LevelFilter::DEBUG,
+        )
+        .unwrap();
+
+        let error = run_failed_test(&log_source, TestInspectBehavior::Success).unwrap_err();
+        assert_eq!(error.to_string(), "original test failure");
+        assert_eq!(inspect_attachment_count(&log_source), 1);
+
+        let pool = pal_async::DefaultPool::new();
+        let driver = pool.driver();
+        let mut guard =
+            test_runtime_guard(driver.clone(), &log_source, TestInspectBehavior::Success);
+        let _runtime = guard.take_for_teardown();
+        drop(guard);
+        drop(driver);
+        pool.run();
+        assert_eq!(inspect_attachment_count(&log_source), 1);
+
+        for behavior in [TestInspectBehavior::Error, TestInspectBehavior::Panic] {
+            let error = run_failed_test(&log_source, behavior).unwrap_err();
+            assert_eq!(error.to_string(), "original test failure");
+            assert_eq!(inspect_attachment_count(&log_source), 1);
+        }
+    }
+
+    #[test]
+    fn test_short_names_unchanged() {
+        let short_name = "short_test_name";
+        assert_eq!(make_vm_safe_name(short_name), short_name);
+    }
+
+    #[test]
+    fn test_exactly_100_chars_unchanged() {
+        let name_100 = "a".repeat(100);
+        assert_eq!(make_vm_safe_name(&name_100), name_100);
+    }
+
+    #[test]
+    fn test_long_name_truncated() {
+        let long_name = "multiarch::openhcl_servicing::hyperv_openhcl_uefi_aarch64_ubuntu_2404_server_aarch64_openhcl_servicing";
+        let result = make_vm_safe_name(long_name);
+
+        // Should be exactly 100 characters
+        assert_eq!(result.len(), 100);
+
+        // Should start with the truncated prefix
+        assert!(result.starts_with("multiarch::openhcl_servicing::hyperv_openhcl_uefi_aarch64_ubuntu_2404_server_aarch64_ope"));
+
+        // Should end with a 4-character hash
+        let suffix = &result[96..];
+        assert_eq!(suffix.len(), 4);
+        // Should be valid hex
+        assert!(u16::from_str_radix(suffix, 16).is_ok());
+    }
+
+    #[test]
+    fn test_deterministic_results() {
+        let long_name = "very_long_test_name_that_exceeds_the_100_character_limit_and_should_be_truncated_consistently_every_time";
+        let result1 = make_vm_safe_name(long_name);
+        let result2 = make_vm_safe_name(long_name);
+
+        assert_eq!(result1, result2);
+        assert_eq!(result1.len(), 100);
+    }
+
+    #[test]
+    fn test_different_names_different_hashes() {
+        let name1 = "very_long_test_name_that_definitely_exceeds_the_100_character_limit_and_should_be_truncated_by_the_function_version_1";
+        let name2 = "very_long_test_name_that_definitely_exceeds_the_100_character_limit_and_should_be_truncated_by_the_function_version_2";
+
+        let result1 = make_vm_safe_name(name1);
+        let result2 = make_vm_safe_name(name2);
+
+        // Both should be 100 chars
+        assert_eq!(result1.len(), 100);
+        assert_eq!(result2.len(), 100);
+
+        // Should have different suffixes since the full names are different
+        assert_ne!(result1, result2);
+        assert_ne!(&result1[96..], &result2[96..]);
+    }
+
+    #[test]
+    fn pcie_nvme_requires_uefi_vpci_boot_without_using_vpci() {
+        assert!(BootDeviceType::PcieNvme.requires_uefi_vpci_boot());
+        assert!(!BootDeviceType::PcieNvme.requires_vpci_boot());
+        assert!(!BootDeviceType::PcieVirtioBlk.requires_uefi_vpci_boot());
+    }
+
+    #[test]
+    fn test_vmbus_storage_controller() {
+        let mut controller = VmbusStorageController::new(Vtl::Vtl0, VmbusStorageType::Scsi);
+        assert_eq!(
+            controller.set_drive(Some(1), Drive::new(None, false), false),
+            1
+        );
+        assert!(controller.drives.contains_key(&1));
+        assert_eq!(
+            controller.set_drive(None, Drive::new(None, false), false),
+            0
+        );
+        assert!(controller.drives.contains_key(&0));
+        assert_eq!(
+            controller.set_drive(None, Drive::new(None, false), false),
+            2
+        );
+        assert!(controller.drives.contains_key(&2));
+        assert_eq!(
+            controller.set_drive(Some(0), Drive::new(None, false), true),
+            0
+        );
+        assert!(controller.drives.contains_key(&0));
+    }
+}

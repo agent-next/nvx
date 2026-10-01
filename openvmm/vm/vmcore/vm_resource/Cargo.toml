@@ -1,0 +1,20 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vm_resource"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+inspect.workspace = true
+mesh.workspace = true
+async-trait.workspace = true
+linkme.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pal_async.workspace = true
+
+[lints]
+workspace = true

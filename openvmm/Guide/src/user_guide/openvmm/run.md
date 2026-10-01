@@ -1,0 +1,280 @@
+
+# Running OpenVMM
+
+This page offers a high-level overview of different ways to launch and interact
+with OpenVMM.
+
+These examples provide a starting point for launching and configuring OpenVMM.
+
+## Obtaining a copy of OpenVMM
+
+To get started, ensure you have a copy of the OpenVMM executable and its runtime
+dependencies, via one of the following options:
+
+### Building OpenVMM Locally
+
+Follow the instructions on: [Building OpenVMM](../../dev_guide/getting_started/build_openvmm.md).
+
+### Pre-Built Binaries
+
+If you would prefer to try OpenVMM without building it from scratch, you can
+download pre-built copies of the binary from
+[OpenVMM CI](https://github.com/microsoft/openvmm/actions/workflows/openvmm-ci.yaml).
+
+Simply select a successful pipeline run (should have a Green checkbox), and
+scroll down to select an appropriate `*-openvmm` artifact for your particular
+architecture and operating system.  **You must be signed into GitHub in order
+to download artifacts**.
+
+## Examples
+
+```admonish tip
+These examples all use `cargo run --`, with the assumption that you are a
+developer building your own copy of OpenVMM locally!
+
+To run these examples using a pre-compiled copy of OpenVMM, swap `cargo run
+--` with `/path/to/openvmm`.
+```
+
+### microVM sandbox block devices
+
+`--machine microvm` is the only microVM profile. It assigns up to three
+read-only lower layers and one writable scratch device to fixed virtio-mmio
+locations:
+
+| Role | Access | MMIO address | IRQ |
+| --- | --- | ---: | ---: |
+| `distro` | read-only | `0xd0003000` | 4 |
+| `runtime` | read-only | `0xd0004000` | 12 |
+| `custom` | read-only | `0xd0005000` | 9 |
+| `scratch` | writable | `0xd0006000` | 11 |
+
+Use `--microvm-sandbox-block ROLE:DISK`, in the order shown. Lower-layer
+roles require the normal disk `,ro` option and a non-empty topology must end
+with `scratch`; ordinary `--virtio-blk` is intentionally rejected.
+For example:
+
+```shell
+openvmm --machine microvm --kernel vmlinux --initrd initramfs.cpio.gz \
+  --microvm-sandbox-block distro:file:distro.erofs,ro \
+  --microvm-sandbox-block runtime:file:runtime.erofs,ro \
+  --microvm-sandbox-block custom:file:custom.erofs,ro \
+  --microvm-sandbox-block scratch:file:scratch.img
+```
+
+Capture and restore support cached regular raw files. Capture records
+the role, access mode, exact geometry, and SHA-256 of every read-only layer. A
+normal snapshot request pairs the writable scratch as `scratch.img`; restore
+accepts the read-only layer arguments again and creates a private scratch copy
+from that artifact. A pre-mount request may select fresh-scratch policy instead,
+in which case restore requires a new writable scratch file of matching size.
+
+### microVM deterministic SMP
+
+`--machine microvm --processors N` selects the microVM machine.
+`N` must be exactly `1`, `2`, `4`, or `8`. The guest topology is independent
+of the host: one socket, one die, `N` cores, one thread per core, no SMT or
+NUMA, xAPIC mode, and contiguous APIC IDs `0..N-1`; APIC ID 0 is the BSP.
+Custom socket, SMT, APIC, x2APIC, and NUMA options are rejected.
+
+The microVM uses fixed virtio device slots and sandbox block roles. Its
+persisted ABI and boot layout remain value 2. The
+MP floating pointer begins at `0x0`, the MP configuration table at `0x400`,
+the boot GDT at `0x1000`, and the Linux zero page at `0x2000`. No ACPI MADT or
+SMBIOS data is exposed.
+
+Snapshots record the ABI version, processor count, full topology, APIC IDs,
+and boot-layout version. Restore requires an exact match before any VP starts.
+For example:
+
+```shell
+openvmm --machine microvm --processors 8 \
+  --kernel vmlinux --initrd initramfs.cpio.gz
+```
+
+~~~admonish tip title="UEFI firmware required when running outside cargo"
+When running via `cargo run`, environment variables in `.cargo/config.toml`
+automatically point OpenVMM to the `mu_msvm` UEFI firmware (`MSVM.fd`)
+downloaded by `cargo xflowey restore-packages`.
+
+When running the `openvmm` binary directly, these environment variables are
+**not set**, and you will get:
+
+> fatal error: must provide uefi firmware when booting with uefi
+
+To fix this, **explicitly pass the firmware** using the `firmware` option:
+
+```shell
+openvmm --uefi firmware=path/to/MSVM.fd \
+  --vmbus-scsi id=scsi0 \
+  --disk memdiff:path/to/disk.vhdx,on=scsi0
+```
+
+If you ran `cargo xflowey restore-packages`, the firmware is at:
+
+```text
+.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd        # x64
+.packages/hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV/MSVM.fd # aarch64
+```
+
+If you used `cargo xflowey vmm-tests-run --build-only --dir <out>`, the firmware
+is copied into that output directory under the same relative path.
+
+Alternatively, set the environment variable so you don't need the flag each time:
+
+```shell
+# x64
+export X86_64_OPENVMM_UEFI_FIRMWARE=path/to/MSVM.fd
+
+# aarch64
+export AARCH64_OPENVMM_UEFI_FIRMWARE=path/to/MSVM.fd
+```
+~~~
+
+If you run into any issues, please refer to [Troubleshooting](./troubleshooting.md).
+
+### _Preface:_ Quitting OpenVMM
+
+By default, OpenVMM will connect the guests's COM1 serial port to the current
+terminal session, forwarding all keystrokes directly to the VM.
+
+As such, a simple `ctrl-c` does not suffice to quit OpenVMM!
+
+Instead, you can type `crtl-q` to enter OpenVMM's [interactive console](../../reference/openvmm/management/interactive_console.md), and enter `q` to quit.
+
+### Sample Linux Kernel, via direct-boot
+
+This example will launch Linux via direct boot (i.e: without going through UEFI
+or BIOS), and appends `single` to the kernel command line.
+
+The Linux guest's console will be hooked up to COM1, and is relayed to the host
+terminal by default.
+
+To launch Linux with an interactive console into the shell within initrd, simply
+run:
+
+```shell
+cargo run
+```
+
+This works by setting the default `[env]` vars in `.cargo/config.toml` to
+configure OpenVMM to use a set of pre-compiled test kernel + initrd images,
+which are downloaded as part of the `cargo xflowey restore-packages` command.
+Note that this behavior only happens when run via `cargo run` (as `cargo` is the
+tool which ensures the required env-vars are set).
+
+The source for the sample kernel + initrd can be found on the
+[microsoft/openvmm-deps](https://github.com/microsoft/openvmm-deps) repo.
+
+The kernel and initrd can be controlled via options:
+
+* `--kernel <PATH>`: The kernel image. Must be an uncompressed kernel (vmlinux, not bzImage).
+* `--initrd <PATH>`: The initial ramdisk image.
+* `-c <STRING>` or `--cmdline <STRING>`: Extra kernel command line options, such as `root=/dev/sda`.
+
+### Windows, via UEFI
+
+This example will launch a modern copy of Windows via UEFI, using the `mu_msvm`
+firmware package.
+
+A copy of the `mu_msvm` UEFI firmware is automatically downloaded via `cargo
+xflowey restore-packages`.
+
+```shell
+cargo run -- --uefi \
+  --vmbus-scsi id=scsi0 \
+  --disk memdiff:path/to/windows.vhdx,on=scsi0 \
+  --gfx
+```
+
+For more info on `--gfx`, and how to actually interact with the VM using a
+mouse/keyboard/video, see the [Graphical Console](../../reference/openvmm/graphical_console.md)
+docs.
+
+The file `windows.vhdx` can be any format of VHD(X).
+
+VHDX files (dynamic, fixed, and differencing) are supported on non-Windows
+platforms via the pure-Rust [`vhdx`](../../reference/backends/vhdx.md)
+parser. On Windows, `.vhdx` files use the native kernel-mode VHD path
+instead. Fixed VHD1 images work on all platforms. Dynamic and differencing VHD1
+files are **not** supported — convert them to VHDX first:
+
+```bash
+qemu-img convert -f vpc -O vhdx dynamic.vhd converted.vhdx
+```
+
+Also, note the use of `memdiff`, which creates a memory-backed "differencing
+disk" shim between the VMM and the backing disk image, which ensures that any
+writes the VM makes to the VHD are not persisted between runs. This is very
+useful when iterating on OpenVMM code, since booting the VM becomes repeatable
+and you don't have to worry about shutting down properly. Use `file` instead for
+normal persistent storage.
+
+### OpenHCL, via Linux Direct Boot
+
+This example will boot OpenHCL in Linux direct mode, running a minimal shell
+inside VTL2. This is the same configuration used by the `openhcl_linux_direct_x64`
+integration tests.
+
+First, build the test artifacts from Linux or WSL using `vmm-tests-run --build-only`.
+The IGVM must be built on Linux:
+
+```shell
+cargo xflowey vmm-tests-run --build-only --dir <out> --target windows-x64
+```
+
+```admonish tip
+If you only need the IGVM binary (and already have `openvmm.exe`), you can
+use `cargo xflowey build-igvm` instead — it's faster than building the full
+test suite.
+```
+
+This places `openvmm.exe` and `openhcl-x64-test-linux-direct.bin` in the
+`<out>` directory. Then, on Windows, from the `<out>` directory:
+
+```powershell
+.\openvmm.exe `
+    --hv `
+    --vtl2 `
+    --igvm openhcl-x64-test-linux-direct.bin `
+    -c "panic=-1 reboot=triple UNDERHILL_SERIAL_WAIT_FOR_RTS=1 UNDERHILL_CMDLINE_APPEND=rdinit=/bin/sh" `
+    -m 2GB `
+    --vmbus-com1-serial "term,name=VTL0 Linux" `
+    --com3 "term,name=VTL2 OpenHCL" `
+    --vmbus-vtl2-vsock-path $env:temp\ohcldiag-dev
+```
+
+```admonish warning
+The `--vmbus-com1-serial` flag is **required** when using `rdinit=/bin/sh`.
+The shell running as PID 1 needs a controlling terminal (tty) — without one
+it exits immediately, causing a kernel panic and infinite reboot loop.
+
+The `--com3` flag is optional but recommended — it gives you VTL2 (OpenHCL)
+kernel console output for debugging.
+```
+
+For more details on running OpenHCL on OpenVMM, including
+[VMBus relay](../../reference/architecture/openhcl/vmbus.md) and device
+assignment, see [Running OpenHCL: OpenVMM](../openhcl/run/openvmm.md).
+
+### Alpine Linux, via Direct Boot
+
+See the dedicated [Alpine Linux](./alpine.md) guide for a full walkthrough of
+booting Alpine from a cloud disk image using direct boot with PCIe and
+virtio-blk.
+
+### DOS, via PCAT BIOS
+
+While DOS in particular is not a scenario that the OpenVMM has heavily invested
+in, the fact DOS is able to boot in OpenVMM serves as a testament to OpenVMM's
+solid support of legacy x86 devices and infrastructure.
+
+The following command will boot a copy of DOS from a virtual floppy disk, using
+the [Hyper-V PCAT BIOS](../../reference/devices/firmware/pcat_bios.md).
+
+Booting via PCAT is not just for DOS though! Many older operating systems,
+including older copies of Windows / Linux, require booting via BIOS.
+
+```bash
+cargo run -- --pcat --gfx --floppy memdiff:/path/to/msdos.vfd --pcat-boot-order=floppy,optical,hdd
+```

@@ -1,0 +1,46 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "fuzz_firmware_uefi"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+arbitrary = { workspace = true, features = ["derive"] }
+crypto = { workspace = true, features = ["test_helpers", "rust", "vendored"] }
+firmware_uefi = { workspace = true, features = ["fuzzing"] }
+firmware_uefi_resources.workspace = true
+guid.workspace = true
+guestmem.workspace = true
+libfuzzer-sys.workspace = true
+ucs2.workspace = true
+uefi_nvram_specvars.workspace = true
+uefi_specs.workspace = true
+xtask_fuzz.workspace = true
+zerocopy.workspace = true
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.xtask.fuzz.onefuzz-allowlist]
+fuzz_firmware_uefi_nvram = ["fuzz_nvram.rs", "../src/service/nvram/spec_services/auth_var_crypto.rs"]
+fuzz_firmware_uefi_diagnostics = ["fuzz_diagnostics.rs", "../src/service/diagnostics/*.rs"]
+
+[[bin]]
+name = "fuzz_firmware_uefi_nvram"
+path = "fuzz_nvram.rs"
+test = false
+doc = false
+doctest = false
+
+[[bin]]
+name = "fuzz_firmware_uefi_diagnostics"
+path = "fuzz_diagnostics.rs"
+test = false
+doc = false
+doctest = false
+
+[lints]
+workspace = true

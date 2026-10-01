@@ -1,0 +1,30 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "hv1_emulator"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aarch64defs.workspace = true
+hv1_structs.workspace = true
+hvdef.workspace = true
+vm_topology.workspace = true
+guestmem.workspace = true
+virt.workspace = true
+vmcore.workspace = true
+x86defs.workspace = true
+
+inspect = { workspace = true, features = ["std"] }
+tracelimit.workspace = true
+parking_lot.workspace = true
+safeatomic.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+
+[build-dependencies]
+build_rs_guest_arch.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "firmware_pcat"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+generation_id.workspace = true
+
+chipset_device.workspace = true
+guestmem.workspace = true
+memory_range.workspace = true
+vmcore.workspace = true
+vm_topology = { workspace = true, features = ["inspect"] }
+
+guid = { workspace = true, features = ["inspect"] }
+inspect.workspace = true
+mesh.workspace = true
+open_enum.workspace = true
+
+getrandom.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+tracelimit.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+
+[lints]
+workspace = true

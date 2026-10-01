@@ -1,0 +1,18 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "firmware_uefi_custom_vars"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+uefi_specs.workspace = true
+
+guid = { workspace = true, features = ["mesh"] }
+mesh_protobuf.workspace = true
+
+thiserror.workspace = true
+
+[lints]
+workspace = true

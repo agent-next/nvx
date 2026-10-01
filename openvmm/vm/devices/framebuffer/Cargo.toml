@@ -1,0 +1,28 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "framebuffer"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+video_core.workspace = true
+vm_resource.workspace = true
+
+chipset_device.workspace = true
+guestmem.workspace = true
+vmcore.workspace = true
+memory_range = { workspace = true, features = ["mesh", "inspect"] }
+
+inspect = { workspace = true, features = ["std"] }
+mesh.workspace = true
+sparse_mmap.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

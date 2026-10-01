@@ -1,0 +1,18 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "virtio_resources"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+net_backend_resources.workspace = true
+serial_core.workspace = true
+unix_socket = { workspace = true, features = ["mesh"] }
+vm_resource.workspace = true
+
+mesh.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+#![expect(missing_docs)]
+#![forbid(unsafe_code)]
+
+pub mod bzimage;
+#[warn(missing_docs)]
+pub mod common;
+pub mod cpuid;
+pub mod elf;
+pub mod importer;
+pub mod linux;
+pub mod mptable;
+pub mod paravisor;
+pub mod pcat;
+pub mod smbios;
+pub mod uefi;

@@ -1,0 +1,30 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "debug_worker"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aarch64defs.workspace = true
+debug_worker_defs.workspace = true
+vmm_core_defs.workspace = true
+
+inspect.workspace = true
+mesh.workspace = true
+mesh_worker.workspace = true
+pal_async.workspace = true
+vmsocket.workspace = true
+
+anyhow.workspace = true
+futures.workspace = true
+gdbstub.workspace = true
+gdbstub_arch.workspace = true
+socket2.workspace = true
+tracing.workspace = true
+tracelimit.workspace = true
+
+
+[lints]
+workspace = true

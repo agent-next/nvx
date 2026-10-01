@@ -1,0 +1,20 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "petri_artifact_resolver_openvmm_known_paths"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+petri_artifacts_vmm_test.workspace = true
+
+petri_artifacts_common.workspace = true
+petri_artifacts_core.workspace = true
+
+anyhow.workspace = true
+fs-err.workspace = true
+target-lexicon.workspace = true
+
+[lints]
+workspace = true

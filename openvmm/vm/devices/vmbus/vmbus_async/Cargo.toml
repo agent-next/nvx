@@ -1,0 +1,23 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmbus_async"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vmbus_channel.workspace = true
+vmbus_ring.workspace = true
+
+guestmem.workspace = true
+
+inspect.workspace = true
+inspect_counters.workspace = true
+pal_async.workspace = true
+
+futures.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+[lints]
+workspace = true

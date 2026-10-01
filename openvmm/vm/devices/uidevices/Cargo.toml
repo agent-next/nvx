@@ -1,0 +1,43 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "uidevices"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hyperv_keyboard_protocol.workspace = true
+input_core.workspace = true
+uidevices_resources.workspace = true
+video_core.workspace = true
+vm_resource.workspace = true
+vmbus_async.workspace = true
+vmbus_channel.workspace = true
+vmbus_ring.workspace = true
+guestmem.workspace = true
+vmcore.workspace = true
+
+inspect.workspace = true
+mesh.workspace = true
+guid.workspace = true
+task_control.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+tracelimit.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+[dev-dependencies]
+pal_async.workspace = true
+tracing_helpers.workspace = true
+
+test_with_tracing.workspace = true
+framebuffer.workspace = true
+sparse_mmap.workspace = true
+
+[lints]
+workspace = true

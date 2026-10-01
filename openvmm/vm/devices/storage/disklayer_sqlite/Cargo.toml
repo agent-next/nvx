@@ -1,0 +1,55 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "disklayer_sqlite"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+disk_backend_resources.workspace = true
+disk_backend.workspace = true
+disk_layered.workspace = true
+guestmem.workspace = true
+scsi_buffers.workspace = true
+vm_resource.workspace = true
+
+inspect = { workspace = true, features = ["filepath"] }
+
+anyhow.workspace = true
+blocking.workspace = true
+fs-err.workspace = true
+futures.workspace = true
+# NOTE: this crate does not rely on any particularly "modern" sqlite features at
+# the moment, and does not require the use of the "bundled" feature to build +
+# link against the most up-to-date sqlite version.
+#
+# That said - top-level binaries which use this crate may wish to enable the
+# "bundled" feature in order to ensure consistent behaviors across platforms.
+#
+# Tests enable "bundled" (see [dev-dependencies] below) so that they do not
+# require a system libsqlite3 development package to link.
+rusqlite.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+tempfile.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pal_async.workspace = true
+storage_tests.workspace = true
+
+# Building SQLite from source needs a C toolchain for the target, which the
+# macOS cross-compile lint job does not have. That job only lints and never
+# links, so it does not need the library at all.
+[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
+rusqlite = { workspace = true, features = ["bundled"] }
+
+[features]
+# Build SQLite from source instead of linking the system library. Test crates
+# enable this so that they do not require a system libsqlite3 development
+# package to link; it is not intended for production builds.
+bundled = ["rusqlite/bundled"]
+
+[lints]
+workspace = true

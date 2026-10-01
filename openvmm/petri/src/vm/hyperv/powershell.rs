@@ -1,0 +1,2271 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Wrappers for Hyper-V Powershell Cmdlets
+
+use crate::CommandError;
+use crate::OpenHclServicingFlags;
+use crate::PetriLogFile;
+use crate::PetriVmConfig;
+use crate::PetriVmProperties;
+use crate::VmScreenshotMeta;
+use crate::run_host_cmd;
+use crate::vm::append_cmdline;
+use anyhow::Context;
+use core::str;
+use guid::Guid;
+use jiff::Timestamp;
+use powershell_builder as ps;
+use powershell_builder::PowerShellBuilder;
+use serde::Deserialize;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+use std::str::FromStr;
+use tempfile::NamedTempFile;
+use tracing::Level;
+
+/// Hyper-V VM Generation
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HyperVGeneration {
+    /// Generation 1 (with emulated legacy devices and PCAT BIOS)
+    One = 1,
+    /// Generation 2 (synthetic devices and UEFI)
+    Two = 2,
+}
+
+impl ps::AsVal for HyperVGeneration {
+    fn as_val(&self) -> impl '_ + AsRef<OsStr> {
+        match self {
+            HyperVGeneration::One => "1",
+            HyperVGeneration::Two => "2",
+        }
+    }
+}
+
+/// Hyper-V Guest State Isolation Type
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
+#[serde(try_from = "i32")]
+pub enum HyperVGuestStateIsolationType {
+    /// Trusted Launch (OpenHCL, SecureBoot, TPM)
+    TrustedLaunch = 0,
+    /// VBS
+    Vbs = 1,
+    /// SNP
+    Snp = 2,
+    /// TDX
+    Tdx = 3,
+    /// OpenHCL but no isolation
+    OpenHCL = 16,
+    /// No HCL and no isolation
+    Disabled = -1,
+}
+
+impl TryFrom<i32> for HyperVGuestStateIsolationType {
+    type Error = String;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            -1 => Ok(HyperVGuestStateIsolationType::Disabled),
+            0 => Ok(HyperVGuestStateIsolationType::TrustedLaunch),
+            1 => Ok(HyperVGuestStateIsolationType::Vbs),
+            2 => Ok(HyperVGuestStateIsolationType::Snp),
+            3 => Ok(HyperVGuestStateIsolationType::Tdx),
+            16 => Ok(HyperVGuestStateIsolationType::OpenHCL),
+            _ => Err(format!("Unknown isolation type: {}", value)),
+        }
+    }
+}
+
+impl ps::AsVal for HyperVGuestStateIsolationType {
+    fn as_val(&self) -> impl '_ + AsRef<OsStr> {
+        match self {
+            HyperVGuestStateIsolationType::Disabled => "-1",
+            HyperVGuestStateIsolationType::TrustedLaunch => "0",
+            HyperVGuestStateIsolationType::Vbs => "1",
+            HyperVGuestStateIsolationType::Snp => "2",
+            HyperVGuestStateIsolationType::Tdx => "3",
+            HyperVGuestStateIsolationType::OpenHCL => "16",
+        }
+    }
+}
+
+impl HyperVGuestStateIsolationType {
+    /// Whether this VM is isolated
+    pub fn isolated(&self) -> bool {
+        match self {
+            HyperVGuestStateIsolationType::Vbs
+            | HyperVGuestStateIsolationType::Snp
+            | HyperVGuestStateIsolationType::Tdx => true,
+            HyperVGuestStateIsolationType::TrustedLaunch
+            | HyperVGuestStateIsolationType::OpenHCL
+            | HyperVGuestStateIsolationType::Disabled => false,
+        }
+    }
+}
+
+/// Hyper-V Secure Boot Template
+#[derive(Clone, Copy)]
+pub enum HyperVSecureBootTemplate {
+    /// Windows Secure Boot Template
+    MicrosoftWindows,
+    /// Microsoft UEFI Certificate Authority Template
+    MicrosoftUEFICertificateAuthority,
+    /// Open Source Shielded VM Template
+    OpenSourceShieldedVM,
+}
+
+impl ps::AsVal for HyperVSecureBootTemplate {
+    fn as_val(&self) -> impl '_ + AsRef<OsStr> {
+        match self {
+            HyperVSecureBootTemplate::MicrosoftWindows => "MicrosoftWindows",
+            HyperVSecureBootTemplate::MicrosoftUEFICertificateAuthority => {
+                "MicrosoftUEFICertificateAuthority"
+            }
+            HyperVSecureBootTemplate::OpenSourceShieldedVM => "OpenSourceShieldedVM",
+        }
+    }
+}
+
+/// Arguments for the New-VM powershell cmdlet
+pub struct HyperVNewVMArgs<'a> {
+    /// Specifies the name of the new virtual machine.
+    pub name: &'a str,
+    /// Specifies the generation for the virtual machine.
+    pub generation: Option<HyperVGeneration>,
+    /// Specifies the Guest State Isolation Type
+    pub guest_state_isolation_type: Option<HyperVGuestStateIsolationType>,
+    /// Specifies the amount of memory, in bytes, to assign to the virtual machine.
+    pub memory_startup_bytes: Option<u64>,
+    /// Specifies the directory to store the files for the new virtual machine.
+    pub path: Option<&'a Path>,
+    /// Specifies the path to a virtual hard disk file.
+    pub vhd_path: Option<&'a Path>,
+    /// Specifies the path to the guest state file for the virtual machine
+    /// being created.
+    pub source_guest_state_path: Option<&'a Path>,
+}
+
+/// Runs New-VM with the given arguments.
+pub async fn run_new_vm(args: HyperVNewVMArgs<'_>) -> anyhow::Result<Guid> {
+    let vmid = run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("New-VM")
+            .arg("Name", args.name)
+            .arg_opt("Generation", args.generation)
+            .arg_opt("GuestStateIsolationType", args.guest_state_isolation_type)
+            .arg_opt("MemoryStartupBytes", args.memory_startup_bytes)
+            .arg_opt("Path", args.path)
+            .arg_opt("VHDPath", args.vhd_path)
+            .arg_opt("SourceGuestStatePath", args.source_guest_state_path)
+            .flag("Force")
+            .pipeline()
+            .cmdlet("Select-Object")
+            .arg("ExpandProperty", "Id")
+            .pipeline()
+            .cmdlet("Select-Object")
+            .arg("ExpandProperty", "Guid")
+            .finish()
+            .build(),
+    )
+    .await
+    .context("new_vm")?;
+
+    Guid::from_str(&vmid).context("invalid vmid")
+}
+
+/// Hyper-V Guest State Lifetime
+#[derive(Clone, Copy)]
+pub enum HyperVGuestStateLifetime {
+    /// Standard persistent VMGS
+    Default = 0,
+    /// Reprovision the VMGS if it is corrupted
+    ReprovisionOnFailure = 1,
+    /// Reprovision the VMGS
+    Reprovision = 2,
+    /// Don't persist anything to the VMGS
+    Ephemeral = 3,
+}
+
+impl ps::AsVal for HyperVGuestStateLifetime {
+    fn as_val(&self) -> impl '_ + AsRef<OsStr> {
+        match self {
+            HyperVGuestStateLifetime::Default => "0",
+            HyperVGuestStateLifetime::ReprovisionOnFailure => "1",
+            HyperVGuestStateLifetime::Reprovision => "2",
+            HyperVGuestStateLifetime::Ephemeral => "3",
+        }
+    }
+}
+
+/// Hyper-V Guest State Encryption Policy
+#[derive(Clone, Copy, Debug)]
+pub enum HyperVGuestStateEncryptionPolicy {
+    /// Use the best available
+    Default = 0,
+    /// Don't encrypt
+    None = 1,
+    /// Encrypt using GspById
+    GspById = 2,
+    /// Encrypt using GspKey
+    GspKey = 3,
+    /// Encrypt using hardware sealing (hash)
+    HardwareSealedSecretsHashPolicy = 4,
+    /// Encrypt using hardware sealing (signer)
+    HardwareSealedSecretsSignerPolicy = 5,
+}
+
+impl ps::AsVal for HyperVGuestStateEncryptionPolicy {
+    fn as_val(&self) -> impl '_ + AsRef<OsStr> {
+        match self {
+            HyperVGuestStateEncryptionPolicy::Default => "0",
+            HyperVGuestStateEncryptionPolicy::None => "1",
+            HyperVGuestStateEncryptionPolicy::GspById => "2",
+            HyperVGuestStateEncryptionPolicy::GspKey => "3",
+            HyperVGuestStateEncryptionPolicy::HardwareSealedSecretsHashPolicy => "4",
+            HyperVGuestStateEncryptionPolicy::HardwareSealedSecretsSignerPolicy => "5",
+        }
+    }
+}
+
+/// Hyper-V Management VTL Feature Flags
+#[bitfield_struct::bitfield(u64)]
+pub struct HyperVManagementVtlFeatureFlags {
+    pub strict_encryption_policy: bool,
+    pub load_firmware_supported: bool,
+    pub control_ak_cert_provisioning: bool,
+    pub attempt_ak_cert_callback: bool,
+    pub tx_only_serial_port: bool,
+    pub _reserved5: bool,
+    pub use_tpm_138_by_default: bool,
+    pub use_tpm_185_by_default: bool,
+    #[bits(56)]
+    pub _reserved2: u64,
+}
+
+impl HyperVManagementVtlFeatureFlags {
+    fn with_tpm_version(self, version: Option<crate::PetriTpmVersion>) -> Self {
+        match version {
+            Some(crate::PetriTpmVersion::V138) => self
+                .with_use_tpm_138_by_default(true)
+                .with_use_tpm_185_by_default(false),
+            Some(crate::PetriTpmVersion::V185) => self
+                .with_use_tpm_138_by_default(false)
+                .with_use_tpm_185_by_default(true),
+            None => self,
+        }
+    }
+}
+
+impl ps::AsVal for HyperVManagementVtlFeatureFlags {
+    fn as_val(&self) -> impl '_ + AsRef<OsStr> {
+        self.0.as_val()
+    }
+}
+
+/// Arguments for the New-CustomVM powershell cmdlet
+pub struct HyperVNewCustomVMArgs {
+    /// Name
+    pub name: String,
+    /// Generation
+    pub generation: Option<HyperVGeneration>,
+    /// Guest State Isolation Type
+    pub guest_state_isolation_type: Option<HyperVGuestStateIsolationType>,
+    /// Guest State Isolation Mode
+    pub guest_state_isolation_mode: Option<HyperVGuestStateIsolationMode>,
+    /// Guest State Lifetime
+    pub guest_state_lifetime: Option<HyperVGuestStateLifetime>,
+    /// Path to the VMGS file (creates a new one if not specified)
+    pub guest_state_path: Option<PathBuf>,
+    /// VMBUS message redirection
+    pub vmbus_message_redirection: Option<bool>,
+    /// Path to the OpenHCL firmware IGVM file
+    pub firmware_file: Option<PathBuf>,
+    /// OpenHCL command line parameters
+    pub firmware_parameters: Option<String>,
+    /// Whether to increase the memory available to VTL2
+    pub increase_vtl2_memory: Option<bool>,
+    /// Whether to attempt a default boot even if existing entries fail
+    pub default_boot_always_attempt: Option<bool>,
+    /// Enable secure boot
+    pub secure_boot_enabled: Option<bool>,
+    /// Secure boot template
+    pub secure_boot_template: Option<HyperVSecureBootTemplate>,
+    /// Management VTL feature flags
+    pub management_vtl_feature_flags: Option<HyperVManagementVtlFeatureFlags>,
+    /// Guest State Encryption Policy
+    pub guest_state_encryption_policy: Option<HyperVGuestStateEncryptionPolicy>,
+    /// Memory to assign to the VM (defaults to 4GB)
+    pub memory: Option<u64>,
+    /// Number of processors for the VM (defaults to 2)
+    pub vp_count: Option<u64>,
+    /// APIC mode
+    pub apic_mode: Option<HyperVApicMode>,
+    /// Threads per core
+    pub hw_threads_per_core: Option<u64>,
+    /// Processors per socket
+    pub max_processors_per_numa_node: Option<u64>,
+    /// VMBus storage controllers (SCSI and NVMe), keyed by VSID
+    pub storage_controllers: HashMap<Guid, HyperVVmbusStorageController>,
+    /// IDE controllers and associated drives/disks
+    pub ide_controllers: HashMap<u32, HashMap<u8, HyperVDrive>>,
+    /// Physical NVMe devices, used exclusively in closed source tests
+    pub physical_nvme_devices: HashMap<Guid, crate::PhysicalNvmeDevice>,
+    /// Temporary file containing initial machine configuration data
+    pub imc_hiv: Option<NamedTempFile>,
+    /// Enable COM1 at \\.\pipe\<VMID>-1
+    pub com_1: bool,
+    /// Enable COM3 at \\.\pipe\<VMID>-3
+    pub com_3: bool,
+    /// Enable the TPM
+    pub tpm_enabled: bool,
+    /// Enable guest hibernation
+    pub hibernation_enabled: bool,
+    /// Temporary file containing management VTL settings
+    pub management_vtl_settings: Option<NamedTempFile>,
+}
+
+/// VMBus storage controller type
+pub enum HyperVVmbusStorageType {
+    /// SCSI controller (Msvm_ResourceAllocationSettingData)
+    Scsi,
+    /// NVMe emulator controller (created via closed-source HvlDeviceHost module)
+    Nvme,
+}
+
+/// VMBus storage controller configuration (SCSI or NVMe), keyed by VSID.
+pub struct HyperVVmbusStorageController {
+    /// Controller type
+    pub controller_type: HyperVVmbusStorageType,
+    /// Target VTL
+    pub target_vtl: crate::Vtl,
+    /// Drives attached to this controller, keyed by LUN (SCSI) or namespace ID (NVMe).
+    pub drives: HashMap<u32, HyperVDrive>,
+}
+
+/// Hyper-V disk drive
+#[derive(Debug, Clone)]
+pub struct HyperVDrive {
+    /// Backing disk
+    pub disk: Option<PathBuf>,
+    /// Whether this is a DVD
+    pub is_dvd: bool,
+}
+
+impl HyperVNewCustomVMArgs {
+    /// Check for missing WMI properties and adjust the OpenHCL command line to compensate
+    pub async fn make_compatible(&mut self) -> anyhow::Result<()> {
+        let available_properties = run_get_vssd_properties().await?;
+        let property_exists = |name: &str| available_properties.iter().any(|x| x == name);
+        let is_openhcl = self.firmware_file.is_some();
+
+        if let Some(guest_state_lifetime) = self.guest_state_lifetime.as_ref()
+            && !property_exists("GuestStateLifetime")
+        {
+            if is_openhcl {
+                let lifetime_cli = match guest_state_lifetime {
+                    HyperVGuestStateLifetime::Default => "DEFAULT",
+                    HyperVGuestStateLifetime::ReprovisionOnFailure => "REPROVISION_ON_FAILURE",
+                    HyperVGuestStateLifetime::Reprovision => "REPROVISION",
+                    HyperVGuestStateLifetime::Ephemeral => "EPHEMERAL",
+                };
+                append_cmdline(
+                    &mut self.firmware_parameters,
+                    format!("HCL_GUEST_STATE_LIFETIME={lifetime_cli}"),
+                );
+
+            // allow default/ephemeral/none to imply default behavior for non-openhcl VMs
+            } else if !matches!(
+                self.guest_state_lifetime,
+                None | Some(
+                    HyperVGuestStateLifetime::Default | HyperVGuestStateLifetime::Ephemeral
+                )
+            ) {
+                anyhow::bail!("OpenHCL is required to set GuestStateLifetime via commandline");
+            }
+            self.guest_state_lifetime = None;
+        }
+
+        if let Some(default_boot_always_attempt) = self.default_boot_always_attempt.as_ref()
+            && !property_exists("DefaultBootAlwaysAttempt")
+        {
+            if is_openhcl {
+                let arg = format!(
+                    "HCL_DEFAULT_BOOT_ALWAYS_ATTEMPT={}",
+                    if *default_boot_always_attempt { 1 } else { 0 }
+                );
+                // In certain cases, this one may have already been added
+                if !self
+                    .firmware_parameters
+                    .as_ref()
+                    .is_some_and(|x| x.contains(&arg))
+                {
+                    append_cmdline(&mut self.firmware_parameters, arg);
+                }
+            }
+
+            // allow default behavior for non-openhcl vms
+            self.default_boot_always_attempt = None;
+        }
+
+        if let Some(management_vtl_feature_flags) = self.management_vtl_feature_flags.as_ref()
+            && !property_exists("ManagementVtlFeatureFlags")
+        {
+            if !is_openhcl {
+                anyhow::bail!("OpenHCL is required to set ManagementVtlFeatureFlags");
+            }
+
+            let supported_flags =
+                HyperVManagementVtlFeatureFlags::new().with_strict_encryption_policy(true);
+            if management_vtl_feature_flags.0 & !supported_flags.0 != 0 {
+                anyhow::bail!(
+                    "not all ManagementVtlFeatureFlags can be set using the command line: {}",
+                    management_vtl_feature_flags.0
+                )
+            }
+            if management_vtl_feature_flags.strict_encryption_policy() {
+                append_cmdline(
+                    &mut self.firmware_parameters,
+                    "HCL_STRICT_ENCRYPTION_POLICY=1",
+                );
+            }
+            self.management_vtl_feature_flags = None;
+        }
+
+        if let Some(guest_state_encryption_policy) = self.guest_state_encryption_policy.as_ref()
+            && !property_exists("GuestStateEncryptionPolicy")
+        {
+            if !is_openhcl {
+                anyhow::bail!("OpenHCL is required to set GuestStateEncryptionPolicy");
+            }
+
+            // Hardware sealing is encoded by the host as a combined
+            // `GuestStateEncryptionPolicy` value, but is plumbed over the
+            // OpenHCL command line as two separate settings: the encryption
+            // policy (`HARDWARE_SEALING`) and the sealing policy id
+            // (`HASH`/`SIGNER`). A single exhaustive match keeps the two
+            // encodings in sync and forces new variants to be handled here.
+            let (encryption_cli, sealing_cli) = match guest_state_encryption_policy {
+                HyperVGuestStateEncryptionPolicy::Default => ("AUTO", None),
+                HyperVGuestStateEncryptionPolicy::None => ("NONE", None),
+                HyperVGuestStateEncryptionPolicy::GspById => ("GSP_BY_ID", None),
+                HyperVGuestStateEncryptionPolicy::GspKey => ("GSP_KEY", None),
+                HyperVGuestStateEncryptionPolicy::HardwareSealedSecretsHashPolicy => {
+                    ("HARDWARE_SEALING", Some("HASH"))
+                }
+                HyperVGuestStateEncryptionPolicy::HardwareSealedSecretsSignerPolicy => {
+                    ("HARDWARE_SEALING", Some("SIGNER"))
+                }
+            };
+            append_cmdline(
+                &mut self.firmware_parameters,
+                format!("HCL_GUEST_STATE_ENCRYPTION_POLICY={encryption_cli}"),
+            );
+            if let Some(sealing_cli) = sealing_cli {
+                append_cmdline(
+                    &mut self.firmware_parameters,
+                    format!("HCL_HARDWARE_SEALING_POLICY={sealing_cli}"),
+                );
+            }
+            self.guest_state_encryption_policy = None;
+        }
+
+        Ok(())
+    }
+
+    /// Create a set of arguments for New-CustomVM from a Petri VM config
+    pub fn from_config(
+        config: &PetriVmConfig,
+        properties: &PetriVmProperties,
+    ) -> anyhow::Result<HyperVNewCustomVMArgs> {
+        use crate::ApicMode;
+        use crate::IsolationType;
+        use crate::PetriHardwareSealingPolicy;
+        use crate::PetriVmgsResource;
+        use crate::SecureBootTemplate;
+        use petri_artifacts_common::tags::MachineArch;
+        use vmgs_resources::GuestStateEncryptionPolicy;
+
+        let PetriVmConfig {
+            name,
+            arch,
+            machine_profile,
+            firmware,
+            memory,
+            proc_topology,
+            vmgs,
+            tpm,
+            physical_nvme_devices,
+            ..
+        } = config;
+
+        crate::vm::microvm::ensure_hyperv_compatible(*machine_profile)?;
+
+        if firmware
+            .openhcl_config()
+            .is_some_and(|c| c.vtl2_base_address_type.is_some())
+        {
+            todo!("custom VTL2 base address type not yet supported for Hyper-V")
+        }
+
+        Ok(HyperVNewCustomVMArgs {
+            name: name.to_owned(),
+            generation: Some(if properties.is_pcat {
+                HyperVGeneration::One
+            } else {
+                HyperVGeneration::Two
+            }),
+            guest_state_isolation_type: match firmware.isolation() {
+                Some(IsolationType::Vbs) => Some(HyperVGuestStateIsolationType::Vbs),
+                Some(IsolationType::Snp) => Some(HyperVGuestStateIsolationType::Snp),
+                Some(IsolationType::Tdx) => Some(HyperVGuestStateIsolationType::Tdx),
+                None if properties.is_openhcl => Some(HyperVGuestStateIsolationType::OpenHCL),
+                None => None,
+            },
+            guest_state_isolation_mode: {
+                let no_persistent_secrets = tpm
+                    .as_ref()
+                    .map(|c| c.no_persistent_secrets)
+                    .unwrap_or(false);
+                if no_persistent_secrets && !properties.is_openhcl {
+                    anyhow::bail!("no persistent secrets requires an hcl");
+                }
+                properties.is_openhcl.then_some(if no_persistent_secrets {
+                    HyperVGuestStateIsolationMode::NoPersistentSecrets
+                } else {
+                    HyperVGuestStateIsolationMode::Default
+                })
+            },
+            guest_state_lifetime: properties.is_openhcl.then_some(match &vmgs {
+                PetriVmgsResource::Disk(_) => HyperVGuestStateLifetime::Default,
+                PetriVmgsResource::ReprovisionOnFailure(_) => {
+                    HyperVGuestStateLifetime::ReprovisionOnFailure
+                }
+                PetriVmgsResource::Reprovision(_) => HyperVGuestStateLifetime::Reprovision,
+                PetriVmgsResource::Ephemeral => HyperVGuestStateLifetime::Ephemeral,
+            }),
+            vmbus_message_redirection: firmware.openhcl_config().map(|c| c.vmbus_redirect),
+            increase_vtl2_memory: properties.is_openhcl.then_some(!properties.is_isolated),
+            default_boot_always_attempt: firmware
+                .uefi_config()
+                .map(|c| c.default_boot_always_attempt),
+            secure_boot_enabled: firmware.uefi_config().map(|c| c.secure_boot_enabled),
+            secure_boot_template: firmware
+                .uefi_config()
+                .and_then(|c| c.secure_boot_template)
+                .map(|t| match t {
+                    SecureBootTemplate::MicrosoftWindows => {
+                        HyperVSecureBootTemplate::MicrosoftWindows
+                    }
+                    SecureBootTemplate::MicrosoftUefiCertificateAuthority => {
+                        HyperVSecureBootTemplate::MicrosoftUEFICertificateAuthority
+                    }
+                }),
+            management_vtl_feature_flags: properties.is_openhcl.then(|| {
+                HyperVManagementVtlFeatureFlags::new()
+                    .with_strict_encryption_policy(
+                        vmgs.encryption_policy()
+                            .map(|p| p.is_strict())
+                            .unwrap_or(false),
+                    )
+                    .with_tpm_version(tpm.as_ref().map(|t| t.version))
+            }),
+            guest_state_encryption_policy: {
+                // A requested hardware sealing policy takes precedence over the
+                // VMGS-derived encryption policy: it maps to a dedicated
+                // `GuestStateEncryptionPolicy` value that selects hardware
+                // sealing as the exclusive encryption source.
+                let hardware_sealing = tpm.as_ref().and_then(|t| match t.hardware_sealing_policy {
+                    PetriHardwareSealingPolicy::Default => None,
+                    PetriHardwareSealingPolicy::HashPolicy => {
+                        Some(HyperVGuestStateEncryptionPolicy::HardwareSealedSecretsHashPolicy)
+                    }
+                    PetriHardwareSealingPolicy::SignerPolicy => {
+                        Some(HyperVGuestStateEncryptionPolicy::HardwareSealedSecretsSignerPolicy)
+                    }
+                });
+                if let Some(policy) = hardware_sealing {
+                    if !firmware.is_openhcl() {
+                        anyhow::bail!("hardware sealing policy requires OpenHCL firmware");
+                    }
+                    Some(policy)
+                } else {
+                    firmware
+                        .is_openhcl()
+                        .then(|| vmgs.encryption_policy())
+                        .flatten()
+                        .map(|p| match p {
+                            GuestStateEncryptionPolicy::Auto => {
+                                HyperVGuestStateEncryptionPolicy::Default
+                            }
+                            GuestStateEncryptionPolicy::None(_) => {
+                                HyperVGuestStateEncryptionPolicy::None
+                            }
+                            GuestStateEncryptionPolicy::GspById(_) => {
+                                HyperVGuestStateEncryptionPolicy::GspById
+                            }
+                            GuestStateEncryptionPolicy::GspKey(_) => {
+                                HyperVGuestStateEncryptionPolicy::GspKey
+                            }
+                        })
+                }
+            },
+            memory: Some(memory.startup_bytes),
+            vp_count: Some(proc_topology.vp_count as u64),
+            // TODO: fix this mapping, and/or update petri to better match
+            // Hyper-V's capabilities.
+            apic_mode: proc_topology
+                .apic_mode
+                .map(|m| match m {
+                    ApicMode::Xapic => HyperVApicMode::Legacy,
+                    ApicMode::X2apicSupported => HyperVApicMode::X2Apic,
+                    ApicMode::X2apicEnabled => HyperVApicMode::X2Apic,
+                })
+                .or(
+                    (*arch == MachineArch::X86_64 && !properties.is_pcat).then_some({
+                        // This is necessary for some tests to pass. TODO: fix.
+                        HyperVApicMode::X2Apic
+                    }),
+                ),
+            hw_threads_per_core: proc_topology.enable_smt.map(|smt| if smt { 2 } else { 1 }),
+            max_processors_per_numa_node: proc_topology.vps_per_socket.map(|v| v as u64),
+            tpm_enabled: {
+                let tpm_enabled = tpm.is_some();
+                if properties.is_pcat && tpm_enabled {
+                    anyhow::bail!("hyper-v gen 1 VMs do not support a TPM");
+                }
+                tpm_enabled
+            },
+            hibernation_enabled: config.hibernation_enabled,
+            com_1: true,
+
+            // specified after creation
+            firmware_file: None,
+            firmware_parameters: None,
+            guest_state_path: None,
+            storage_controllers: HashMap::new(),
+            ide_controllers: HashMap::new(),
+            com_3: false,
+            imc_hiv: None,
+            management_vtl_settings: None,
+            physical_nvme_devices: physical_nvme_devices.clone(),
+        })
+    }
+}
+
+/// Runs New-CustomVM with the given arguments.
+pub async fn run_new_customvm(ps_mod: &Path, args: HyperVNewCustomVMArgs) -> anyhow::Result<Guid> {
+    let (guest_state_isolation_enabled, guest_state_isolation_type) = args
+        .guest_state_isolation_type
+        .and_then(|isolation_type| match isolation_type {
+            HyperVGuestStateIsolationType::Disabled => None,
+            isolation_type => Some((true, isolation_type)),
+        })
+        .unzip();
+
+    let secure_boot_template_id = args.secure_boot_template.map(|t| match t {
+        HyperVSecureBootTemplate::MicrosoftWindows => {
+            guid::guid!("1734c6e8-3154-4dda-ba5f-a874cc483422")
+        }
+        HyperVSecureBootTemplate::MicrosoftUEFICertificateAuthority => {
+            guid::guid!("272e7447-90a4-4563-a4b9-8e4ab00526ce")
+        }
+        HyperVSecureBootTemplate::OpenSourceShieldedVM => {
+            guid::guid!("4292ae2b-ee2c-42b5-a969-dd8f8689f6f3")
+        }
+    });
+
+    // Partition storage controllers into SCSI and NVMe.
+    let mut scsi_map: HashMap<Guid, HyperVVmbusStorageController> = HashMap::new();
+    let mut nvme_map: HashMap<Guid, HyperVVmbusStorageController> = HashMap::new();
+    for (vsid, controller) in args.storage_controllers {
+        match controller.controller_type {
+            HyperVVmbusStorageType::Scsi => {
+                scsi_map.insert(vsid, controller);
+            }
+            HyperVVmbusStorageType::Nvme => {
+                nvme_map.insert(vsid, controller);
+            }
+        }
+    }
+
+    let scsi_controllers = (!scsi_map.is_empty()).then(|| {
+        ps::HashTable::new(scsi_map.into_iter().map(
+            |(
+                vsid,
+                HyperVVmbusStorageController {
+                    target_vtl, drives, ..
+                },
+            )| {
+                (
+                    vsid,
+                    ps::Value::new(ps::HashTable::new([
+                        ("Vtl", ps::Value::new(target_vtl as u32)),
+                        (
+                            "Drives",
+                            ps::Value::new(ps::HashTable::new(drives.into_iter().map(
+                                |(lun, HyperVDrive { disk, is_dvd })| {
+                                    (lun, {
+                                        let mut drive = vec![("Dvd", ps::Value::new(is_dvd))];
+                                        if let Some(disk) = disk {
+                                            drive.push(("DiskPath", ps::Value::new(disk)));
+                                        }
+                                        ps::Value::new(ps::HashTable::new(drive))
+                                    })
+                                },
+                            ))),
+                        ),
+                    ])),
+                )
+            },
+        ))
+    });
+
+    let ide_controllers =
+        (!args.ide_controllers.is_empty()).then(|| {
+            ps::HashTable::new(args.ide_controllers.into_iter().map(
+                |(controller_number, drives)| {
+                    (
+                        controller_number,
+                        ps::Value::new(ps::HashTable::new(drives.into_iter().map(
+                            |(lun, HyperVDrive { disk, is_dvd })| {
+                                (lun, {
+                                    let mut drive = vec![("Dvd", ps::Value::new(is_dvd))];
+                                    if let Some(disk) = disk {
+                                        drive.push(("DiskPath", ps::Value::new(disk)));
+                                    }
+                                    ps::Value::new(ps::HashTable::new(drive))
+                                })
+                            },
+                        ))),
+                    )
+                },
+            ))
+        });
+
+    // Serialize NVMe controllers as a hashtable keyed by VSID.
+    // Each value: @{ Vtl = N; Drives = @("path1", "path2", ...) }
+    // New-CustomVM imports HvlDeviceHost internally and calls New-NvmeEmulatorRasd.
+    let nvme_controllers = if nvme_map.is_empty() {
+        None
+    } else {
+        let mut nvme_entries = Vec::new();
+        for (
+            vsid,
+            HyperVVmbusStorageController {
+                target_vtl, drives, ..
+            },
+        ) in nvme_map
+        {
+            // Sort drives by namespace ID and validate they are exactly
+            // 1..N — the emulator assigns NSIDs sequentially by VHD
+            // argument order.
+            let mut sorted_drives: Vec<_> = drives.into_iter().collect();
+            sorted_drives.sort_by_key(|(nsid, _)| *nsid);
+            let expected: Vec<u32> = (1..=sorted_drives.len() as u32).collect();
+            let actual: Vec<u32> = sorted_drives.iter().map(|(nsid, _)| *nsid).collect();
+            anyhow::ensure!(
+                actual == expected,
+                "NVMe namespace IDs must be 1..{}, got {:?}",
+                expected.len(),
+                actual
+            );
+            nvme_entries.push((
+                vsid,
+                ps::Value::new(ps::HashTable::new([
+                    ("Vtl", ps::Value::new(target_vtl as u32)),
+                    (
+                        "Drives",
+                        ps::Value::new(ps::Array::new(sorted_drives.into_iter().map(
+                            |(_, HyperVDrive { disk, .. })| {
+                                disk.expect("NVMe drives must have disk paths")
+                            },
+                        ))),
+                    ),
+                ])),
+            ));
+        }
+        Some(ps::HashTable::new(nvme_entries))
+    };
+
+    let physical_nvme_controllers = if args.physical_nvme_devices.is_empty() {
+        None
+    } else {
+        Some(ps::HashTable::new(args.physical_nvme_devices.iter().map(
+            |(vsid, dev)| {
+                (
+                    vsid,
+                    ps::Value::new(ps::HashTable::new([
+                        ("Vtl", ps::Value::new(dev.target_vtl as u32)),
+                        ("Nsid", ps::Value::new(dev.nsid)),
+                    ])),
+                )
+            },
+        )))
+    };
+
+    let builder = PowerShellBuilder::new()
+        .cmdlet("Import-Module")
+        .positional(ps_mod)
+        .next();
+
+    let vmid = run_host_cmd(
+        builder
+            .cmdlet("New-CustomVM")
+            .arg("VMName", args.name)
+            .arg_opt("Generation", args.generation)
+            .arg_opt("GuestStateIsolationEnabled", guest_state_isolation_enabled)
+            .arg_opt("GuestStateIsolationType", guest_state_isolation_type)
+            .arg_opt("GuestStateIsolationMode", args.guest_state_isolation_mode)
+            .arg_opt("GuestStateLifetime", args.guest_state_lifetime)
+            .arg_opt("GuestStateFilePath", args.guest_state_path)
+            .arg_opt("VMBusMessageRedirection", args.vmbus_message_redirection)
+            .arg_opt("FirmwareFile", args.firmware_file)
+            .arg_opt("FirmwareParameters", args.firmware_parameters)
+            .flag_opt(
+                args.increase_vtl2_memory
+                    .and_then(|v| v.then_some("IncreaseVtl2Memory")),
+            )
+            .arg_opt("DefaultBootAlwaysAttempt", args.default_boot_always_attempt)
+            .arg_opt("SecureBootEnabled", args.secure_boot_enabled)
+            .arg_opt("SecureBootTemplateId", secure_boot_template_id)
+            .arg_opt(
+                "ManagementVtlFeatureFlags",
+                args.management_vtl_feature_flags,
+            )
+            .arg_opt(
+                "GuestStateEncryptionPolicy",
+                args.guest_state_encryption_policy,
+            )
+            .arg_opt("Memory", args.memory)
+            .arg_opt("VpCount", args.vp_count)
+            .arg_opt("ApicMode", args.apic_mode)
+            .arg_opt("HwThreadsPerCore", args.hw_threads_per_core)
+            .arg_opt(
+                "MaxProcessorsPerNumaNode",
+                args.max_processors_per_numa_node,
+            )
+            .arg_opt("ScsiControllers", scsi_controllers)
+            .arg_opt("IdeControllers", ide_controllers)
+            .arg_opt("NvmeControllers", nvme_controllers)
+            .arg_opt("PhysicalNvmeControllers", physical_nvme_controllers)
+            .arg_opt("ImcHive", args.imc_hiv.as_ref().map(|f| f.path()))
+            .arg("Com1", args.com_1)
+            .arg("Com3", args.com_3)
+            .arg("TpmEnabled", args.tpm_enabled)
+            .arg("EnableHibernation", args.hibernation_enabled)
+            .arg_opt(
+                "ManagementVtlSettings",
+                args.management_vtl_settings.as_ref().map(|f| f.path()),
+            )
+            .finish()
+            .build(),
+    )
+    .await
+    .context("new_customvm")?;
+
+    Guid::from_str(&vmid).context("invalid vmid")
+}
+
+/// Runs New-VM with the given arguments.
+pub async fn run_remove_vm(vmid: &Guid) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Remove-VM")
+            .flag("Force")
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("remove_vm")
+}
+
+/// Request a physical NVMe device via closed-source script
+pub async fn request_physical_nvme(
+    namespace_size_mib: u64,
+    target_vtl: crate::Vtl,
+) -> anyhow::Result<(Guid, crate::PhysicalNvmeDevice)> {
+    let output = run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional("PhysicalNvme")
+            .next()
+            .cmdlet("Get-PhysicalNvmeDevices")
+            .arg("Count", 1u64)
+            .arg("NamespaceSizeMiB", namespace_size_mib)
+            .finish()
+            .build(),
+    )
+    .await
+    .context("physical NVMe device discovery")?;
+
+    let nsid: u32 =
+        serde_json::from_str(&output).context("failed to parse PhysicalNvme discovery output")?;
+
+    let vsid = Guid::new_random();
+
+    Ok((
+        vsid,
+        crate::PhysicalNvmeDevice {
+            target_vtl,
+            nsid,
+            namespace_size_mib,
+        },
+    ))
+}
+
+/// Arguments for the Set-VMProcessor powershell cmdlet
+pub struct HyperVSetVMProcessorArgs {
+    /// Specifies the number of virtual processors to assign to the virtual
+    /// machine. If not specified, the number of virtual processors is not
+    /// changed.
+    pub count: Option<u32>,
+    /// Specifies the Hyper-V APIC mode to use for the virtual machine.
+    pub apic_mode: Option<HyperVApicMode>,
+    /// Specifies the number of hardware threads per core to assign to the
+    /// VM.
+    pub hw_thread_count_per_core: Option<u32>,
+    /// The maximum number of virtual processors that can be assigned to a
+    /// NUMA node.
+    pub maximum_count_per_numa_node: Option<u32>,
+}
+
+/// The Hyper-V APIC mode
+#[derive(Clone, Copy)]
+pub enum HyperVApicMode {
+    /// Default APIC mode (what is this, exactly? It seems to not always include
+    /// x2apic support).
+    Default = 0,
+    /// Legacy APIC mode (no x2apic support).
+    Legacy = 1,
+    /// x2apic mode (enabled by default? or just supported? unclear)
+    X2Apic = 2,
+}
+
+impl ps::AsVal for HyperVApicMode {
+    fn as_val(&self) -> impl '_ + AsRef<OsStr> {
+        match self {
+            HyperVApicMode::Default => "0",
+            HyperVApicMode::Legacy => "1",
+            HyperVApicMode::X2Apic => "2",
+        }
+    }
+}
+
+/// Runs Set-VMProcessor with the given arguments.
+pub async fn run_set_vm_processor(
+    vmid: &Guid,
+    args: &HyperVSetVMProcessorArgs,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-VMProcessor")
+            .arg_opt("Count", args.count)
+            .arg_opt("ApicMode", args.apic_mode)
+            .arg_opt("HwThreadCountPerCore", args.hw_thread_count_per_core)
+            .arg_opt("MaximumCountPerNumaNode", args.maximum_count_per_numa_node)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_vm_processor")
+}
+
+/// Arguments for the Set-VMMemory powershell cmdlet.
+#[derive(Default)]
+pub struct HyperVSetVMMemoryArgs {
+    /// Specifies whether to enable dynamic memory for the virtual machine.
+    pub dynamic_memory_enabled: Option<bool>,
+    /// Specifies the maximum amount of memory, in bytes, to assign to the virtual
+    /// machine.
+    pub maximum_bytes: Option<u64>,
+    /// Specifies the minimum amount of memory, in bytes, to assign to the virtual
+    /// machine.
+    pub minimum_bytes: Option<u64>,
+    /// Specifies the startup amount of memory, in bytes, to assign to the
+    /// virtual machine.
+    pub startup_bytes: Option<u64>,
+}
+
+/// Runs Set-VMMemory with the given arguments.
+pub async fn run_set_vm_memory(vmid: &Guid, args: &HyperVSetVMMemoryArgs) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-VMMemory")
+            .arg_opt("DynamicMemoryEnabled", args.dynamic_memory_enabled)
+            .arg_opt("MaximumBytes", args.maximum_bytes)
+            .arg_opt("MinimumBytes", args.minimum_bytes)
+            .arg_opt("StartupBytes", args.startup_bytes)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_vm_memory")
+}
+
+/// Arguments for the Add-VMHardDiskDrive powershell cmdlet
+pub struct HyperVAddVMHardDiskDriveArgs<'a> {
+    /// Specifies the ID of the virtual machine to which the hard disk
+    /// drive is to be added.
+    pub vmid: &'a Guid,
+    /// Specifies the type of controller to which the hard disk drive is
+    /// to be added.
+    pub controller_type: ControllerType,
+    /// Specifies the number of the location on the controller at which the
+    /// hard disk drive is to be added. If not specified, the first available
+    /// location in the controller specified with the ControllerNumber parameter
+    /// is used.
+    pub controller_location: Option<u8>,
+    /// Specifies the number of the controller to which the hard disk drive is
+    /// to be added. If not specified, this parameter assumes the value of the
+    /// first available controller at the location specified in the
+    /// ControllerLocation parameter.
+    pub controller_number: Option<u32>,
+    /// Specifies the full path of the hard disk drive file to be added.
+    pub path: Option<&'a Path>,
+}
+
+/// The type of controller to which a hard disk drive is to be added.
+#[derive(Copy, Clone, Debug)]
+pub enum ControllerType {
+    /// IDE controller
+    Ide,
+    /// SCSI controller
+    Scsi,
+    /// Persistent memory controller
+    Pmem,
+}
+
+impl ps::AsVal for ControllerType {
+    fn as_val(&self) -> impl '_ + AsRef<OsStr> {
+        match self {
+            ControllerType::Ide => "IDE",
+            ControllerType::Scsi => "SCSI",
+            ControllerType::Pmem => "PMem",
+        }
+    }
+}
+
+/// Runs Add-VMHardDiskDrive with the given arguments.
+pub async fn run_add_vm_hard_disk_drive(
+    args: HyperVAddVMHardDiskDriveArgs<'_>,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", args.vmid)
+            .pipeline()
+            .cmdlet("Add-VMHardDiskDrive")
+            .arg("ControllerType", args.controller_type)
+            .arg_opt("ControllerLocation", args.controller_location)
+            .arg_opt("ControllerNumber", args.controller_number)
+            .arg_opt("Path", args.path)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("add_vm_hard_disk_drive")
+}
+
+/// Arguments for the Add-VMDvdDrive powershell cmdlet
+pub struct HyperVAddVMDvdDriveArgs<'a> {
+    /// Specifies the ID of the virtual machine on which the DVD drive
+    /// is to be configured.
+    pub vmid: &'a Guid,
+    /// Specifies the IDE controller location of the DVD drives to be
+    /// configured. If not specified, DVD drives in all controller locations
+    /// are configured.
+    pub controller_location: Option<u32>,
+    /// Specifies the IDE controller of the DVD drives to be configured.
+    /// If not specified, DVD drives attached to all controllers are configured.
+    pub controller_number: Option<u32>,
+    /// Specifies the path to the ISO file or physical DVD drive that will serv
+    /// as media for the virtual DVD drive.
+    pub path: Option<&'a Path>,
+}
+
+/// Runs Add-VMDvdDrive with the given arguments.
+pub async fn run_add_vm_dvd_drive(args: HyperVAddVMDvdDriveArgs<'_>) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", args.vmid)
+            .pipeline()
+            .cmdlet("Add-VMDvdDrive")
+            .arg_opt("ControllerLocation", args.controller_location)
+            .arg_opt("ControllerNumber", args.controller_number)
+            .arg_opt("Path", args.path)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("add_vm_dvd_drive")
+}
+
+/// Adds a SCSI controller with the specified VSID and target VTL to the VM
+pub async fn run_add_vm_scsi_controller_with_id(
+    ps_mod: &Path,
+    vmid: &Guid,
+    vsid: &Guid,
+    target_vtl: u32,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Add-VmScsiControllerWithId")
+            .arg("Vsid", vsid)
+            .arg("TargetVtl", target_vtl)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("add_vm_scsi_controller_with_id")
+}
+
+/// Adds or modifies the drive at the specified location on the SCSI controller
+/// with the specified VSID.
+pub async fn run_set_vm_drive_scsi(
+    ps_mod: &Path,
+    vmid: &Guid,
+    controller_vsid: &Guid,
+    controller_location: u8,
+    disk_path: Option<&Path>,
+    dvd: bool,
+    allow_modify_existing: bool,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-VmDrive")
+            .arg("ControllerVsid", controller_vsid)
+            .arg("Lun", controller_location)
+            .arg_opt("DiskPath", disk_path)
+            .flag_opt(dvd.then_some("Dvd"))
+            .flag_opt(allow_modify_existing.then_some("AllowModifyExisting"))
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_vm_drive_scsi")
+}
+
+/// Adds or modifies the drive at the specified location on the IDE controller
+/// with the specified number.
+pub async fn run_set_vm_drive_ide(
+    ps_mod: &Path,
+    vmid: &Guid,
+    controller_number: u32,
+    controller_location: u8,
+    disk_path: Option<&Path>,
+    dvd: bool,
+    allow_modify_existing: bool,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-VmDrive")
+            .arg("ControllerNumber", controller_number)
+            .arg("Lun", controller_location)
+            .arg_opt("DiskPath", disk_path)
+            .flag_opt(dvd.then_some("Dvd"))
+            .flag_opt(allow_modify_existing.then_some("AllowModifyExisting"))
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_vm_drive_ide")
+}
+
+/// Runs Add-VMScsiController with the given arguments.
+///
+/// Returns the controller number and controller instance guid.
+pub async fn run_add_vm_scsi_controller(ps_mod: &Path, vmid: &Guid) -> anyhow::Result<(u32, Guid)> {
+    let output = run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Add-VMScsiController")
+            .flag("Passthru")
+            .pipeline()
+            .cmdlet("Get-VmScsiControllerProperties")
+            .finish()
+            .build(),
+    )
+    .await
+    .context("add_vm_scsi_controller")?;
+
+    let mut out = output.trim().split(',');
+    let controller_number = out
+        .next()
+        .context("no output")?
+        .parse::<u32>()
+        .context("invalid controller number")?;
+    let vsid = out
+        .next()
+        .context("no vsid")?
+        .parse::<Guid>()
+        .context("vsid not a guid")?;
+
+    Ok((controller_number, vsid))
+}
+
+/// Sets the target VTL for a SCSI controller.
+pub async fn run_set_vm_scsi_controller_target_vtl(
+    ps_mod: &Path,
+    vmid: &Guid,
+    controller_number: u32,
+    target_vtl: u32,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-VMScsiControllerTargetVtl")
+            .arg("ControllerNumber", controller_number)
+            .arg("TargetVtl", target_vtl)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_vm_scsi_controller_target_vtl")
+}
+
+/// Runs Dismount-VHD with the given arguments.
+pub async fn run_dismount_vhd(path: &Path) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Dismount-VHD")
+            .arg("Path", path)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("dismount_vhd")
+}
+
+/// Arguments for the Set-VMFirmware powershell cmdlet
+pub struct HyperVSetVMFirmwareArgs<'a> {
+    /// Specifies the ID of virtual machines for which you want to modify the
+    /// firmware configuration.
+    pub vmid: &'a Guid,
+    /// Whether to enable secure boot
+    pub secure_boot_enabled: Option<bool>,
+    /// Specifies the name of the secure boot template. If secure boot is
+    /// enabled, you must have a valid secure boot template for the guest
+    /// operating system to start.
+    pub secure_boot_template: Option<HyperVSecureBootTemplate>,
+}
+
+/// Runs Set-VMFirmware with the given arguments.
+pub async fn run_set_vm_firmware(args: HyperVSetVMFirmwareArgs<'_>) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", args.vmid)
+            .pipeline()
+            .cmdlet("Set-VMFirmware")
+            .arg_opt(
+                "EnableSecureBoot",
+                args.secure_boot_enabled.map(|enabled| {
+                    if enabled {
+                        ps::RawVal::new("On")
+                    } else {
+                        ps::RawVal::new("Off")
+                    }
+                }),
+            )
+            .arg_opt("SecureBootTemplate", args.secure_boot_template)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_vm_firmware")
+}
+
+/// Runs Set-OpenHCLFirmware with the given arguments.
+pub async fn run_set_openhcl_firmware(
+    vmid: &Guid,
+    ps_mod: &Path,
+    igvm_file: &Path,
+    increase_vtl2_memory: bool,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-OpenHCLFirmware")
+            .arg("IgvmFile", igvm_file)
+            .flag_opt(increase_vtl2_memory.then_some("IncreaseVtl2Memory"))
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_openhcl_firmware")
+}
+
+/// Runs Set-VmCommandLine with the given arguments.
+pub async fn run_set_vm_command_line(
+    vmid: &Guid,
+    ps_mod: &Path,
+    command_line: impl AsRef<str>,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-VmCommandLine")
+            .arg("CommandLine", command_line.as_ref())
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_vm_command_line")
+}
+
+/// Sets the initial machine configuration for a VM
+pub async fn run_set_initial_machine_configuration(
+    vmid: &Guid,
+    ps_mod: &Path,
+    imc_hive: &Path,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-InitialMachineConfiguration")
+            .arg("ImcHive", imc_hive)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_initial_machine_configuration")
+}
+
+/// Enables the specified vm com port and binds it to the named pipe path
+pub async fn run_set_vm_com_port(vmid: &Guid, port: u8, path: &Path) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-VMComPort")
+            .arg("Number", port)
+            .arg("Path", path)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_vm_com_port")
+}
+
+/// Run Set-VMBusRelay commandlet
+pub async fn run_set_vmbus_redirect(
+    vmid: &Guid,
+    ps_mod: &Path,
+    enable: bool,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-VMBusRedirect")
+            .arg("Enable", enable)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_vmbus_redirect")
+}
+
+/// Runs Restart-OpenHCL, which will perform and OpenHCL servicing operation.
+pub async fn run_restart_openhcl(
+    vmid: &Guid,
+    ps_mod: &Path,
+    flags: OpenHclServicingFlags,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Restart-OpenHCL")
+            .arg_opt("TimeoutHintSeconds", flags.stop_timeout_hint_secs)
+            .flag_opt(
+                flags
+                    .override_version_checks
+                    .then_some("OverrideVersionChecks"),
+            )
+            .flag_opt((!flags.enable_nvme_keepalive).then_some("DisableNvmeKeepalive"))
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("restart_openhcl")
+}
+
+/// Windows event log as retrieved by `run_get_winevent`
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+pub struct WinEvent {
+    /// Time of event
+    pub time_created: Timestamp,
+    /// Event provider name
+    pub provider_name: String,
+    /// Event level (see winmeta.h)
+    pub level: u8,
+    /// Event ID
+    pub id: u32,
+    /// Message content
+    pub message: String,
+    /// Raw event data property values, stringified in template order. Empty
+    /// when the event carries no data.
+    #[serde(default, deserialize_with = "deserialize_event_properties")]
+    pub properties: Vec<String>,
+}
+
+impl WinEvent {
+    /// Writes the event to `log_file`.
+    pub fn write_to(&self, log_file: &PetriLogFile) {
+        log_file.write_entry_fmt(
+            Some(self.time_created),
+            match self.level {
+                1 | 2 => Level::ERROR,
+                3 => Level::WARN,
+                5 => Level::TRACE,
+                _ => Level::INFO,
+            },
+            format_args!(
+                "[{}] {}: ({}, {}) {} ({})",
+                self.time_created,
+                self.provider_name,
+                self.level,
+                self.id,
+                self.message,
+                self.properties.join(",")
+            ),
+        );
+    }
+}
+
+/// Deserialize the `Properties` projection of a Windows event into a flat list
+/// of stringified values.
+fn deserialize_event_properties<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    use serde_json::Value;
+
+    fn flatten(value: Value, out: &mut Vec<String>) {
+        match value {
+            Value::Null => out.push("<null>".to_string()),
+            Value::String(s) => out.push(s),
+            Value::Bool(b) => out.push(b.to_string()),
+            Value::Number(n) => out.push(n.to_string()),
+            Value::Array(items) => {
+                for item in items {
+                    flatten(item, out);
+                }
+            }
+            // PowerShell wraps the array as
+            // `{ "value": [...], "Count": N }` (and an empty array as `{}`).
+            // Pull the values out and ignore the bookkeeping `Count` field.
+            Value::Object(mut map) => {
+                if let Some(inner) = map.remove("value") {
+                    flatten(inner, out);
+                }
+            }
+        }
+    }
+
+    let mut properties = Vec::new();
+    flatten(Value::deserialize(deserializer)?, &mut properties);
+    Ok(properties)
+}
+
+/// Get event logs
+pub async fn run_get_winevent(
+    log_name: &[&str],
+    provider_name: &[&str],
+    start_time: Option<&Timestamp>,
+    find: Option<&str>,
+    ids: &[u32],
+) -> anyhow::Result<Vec<WinEvent>> {
+    let mut filter = Vec::new();
+    if !log_name.is_empty() {
+        filter.push(("LogName", ps::Value::new(ps::Array::new(log_name))));
+    }
+    if !provider_name.is_empty() {
+        filter.push((
+            "ProviderName",
+            ps::Value::new(ps::Array::new(provider_name)),
+        ));
+    }
+    if let Some(start_time) = start_time {
+        filter.push(("StartTime", ps::Value::new(start_time)));
+    }
+    if !ids.is_empty() {
+        filter.push(("Id", ps::Value::new(ps::Array::new(ids))));
+    }
+    let filter = ps::HashTable::new(filter);
+
+    let output_var = ps::Variable::new("events");
+
+    let mut builder = PowerShellBuilder::new()
+        .cmdlet_to_var("Get-WinEvent", &output_var)
+        .flag("Oldest")
+        .arg("FilterHashtable", filter)
+        .pipeline();
+
+    if let Some(find) = find {
+        builder = builder
+            .cmdlet("where")
+            .positional("message")
+            .arg("Match", find)
+            .pipeline();
+    }
+
+    let props = ps::Array::new([
+        ps::Value::new(ps::HashTable::new([
+            ("label", ps::Value::new("TimeCreated")),
+            (
+                "expression",
+                ps::Value::new(ps::Script::new("Get-Date $_.TimeCreated -Format o")),
+            ),
+        ])),
+        ps::Value::new("ProviderName"),
+        ps::Value::new("Level"),
+        ps::Value::new("Id"),
+        ps::Value::new("Message"),
+        ps::Value::new(ps::HashTable::new([
+            ("label", ps::Value::new("Properties")),
+            (
+                "expression",
+                ps::Value::new(ps::Script::new(
+                    "@($_.Properties | ForEach-Object { [string]$_.Value })",
+                )),
+            ),
+        ])),
+    ]);
+
+    let output = run_host_cmd(
+        builder
+            .cmdlet("Select-Object")
+            .positional(props)
+            .next()
+            .cmdlet("ConvertTo-Json")
+            .arg("InputObject", ps::Array::new([&output_var]))
+            .finish()
+            .build(),
+    )
+    .await;
+
+    match output {
+        Ok(logs) => {
+            // `Get-WinEvent` writes its failures to stderr and still exits
+            // zero, leaving the output variable unset and the JSON array
+            // holding a single `null`. `run_host_cmd` has already logged the
+            // reason, which is usually that the requested log or provider is
+            // not registered on this machine.
+            let events: Vec<Option<WinEvent>> =
+                serde_json::from_str(&logs).context("parsing winevents")?;
+            Ok(events.into_iter().flatten().collect())
+        }
+        Err(e) => match e {
+            CommandError::Command(_, err_output)
+                if err_output.contains(
+                    "No events were found that match the specified selection criteria.",
+                ) =>
+            {
+                Ok(Vec::new())
+            }
+            e => Err(e).context("get_winevent"),
+        },
+    }
+}
+
+const HYPERV_WORKER_TABLE: &str = "Microsoft-Windows-Hyper-V-Worker-Admin";
+const HYPERV_VMMS_TABLE: &str = "Microsoft-Windows-Hyper-V-VMMS-Admin";
+const HYPERV_WORKER_OPERATIONAL_TABLE: &str = "Microsoft-Windows-Hyper-V-Worker-Operational";
+const HYPERV_VMMS_OPERATIONAL_TABLE: &str = "Microsoft-Windows-Hyper-V-VMMS-Operational";
+const HYPERV_WORKER_ANALYTIC_TABLE: &str = "Microsoft-Windows-Hyper-V-Worker-Analytic";
+const HYPERV_WORKER_VDEV_ANALYTIC_TABLE: &str = "Microsoft-Windows-Hyper-V-Worker-VDev-Analytic";
+const HYPERV_VMMS_ANALYTIC_TABLE: &str = "Microsoft-Windows-Hyper-V-VMMS-Analytic";
+
+/// Providers that report a process fault to Windows Error Reporting and the
+/// Azure Watson agent.
+///
+/// The `Application Error` and `Windows Error Reporting` events carry the
+/// Watson report ID, which is what the crash analysis at
+/// <https://azurewatson.microsoft.com> is looked up by. On CI machines the
+/// faulting details themselves are redacted from the event in favor of that
+/// report ID, so capturing these events is the only way to get from a failed
+/// test back to the crash dump.
+const WATSON_PROVIDERS: &[&str] = &[
+    "Application Error",
+    "Windows Error Reporting",
+    "Microsoft-Windows Azure-AzureWatsonAgent",
+];
+
+macro_rules! define_winevents {
+    (
+        $($collection_name:ident(
+            $(
+                $(#[doc = $doc:literal])*
+                $vis:vis const $name:ident: u32 = $id:literal;
+            )*
+        )),*
+    ) => {
+        $($(
+            $(#[doc = $doc])*
+            $vis const $name: u32 = $id;
+        )*)*
+
+        /// Get the name of a Windows event ID
+        pub fn winevent_name(id: u32) -> Option<&'static str> {
+            match id {
+                $($(
+                    $name => Some(stringify!($name)),
+                )*)*
+                _ => None
+            }
+        }
+
+        $(
+            const $collection_name: &[u32] = &[
+                $($name,)*
+            ];
+        )*
+    };
+}
+
+define_winevents!(
+    BOOT_EVENT_IDS(
+        /// The vm successfully booted an operating system.
+        pub const MSVM_BOOT_RESULTS_SUCCESS: u32 = 18601;
+        /// The vm successfully booted an operating system, but at least one boot source failed secure boot validation.
+        pub const MSVM_BOOT_RESULTS_SUCCESS_SECURE_BOOT_FAILURES: u32 = 18602;
+        /// The vm failed to boot an operating system.
+        pub const MSVM_BOOT_RESULTS_FAILURE: u32 = 18603;
+        /// The vm failed to boot an operating system. At least one boot source failed secure boot validation.
+        pub const MSVM_BOOT_RESULTS_FAILURE_SECURE_BOOT_FAILURES: u32 = 18604;
+        /// The vm failed to boot an operating system. No bootable devices are configured.
+        pub const MSVM_BOOT_RESULTS_FAILURE_NO_DEVICES: u32 = 18605;
+        /// The vm is attempting to boot an operating system. (PCAT only)
+        pub const MSVM_BOOT_RESULTS_ATTEMPT: u32 = 18606;
+    ),
+    HALT_EVENT_IDS(
+        /// The vm was turned off.
+        pub const MSVM_HOST_STOP_SUCCESS: u32 = 18502;
+        /// The vm was shut down using the Shutdown Integration Component.
+        pub const MSVM_HOST_SHUTDOWN_SUCCESS: u32 = 18504;
+        /// The vm was shut down by the guest operating system.
+        pub const MSVM_GUEST_SHUTDOWN_SUCCESS: u32 = 18508;
+        /// The vm was shut down using the Shutdown Integration Component.
+        pub const MSVM_HOST_RESET_SUCCESS: u32 = 18512;
+        /// The vm was shut down by the guest operating system.
+        pub const MSVM_GUEST_RESET_SUCCESS: u32 = 18514;
+        /// The vm was shut down for a reset initiated by the guest operating system.
+        pub const MSVM_STOP_FOR_GUEST_RESET_SUCCESS: u32 = 18515;
+        /// The vm was turned off as it could not recover from a critical error.
+        pub const MSVM_STOP_CRITICAL_SUCCESS: u32 = 18528;
+        /// The vm was reset because the guest operating system requested an operation
+        /// that is not supported by Hyper-V or an unrecoverable error occurred.
+        /// This caused a triple fault.
+        pub const MSVM_TRIPLE_FAULT_GENERAL_ERROR: u32 = 18539;
+        /// The vm was reset because the guest operating system requested an operation
+        /// that is not supported by Hyper-V. This request caused a triple fault.
+        pub const MSVM_TRIPLE_FAULT_UNSUPPORTED_FEATURE_ERROR: u32 = 18540;
+        /// The vm was reset because an unrecoverable error occurred while accessing a
+        /// virtual processor register which caused a triple fault.
+        pub const MSVM_TRIPLE_FAULT_INVALID_VP_REGISTER_ERROR: u32 = 18550;
+        /// The vm was reset because an unrecoverable error occurred on a virtual
+        /// processor that caused a triple fault.
+        pub const MSVM_TRIPLE_FAULT_UNRECOVERABLE_EXCEPTION_ERROR: u32 = 18560;
+        /// The vm was hibernated successfully.
+        pub const MSVM_GUEST_HIBERNATE_SUCCESS: u32 = 18608;
+        /// The vm has quit unexpectedly (the worker process terminated).
+        pub const MSVM_VMMS_VM_TERMINATE_ERROR: u32 = 14070;
+        /// The vm has encountered a fatal error. The guest operating system reported that it failed.
+        pub const MSVM_GUEST_CRASH_REPORT: u32 = 18590;
+        /// The vm failed in the management VTL before starting guest VTL0.
+        pub const MSVM_START_VTL0_REQUEST_ERROR: u32 = 18620;
+    )
+);
+
+/// Get Hyper-V event logs for a VM
+pub async fn hyperv_event_logs(vmid: Option<&Guid>, start_time: &Timestamp) -> Vec<WinEvent> {
+    let vmid = vmid.map(|id| id.to_string());
+    // All the logs are fetched in a single query. `Get-WinEvent` reports a log
+    // that is missing or disabled as a non-terminating error and still returns
+    // the events from the remaining logs.
+    let mut events = match run_get_winevent(
+        &[
+            HYPERV_WORKER_TABLE,
+            HYPERV_VMMS_TABLE,
+            HYPERV_WORKER_OPERATIONAL_TABLE,
+            HYPERV_VMMS_OPERATIONAL_TABLE,
+            HYPERV_WORKER_ANALYTIC_TABLE,
+            HYPERV_WORKER_VDEV_ANALYTIC_TABLE,
+            HYPERV_VMMS_ANALYTIC_TABLE,
+        ],
+        &[],
+        Some(start_time),
+        vmid.as_deref(),
+        &[],
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(err) => {
+            tracing::warn!(
+                error = err.as_ref() as &dyn std::error::Error,
+                "failed to read hyper-v event logs"
+            );
+            Vec::new()
+        }
+    };
+    events.sort_by_key(|e| e.time_created);
+    events
+}
+
+/// Get the Windows Error Reporting / Azure Watson events logged since
+/// `start_time`.
+///
+/// A process that is faulted or killed writes nothing to its own logs, so
+/// these events are the only record that it crashed, and the report ID they
+/// contain is the only handle on the dump Watson collected.
+pub async fn watson_events(start_time: &Timestamp) -> Vec<WinEvent> {
+    let mut events = Vec::new();
+    // Query each provider separately, since `Get-WinEvent` fails the whole
+    // query if any one provider is unregistered on this machine.
+    for provider in WATSON_PROVIDERS {
+        match run_get_winevent(&[], &[provider], Some(start_time), None, &[]).await {
+            Ok(e) => events.extend(e),
+            Err(err) => tracing::warn!(
+                provider,
+                error = err.as_ref() as &dyn std::error::Error,
+                "failed to read error reporting events"
+            ),
+        }
+    }
+    events.sort_by_key(|e| e.time_created);
+    events
+}
+
+/// Get Hyper-V boot event logs for a VM
+pub async fn hyperv_boot_events(
+    vmid: &Guid,
+    start_time: &Timestamp,
+) -> anyhow::Result<Vec<WinEvent>> {
+    let vmid = vmid.to_string();
+    run_get_winevent(
+        &[HYPERV_WORKER_TABLE],
+        &[],
+        Some(start_time),
+        Some(&vmid),
+        BOOT_EVENT_IDS,
+    )
+    .await
+}
+
+/// Get Hyper-V halt event logs for a VM
+pub async fn hyperv_halt_events(
+    vmid: &Guid,
+    start_time: &Timestamp,
+) -> anyhow::Result<Vec<WinEvent>> {
+    let vmid = vmid.to_string();
+    run_get_winevent(
+        &[HYPERV_WORKER_TABLE, HYPERV_VMMS_TABLE],
+        &[],
+        Some(start_time),
+        Some(&vmid),
+        HALT_EVENT_IDS,
+    )
+    .await
+}
+
+/// Get the IDs of the VM(s) with the specified name
+pub async fn vm_id_from_name(name: &str) -> anyhow::Result<Vec<Guid>> {
+    let output = run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Name", name)
+            .pipeline()
+            .cmdlet("Select-Object")
+            .arg("ExpandProperty", "Id")
+            .pipeline()
+            .cmdlet("Select-Object")
+            .arg("ExpandProperty", "Guid")
+            .finish()
+            .build(),
+    )
+    .await
+    .context("vm_id_from_name")?;
+    let mut vmids = Vec::new();
+    for s in output.lines() {
+        vmids.push(Guid::from_str(s)?);
+    }
+    Ok(vmids)
+}
+
+/// Hyper-V VM Shutdown Integration Component Status
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum VmShutdownIcStatus {
+    /// The VM is off
+    Off,
+    /// The component is operating normally.
+    Ok,
+    /// The component is operating normally but the guest component negotiated
+    /// a compatiable communications protocol version.
+    Degraded,
+    /// The guest does not support a compatible protocol version.
+    NonRecoverableError,
+    /// The guest component is not installed or has not yet been contacted.
+    NoContact,
+    /// The guest component is no longer responding normally.
+    LostCommunication,
+}
+
+/// Get the VM's shutdown IC status
+pub async fn vm_shutdown_ic_status(vmid: &Guid) -> anyhow::Result<VmShutdownIcStatus> {
+    let status = run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Get-VMIntegrationService")
+            .arg("Name", "Shutdown")
+            .pipeline()
+            .cmdlet("Select-Object")
+            .arg("ExpandProperty", "PrimaryStatusDescription")
+            .finish()
+            .build(),
+    )
+    .await
+    .context("vm_shutdown_ic_status")?;
+
+    Ok(match status.as_str() {
+        "" => VmShutdownIcStatus::Off,
+        "OK" => VmShutdownIcStatus::Ok,
+        "Degraded" => VmShutdownIcStatus::Degraded,
+        "Non-Recoverable Error" => VmShutdownIcStatus::NonRecoverableError,
+        "No Contact" => VmShutdownIcStatus::NoContact,
+        "Lost Communication" => VmShutdownIcStatus::LostCommunication,
+        s => anyhow::bail!("Unknown VM shutdown status: {s}"),
+    })
+}
+
+/// Runs Remove-VmNetworkAdapter to remove all network adapters from a VM.
+pub async fn run_remove_vm_network_adapter(vmid: &Guid) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Remove-VMNetworkAdapter")
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("remove_vm_network_adapters")
+}
+
+/// Runs Remove-VMScsiController with the given arguments.
+pub async fn run_remove_vm_scsi_controller(
+    vmid: &Guid,
+    controller_number: u32,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Get-VMScsiController")
+            .arg("ControllerNumber", controller_number)
+            .pipeline()
+            .cmdlet("Remove-VMScsiController")
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("remove_vm_scsi_controller")
+}
+
+/// Run Get-VmScreenshot commandlet
+///
+/// Returns `None` if the VM currently has no active video head, which happens
+/// routinely while the guest is switching video modes or before the firmware
+/// has brought up a framebuffer.
+pub async fn run_get_vm_screenshot(
+    vmid: &Guid,
+    image: &mut Vec<u8>,
+    ps_mod: &Path,
+    temp_bin_path: &Path,
+) -> anyhow::Result<Option<VmScreenshotMeta>> {
+    // execute wmi via powershell
+    let output = run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Get-VmScreenshot")
+            .arg("Path", temp_bin_path)
+            .finish()
+            .build(),
+    )
+    .await
+    .context("get_vm_screenshot")?;
+
+    // parse output
+    let (x, y) = output.split_once(',').context("invalid dimensions")?;
+    let (Ok(x), Ok(y)) = (x.trim().parse::<u16>(), y.trim().parse::<u16>()) else {
+        return Ok(None);
+    };
+    if x == 0 || y == 0 {
+        return Ok(None);
+    }
+    let (widthsize, heightsize) = (x as usize, y as usize);
+    let mut image_rgb565 = fs_err::read(temp_bin_path)?;
+
+    // calculate length and truncate
+    const IN_BYTES_PER_PIXEL: usize = 2;
+    const OUT_BYTES_PER_PIXEL: usize = 3;
+    let in_len = widthsize * heightsize * IN_BYTES_PER_PIXEL;
+    let out_len = widthsize * heightsize * OUT_BYTES_PER_PIXEL;
+    image_rgb565.truncate(in_len);
+    if image_rgb565.len() != in_len {
+        anyhow::bail!("did not get enough bytes for screenshot");
+    }
+
+    // convert from rgb565 to rgb888
+    image.resize(out_len, 0);
+    for (out_pixel, in_pixel) in image
+        .chunks_exact_mut(OUT_BYTES_PER_PIXEL)
+        .zip(image_rgb565.chunks_exact(IN_BYTES_PER_PIXEL))
+    {
+        // convert from rgb565 ( gggbbbbb rrrrrggg )
+        // to rgb888 ( rrrrrrrr gggggggg bbbbbbbb )
+
+        // red
+        out_pixel[0] = in_pixel[1] & 0b11111000;
+        // green
+        out_pixel[1] = ((in_pixel[1] & 0b00000111) << 5) + ((in_pixel[0] & 0b11100000) >> 3);
+        // blue
+        out_pixel[2] = in_pixel[0] << 3;
+    }
+
+    Ok(Some(VmScreenshotMeta {
+        color: image::ExtendedColorType::Rgb8,
+        width: x,
+        height: y,
+    }))
+}
+
+/// Run Set-TurnOffOnGuestRestart commandlet
+pub async fn run_set_turn_off_on_guest_restart(
+    vmid: &Guid,
+    ps_mod: &Path,
+    enable: bool,
+) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-TurnOffOnGuestRestart")
+            .arg("Enable", enable)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_turn_off_on_guest_restart")
+}
+
+/// Hyper-V Get VM Host Output
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct HyperVGetVmHost {
+    /// GuestIsolationTypes supported on the host. While GuestStateIsolationTypes contains values
+    /// for SNP and TDX, there are other factors that determine SNP/TDX support than just hardware
+    /// compatibility, hence we rely on SnpStatus and TdxStatus for that information.
+    #[serde(rename = "GuestIsolationTypes")]
+    pub guest_isolation_types: Vec<HyperVGuestStateIsolationType>,
+    /// Whether SNP is supported on the host.
+    #[serde(rename = "SnpStatus", deserialize_with = "int_to_bool")]
+    pub snp_status: bool,
+    /// Whether TDX is supported on the host.
+    #[serde(rename = "TdxStatus", deserialize_with = "int_to_bool")]
+    pub tdx_status: bool,
+}
+
+fn int_to_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = i32::deserialize(deserializer)?;
+    Ok(v == 1)
+}
+
+/// Gets the VM host information and returns the output string
+pub async fn run_get_vm_host() -> anyhow::Result<HyperVGetVmHost> {
+    let output = run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VMHost")
+            .pipeline()
+            .cmdlet("ConvertTo-Json")
+            .arg("Depth", 3)
+            .arg("WarningAction", "Ignore")
+            .flag("Compress")
+            .finish()
+            .build(),
+    )
+    .await
+    .context("get_vm_host")?;
+
+    serde_json::from_str::<HyperVGetVmHost>(&output)
+        .map_err(|e| anyhow::anyhow!("failed to parse HyperVGetVmHost: {}", e))
+}
+
+/// Get available vssd properties
+pub async fn run_get_vssd_properties() -> anyhow::Result<Vec<String>> {
+    let output = run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-CimClass")
+            .arg("Namespace", "root\\virtualization\\v2")
+            .arg("ClassName", "Msvm_VirtualSystemSettingData")
+            .pipeline()
+            .cmdlet("Select-Object")
+            .arg("ExpandProperty", "CimClassProperties")
+            .pipeline()
+            .cmdlet("Select-Object")
+            .arg("ExpandProperty", "Name")
+            .finish()
+            .build(),
+    )
+    .await
+    .context("get_vssd_properties")?;
+
+    Ok(output.lines().map(|x| x.to_owned()).collect())
+}
+
+/// Runs Get-GuestStateFile with the given arguments.
+pub async fn run_get_guest_state_file(vmid: &Guid, ps_mod: &Path) -> anyhow::Result<PathBuf> {
+    let output = run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Get-GuestStateFile")
+            .finish()
+            .build(),
+    )
+    .await
+    .context("get_guest_state_file")?;
+
+    Ok(PathBuf::from(output))
+}
+
+/// Sets the VTL2 settings (in the `Base` namespace) for a VM.
+///
+/// This should include the fixed VTL2 settings, as well as any storage
+/// settings.
+///
+/// TODO FUTURE: Detect if the settings should be in `json` or `protobuf` format
+/// based on what is already there (or let the caller specify explicitly so that
+/// we can test the handling of both deserializers).
+pub async fn run_set_base_vtl2_settings(
+    vmid: &Guid,
+    ps_mod: &Path,
+    vtl2_settings: &vtl2_settings_proto::Vtl2Settings,
+) -> anyhow::Result<()> {
+    // Pass the settings via a file to avoid challenges escaping the string across
+    // the command line.
+    let temp_dir = ps_mod.parent().unwrap();
+    let mut tempfile = tempfile::Builder::new()
+        .prefix("base-vtl2-settings-")
+        .tempfile_in(temp_dir)
+        .context("creating base VTL2 settings tempfile")?;
+    tempfile
+        .write_all(serde_json::to_string(vtl2_settings)?.as_bytes())
+        .context("writing settings to tempfile")?;
+
+    tracing::trace!(?tempfile, ?vtl2_settings, ?vmid, "set base vtl2 settings");
+
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Set-Vtl2Settings")
+            .arg("VmId", vmid)
+            .arg("SettingsFile", tempfile.path())
+            .arg("Namespace", "Base")
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_base_vtl2_settings")
+}
+
+/// Guest state isolation modes for Hyper-V VMs.
+#[derive(Debug)]
+pub enum HyperVGuestStateIsolationMode {
+    /// Default isolation mode.
+    Default = 0,
+    /// No persistent secrets isolation mode.
+    NoPersistentSecrets = 1,
+    /// No management VTL isolation mode.
+    NoManagementVtl = 2,
+}
+
+impl ps::AsVal for HyperVGuestStateIsolationMode {
+    fn as_val(&self) -> impl '_ + AsRef<OsStr> {
+        match self {
+            HyperVGuestStateIsolationMode::Default => "0",
+            HyperVGuestStateIsolationMode::NoPersistentSecrets => "1",
+            HyperVGuestStateIsolationMode::NoManagementVtl => "2",
+        }
+    }
+}
+
+/// Sets the guest state isolation mode for a VM.
+pub async fn run_set_guest_state_isolation_mode(
+    vmid: &Guid,
+    ps_mod: &Path,
+    mode: HyperVGuestStateIsolationMode,
+) -> anyhow::Result<()> {
+    tracing::trace!(?mode, ?vmid, "set guest state isolation mode");
+
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Import-Module")
+            .positional(ps_mod)
+            .next()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Set-GuestStateIsolationMode")
+            .arg("Mode", mode)
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("set_guest_state_isolation_mode")
+}
+
+/// Runs Enable-VMTPM
+pub async fn run_enable_vmtpm(vmid: &Guid) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Enable-VMTPM")
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("run_enable_vmtpm")
+}
+
+/// Runs Disable-VMTPM
+pub async fn run_disable_vmtpm(vmid: &Guid) -> anyhow::Result<()> {
+    run_host_cmd(
+        PowerShellBuilder::new()
+            .cmdlet("Get-VM")
+            .arg("Id", vmid)
+            .pipeline()
+            .cmdlet("Disable-VMTPM")
+            .finish()
+            .build(),
+    )
+    .await
+    .map(|_| ())
+    .context("run_disable_vmtpm")
+}

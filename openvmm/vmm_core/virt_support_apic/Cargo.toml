@@ -1,0 +1,27 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "virt_support_apic"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hvdef.workspace = true
+vm_topology.workspace = true
+vmcore.workspace = true
+virt.workspace = true
+x86defs.workspace = true
+
+inspect = { workspace = true, features = ["std"] }
+inspect_counters.workspace = true
+test_with_tracing.workspace = true
+tracelimit.workspace = true
+
+bitfield-struct.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

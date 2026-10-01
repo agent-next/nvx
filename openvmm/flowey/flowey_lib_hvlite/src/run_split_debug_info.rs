@@ -1,0 +1,147 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Splits debug info from a binary into a separate file using `objcopy`
+
+use crate::common::CommonArch;
+use flowey::node::prelude::*;
+
+flowey_request! {
+    pub struct Request {
+        pub arch: CommonArch,
+        pub in_bin: ReadVar<PathBuf>,
+        pub out_bin: WriteVar<PathBuf>,
+        pub out_dbg_info: WriteVar<PathBuf>,
+        // TODO: This is only necessary because our .dbg file is not reproducible and the build-id
+        // is a hash over the binary + the .dbg file, rendering the whole build non-reproducible.
+        // We don't want to do this for all builds because we would lose the ability for the debugger
+        // to auto-discover the .dbg file when debugging. For now, this is only used for Nix builds
+        // where reproducibility is the main concern and will be removed when the debug file is reproducible.
+        /// When true, remove `.note.gnu.build-id` and omit `--add-gnu-debuglink`
+        /// to produce byte-for-byte reproducible stripped binaries.
+        pub reproducible_without_debuglink: bool,
+    }
+}
+
+new_simple_flow_node!(struct Node);
+
+impl SimpleFlowNode for Node {
+    type Request = Request;
+
+    fn imports(ctx: &mut ImportCtx<'_>) {
+        ctx.import::<flowey_lib_common::install_dist_pkg::Node>();
+    }
+
+    fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
+        let Request {
+            arch,
+            in_bin,
+            out_bin,
+            out_dbg_info,
+            reproducible_without_debuglink,
+        } = request;
+
+        let host_arch = ctx.arch();
+        let platform = ctx.platform();
+
+        let (objcopy_pkg, objcopy_bin): (Option<&str>, &str) = match arch {
+            CommonArch::X86_64 => match platform {
+                FlowPlatform::Linux(linux_distribution) => match linux_distribution {
+                    FlowPlatformLinuxDistro::Fedora => (
+                        Some("binutils-x86_64-linux-gnu"),
+                        "x86_64-linux-gnu-objcopy",
+                    ),
+                    FlowPlatformLinuxDistro::Ubuntu => (
+                        Some("binutils-x86-64-linux-gnu"),
+                        "x86_64-linux-gnu-objcopy",
+                    ),
+                    FlowPlatformLinuxDistro::AzureLinux => {
+                        match_arch!(host_arch, FlowArch::X86_64, (Some("binutils"), "objcopy"))
+                    }
+                    FlowPlatformLinuxDistro::Arch => {
+                        match_arch!(host_arch, FlowArch::X86_64, (Some("binutils"), "objcopy"))
+                    }
+                    FlowPlatformLinuxDistro::Nix => (None, "x86_64-linux-gnu-objcopy"),
+                    FlowPlatformLinuxDistro::Unknown => anyhow::bail!("Unknown Linux distribution"),
+                },
+                _ => anyhow::bail!("Unsupported platform"),
+            },
+            CommonArch::Aarch64 => match platform {
+                FlowPlatform::Linux(linux_distribution) => match linux_distribution {
+                    FlowPlatformLinuxDistro::Fedora | FlowPlatformLinuxDistro::Ubuntu => (
+                        Some("binutils-aarch64-linux-gnu"),
+                        "aarch64-linux-gnu-objcopy",
+                    ),
+                    FlowPlatformLinuxDistro::AzureLinux => match host_arch {
+                        FlowArch::Aarch64 => (Some("binutils"), "objcopy"),
+                        FlowArch::X86_64 => (
+                            Some("binutils-aarch64-linux-gnu"),
+                            "aarch64-linux-gnu-objcopy",
+                        ),
+                        _ => anyhow::bail!("unsupported host arch {host_arch:?}"),
+                    },
+                    FlowPlatformLinuxDistro::Arch => {
+                        match_arch!(
+                            host_arch,
+                            FlowArch::X86_64,
+                            (
+                                Some("aarch64-linux-gnu-binutils"),
+                                "aarch64-linux-gnu-objcopy"
+                            )
+                        )
+                    }
+                    FlowPlatformLinuxDistro::Nix => (None, "aarch64-linux-gnu-objcopy"),
+                    FlowPlatformLinuxDistro::Unknown => {
+                        anyhow::bail!("Unknown Linux distribution")
+                    }
+                },
+                _ => anyhow::bail!("Unsupported platform"),
+            },
+        };
+
+        let installed_objcopy = objcopy_pkg.map(|objcopy_pkg| {
+            ctx.reqv(
+                |side_effect| flowey_lib_common::install_dist_pkg::Request::Install {
+                    package_names: vec![objcopy_pkg.into()],
+                    done: side_effect,
+                },
+            )
+        });
+
+        ctx.emit_rust_step("split debug symbols", |ctx| {
+            installed_objcopy.claim(ctx);
+            let in_bin = in_bin.claim(ctx);
+            let out_bin = out_bin.claim(ctx);
+            let out_dbg_info = out_dbg_info.claim(ctx);
+            move |rt| {
+                let in_bin = rt.read(in_bin);
+
+                let output = rt.sh.current_dir().join(in_bin.file_name().unwrap());
+                flowey::shell_cmd!(rt, "{objcopy_bin} --only-keep-debug {in_bin} {output}.dbg")
+                    .run()?;
+                if reproducible_without_debuglink {
+                    flowey::shell_cmd!(
+                        rt,
+                        "{objcopy_bin} --strip-all --keep-section=.build_info --remove-section=.note.gnu.build-id {in_bin} {output}"
+                    )
+                    .run()?;
+                } else {
+                    flowey::shell_cmd!(
+                        rt,
+                        "{objcopy_bin} --strip-all --keep-section=.build_info --add-gnu-debuglink={output}.dbg {in_bin} {output}"
+                    )
+                    .run()?;
+                }
+
+                let output = output.absolute()?;
+
+                rt.write(out_bin, &output);
+                rt.write(out_dbg_info, &output.with_extension("dbg"));
+
+                Ok(())
+            }
+        });
+
+        Ok(())
+    }
+}

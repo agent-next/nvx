@@ -1,0 +1,1718 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Implements a loader that serializes the loaded state into the IGVM binary format.
+
+use crate::vp_context_builder::VpContextBuilder;
+use crate::vp_context_builder::VpContextPageState;
+use crate::vp_context_builder::VpContextState;
+use crate::vp_context_builder::snp::InjectionType;
+use crate::vp_context_builder::snp::SecureAvic;
+use crate::vp_context_builder::snp::SnpHardwareContext;
+use crate::vp_context_builder::tdx::TdxHardwareContext;
+use crate::vp_context_builder::vbs::VbsRegister;
+use crate::vp_context_builder::vbs::VbsVpContext;
+use anyhow::Context;
+use crypto::sha_384::Sha384;
+use hvdef::Vtl;
+use igvm::IgvmDirectiveHeader;
+use igvm::IgvmFile;
+use igvm::IgvmInitializationHeader;
+use igvm::IgvmPlatformHeader;
+use igvm::IgvmRelocatableRegion;
+use igvm::IgvmRevision;
+use igvm::snp_defs::SevVmsa;
+use igvm_defs::IGVM_VHS_PARAMETER;
+use igvm_defs::IGVM_VHS_PARAMETER_INSERT;
+use igvm_defs::IGVM_VHS_SUPPORTED_PLATFORM;
+use igvm_defs::IgvmPageDataFlags;
+use igvm_defs::IgvmPageDataType;
+use igvm_defs::IgvmPlatformType;
+use igvm_defs::PAGE_SIZE_4K;
+use igvm_defs::SnpPolicy;
+use igvm_defs::TdxPolicy;
+use loader::importer::Aarch64Register;
+use loader::importer::BootPageAcceptance;
+use loader::importer::GuestArch;
+use loader::importer::GuestArchKind;
+use loader::importer::IgvmParameterType;
+use loader::importer::ImageLoad;
+use loader::importer::IsolationConfig;
+use loader::importer::IsolationType;
+use loader::importer::ParameterAreaIndex;
+use loader::importer::X86Register;
+use memory_range::MemoryRange;
+use range_map_vec::Entry;
+use range_map_vec::RangeMap;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::fmt::Debug;
+use std::fmt::Display;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
+
+pub const DEFAULT_COMPATIBILITY_MASK: u32 = 0x1;
+
+const TDX_SHARED_GPA_BOUNDARY_BITS: u8 = 47;
+
+fn to_igvm_vtl(vtl: Vtl) -> igvm::hv_defs::Vtl {
+    match vtl {
+        Vtl::Vtl0 => igvm::hv_defs::Vtl::Vtl0,
+        Vtl::Vtl1 => igvm::hv_defs::Vtl::Vtl1,
+        Vtl::Vtl2 => igvm::hv_defs::Vtl::Vtl2,
+    }
+}
+
+/// Page table relocation information kept for debugging purposes.
+// Allow dead code because clippy doesn't count #[derive(Debug)] as non-dead code usage.
+#[expect(dead_code)]
+#[derive(Debug, Clone)]
+struct PageTableRegion {
+    gpa: u64,
+    size_pages: u64,
+    used_size_pages: u64,
+}
+
+#[derive(Debug, Clone)]
+enum RelocationType {
+    PageTable(PageTableRegion),
+    Normal(IgvmRelocatableRegion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RangeInfo {
+    tag: String,
+    acceptance: BootPageAcceptance,
+}
+
+/// Additional finalization needed by a self-contained SNP Linux-direct image.
+#[derive(Debug, Copy, Clone)]
+pub struct SnpLinuxDirectConfig {
+    pub policy: SnpPolicy,
+    pub c_bit_mask: u64,
+    pub ram_page_count: u64,
+    pub vmsa_page: Option<u64>,
+    pub injection_type: InjectionType,
+}
+
+pub struct IgvmLoader<R: VbsRegister + GuestArch> {
+    accepted_ranges: RangeMap<u64, RangeInfo>,
+    relocatable_regions: RangeMap<u64, RelocationType>,
+    required_memory: Vec<RequiredMemory>,
+    page_table_region: Option<PageTableRegion>,
+    platform_header: IgvmPlatformHeader,
+    initialization_headers: Vec<IgvmInitializationHeader>,
+    directives: Vec<IgvmDirectiveHeader>,
+    page_data_directives: Vec<IgvmDirectiveHeader>,
+    vp_context: Option<Box<dyn VpContextBuilder<Register = R>>>,
+    max_vtl: Vtl,
+    parameter_areas: BTreeMap<(u64, u32), u32>,
+    isolation_type: LoaderIsolationType,
+    paravisor_present: bool,
+    imported_regions_config_page: Option<u64>,
+    expected_page_hashes_config_page: Option<u64>,
+    snp_linux_direct: Option<SnpLinuxDirectConfig>,
+}
+
+pub struct IgvmVtlLoader<'a, R: VbsRegister + GuestArch> {
+    loader: &'a mut IgvmLoader<R>,
+    vtl: Vtl,
+    vp_context: Option<VbsVpContext<R>>,
+}
+
+impl<R: VbsRegister + GuestArch> IgvmVtlLoader<'_, R> {
+    pub fn loader(&self) -> &IgvmLoader<R> {
+        self.loader
+    }
+
+    /// Returns a loader for importing an inner image as part of the actual
+    /// (paravisor) image to load.
+    ///
+    /// Use `take_vp_context` on the returned loader to get the VP context that
+    /// the paravisor should load.
+    pub fn nested_loader(&mut self) -> IgvmVtlLoader<'_, R> {
+        IgvmVtlLoader {
+            loader: &mut *self.loader,
+            vtl: Vtl::Vtl0,
+            vp_context: Some(VbsVpContext::new(self.vtl)),
+        }
+    }
+
+    pub fn take_vp_context(&mut self) -> Vec<u8> {
+        self.vp_context
+            .take()
+            .map_or_else(Vec::new, |vp| vp.as_page())
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LoaderIsolationType {
+    None,
+    Vbs {
+        enable_debug: bool,
+    },
+    Snp {
+        shared_gpa_boundary_bits: Option<u8>,
+        policy: SnpPolicy,
+        injection_type: InjectionType,
+        secure_avic: SecureAvic,
+        // TODO SNP: SNP Keys? Other data?
+    },
+    Tdx {
+        policy: TdxPolicy,
+    },
+}
+
+/// A trait to specialize behavior based on different register types for
+/// different architectures.
+pub trait IgvmLoaderRegister: VbsRegister {
+    /// Perform arch specific initialization.
+    fn init(
+        with_paravisor: bool,
+        max_vtl: Vtl,
+        isolation: LoaderIsolationType,
+    ) -> (
+        IgvmPlatformHeader,
+        Vec<IgvmInitializationHeader>,
+        Box<dyn VpContextBuilder<Register = Self>>,
+    );
+
+    /// The IGVM file revision to use for the built igvm file.
+    fn igvm_revision() -> IgvmRevision;
+}
+
+impl IgvmLoaderRegister for X86Register {
+    fn init(
+        with_paravisor: bool,
+        max_vtl: Vtl,
+        isolation: LoaderIsolationType,
+    ) -> (
+        IgvmPlatformHeader,
+        Vec<IgvmInitializationHeader>,
+        Box<dyn VpContextBuilder<Register = Self>>,
+    ) {
+        match isolation {
+            LoaderIsolationType::None | LoaderIsolationType::Vbs { .. } => {
+                unreachable!("should be handled by common code")
+            }
+            LoaderIsolationType::Snp {
+                shared_gpa_boundary_bits,
+                policy,
+                injection_type,
+                secure_avic,
+            } => {
+                // TODO SNP: assumed that shared_gpa_boundary is always available.
+                let shared_gpa_boundary =
+                    1 << shared_gpa_boundary_bits.expect("shared gpa boundary must be set");
+
+                // Add SNP Platform header
+                let info = IGVM_VHS_SUPPORTED_PLATFORM {
+                    compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                    highest_vtl: max_vtl as u8,
+                    platform_type: IgvmPlatformType::SEV_SNP,
+                    platform_version: igvm_defs::IGVM_SEV_SNP_PLATFORM_VERSION,
+                    shared_gpa_boundary,
+                };
+
+                let platform_header = IgvmPlatformHeader::SupportedPlatform(info);
+
+                let init_header = IgvmInitializationHeader::GuestPolicy {
+                    policy: policy.into(),
+                    compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                };
+
+                let vp_context_builder = Box::new(SnpHardwareContext::new(
+                    max_vtl,
+                    !with_paravisor,
+                    shared_gpa_boundary,
+                    injection_type,
+                    secure_avic,
+                ));
+
+                (platform_header, vec![init_header], vp_context_builder)
+            }
+            LoaderIsolationType::Tdx { policy } => {
+                // NOTE: TDX always has a shared_gpa_boundary and has it at 47 bits.
+                let info = IGVM_VHS_SUPPORTED_PLATFORM {
+                    compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                    highest_vtl: max_vtl as u8,
+                    platform_type: IgvmPlatformType::TDX,
+                    platform_version: igvm_defs::IGVM_TDX_PLATFORM_VERSION,
+                    shared_gpa_boundary: 1 << TDX_SHARED_GPA_BOUNDARY_BITS,
+                };
+
+                let platform_header = IgvmPlatformHeader::SupportedPlatform(info);
+
+                let mut init_headers = Vec::new();
+                if u64::from(policy) != 0 {
+                    init_headers.push(IgvmInitializationHeader::GuestPolicy {
+                        policy: policy.into(),
+                        compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                    });
+                }
+
+                let vp_context_builder = Box::new(TdxHardwareContext::new(!with_paravisor));
+
+                (platform_header, init_headers, vp_context_builder)
+            }
+        }
+    }
+
+    fn igvm_revision() -> IgvmRevision {
+        // For now, x86 built files always uses V1 of the IGVM format. This is
+        // to maintain compatibility with older OS repo loaders that do not
+        // understand the V2 format.
+        IgvmRevision::V1
+    }
+}
+
+impl IgvmLoaderRegister for Aarch64Register {
+    fn init(
+        _with_paravisor: bool,
+        _max_vtl: Vtl,
+        _isolation: LoaderIsolationType,
+    ) -> (
+        IgvmPlatformHeader,
+        Vec<IgvmInitializationHeader>,
+        Box<dyn VpContextBuilder<Register = Self>>,
+    ) {
+        unreachable!("should never be called")
+    }
+
+    fn igvm_revision() -> IgvmRevision {
+        // AArch64 IGVM files are always V2.
+        IgvmRevision::V2 {
+            arch: igvm::Arch::AArch64,
+            page_size: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RequiredMemory {
+    range: MemoryRange,
+    vtl2_protectable: bool,
+}
+
+/// A map file representing information about a given generated IGVM file from a
+/// loader.
+///
+/// This can be used to save additional information about the layout of the
+/// address space that importing an IGVM file will create.
+#[derive(Debug)]
+pub struct MapFile {
+    isolation: LoaderIsolationType,
+    required_memory: Vec<RequiredMemory>,
+    accepted_ranges: Vec<(MemoryRange, RangeInfo)>,
+    relocatable_regions: Vec<(MemoryRange, RelocationType)>,
+    reported_ranges: Vec<(MemoryRange, String)>,
+}
+
+impl MapFile {
+    /// Adds a map-only annotation for a range that is not represented by an
+    /// IGVM directive.
+    ///
+    /// Reported ranges appear under `IGVM file reported ranges` in tracing and
+    /// the written map file. They do not change the generated IGVM file.
+    pub fn report_range(&mut self, range: MemoryRange, tag: impl Into<String>) {
+        self.reported_ranges.push((range, tag.into()));
+    }
+
+    /// Emit this map file information to tracing::info.
+    pub fn emit_tracing(&self) {
+        tracing::info!(isolation = ?self.isolation, "IGVM file isolation");
+        tracing::info!("IGVM file layout:");
+        for (range, info) in self.accepted_ranges.iter() {
+            tracing::info!(
+                tag = info.tag,
+                size_bytes = range.len(),
+                "{:#x} - {:#x}",
+                range.start(),
+                range.end(),
+            );
+        }
+
+        if !self.required_memory.is_empty() {
+            tracing::info!("IGVM file required memory:");
+            for region in &self.required_memory {
+                tracing::info!(
+                    size_bytes = region.range.len(),
+                    vtl2_protectable = region.vtl2_protectable,
+                    "{:#x} - {:#x}",
+                    region.range.start(),
+                    region.range.end(),
+                );
+            }
+        }
+
+        if !self.relocatable_regions.is_empty() {
+            tracing::info!("IGVM file relocatable regions:");
+            for (range, info) in self.relocatable_regions.iter().rev() {
+                match info {
+                    RelocationType::PageTable(region) => {
+                        tracing::info!(
+                            size_bytes = region.size_pages * PAGE_SIZE_4K,
+                            "{:#x} - {:#x} pagetable relocation region",
+                            region.gpa,
+                            range.end(),
+                        );
+                    }
+                    RelocationType::Normal(region) => {
+                        tracing::info!(
+                            base_gpa = format_args!("{:#x}", region.base_gpa),
+                            size_bytes = region.size,
+                            minimum_relocation_gpa =
+                                format_args!("{:#x}", region.minimum_relocation_gpa),
+                            maximum_relocation_gpa =
+                                format_args!("{:#x}", region.maximum_relocation_gpa),
+                            relocation_alignment = region.relocation_alignment,
+                            "{:#x} - {:#x} relocation region",
+                            region.base_gpa,
+                            range.end(),
+                        );
+                    }
+                }
+            }
+        }
+
+        if !self.reported_ranges.is_empty() {
+            tracing::info!("IGVM file reported ranges:");
+            for (range, tag) in &self.reported_ranges {
+                tracing::info!(
+                    size_bytes = range.len(),
+                    "{:#x} - {:#x} {}",
+                    range.start(),
+                    range.end(),
+                    tag,
+                );
+            }
+        }
+    }
+}
+
+impl Display for MapFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "IGVM file isolation: {:?}", self.isolation)?;
+
+        writeln!(f, "IGVM file layout:")?;
+        for (range, info) in &self.accepted_ranges {
+            writeln!(
+                f,
+                "  {:016x} - {:016x} ({:#x} bytes) {}",
+                range.start(),
+                range.end(),
+                range.len(),
+                info.tag
+            )?;
+        }
+
+        if !self.required_memory.is_empty() {
+            writeln!(f, "IGVM file required memory:")?;
+            for region in &self.required_memory {
+                writeln!(
+                    f,
+                    "  {:016x} - {:016x} ({:#x} bytes) {}",
+                    region.range.start(),
+                    region.range.end(),
+                    region.range.len(),
+                    if region.vtl2_protectable {
+                        "VTL2 protectable"
+                    } else {
+                        ""
+                    }
+                )?;
+            }
+        }
+
+        if !self.relocatable_regions.is_empty() {
+            writeln!(f, "IGVM file relocatable regions:")?;
+            for (range, info) in &self.relocatable_regions {
+                match info {
+                    RelocationType::PageTable(region) => {
+                        writeln!(
+                            f,
+                            "  {:016x} - {:016x} ({:#x} bytes) pagetable relocation region",
+                            region.gpa,
+                            range.end(),
+                            region.size_pages * PAGE_SIZE_4K,
+                        )?;
+                    }
+                    RelocationType::Normal(region) => {
+                        writeln!(
+                            f,
+                            "  {:016x} - {:016x} ({:#x} bytes) relocation region",
+                            region.base_gpa,
+                            range.end(),
+                            region.size
+                        )?;
+                    }
+                }
+            }
+        }
+
+        if !self.reported_ranges.is_empty() {
+            writeln!(f, "IGVM file reported ranges:")?;
+            for (range, tag) in &self.reported_ranges {
+                writeln!(
+                    f,
+                    "  {:016x} - {:016x} ({:#x} bytes) {}",
+                    range.start(),
+                    range.end(),
+                    range.len(),
+                    tag
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Returns output from finalize
+#[derive(Debug)]
+pub struct IgvmOutput {
+    pub guest: IgvmFile,
+    pub map: MapFile,
+}
+
+impl IgvmLoader<X86Register> {
+    /// Create a loader for a self-contained SNP Linux-direct image.
+    pub fn new_snp_linux_direct(config: SnpLinuxDirectConfig) -> Self {
+        let isolation_type = LoaderIsolationType::Snp {
+            shared_gpa_boundary_bits: None,
+            policy: config.policy,
+            injection_type: config.injection_type,
+            secure_avic: SecureAvic::Disabled,
+        };
+        let platform_header = IgvmPlatformHeader::SupportedPlatform(IGVM_VHS_SUPPORTED_PLATFORM {
+            compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+            highest_vtl: Vtl::Vtl0 as u8,
+            platform_type: IgvmPlatformType::SEV_SNP,
+            platform_version: igvm_defs::IGVM_SEV_SNP_PLATFORM_VERSION,
+            shared_gpa_boundary: 0,
+        });
+        let initialization_headers = vec![IgvmInitializationHeader::GuestPolicy {
+            policy: config.policy.into(),
+            compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+        }];
+        let mut vp_context =
+            SnpHardwareContext::new_linux_direct(config.c_bit_mask, config.injection_type);
+        if let Some(page) = config.vmsa_page {
+            vp_context.set_vp_context_memory(page);
+        }
+
+        Self {
+            accepted_ranges: RangeMap::new(),
+            relocatable_regions: RangeMap::new(),
+            required_memory: Vec::new(),
+            page_table_region: None,
+            platform_header,
+            initialization_headers,
+            directives: Vec::new(),
+            page_data_directives: Vec::new(),
+            vp_context: Some(Box::new(vp_context)),
+            max_vtl: Vtl::Vtl0,
+            parameter_areas: BTreeMap::new(),
+            isolation_type,
+            paravisor_present: false,
+            imported_regions_config_page: None,
+            expected_page_hashes_config_page: None,
+            snp_linux_direct: Some(config),
+        }
+    }
+}
+
+impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
+    pub fn new(with_paravisor: bool, isolation_type: LoaderIsolationType) -> Self {
+        let vp_context_builder: Option<Box<dyn VpContextBuilder<Register = R>>>;
+        let platform_header;
+        let max_vtl = if with_paravisor { Vtl::Vtl2 } else { Vtl::Vtl0 };
+        let initialization_headers;
+
+        match isolation_type {
+            LoaderIsolationType::None | LoaderIsolationType::Vbs { .. } => {
+                vp_context_builder = Some(Box::new(VbsVpContext::<R>::new(max_vtl)));
+
+                // Add VBS platform header
+                let info = IGVM_VHS_SUPPORTED_PLATFORM {
+                    compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                    highest_vtl: max_vtl as u8,
+                    platform_type: IgvmPlatformType::VSM_ISOLATION,
+                    platform_version: igvm_defs::IGVM_VSM_ISOLATION_PLATFORM_VERSION,
+                    shared_gpa_boundary: 0,
+                };
+
+                platform_header = IgvmPlatformHeader::SupportedPlatform(info);
+                initialization_headers = Vec::new();
+            }
+            _ => {
+                let (header, init_headers, vp_builder) =
+                    R::init(with_paravisor, max_vtl, isolation_type);
+                platform_header = header;
+                initialization_headers = init_headers;
+                vp_context_builder = Some(vp_builder);
+            }
+        }
+
+        IgvmLoader {
+            accepted_ranges: RangeMap::new(),
+            relocatable_regions: RangeMap::new(),
+            required_memory: Vec::new(),
+            page_table_region: None,
+            platform_header,
+            initialization_headers,
+            directives: Vec::new(),
+            page_data_directives: Vec::new(),
+            vp_context: vp_context_builder,
+            max_vtl,
+            parameter_areas: BTreeMap::new(),
+            isolation_type,
+            paravisor_present: with_paravisor,
+            imported_regions_config_page: None,
+            expected_page_hashes_config_page: None,
+            snp_linux_direct: None,
+        }
+    }
+
+    /// Adds the fixed-memory contract required by a self-contained
+    /// Linux-direct image.
+    ///
+    /// The generic Linux loader imports only the pages that contain boot data
+    /// and does not call `verify_startup_memory_available`. UEFI and paravisor
+    /// loaders use that callback to emit their required-memory directives, but
+    /// a direct Linux IGVM must describe its complete startup RAM here. When
+    /// requested, this also imports every otherwise-unused RAM page as measured
+    /// zero data. The caller then places the BSP VMSA after those page updates.
+    fn finalize_snp_linux_direct(&mut self, config: SnpLinuxDirectConfig) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.required_memory.is_empty(),
+            "SNP Linux-direct image already contains a required-memory directive"
+        );
+        let ram_size = config
+            .ram_page_count
+            .checked_mul(PAGE_SIZE_4K)
+            .context("RAM size overflow")?;
+        let number_of_bytes = ram_size
+            .try_into()
+            .context("RAM size does not fit in an IGVM required-memory directive")?;
+        self.directives.insert(
+            0,
+            IgvmDirectiveHeader::RequiredMemory {
+                gpa: 0,
+                compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                number_of_bytes,
+                vtl2_protectable: false,
+            },
+        );
+        self.required_memory.push(RequiredMemory {
+            range: MemoryRange::new(0..ram_size),
+            vtl2_protectable: false,
+        });
+
+        let mut page_data_pages = BTreeSet::new();
+        for directive in &self.page_data_directives {
+            let IgvmDirectiveHeader::PageData { gpa, .. } = directive else {
+                unreachable!("page_data_directives contains only PageData")
+            };
+            anyhow::ensure!(
+                gpa.is_multiple_of(PAGE_SIZE_4K),
+                "unaligned page-data GPA {gpa:#x}"
+            );
+            let page = gpa / PAGE_SIZE_4K;
+            anyhow::ensure!(
+                page < config.ram_page_count,
+                "page-data GPA {gpa:#x} lies outside configured RAM"
+            );
+            anyhow::ensure!(
+                page_data_pages.insert(page),
+                "duplicate page-data GPA {gpa:#x}"
+            );
+        }
+
+        self.page_data_directives
+            .sort_unstable_by_key(|directive| match directive {
+                IgvmDirectiveHeader::PageData { gpa, .. } => *gpa,
+                _ => unreachable!("page_data_directives contains only PageData"),
+            });
+
+        let vmsa_count = self
+            .directives
+            .iter()
+            .filter(|directive| matches!(directive, IgvmDirectiveHeader::SnpVpContext { .. }))
+            .count();
+        anyhow::ensure!(
+            vmsa_count == 1,
+            "expected one SNP BSP VMSA context, found {vmsa_count}"
+        );
+        Ok(())
+    }
+
+    /// Compute both the combined SHA-384 over all shared (unmeasured) pages
+    /// (matching the value stored in `ImportedRegionsPageHeader::sha384_hash`)
+    /// and a per-page array of SHA-384s (one entry per 4 KB shared page, in
+    /// ascending-GPA order) suitable for the expected-page-hashes region.
+    ///
+    /// The per-page array is what the boot shim uses to identify which
+    /// individual pages diverged from the measured baseline on a hash
+    /// mismatch.
+    fn generate_cryptographic_hashes_of_shared_pages(
+        &mut self,
+    ) -> (Vec<u8>, Vec<loader_defs::paravisor::ExpectedPageHash>) {
+        // Sort the page data directives by GPA to ensure the hashes are
+        // consistent and that the per-page array is in ascending-GPA order.
+        self.page_data_directives
+            .sort_unstable_by_key(|directive| match directive {
+                IgvmDirectiveHeader::PageData { gpa, .. } => *gpa,
+                _ => unreachable!("all directives should be IgvmDirectiveHeader::PageData"),
+            });
+
+        let mut combined = Sha384::new();
+        let mut per_page = Vec::new();
+        self.page_data_directives.iter().for_each(|directive| {
+            if let IgvmDirectiveHeader::PageData {
+                gpa: _,
+                compatibility_mask: _,
+                flags,
+                data_type,
+                data,
+            } = directive
+            {
+                if *data_type == IgvmPageDataType::NORMAL && flags.shared() {
+                    // Measure the pages. If the data length is smaller than a page then zero extend
+                    // the data to a full page.
+                    let mut zero_data;
+                    let data_to_hash = if data.len() < PAGE_SIZE_4K as usize {
+                        zero_data = vec![0; PAGE_SIZE_4K as usize];
+                        zero_data[..data.len()].copy_from_slice(data);
+                        &zero_data
+                    } else {
+                        data
+                    };
+
+                    combined.update(data_to_hash);
+
+                    // Per-page hash: a fresh Sha384 fed the same zero-
+                    // extended page bytes.
+                    let mut per = Sha384::new();
+                    per.update(data_to_hash);
+                    let hash: [u8; 48] = per
+                        .finish()
+                        .as_bytes()
+                        .try_into()
+                        .expect("sha384 output should be 48 bytes");
+                    per_page.push(loader_defs::paravisor::ExpectedPageHash { sha384_hash: hash });
+                }
+            }
+        });
+        (combined.finish().to_vec(), per_page)
+    }
+
+    /// Finalize the loader state, returning an IGVM file.
+    pub fn finalize(mut self) -> anyhow::Result<IgvmOutput> {
+        // Finalize any VP state.
+        let mut state = Vec::new();
+        self.vp_context.take().unwrap().finalize(&mut state);
+
+        for context in state {
+            match context {
+                VpContextState::Page(VpContextPageState {
+                    page_base,
+                    page_count,
+                    acceptance,
+                    data,
+                }) => {
+                    self.import_pages(page_base, page_count, "vp-context-page", acceptance, &data)
+                        .context("failed to import vp context page")?;
+                }
+                VpContextState::Directive(directive) => {
+                    self.directives.push(directive);
+                }
+            }
+        }
+
+        // Merge adjacent accepted ranges with the same tag and acceptance
+        // to undo fragmentation from chunked imports.
+        self.accepted_ranges
+            .merge_adjacent(range_map_vec::u64_is_adjacent);
+
+        // Put list of accepted pages into the config region, if there
+        if let Some(page_base) = self.imported_regions_config_page {
+            // All shared pages have been imported. Generate both the combined
+            // cryptographic hash of the unaccepted (shared) imported pages
+            // (stored in the header) and the per-page hash array (imported
+            // separately below into the expected-page-hashes region).
+            let (combined_hash, per_page_hashes) =
+                self.generate_cryptographic_hashes_of_shared_pages();
+
+            // Emit the per-page expected-hashes region *first* if we have
+            // one, so that when we snapshot `imported_regions_data` below
+            // the descriptor list already covers it. Otherwise the shim
+            // would see this Exclusive region in the RMP (loader-pvalidated)
+            // but not in its imported-regions list, and would try to
+            // PVALIDATE it again -- resulting in `MemorySecurityViolation
+            // { carry_flag: 1 }` at the first page of the region.
+            //
+            // This is a separate measured region rather than an extension
+            // of the imported-regions page header so that older consumers
+            // of `ImportedRegionsPageHeader` see the exact same layout as
+            // before.
+            if let Some(hashes_page_base) = self.expected_page_hashes_config_page {
+                use loader_defs::paravisor::{
+                    EXPECTED_PAGE_HASH_MAX_COUNT, EXPECTED_PAGE_HASHES_MAGIC,
+                    EXPECTED_PAGE_HASHES_VERSION, ExpectedPageHashesHeader,
+                    PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_HASHES_SIZE_PAGES,
+                };
+
+                let count = per_page_hashes.len();
+                if count > EXPECTED_PAGE_HASH_MAX_COUNT {
+                    anyhow::bail!(
+                        "expected-page-hashes region overflow: {} pages > {} max \
+                         (increase PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_HASHES_SIZE_PAGES)",
+                        count,
+                        EXPECTED_PAGE_HASH_MAX_COUNT,
+                    );
+                }
+
+                let hashes_header = ExpectedPageHashesHeader {
+                    magic: EXPECTED_PAGE_HASHES_MAGIC,
+                    version: EXPECTED_PAGE_HASHES_VERSION,
+                    page_hash_count: count as u32,
+                    reserved: 0,
+                };
+
+                let region_bytes_capacity = PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_HASHES_SIZE_PAGES
+                    as usize
+                    * PAGE_SIZE_4K as usize;
+                let mut region = Vec::with_capacity(region_bytes_capacity);
+                region.extend_from_slice(hashes_header.as_bytes());
+                region.extend_from_slice(per_page_hashes.as_bytes());
+                // Zero-pad to fill the whole reserved region so measurement
+                // sees a deterministic image regardless of how many pages
+                // this build ended up with.
+                region.resize(region_bytes_capacity, 0);
+
+                self.import_pages(
+                    hashes_page_base,
+                    PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_HASHES_SIZE_PAGES,
+                    "loader-expected-page-hashes",
+                    BootPageAcceptance::Exclusive,
+                    &region,
+                )
+                .context("failed to import expected-page-hashes region")?;
+            }
+
+            // Snapshot accepted_ranges *after* the hashes region (if any)
+            // has been imported so it appears in the descriptor list.
+            let mut imported_regions_data: Vec<_> = self.imported_regions();
+
+            // Add this config page as well (still not in accepted_ranges
+            // until the import_pages below runs).
+            imported_regions_data.push(loader_defs::paravisor::ImportedRegionDescriptor::new(
+                page_base, 1, true,
+            ));
+
+            // The accepted regions have been guaranteed to not overlap,
+            // so just sort by the base page number
+            imported_regions_data.sort_by_key(|region| region.base_page_number);
+
+            let page_header = loader_defs::paravisor::ImportedRegionsPageHeader {
+                sha384_hash: combined_hash
+                    .as_bytes()
+                    .try_into()
+                    .expect("hash should be correct size"),
+            };
+
+            let mut imported_regions_page = page_header.as_bytes().to_vec();
+
+            // Append the (sorted) imported region data.
+            imported_regions_page.extend_from_slice(imported_regions_data.as_bytes());
+
+            // This list should be measured
+            self.import_pages(
+                page_base,
+                1,
+                "loader-imported-regions",
+                BootPageAcceptance::Exclusive,
+                imported_regions_page.as_bytes(),
+            )
+            .context("failed to import config regions")?;
+        }
+
+        // Finalize parameter pages with insert directives.
+        for ((page_base, _page_count), index) in self.parameter_areas.iter() {
+            self.directives.push(IgvmDirectiveHeader::ParameterInsert(
+                IGVM_VHS_PARAMETER_INSERT {
+                    gpa: page_base * PAGE_SIZE_4K,
+                    compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                    parameter_area_index: *index,
+                },
+            ));
+        }
+
+        if let Some(config) = self.snp_linux_direct {
+            self.finalize_snp_linux_direct(config)?;
+        }
+
+        // Merge the page_data_directives into the others directives. This
+        // must be done before constructing the IGVM file so that subsequent
+        // measurement computation (in `IgvmSerializer`) sees the full set
+        // of directives.
+        self.directives.append(&mut self.page_data_directives);
+
+        // Display a report about the build igvm file's layout.
+        let map_file = MapFile {
+            isolation: self.isolation_type,
+            required_memory: self.required_memory,
+            accepted_ranges: self
+                .accepted_ranges
+                .iter()
+                .rev()
+                .map(|(range, info)| {
+                    (
+                        MemoryRange::from_4k_gpn_range(*range.start()..(range.end() + 1)),
+                        info.clone(),
+                    )
+                })
+                .collect(),
+            relocatable_regions: self
+                .relocatable_regions
+                .iter()
+                .rev()
+                .map(|(range, info)| {
+                    (
+                        MemoryRange::new(*range.start()..(range.end() + 1)),
+                        info.clone(),
+                    )
+                })
+                .collect(),
+            reported_ranges: Vec::new(),
+        };
+
+        // Create an IGVM file with the loader's internal state.
+        let igvm_file = IgvmFile::new(
+            R::igvm_revision(),
+            vec![self.platform_header],
+            self.initialization_headers,
+            self.directives,
+        )
+        .context("unable to create igvm file")?;
+
+        let output = IgvmOutput {
+            guest: igvm_file,
+            map: map_file,
+        };
+        Ok(output)
+    }
+
+    /// Accept a new page range with a given acceptance into the map of accepted
+    /// ranges.
+    fn accept_new_range(
+        &mut self,
+        page_base: u64,
+        page_count: u64,
+        tag: &str,
+        acceptance: BootPageAcceptance,
+    ) -> anyhow::Result<()> {
+        let page_end = page_base + page_count - 1;
+        match self.accepted_ranges.entry(page_base..=page_end) {
+            Entry::Overlapping(entry) => {
+                let (overlap_start, overlap_end, ref overlap_info) = *entry.get();
+                Err(anyhow::anyhow!(
+                    "{} at {} ({:?}) overlaps {} at {}",
+                    tag,
+                    MemoryRange::from_4k_gpn_range(page_base..page_end + 1),
+                    acceptance,
+                    overlap_info.tag,
+                    MemoryRange::from_4k_gpn_range(overlap_start..overlap_end + 1),
+                ))
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(RangeInfo {
+                    tag: tag.to_string(),
+                    acceptance,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn imported_regions(&self) -> Vec<loader_defs::paravisor::ImportedRegionDescriptor> {
+        // N.B. If the imported regions page grows too large, contiguous
+        // regions with the same acceptance type (but different tags) could
+        // be coalesced here to reduce the descriptor count.
+        self.accepted_ranges
+            .iter()
+            .map(|(r, info)| {
+                loader_defs::paravisor::ImportedRegionDescriptor::new(
+                    *r.start(),
+                    r.end() - r.start() + 1,
+                    info.acceptance != BootPageAcceptance::Shared,
+                )
+            })
+            .collect()
+    }
+
+    /// The guest architecture used by this loader.
+    pub fn arch(&self) -> GuestArchKind {
+        R::arch()
+    }
+
+    /// Returns the first GPA after all imported page-data directives.
+    pub fn next_available_gpa(&self) -> anyhow::Result<u64> {
+        self.page_data_directives
+            .iter()
+            .filter_map(|directive| match directive {
+                IgvmDirectiveHeader::PageData { gpa, .. } => Some(*gpa),
+                _ => None,
+            })
+            .max()
+            .map_or(Ok(0), |gpa| {
+                gpa.checked_add(PAGE_SIZE_4K)
+                    .context("next imported address overflow")
+            })
+    }
+
+    /// Returns unimported RAM page ranges for an SNP Linux-direct image.
+    pub fn unimported_ram_ranges(
+        &self,
+        additional_imported_pages: impl IntoIterator<Item = u64>,
+    ) -> anyhow::Result<Vec<std::ops::Range<u64>>> {
+        let config = self
+            .snp_linux_direct
+            .context("unimported RAM ranges require an SNP Linux-direct loader")?;
+        let mut imported_pages = BTreeSet::new();
+        for (range, _) in self.accepted_ranges.iter() {
+            for page in range.clone() {
+                if page < config.ram_page_count {
+                    imported_pages.insert(page);
+                }
+            }
+        }
+        imported_pages.extend(additional_imported_pages);
+        anyhow::ensure!(
+            imported_pages
+                .last()
+                .is_none_or(|page| *page < config.ram_page_count),
+            "an imported page lies outside RAM"
+        );
+
+        let mut ranges = Vec::new();
+        let mut cursor = 0;
+        for page in imported_pages {
+            if cursor < page {
+                ranges.push(cursor..page);
+            }
+            cursor = page + 1;
+        }
+        if cursor < config.ram_page_count {
+            ranges.push(cursor..config.ram_page_count);
+        }
+        Ok(ranges)
+    }
+
+    pub fn loader(&mut self) -> IgvmVtlLoader<'_, R> {
+        IgvmVtlLoader {
+            vtl: self.max_vtl,
+            loader: self,
+            vp_context: None,
+        }
+    }
+
+    fn import_pages(
+        &mut self,
+        page_base: u64,
+        page_count: u64,
+        debug_tag: &'static str,
+        acceptance: BootPageAcceptance,
+        mut data: &[u8],
+    ) -> Result<(), anyhow::Error> {
+        tracing::debug!(
+            page_base,
+            ?acceptance,
+            page_count,
+            data_size = data.len(),
+            "Importing page",
+        );
+
+        anyhow::ensure!(page_count != 0, "cannot import an empty page range");
+        page_base
+            .checked_add(page_count)
+            .context("imported page range overflow")?;
+
+        // Pages must not overlap already accepted ranges
+        self.accept_new_range(page_base, page_count, debug_tag, acceptance)?;
+
+        // Page count must be larger or equal to data.
+        if page_count * PAGE_SIZE_4K < data.len() as u64 {
+            anyhow::bail!(
+                "data len {:x} is larger than page_count {page_count:x}",
+                data.len()
+            );
+        }
+
+        // VpContext imports are handled differently, as they have a different IGVM header
+        // type than normal data pages.
+        if acceptance == BootPageAcceptance::VpContext {
+            // This is only supported on SNP currently.
+            match self.isolation_type {
+                LoaderIsolationType::Snp { .. } => {}
+                _ => {
+                    anyhow::bail!("vpcontext acceptance only supported on SNP");
+                }
+            }
+
+            // The VP context builder produces the architectural VMSA
+            // (`x86defs::snp::SevVmsa`, 1648 bytes); the igvm crate's `SevVmsa`
+            // is padded out to a full 4K page, so accept input in the range
+            // [architectural size, padded size] and zero-pad it to the padded
+            // size before reading. Anything smaller than the architectural size
+            // would be silently zero-extended into a malformed VMSA, so reject
+            // it.
+            if data.len() < size_of::<x86defs::snp::SevVmsa>() {
+                anyhow::bail!(
+                    "data len {:x} is smaller than the architectural VMSA size {:x}",
+                    data.len(),
+                    size_of::<x86defs::snp::SevVmsa>()
+                );
+            }
+            if data.len() > size_of::<SevVmsa>() {
+                anyhow::bail!(
+                    "data len {:x} exceeds VMSA size {:x}",
+                    data.len(),
+                    size_of::<SevVmsa>()
+                );
+            }
+
+            // Page count must be 1.
+            if page_count != 1 {
+                anyhow::bail!("page count {page_count:x} for snp vmsa is not 1");
+            }
+
+            let mut padded = vec![0u8; size_of::<SevVmsa>()];
+            padded[..data.len()].copy_from_slice(data);
+
+            let vmsa = SevVmsa::read_from_bytes(padded.as_slice()).expect("should be correct size");
+            if let Some(config) = self.snp_linux_direct {
+                anyhow::ensure!(vmsa.rip != 0, "Linux loader did not provide an entry point");
+                anyhow::ensure!(
+                    vmsa.cr3 & config.c_bit_mask != 0,
+                    "initial CR3 does not contain the configured SNP C-bit"
+                );
+                anyhow::ensure!(
+                    !vmsa.sev_features.vtom() && vmsa.virtual_tom == 0,
+                    "C-bit image must not enable vTOM"
+                );
+            }
+            self.directives.push(IgvmDirectiveHeader::SnpVpContext {
+                gpa: page_base * PAGE_SIZE_4K,
+                compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                vp_index: 0,
+                vmsa: Box::new(vmsa),
+            });
+        } else {
+            for page in page_base..page_base + page_count {
+                let (data_type, flags) = match acceptance {
+                    BootPageAcceptance::Exclusive => {
+                        (IgvmPageDataType::NORMAL, IgvmPageDataFlags::new())
+                    }
+                    BootPageAcceptance::ExclusiveUnmeasured => (
+                        IgvmPageDataType::NORMAL,
+                        IgvmPageDataFlags::new().with_unmeasured(true),
+                    ),
+                    BootPageAcceptance::SecretsPage => {
+                        (IgvmPageDataType::SECRETS, IgvmPageDataFlags::new())
+                    }
+                    BootPageAcceptance::CpuidPage => {
+                        (IgvmPageDataType::CPUID_DATA, IgvmPageDataFlags::new())
+                    }
+                    BootPageAcceptance::CpuidExtendedStatePage => {
+                        (IgvmPageDataType::CPUID_XF, IgvmPageDataFlags::new())
+                    }
+                    BootPageAcceptance::VpContext => unreachable!(),
+                    BootPageAcceptance::Shared => (
+                        IgvmPageDataType::NORMAL,
+                        IgvmPageDataFlags::new().with_shared(true),
+                    ),
+                };
+
+                // Split data slice into data to be imported for this page and remaining.
+                let import_data_len = std::cmp::min(PAGE_SIZE_4K as usize, data.len());
+                let (import_data, data_remaining) = data.split_at(import_data_len);
+                data = data_remaining;
+
+                self.page_data_directives
+                    .push(IgvmDirectiveHeader::PageData {
+                        gpa: page * PAGE_SIZE_4K,
+                        compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                        flags,
+                        data_type,
+                        data: import_data.to_vec(),
+                    });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<R: IgvmLoaderRegister + GuestArch + 'static> ImageLoad<R> for IgvmVtlLoader<'_, R> {
+    fn isolation_config(&self) -> IsolationConfig {
+        match self.loader.isolation_type {
+            LoaderIsolationType::None => IsolationConfig {
+                paravisor_present: self.loader.paravisor_present,
+                isolation_type: IsolationType::None,
+                shared_gpa_boundary_bits: None,
+            },
+            LoaderIsolationType::Vbs { .. } => IsolationConfig {
+                paravisor_present: self.loader.paravisor_present,
+                isolation_type: IsolationType::Vbs,
+                shared_gpa_boundary_bits: None,
+            },
+            LoaderIsolationType::Snp {
+                shared_gpa_boundary_bits,
+                policy: _,
+                injection_type: _,
+                secure_avic: _,
+            } => IsolationConfig {
+                paravisor_present: self.loader.paravisor_present,
+                isolation_type: IsolationType::Snp,
+                shared_gpa_boundary_bits,
+            },
+            LoaderIsolationType::Tdx { .. } => IsolationConfig {
+                paravisor_present: self.loader.paravisor_present,
+                isolation_type: IsolationType::Tdx,
+                shared_gpa_boundary_bits: Some(TDX_SHARED_GPA_BOUNDARY_BITS),
+            },
+        }
+    }
+
+    fn create_parameter_area(
+        &mut self,
+        page_base: u64,
+        page_count: u32,
+        debug_tag: &str,
+    ) -> anyhow::Result<ParameterAreaIndex> {
+        self.create_parameter_area_with_data(page_base, page_count, debug_tag, &[])
+    }
+
+    fn create_parameter_area_with_data(
+        &mut self,
+        page_base: u64,
+        page_count: u32,
+        debug_tag: &str,
+        initial_data: &[u8],
+    ) -> anyhow::Result<ParameterAreaIndex> {
+        let area_id = (page_base, page_count);
+
+        // Allocate a new parameter area, that must not overlap other accepted ranges.
+        self.loader.accept_new_range(
+            page_base,
+            page_count as u64,
+            debug_tag,
+            BootPageAcceptance::ExclusiveUnmeasured,
+        )?;
+
+        let index: u32 = self
+            .loader
+            .parameter_areas
+            .len()
+            .try_into()
+            .expect("parameter area greater than u32");
+        self.loader.parameter_areas.insert(area_id, index);
+
+        // Add the newly allocated parameter area index to headers.
+        self.loader
+            .directives
+            .push(IgvmDirectiveHeader::ParameterArea {
+                number_of_bytes: page_count as u64 * PAGE_SIZE_4K,
+                parameter_area_index: index,
+                initial_data: initial_data.to_vec(),
+            });
+
+        tracing::debug!(
+            index,
+            page_base,
+            page_count,
+            initial_data_len = initial_data.len(),
+            "Creating new parameter area",
+        );
+
+        Ok(ParameterAreaIndex(index))
+    }
+
+    fn import_parameter(
+        &mut self,
+        parameter_area: ParameterAreaIndex,
+        byte_offset: u32,
+        parameter_type: IgvmParameterType,
+    ) -> anyhow::Result<()> {
+        let index = parameter_area.0;
+
+        if index >= self.loader.parameter_areas.len() as u32 {
+            anyhow::bail!("invalid parameter area index: {:x}", index);
+        }
+
+        tracing::debug!(
+            ?parameter_type,
+            parameter_area_index = parameter_area.0,
+            byte_offset,
+            "Importing parameter",
+        );
+
+        let info = IGVM_VHS_PARAMETER {
+            parameter_area_index: index,
+            byte_offset,
+        };
+
+        let header = match parameter_type {
+            IgvmParameterType::VpCount => IgvmDirectiveHeader::VpCount(info),
+            IgvmParameterType::Srat => IgvmDirectiveHeader::Srat(info),
+            IgvmParameterType::Madt => IgvmDirectiveHeader::Madt(info),
+            IgvmParameterType::Slit => IgvmDirectiveHeader::Slit(info),
+            IgvmParameterType::Pptt => IgvmDirectiveHeader::Pptt(info),
+            IgvmParameterType::MmioRanges => IgvmDirectiveHeader::MmioRanges(info),
+            IgvmParameterType::MemoryMap => IgvmDirectiveHeader::MemoryMap(info),
+            IgvmParameterType::CommandLine => IgvmDirectiveHeader::CommandLine(info),
+            IgvmParameterType::DeviceTree => IgvmDirectiveHeader::DeviceTree(info),
+        };
+
+        self.loader.directives.push(header);
+
+        Ok(())
+    }
+
+    fn import_pages(
+        &mut self,
+        page_base: u64,
+        page_count: u64,
+        debug_tag: &'static str,
+        acceptance: BootPageAcceptance,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        self.loader
+            .import_pages(page_base, page_count, debug_tag, acceptance, data)
+    }
+
+    fn import_vp_register(&mut self, register: R) -> anyhow::Result<()> {
+        if let Some(vp_context) = &mut self.vp_context {
+            vp_context.import_vp_register(register)
+        } else {
+            self.loader
+                .vp_context
+                .as_mut()
+                .unwrap()
+                .import_vp_register(register);
+        }
+
+        Ok(())
+    }
+
+    fn verify_startup_memory_available(
+        &mut self,
+        page_base: u64,
+        page_count: u64,
+        memory_type: loader::importer::StartupMemoryType,
+    ) -> anyhow::Result<()> {
+        let gpa = page_base * PAGE_SIZE_4K;
+        let compatibility_mask = DEFAULT_COMPATIBILITY_MASK;
+        let number_of_bytes = (page_count * PAGE_SIZE_4K)
+            .try_into()
+            .expect("startup memory request overflowed u32");
+
+        tracing::trace!(
+            page_base,
+            page_count,
+            ?memory_type,
+            number_of_bytes,
+            "verify memory"
+        );
+
+        // Set VTL2 protectable flag on isolation types which make sense
+        // TODO SNP: Temporarily allow this on all isolation types to force the host to generate
+        // the correct device tree structures.
+        let vtl2_protectable =
+            memory_type == loader::importer::StartupMemoryType::Vtl2ProtectableRam;
+
+        self.loader
+            .directives
+            .push(IgvmDirectiveHeader::RequiredMemory {
+                gpa,
+                compatibility_mask,
+                number_of_bytes,
+                vtl2_protectable,
+            });
+
+        self.loader.required_memory.push(RequiredMemory {
+            range: MemoryRange::new(gpa..gpa + number_of_bytes as u64),
+            vtl2_protectable,
+        });
+
+        Ok(())
+    }
+
+    fn set_vp_context_page(&mut self, page_base: u64) -> anyhow::Result<()> {
+        if let Some(config) = &mut self.loader.snp_linux_direct {
+            anyhow::ensure!(
+                page_base < config.ram_page_count,
+                "Linux-selected VP context page lies outside RAM"
+            );
+            if config.vmsa_page.is_some() {
+                return Ok(());
+            }
+            config.vmsa_page = Some(page_base);
+        }
+        self.loader
+            .vp_context
+            .as_mut()
+            .unwrap()
+            .set_vp_context_memory(page_base);
+
+        Ok(())
+    }
+
+    fn relocation_region(
+        &mut self,
+        gpa: u64,
+        size_bytes: u64,
+        relocation_alignment: u64,
+        minimum_relocation_gpa: u64,
+        maximum_relocation_gpa: u64,
+        apply_rip_offset: bool,
+        apply_gdtr_offset: bool,
+        vp_index: u16,
+    ) -> anyhow::Result<()> {
+        if let Some(overlap) = self
+            .loader
+            .relocatable_regions
+            .get_range(gpa..=(gpa + size_bytes - 1))
+        {
+            anyhow::bail!(
+                "new relocation region overlaps existing region {:?}",
+                overlap
+            );
+        }
+
+        if !size_bytes.is_multiple_of(PAGE_SIZE_4K) {
+            anyhow::bail!("relocation size {size_bytes:#x} must be a multiple of 4K");
+        }
+
+        if !relocation_alignment.is_multiple_of(PAGE_SIZE_4K) {
+            anyhow::bail!(
+                "relocation alignment {relocation_alignment:#x} must be a multiple of 4K"
+            );
+        }
+
+        if !gpa.is_multiple_of(relocation_alignment) {
+            anyhow::bail!(
+                "relocation base {gpa:#x} must be aligned to relocation alignment {relocation_alignment:#x}"
+            );
+        }
+
+        if !minimum_relocation_gpa.is_multiple_of(relocation_alignment) {
+            anyhow::bail!(
+                "relocation minimum GPA {minimum_relocation_gpa:#x} must be aligned to relocation alignment {relocation_alignment:#x}"
+            );
+        }
+
+        if !maximum_relocation_gpa.is_multiple_of(relocation_alignment) {
+            anyhow::bail!(
+                "relocation maximum GPA {maximum_relocation_gpa:#x} must be aligned to relocation alignment {relocation_alignment:#x}"
+            );
+        }
+
+        self.loader
+            .initialization_headers
+            .push(IgvmInitializationHeader::RelocatableRegion {
+                compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                relocation_alignment,
+                relocation_region_gpa: gpa,
+                relocation_region_size: size_bytes,
+                minimum_relocation_gpa,
+                maximum_relocation_gpa,
+                is_vtl2: self.vtl == Vtl::Vtl2,
+                apply_rip_offset,
+                apply_gdtr_offset,
+                vp_index,
+                vtl: to_igvm_vtl(self.vtl),
+            });
+
+        self.loader.relocatable_regions.insert(
+            gpa..=gpa + size_bytes - 1,
+            RelocationType::Normal(IgvmRelocatableRegion {
+                base_gpa: gpa,
+                size: size_bytes,
+                minimum_relocation_gpa,
+                maximum_relocation_gpa,
+                relocation_alignment,
+                is_vtl2: self.vtl == Vtl::Vtl2,
+                apply_rip_offset,
+                apply_gdtr_offset,
+                vp_index,
+                vtl: to_igvm_vtl(self.vtl),
+            }),
+        );
+
+        Ok(())
+    }
+
+    fn page_table_relocation(
+        &mut self,
+        page_table_gpa: u64,
+        size_pages: u64,
+        used_size_pages: u64,
+        vp_index: u16,
+    ) -> anyhow::Result<()> {
+        // can only be one set
+        if let Some(region) = &self.loader.page_table_region {
+            anyhow::bail!("page table relocation already set {:?}", region)
+        }
+
+        if used_size_pages > size_pages {
+            anyhow::bail!(
+                "used size pages {used_size_pages:#x} cannot be greater than size pages {size_pages:#x}"
+            );
+        }
+
+        let end_gpa = page_table_gpa + size_pages * PAGE_SIZE_4K - 1;
+
+        // cannot override other relocatable regions
+        if let Some(overlap) = self
+            .loader
+            .relocatable_regions
+            .get_range(page_table_gpa..=end_gpa)
+        {
+            anyhow::bail!(
+                "new page table relocation region overlaps existing region {:?}",
+                overlap
+            );
+        }
+
+        self.loader.initialization_headers.push(
+            IgvmInitializationHeader::PageTableRelocationRegion {
+                compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                gpa: page_table_gpa,
+                size: size_pages * PAGE_SIZE_4K,
+                used_size: used_size_pages * PAGE_SIZE_4K,
+                vp_index,
+                vtl: to_igvm_vtl(self.vtl),
+            },
+        );
+
+        let region = PageTableRegion {
+            gpa: page_table_gpa,
+            size_pages,
+            used_size_pages,
+        };
+
+        self.loader.relocatable_regions.insert(
+            page_table_gpa..=end_gpa,
+            RelocationType::PageTable(region.clone()),
+        );
+
+        self.loader.page_table_region = Some(region);
+
+        Ok(())
+    }
+
+    fn set_imported_regions_config_page(&mut self, page_base: u64) {
+        self.loader.imported_regions_config_page = Some(page_base);
+    }
+
+    fn set_expected_page_hashes_config_page(&mut self, page_base: u64) {
+        self.loader.expected_page_hashes_config_page = Some(page_base);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IgvmLoader;
+    use super::*;
+    use igvm::IgvmSerializer;
+    use loader::importer::BootPageAcceptance;
+    use loader::importer::ImageLoad;
+    use loader_defs::paravisor::ImportedRegionDescriptor;
+
+    #[test]
+    fn reported_ranges_appear_in_map_output() {
+        let mut map = MapFile {
+            isolation: LoaderIsolationType::None,
+            required_memory: Vec::new(),
+            accepted_ranges: Vec::new(),
+            relocatable_regions: Vec::new(),
+            reported_ranges: Vec::new(),
+        };
+        map.report_range(
+            MemoryRange::new(0x1000..0x3000),
+            "snp-bootshim-accepted-ram [PVALIDATE]",
+        );
+
+        assert!(map.to_string().contains(concat!(
+            "IGVM file reported ranges:\n",
+            "  0000000000001000 - 0000000000003000 (0x2000 bytes) ",
+            "snp-bootshim-accepted-ram [PVALIDATE]\n",
+        )));
+    }
+
+    #[test]
+    fn test_snp_measurement() {
+        use igvm_defs::SnpPolicy;
+        let ref_ld: [u8; 48] = [
+            136, 154, 25, 56, 108, 130, 226, 33, 155, 222, 211, 233, 42, 118, 78, 140, 0, 194, 155,
+            150, 109, 4, 166, 98, 188, 166, 207, 223, 236, 100, 123, 144, 81, 153, 86, 83, 57, 7,
+            131, 132, 101, 87, 145, 50, 99, 215, 28, 79,
+        ];
+
+        let mut loader = IgvmLoader::<X86Register>::new(
+            true,
+            LoaderIsolationType::Snp {
+                shared_gpa_boundary_bits: Some(39),
+                policy: SnpPolicy::from((0x1 << 17) | (0x1 << 16) | (0x1f)),
+                injection_type: InjectionType::Restricted,
+                secure_avic: SecureAvic::Enabled,
+            },
+        );
+        let data = vec![0, 5];
+        loader
+            .import_pages(0, 5, "data", BootPageAcceptance::Exclusive, &data)
+            .unwrap();
+        loader
+            .import_pages(5, 5, "data", BootPageAcceptance::ExclusiveUnmeasured, &data)
+            .unwrap();
+        loader
+            .import_pages(10, 1, "data", BootPageAcceptance::Exclusive, &data)
+            .unwrap();
+        loader
+            .import_pages(20, 1, "data", BootPageAcceptance::Shared, &data)
+            .unwrap();
+
+        let igvm_output = loader.finalize().unwrap();
+        let serializer = IgvmSerializer::new(&igvm_output.guest).unwrap();
+        let measurement = serializer
+            .measurement_for(IgvmPlatformType::SEV_SNP)
+            .expect("snp measurement");
+        assert_eq!(ref_ld.as_slice(), measurement.digest.as_slice());
+    }
+
+    #[test]
+    fn test_tdx_measurement() {
+        let ref_mrtd: [u8; 48] = [
+            200, 137, 46, 40, 88, 218, 231, 7, 90, 231, 125, 247, 18, 243, 41, 158, 32, 81, 49, 30,
+            168, 163, 220, 29, 216, 52, 151, 164, 255, 25, 88, 0, 246, 62, 147, 140, 34, 201, 70,
+            89, 34, 32, 239, 182, 77, 169, 96, 235,
+        ];
+
+        let mut loader = IgvmLoader::<X86Register>::new(
+            true,
+            LoaderIsolationType::Tdx {
+                policy: TdxPolicy::new()
+                    .with_debug_allowed(0u8)
+                    .with_sept_ve_disable(0u8),
+            },
+        );
+        let data = vec![0, 5];
+        loader
+            .import_pages(0, 5, "data", BootPageAcceptance::Exclusive, &data)
+            .unwrap();
+        loader
+            .import_pages(5, 5, "data", BootPageAcceptance::ExclusiveUnmeasured, &data)
+            .unwrap();
+        loader
+            .import_pages(10, 1, "data", BootPageAcceptance::Exclusive, &data)
+            .unwrap();
+        loader
+            .import_pages(20, 1, "data", BootPageAcceptance::Shared, &data)
+            .unwrap();
+
+        let igvm_output = loader.finalize().unwrap();
+        let serializer = IgvmSerializer::new(&igvm_output.guest).unwrap();
+        let measurement = serializer
+            .measurement_for(IgvmPlatformType::TDX)
+            .expect("tdx measurement");
+        assert_eq!(ref_mrtd.as_slice(), measurement.digest.as_slice());
+    }
+
+    #[test]
+    fn test_vbs_digest() {
+        let ref_digest: [u8; 32] = [
+            0x30, 0x13, 0x4C, 0x9B, 0xB8, 0x9C, 0xD7, 0x2D, 0x8A, 0x41, 0x8D, 0x1E, 0x7A, 0xFB,
+            0x75, 0x92, 0x7F, 0x45, 0xE8, 0x57, 0x1D, 0xDA, 0x7A, 0xC7, 0xBE, 0x87, 0xD4, 0xB6,
+            0xC7, 0x2C, 0xA6, 0x4C,
+        ];
+        let mut loader = IgvmLoader::<X86Register>::new(
+            true,
+            LoaderIsolationType::Vbs {
+                enable_debug: false,
+            },
+        );
+        {
+            let mut loader = loader.loader();
+
+            let data = vec![0, 5];
+            loader
+                .import_pages(0, 5, "data", BootPageAcceptance::Exclusive, &data)
+                .unwrap();
+            loader
+                .import_pages(5, 5, "data", BootPageAcceptance::ExclusiveUnmeasured, &data)
+                .unwrap();
+            loader
+                .import_pages(10, 1, "data", BootPageAcceptance::Exclusive, &data)
+                .unwrap();
+            loader
+                .import_pages(20, 1, "data", BootPageAcceptance::Shared, &data)
+                .unwrap();
+        }
+
+        let igvm_output = loader.finalize().unwrap();
+        let serializer = IgvmSerializer::new(&igvm_output.guest).unwrap();
+        let measurement = serializer
+            .measurement_for(IgvmPlatformType::VSM_ISOLATION)
+            .expect("vbs measurement");
+        assert_eq!(ref_digest.as_slice(), measurement.digest.as_slice());
+    }
+
+    #[test]
+    fn test_accepted_regions() {
+        let mut loader = IgvmLoader::<X86Register>::new(true, LoaderIsolationType::None);
+
+        let data = vec![0, 5];
+        loader
+            .import_pages(0, 5, "test1", BootPageAcceptance::Exclusive, &data)
+            .unwrap();
+
+        loader
+            .import_pages(15, 5, "test2", BootPageAcceptance::Exclusive, &data)
+            .unwrap();
+
+        loader
+            .import_pages(10, 5, "test3", BootPageAcceptance::Exclusive, &data)
+            .unwrap();
+
+        assert_eq!(
+            loader.imported_regions(),
+            vec![
+                ImportedRegionDescriptor::new(15, 5, true),
+                ImportedRegionDescriptor::new(10, 5, true),
+                ImportedRegionDescriptor::new(0, 5, true),
+            ]
+        );
+
+        loader
+            .import_pages(20, 10, "test1", BootPageAcceptance::Exclusive, &data)
+            .unwrap();
+
+        loader
+            .import_pages(30, 1, "test2", BootPageAcceptance::Exclusive, &data)
+            .unwrap();
+
+        assert_eq!(
+            loader.imported_regions(),
+            vec![
+                ImportedRegionDescriptor::new(30, 1, true),
+                ImportedRegionDescriptor::new(20, 10, true),
+                ImportedRegionDescriptor::new(15, 5, true),
+                ImportedRegionDescriptor::new(10, 5, true),
+                ImportedRegionDescriptor::new(0, 5, true),
+            ]
+        );
+    }
+}

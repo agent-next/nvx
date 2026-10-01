@@ -1,0 +1,25 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "underhill_init"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kmsg_defs.workspace = true
+
+underhill_confidentiality = { workspace = true, features = ["std"] }
+
+anyhow.workspace = true
+fs-err.workspace = true
+libc.workspace = true
+log = { workspace = true, features = ["std"] }
+nix = { workspace = true, features = ["ioctl"] }
+walkdir.workspace = true
+
+[build-dependencies]
+build_rs_git_info.workspace = true
+
+[lints]
+workspace = true

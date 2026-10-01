@@ -1,0 +1,19 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmfirmwareigvm_dll"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+ci = []
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+embed-resource.workspace = true
+
+[lints]
+workspace = true

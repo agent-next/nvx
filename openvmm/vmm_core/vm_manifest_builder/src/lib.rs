@@ -1,0 +1,1163 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Crate to help build a VM manifest.
+//!
+//! The VM's _manifest_ is a list of device handles (and, for now, legacy device
+//! configuration for [`vmotherboard`]) for devices that are present in a VM.
+//!
+//! This crate helps build the manifest via the [`VmManifestBuilder`] type. This
+//! can be used to construct common manifests for different VM types, such as
+//! Hyper-V generation 1 and 2 VMs, unenlightened Linux VMs, and Underhill VMs.
+//!
+//! For now, this crate only builds handles and configuration for "chipset"
+//! devices. In the future, it will also build handles for PCI and VMBus
+//! devices.
+
+#![forbid(unsafe_code)]
+
+mod microvm;
+
+use chipset_resources::LEGACY_CHIPSET_PCI_BUS_NAME;
+use chipset_resources::battery::BatteryDeviceHandleAArch64;
+use chipset_resources::battery::BatteryDeviceHandleX64;
+use chipset_resources::battery::HostBatteryUpdate;
+use chipset_resources::hyperv_guest_watchdog::DEFAULT_WDAT_PORT_BASE;
+use chipset_resources::hyperv_guest_watchdog::HyperVGuestWatchdogDeviceHandle;
+use chipset_resources::i440bx_host_pci_bridge::I440BX_HOST_PCI_BRIDGE_BDF;
+use chipset_resources::i440bx_host_pci_bridge::I440BxHostPciBridgeDeviceHandle;
+use chipset_resources::i8042::I8042DeviceHandle;
+use chipset_resources::ioapic::GenericIoApicDeviceHandle;
+use chipset_resources::ipmi_kcs::IpmiKcsDeviceHandleAArch64;
+use chipset_resources::ipmi_kcs::IpmiKcsDeviceHandleX64;
+use chipset_resources::isa_dma::GenericIsaDmaDeviceHandle;
+use chipset_resources::pic::PicDeviceHandle;
+use chipset_resources::piix4_pci_isa_bridge::PIIX4_PCI_ISA_BRIDGE_BDF;
+use chipset_resources::piix4_pci_isa_bridge::Piix4PciIsaBridgeDeviceHandle;
+use chipset_resources::piix4_uhci::PIIX4_PCI_USB_UHCI_STUB_BDF;
+use chipset_resources::piix4_uhci::Piix4PciUsbUhciStubDeviceHandle;
+use chipset_resources::pit::PitDeviceHandle;
+use chipset_resources::pm::DEFAULT_ACPI_IRQ;
+use chipset_resources::pm::DEFAULT_PM_PIO_BASE;
+use chipset_resources::pm::HyperVPowerManagementDeviceHandle;
+use chipset_resources::pm::PIIX4_PM_BDF;
+use chipset_resources::pm::Piix4PowerManagementDeviceHandle;
+use firmware_uefi_resources::BaseTemplate;
+use firmware_uefi_resources::HclCompatNvramQuirks;
+use firmware_uefi_resources::LogLevel;
+use firmware_uefi_resources::UefiCommandSet;
+use firmware_uefi_resources::UefiConfig;
+use firmware_uefi_resources::UefiDeviceHandle;
+use firmware_uefi_resources::UefiVarsDeltaJson;
+use input_core::MultiplexedInputHandle;
+use missing_dev_resources::MissingDevHandle;
+use serial_16550_resources::Serial16550DeviceHandle;
+use serial_core::resources::DisconnectedSerialBackendHandle;
+use serial_debugcon_resources::SerialDebugconDeviceHandle;
+use serial_pl011_resources::SerialPl011DeviceHandle;
+use std::iter::zip;
+use thiserror::Error;
+use vm_resource::IntoResource;
+use vm_resource::PlatformResource;
+use vm_resource::Resource;
+use vm_resource::ResourceId;
+use vm_resource::kind::IsaDmaControllerHandleKind;
+use vm_resource::kind::NonVolatileStoreKind;
+use vm_resource::kind::SerialBackendHandle;
+pub use vmm_core_defs::LayoutConfig;
+use vmotherboard::ChipsetDeviceHandle;
+use vmotherboard::LegacyPciChipsetDeviceHandle;
+use vmotherboard::options::BaseChipsetManifest;
+use vmotherboard::options::VmChipsetCapabilities;
+
+/// Builder for a VM manifest.
+pub struct VmManifestBuilder {
+    ty: BaseChipsetType,
+    arch: MachineArch,
+    serial: Option<[Option<Resource<SerialBackendHandle>>; 4]>,
+    serial_wait_for_rts: bool,
+    serial_debugger_mode: [bool; 4],
+    proxy_vga: bool,
+    stub_floppy: bool,
+    battery_status_recv: Option<mesh::Receiver<HostBatteryUpdate>>,
+    framebuffer: bool,
+    guest_watchdog: bool,
+    ipmi_kcs: bool,
+    psp: bool,
+    platform_pm_timer_assist: bool,
+    uefi: Option<UefiManifest>,
+    debugcon: Option<(Resource<SerialBackendHandle>, u16)>,
+    vmbus: bool,
+}
+
+/// Configuration for the Hyper-V UEFI helper device.
+pub struct UefiManifest {
+    /// Static configuration for the UEFI device.
+    pub config: UefiConfig,
+    /// Quirks for the NVRAM storage.
+    pub storage_quirks: Option<HclCompatNvramQuirks>,
+    /// Channel receiver for guest generation ID updates.
+    pub generation_id_recv: mesh::Receiver<[u8; 16]>,
+    /// NVRAM backing storage resource.
+    pub nvram_storage: Resource<NonVolatileStoreKind>,
+    /// Whether to wire up the platform VSM configuration resource.
+    pub vsm_config: bool,
+    /// Time source resource for UEFI time services.
+    pub time_source: Resource<chipset_resources::CmosRtcTimeSourceHandleKind>,
+}
+
+impl UefiManifest {
+    /// Construct a [`UefiManifest`] with sensible defaults for the given
+    /// architecture:
+    ///
+    /// - `command_set` and `use_mmio` are derived from `arch`.
+    /// - `initial_generation_id` is randomized.
+    /// - `generation_id_recv` is a disconnected receiver (no host updates).
+    /// - `vsm_config` is disabled.
+    /// - `time_source` is a [`SystemTimeClockHandle`] with no delta.
+    ///
+    /// [`SystemTimeClockHandle`]: chipset_resources::cmos_rtc_time_source::SystemTimeClockHandle
+    pub fn new(
+        arch: MachineArch,
+        base_template: Option<BaseTemplate>,
+        custom_uefi_json: Option<UefiVarsDeltaJson>,
+        secure_boot: bool,
+        diagnostics_log_level: LogLevel,
+        diagnostics_rate_limit: Option<u32>,
+        nvram_storage: Resource<NonVolatileStoreKind>,
+        storage_quirks: Option<HclCompatNvramQuirks>,
+    ) -> Self {
+        let mut initial_generation_id = [0; 16];
+        getrandom::fill(&mut initial_generation_id).expect("rng failure");
+        Self {
+            config: UefiConfig {
+                base_template,
+                custom_uefi_json,
+                secure_boot,
+                initial_generation_id,
+                use_mmio: !matches!(arch, MachineArch::X86_64),
+                command_set: match arch {
+                    MachineArch::X86_64 => UefiCommandSet::X64,
+                    MachineArch::Aarch64 => UefiCommandSet::Aarch64,
+                },
+                diagnostics_log_level,
+                diagnostics_rate_limit,
+            },
+            storage_quirks,
+            generation_id_recv: mesh::channel().1,
+            nvram_storage,
+            vsm_config: false,
+            time_source: chipset_resources::cmos_rtc_time_source::SystemTimeClockHandle {
+                delta_milliseconds: 0,
+            }
+            .into_resource(),
+        }
+    }
+}
+
+/// The VM's base chipset type, which determines the set of core devices (such
+/// as timers, interrupt controllers, and buses) that are present in the VM.
+pub enum BaseChipsetType {
+    /// Hyper-V generation 1 VM, with a PCAT firmware and PIIX4 chipset.
+    HypervGen1,
+    /// Hyper-V generation 2 VM, with a UEFI firmware and no legacy devices.
+    HypervGen2Uefi,
+    /// Hyper-V generation 2 VM, booting directly from Linux with no legacy
+    /// devices.
+    HyperVGen2LinuxDirect,
+    /// VM hosting an HCL (Underhill) instance, with no architectural devices at
+    /// all.
+    ///
+    /// The HCL will determine the actual devices presented to the guest OS;
+    /// this VMM just needs to present the devices needed by the HCL.
+    HclHost,
+    /// Unenlightened Linux VM, with basic architectural devices.
+    UnenlightenedLinuxDirect,
+    /// Enlightened Linux VM with a minimal emulated chipset for direct boot.
+    EnlightenedLinuxDirect,
+    /// microVM with only its allowlisted architectural devices.
+    Microvm,
+}
+
+/// The machine architecture of the VM.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MachineArch {
+    /// x86_64 (AMD64) architecture.
+    X86_64,
+    /// AArch64 (ARM64) architecture.
+    Aarch64,
+}
+
+/// The result of building a VM manifest.
+pub struct VmChipsetResult {
+    /// The base chipset manifest for the VM.
+    pub chipset: BaseChipsetManifest,
+    /// The list of chipset devices present in the VM.
+    pub chipset_devices: Vec<ChipsetDeviceHandle>,
+    /// The list of legacy PCI chipset devices with explicit placement metadata.
+    pub pci_chipset_devices: Vec<LegacyPciChipsetDeviceHandle>,
+    /// Optional ISA DMA controller resource handle.
+    pub isa_dma_controller: Option<Resource<IsaDmaControllerHandleKind>>,
+    /// Derived chipset capabilities needed by firmware and table generation.
+    pub capabilities: VmChipsetCapabilities,
+}
+
+/// Error type for building a VM manifest.
+#[derive(Debug, Error)]
+#[error(transparent)]
+pub struct Error(#[from] ErrorInner);
+
+#[derive(Debug, Error)]
+enum ErrorInner {
+    #[error("unsupported architecture")]
+    UnsupportedArch,
+    #[error("unsupported serial port count")]
+    UnsupportedSerialCount,
+    #[error("unsupported debugcon architecture")]
+    UnsupportedDebugconArch,
+    #[error("wait for RTS not supported with this serial type")]
+    WaitForRtsNotSupported,
+}
+
+fn serial_16550_devices(
+    wait_for_rts: bool,
+    debugger_mode: [bool; 4],
+    backends: [Option<Resource<SerialBackendHandle>>; 4],
+) -> [Serial16550DeviceHandle; 4] {
+    let [d0, d1, d2, d3] = Serial16550DeviceHandle::com_ports(
+        backends.map(|r| r.unwrap_or_else(|| DisconnectedSerialBackendHandle.into_resource())),
+    );
+    [
+        Serial16550DeviceHandle {
+            wait_for_rts,
+            debugger_mode: debugger_mode[0],
+            ..d0
+        },
+        Serial16550DeviceHandle {
+            wait_for_rts,
+            debugger_mode: debugger_mode[1],
+            ..d1
+        },
+        Serial16550DeviceHandle {
+            wait_for_rts,
+            debugger_mode: debugger_mode[2],
+            ..d2
+        },
+        Serial16550DeviceHandle {
+            wait_for_rts,
+            debugger_mode: debugger_mode[3],
+            ..d3
+        },
+    ]
+}
+
+fn serial_pl011_devices(
+    debugger_mode: [bool; 4],
+    backends: [Option<Resource<SerialBackendHandle>>; 4],
+) -> Result<[SerialPl011DeviceHandle; 2], ErrorInner> {
+    const PL011_SERIAL0_BASE: u64 = 0xEFFEC000;
+    const PL011_SERIAL0_IRQ: u32 = 1;
+    const PL011_SERIAL1_BASE: u64 = 0xEFFEB000;
+    const PL011_SERIAL1_IRQ: u32 = 2;
+
+    let [backend0, backend1, backend2, backend3] = backends;
+    if backend2.is_some() || backend3.is_some() {
+        return Err(ErrorInner::UnsupportedSerialCount);
+    }
+
+    Ok([
+        SerialPl011DeviceHandle {
+            base: PL011_SERIAL0_BASE,
+            irq: PL011_SERIAL0_IRQ,
+            io: backend0.unwrap_or_else(|| DisconnectedSerialBackendHandle.into_resource()),
+            debugger_mode: debugger_mode[0],
+        },
+        SerialPl011DeviceHandle {
+            base: PL011_SERIAL1_BASE,
+            irq: PL011_SERIAL1_IRQ,
+            io: backend1.unwrap_or_else(|| DisconnectedSerialBackendHandle.into_resource()),
+            debugger_mode: debugger_mode[1],
+        },
+    ])
+}
+
+impl VmManifestBuilder {
+    /// Create a new VM manifest builder for the given chipset type and
+    /// architecture.
+    pub fn new(ty: BaseChipsetType, arch: MachineArch) -> Self {
+        let vmbus = !matches!(ty, BaseChipsetType::UnenlightenedLinuxDirect);
+        let vmbus = microvm::vmbus_enabled(&ty, vmbus);
+        VmManifestBuilder {
+            ty,
+            arch,
+            serial: None,
+            serial_wait_for_rts: false,
+            serial_debugger_mode: [false; 4],
+            proxy_vga: false,
+            stub_floppy: false,
+            battery_status_recv: None,
+            framebuffer: false,
+            guest_watchdog: false,
+            ipmi_kcs: false,
+            psp: false,
+            platform_pm_timer_assist: false,
+            uefi: None,
+            debugcon: None,
+            vmbus,
+        }
+    }
+
+    /// Enable serial ports (of a type determined by the chipset type), backed
+    /// by the given serial backends.
+    ///
+    /// For Hyper-V generation 1 VMs, serial ports are always present but are
+    /// disconnected unless this method is called. For other VMs, this method
+    /// must be called to add serial ports.
+    ///
+    /// For ARM64 VMs, only two serial ports are supported.
+    pub fn with_serial(mut self, serial: [Option<Resource<SerialBackendHandle>>; 4]) -> Self {
+        self.serial = Some(serial);
+        self
+    }
+
+    /// Enable wait-for-RTS mode for serial ports.
+    ///
+    /// This ensures that the VMM will not push data into the serial port's FIFO
+    /// until the guest has raised the RTS line.
+    pub fn with_serial_wait_for_rts(mut self) -> Self {
+        self.serial_wait_for_rts = true;
+        self
+    }
+
+    /// Enable serial debugger mode per COM port, for WinDbg / KD-over-serial.
+    ///
+    /// Each element enables debugger mode for the corresponding COM port
+    /// (index 0 = COM1, .., index 3 = COM4; for PL011, index 0 and 1). In
+    /// debugger mode the serial backend is kept drained and may drop bytes
+    /// instead of applying backpressure so the kernel debugger transport does
+    /// not deadlock. Ports are independent: one COM port can run in debugger
+    /// mode while another behaves normally.
+    pub fn with_serial_debugger_mode(mut self, debugger_mode: [bool; 4]) -> Self {
+        self.serial_debugger_mode = debugger_mode;
+        self
+    }
+
+    /// Enable the debugcon output-only serial device at the specified port,
+    /// backed by the given serial backend.
+    ///
+    /// Only supported on x86
+    pub fn with_debugcon(mut self, serial: Resource<SerialBackendHandle>, port: u16) -> Self {
+        self.debugcon = Some((serial, port));
+        self
+    }
+
+    /// Enable the proxy VGA device.
+    ///
+    /// This is used for Underhill VMs that are emulating Hyper-V generation 1
+    /// VMs.
+    pub fn with_proxy_vga(mut self) -> Self {
+        assert!(matches!(self.ty, BaseChipsetType::HypervGen1));
+        self.proxy_vga = true;
+        self
+    }
+
+    /// Enable the battery device.
+    pub fn with_battery(mut self, battery_status_recv: mesh::Receiver<HostBatteryUpdate>) -> Self {
+        self.battery_status_recv = Some(battery_status_recv);
+        self
+    }
+
+    /// Enable the stub floppy device instead of the full floppy device
+    /// implementation.
+    ///
+    /// This is used to support the saved states for VMs that used the stub
+    /// floppy device.
+    ///
+    /// This is only supported for Hyper-V generation 1 VMs. Panics otherwise.
+    pub fn with_stub_floppy(mut self) -> Self {
+        assert!(matches!(self.ty, BaseChipsetType::HypervGen1));
+        self.stub_floppy = true;
+        self
+    }
+
+    /// Enable the framebuffer device.
+    ///
+    /// This is implicit for Hyper-V generation 1 VMs.
+    ///
+    /// This method will be removed once all devices depending on the
+    /// framebuffer are managed through this builder type.
+    pub fn with_framebuffer(mut self) -> Self {
+        self.framebuffer = true;
+        self
+    }
+
+    /// Enable the guest watchdog device.
+    pub fn with_guest_watchdog(mut self) -> Self {
+        self.guest_watchdog = true;
+        self
+    }
+
+    /// Enable the architecture-specific IPMI KCS virtual BMC.
+    ///
+    /// This is supported only for UEFI-booted guests.
+    pub fn with_ipmi_kcs(mut self) -> Self {
+        assert!(matches!(self.ty, BaseChipsetType::HypervGen2Uefi));
+        self.ipmi_kcs = true;
+        self
+    }
+
+    /// Enable the AMD64 PSP device.
+    pub fn with_psp(mut self) -> Self {
+        self.psp = true;
+        self
+    }
+
+    /// Use the platform-provided PM timer assist implementation for power
+    /// management devices.
+    ///
+    /// When set, the PM device handles will include a platform resource
+    /// reference for PM timer assist, which must be resolved by a
+    /// platform-specific resolver registered with the resource resolver.
+    pub fn with_platform_pm_timer_assist(mut self) -> Self {
+        self.platform_pm_timer_assist = true;
+        self
+    }
+
+    /// Enable the Hyper-V UEFI helper device.
+    ///
+    /// All platform-specific dependencies (logger, NVRAM storage, watchdog
+    /// platform, optional VSM config, time source) are resolved via
+    /// [`vm_resource::PlatformResource`] resolvers that the caller must
+    /// register with the resource resolver.
+    ///
+    /// Only supported by [`BaseChipsetType::HypervGen2Uefi`]. Panics
+    /// otherwise.
+    pub fn with_uefi(mut self, uefi: UefiManifest) -> Self {
+        assert!(matches!(self.ty, BaseChipsetType::HypervGen2Uefi));
+        self.uefi = Some(uefi);
+        self
+    }
+
+    /// Mark this VM as not having VMBus.
+    ///
+    /// This affects the default memory layout: the chipset high MMIO region
+    /// (used for VMBus) is not allocated, while the low MMIO region is kept
+    /// for architecturally required address space.
+    pub fn without_vmbus(mut self) -> Self {
+        self.vmbus = false;
+        self
+    }
+
+    /// Build the VM manifest.
+    pub fn build(self) -> Result<VmChipsetResult, Error> {
+        let mut result = VmChipsetResult {
+            chipset_devices: Vec::new(),
+            pci_chipset_devices: Vec::new(),
+            chipset: BaseChipsetManifest::empty(),
+            isa_dma_controller: None,
+            capabilities: VmChipsetCapabilities {
+                with_ioapic: false,
+                with_pic: false,
+                with_pit: false,
+                with_generic_isa_dma: false,
+                with_psp: false,
+                with_guest_watchdog: false,
+                with_i440bx_host_pci_bridge: false,
+            },
+        };
+        let is_x86 = matches!(self.arch, MachineArch::X86_64);
+
+        if let Some((backend, port)) = self.debugcon {
+            if is_x86 {
+                result.attach_debugcon(port, backend);
+            } else {
+                return Err(ErrorInner::UnsupportedDebugconArch.into());
+            }
+        }
+
+        match self.ty {
+            BaseChipsetType::HypervGen1 => {
+                if self.arch != MachineArch::X86_64 {
+                    return Err(Error(ErrorInner::UnsupportedArch));
+                }
+                result.attach_i8042();
+                result.attach_generic_isa_dma();
+                result.attach_piix4_pci_usb_uhci_stub();
+                result.attach_piix4_pci_isa_bridge();
+                result.attach_i440bx_host_pci_bridge();
+                // This chipset always has a serial port even if not requested.
+                result.attach_serial_16550(
+                    self.serial_wait_for_rts,
+                    self.serial_debugger_mode,
+                    self.serial.unwrap_or_else(|| [(); 4].map(|_| None)),
+                );
+                result.chipset = BaseChipsetManifest {
+                    with_generic_cmos_rtc: false,
+                    with_generic_isa_floppy: false,
+                    with_generic_pci_bus: false,
+                    with_generic_psp: false,
+                    with_hyperv_firmware_pcat: true,
+                    with_hyperv_framebuffer: !self.proxy_vga,
+                    with_hyperv_ide: true,
+                    with_hyperv_vga: !self.proxy_vga,
+                    with_piix4_cmos_rtc: true,
+                    with_piix4_pci_bus: true,
+                    with_underhill_vga_proxy: self.proxy_vga,
+                    with_winbond_super_io_and_floppy_stub: self.stub_floppy,
+                    with_winbond_super_io_and_floppy_full: !self.stub_floppy,
+                };
+                result.attach_generic_ioapic();
+                result.attach_pic();
+                result.attach_pit();
+                result.attach_piix4_power_management(self.platform_pm_timer_assist);
+                result.attach_missing_arch_ports(self.arch, false);
+                if let Some(recv) = self.battery_status_recv {
+                    result.attach_battery(self.arch, recv);
+                }
+            }
+            BaseChipsetType::UnenlightenedLinuxDirect => {
+                result.chipset = BaseChipsetManifest {
+                    with_generic_cmos_rtc: is_x86,
+                    with_generic_isa_floppy: false,
+                    with_generic_pci_bus: false,
+                    with_generic_psp: self.psp,
+                    with_hyperv_firmware_pcat: false,
+                    with_hyperv_framebuffer: self.framebuffer,
+                    with_hyperv_ide: false,
+                    with_hyperv_vga: false,
+                    with_piix4_cmos_rtc: false,
+                    with_piix4_pci_bus: false,
+                    with_underhill_vga_proxy: false,
+                    with_winbond_super_io_and_floppy_stub: false,
+                    with_winbond_super_io_and_floppy_full: false,
+                };
+                if is_x86 {
+                    result.attach_generic_ioapic();
+                }
+                result.capabilities.with_psp = self.psp;
+                if is_x86 {
+                    result.attach_pic();
+                    result.attach_pit();
+                    result.attach_hyperv_power_management(self.platform_pm_timer_assist);
+                }
+                result
+                    .maybe_attach_arch_serial(
+                        self.arch,
+                        self.serial_wait_for_rts,
+                        self.serial_debugger_mode,
+                        true,
+                        self.serial,
+                    )?
+                    .attach_missing_arch_ports(self.arch, false);
+                if let Some(recv) = self.battery_status_recv {
+                    result.attach_battery(self.arch, recv);
+                }
+                if self.guest_watchdog {
+                    result.attach_guest_watchdog();
+                }
+            }
+            BaseChipsetType::EnlightenedLinuxDirect => {
+                result.chipset = BaseChipsetManifest {
+                    // HACK: The current SNP direct-boot repro kernel requires
+                    // a CMOS RTC. Remove or gate this when it no longer does.
+                    with_generic_cmos_rtc: is_x86,
+                    ..BaseChipsetManifest::empty()
+                };
+                result.capabilities.with_ioapic = is_x86;
+                result.capabilities.with_psp = self.psp;
+                if is_x86 {
+                    // TODO: This is a bring-up workaround for SNP Linux direct
+                    // boot. Without these legacy-ish x86 platform devices,
+                    // the current repro kernel reaches early TSC calibration
+                    // and then fails all reference paths:
+                    // "Fast TSC calibration failed", "Unable to calibrate
+                    // against PIT", and "HPET/PMTIMER calibration failed".
+                    //
+                    // Cloud Hypervisor avoids a similar Linux
+                    // pit_calibrate_tsc() hang with a much narrower platform
+                    // surface: IOAPIC, ACPI PM timer, and an i8042/port 0x61
+                    // stub that returns bit 5 set. We should investigate
+                    // whether OpenVMM can expose a similarly minimal
+                    // enlightened timer/interrupt surface for direct-boot
+                    // Linux instead of attaching full PIC/PIT/PM devices here.
+                    result.attach_generic_ioapic();
+                    result.attach_pic();
+                    result.attach_pit();
+                    result.attach_hyperv_power_management(self.platform_pm_timer_assist);
+                }
+                result
+                    .maybe_attach_arch_serial(
+                        self.arch,
+                        self.serial_wait_for_rts,
+                        self.serial_debugger_mode,
+                        false,
+                        self.serial,
+                    )?
+                    .attach_missing_arch_ports(self.arch, false)
+                    // Linux probes legacy PCI configuration ports even when
+                    // PCIe ECAM is available. Absorb those probes as missing
+                    // devices instead of tracing them as unknown PIO.
+                    .attach_missing_pci_config_ports(self.arch);
+                if self.guest_watchdog {
+                    result.attach_guest_watchdog();
+                }
+            }
+            BaseChipsetType::Microvm => {
+                microvm::build(self.arch, &mut result)?;
+            }
+            BaseChipsetType::HypervGen2Uefi | BaseChipsetType::HyperVGen2LinuxDirect => {
+                result.chipset = BaseChipsetManifest {
+                    with_generic_cmos_rtc: is_x86,
+                    with_generic_isa_floppy: false,
+                    with_generic_pci_bus: false,
+                    with_generic_psp: self.psp,
+                    with_hyperv_firmware_pcat: false,
+                    with_hyperv_framebuffer: self.framebuffer,
+                    with_hyperv_ide: false,
+                    with_hyperv_vga: false,
+                    with_piix4_cmos_rtc: false,
+                    with_piix4_pci_bus: false,
+
+                    with_underhill_vga_proxy: false,
+                    with_winbond_super_io_and_floppy_stub: false,
+                    with_winbond_super_io_and_floppy_full: false,
+                };
+                if is_x86 {
+                    result.attach_generic_ioapic();
+                    result.attach_hyperv_power_management(self.platform_pm_timer_assist);
+                }
+                result.capabilities.with_psp = self.psp;
+                result
+                    .maybe_attach_arch_serial(
+                        self.arch,
+                        self.serial_wait_for_rts,
+                        self.serial_debugger_mode,
+                        true,
+                        self.serial,
+                    )?
+                    .attach_missing_arch_ports(self.arch, true);
+                if let Some(recv) = self.battery_status_recv {
+                    result.attach_battery(self.arch, recv);
+                }
+                if self.guest_watchdog {
+                    result.attach_guest_watchdog();
+                }
+                if matches!(self.ty, BaseChipsetType::HypervGen2Uefi) {
+                    if self.ipmi_kcs {
+                        result.attach_ipmi_kcs(self.arch);
+                    }
+                    result.attach_uefi(
+                        self.uefi
+                            .expect("must have called .with_uefi to enable uefi"),
+                    );
+                }
+            }
+            BaseChipsetType::HclHost => {
+                result.chipset = BaseChipsetManifest {
+                    with_hyperv_framebuffer: self.framebuffer,
+                    ..BaseChipsetManifest::empty()
+                };
+                result.maybe_attach_arch_serial(
+                    self.arch,
+                    self.serial_wait_for_rts,
+                    self.serial_debugger_mode,
+                    false,
+                    self.serial,
+                )?;
+                if let Some(recv) = self.battery_status_recv {
+                    result.attach_battery(self.arch, recv);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Returns the default memory layout sizing for this VM type and
+    /// architecture.
+    ///
+    /// This is separate from [`Self::build`] because not every consumer runs
+    /// the layout engine. In particular, OpenHCL (Underhill) receives its
+    /// memory layout from the host and does not use these defaults.
+    pub fn layout_config(&self) -> LayoutConfig {
+        let default_low = match self.arch {
+            MachineArch::X86_64 => 128 * 1024 * 1024,
+            MachineArch::Aarch64 => 512 * 1024 * 1024,
+        };
+        let default_high: u64 = 512 * 1024 * 1024;
+        let default_vtl2: u64 = 1024 * 1024 * 1024;
+        match self.ty {
+            BaseChipsetType::HypervGen1
+            | BaseChipsetType::HypervGen2Uefi
+            | BaseChipsetType::HyperVGen2LinuxDirect
+            | BaseChipsetType::UnenlightenedLinuxDirect
+            | BaseChipsetType::EnlightenedLinuxDirect => LayoutConfig {
+                chipset_low_mmio_size: default_low,
+                chipset_high_mmio_size: if self.vmbus { default_high } else { 0 },
+                vtl2_chipset_mmio_size: 0,
+            },
+            BaseChipsetType::Microvm => microvm::layout_config(),
+            BaseChipsetType::HclHost => LayoutConfig {
+                chipset_low_mmio_size: default_low,
+                chipset_high_mmio_size: if self.vmbus { default_high } else { 0 },
+                vtl2_chipset_mmio_size: default_vtl2,
+            },
+        }
+    }
+}
+
+impl VmChipsetResult {
+    fn attach_i8042(&mut self) -> &mut Self {
+        self.chipset_devices.push(ChipsetDeviceHandle {
+            name: "i8042".to_owned(),
+            resource: I8042DeviceHandle {
+                keyboard_input: MultiplexedInputHandle { elevation: 0 }.into_resource(),
+            }
+            .into_resource(),
+        });
+        self
+    }
+
+    fn attach_generic_isa_dma(&mut self) -> &mut Self {
+        self.isa_dma_controller = Some(GenericIsaDmaDeviceHandle.into_resource());
+        self.capabilities.with_generic_isa_dma = true;
+        self
+    }
+
+    fn attach_pic(&mut self) -> &mut Self {
+        self.chipset_devices.push(ChipsetDeviceHandle {
+            name: PicDeviceHandle::ID.to_owned(),
+            resource: PicDeviceHandle.into_resource(),
+        });
+        self.capabilities.with_pic = true;
+        self
+    }
+
+    fn attach_pit(&mut self) -> &mut Self {
+        self.chipset_devices.push(ChipsetDeviceHandle {
+            name: PitDeviceHandle::ID.to_owned(),
+            resource: PitDeviceHandle.into_resource(),
+        });
+        self.capabilities.with_pit = true;
+        self
+    }
+
+    fn attach_generic_ioapic(&mut self) -> &mut Self {
+        self.chipset_devices.push(ChipsetDeviceHandle {
+            // Use "ioapic" (not GenericIoApicDeviceHandle::ID) to match the
+            // device unit name used by the old inline construction path. This
+            // is required for servicing compatibility (upgrade from old ->
+            // new OpenHCL).
+            name: "ioapic".to_owned(),
+            resource: GenericIoApicDeviceHandle {
+                routing: PlatformResource.into_resource(),
+            }
+            .into_resource(),
+        });
+        self.capabilities.with_ioapic = true;
+        self
+    }
+
+    fn attach_battery(
+        &mut self,
+        arch: MachineArch,
+        battery_status_recv: mesh::Receiver<HostBatteryUpdate>,
+    ) -> &mut Self {
+        self.chipset_devices.push(ChipsetDeviceHandle {
+            name: "battery".to_owned(),
+            resource: match arch {
+                MachineArch::X86_64 => BatteryDeviceHandleX64 {
+                    battery_status_recv,
+                }
+                .into_resource(),
+                MachineArch::Aarch64 => BatteryDeviceHandleAArch64 {
+                    battery_status_recv,
+                }
+                .into_resource(),
+            },
+        });
+
+        self
+    }
+
+    fn attach_piix4_pci_usb_uhci_stub(&mut self) -> &mut Self {
+        self.pci_chipset_devices.push(LegacyPciChipsetDeviceHandle {
+            name: "piix4-usb-uhci-stub".to_string(),
+            resource: Piix4PciUsbUhciStubDeviceHandle.into_resource(),
+            pci_bus_name: LEGACY_CHIPSET_PCI_BUS_NAME.to_string(),
+            bdf: PIIX4_PCI_USB_UHCI_STUB_BDF,
+        });
+        self
+    }
+
+    fn attach_piix4_pci_isa_bridge(&mut self) -> &mut Self {
+        self.pci_chipset_devices.push(LegacyPciChipsetDeviceHandle {
+            name: "piix4-pci-isa-bridge".to_string(),
+            resource: Piix4PciIsaBridgeDeviceHandle.into_resource(),
+            pci_bus_name: LEGACY_CHIPSET_PCI_BUS_NAME.to_string(),
+            bdf: PIIX4_PCI_ISA_BRIDGE_BDF,
+        });
+        self
+    }
+
+    fn attach_guest_watchdog(&mut self) -> &mut Self {
+        self.chipset_devices.push(ChipsetDeviceHandle {
+            name: "guest-watchdog".to_owned(),
+            resource: HyperVGuestWatchdogDeviceHandle {
+                port_base: DEFAULT_WDAT_PORT_BASE,
+            }
+            .into_resource(),
+        });
+        self.capabilities.with_guest_watchdog = true;
+        self
+    }
+
+    fn attach_ipmi_kcs(&mut self, arch: MachineArch) -> &mut Self {
+        let resource = match arch {
+            MachineArch::X86_64 => IpmiKcsDeviceHandleX64 {
+                event_sink: PlatformResource.into_resource(),
+                time_source: PlatformResource.into_resource(),
+            }
+            .into_resource(),
+            MachineArch::Aarch64 => IpmiKcsDeviceHandleAArch64 {
+                event_sink: PlatformResource.into_resource(),
+                time_source: PlatformResource.into_resource(),
+            }
+            .into_resource(),
+        };
+        self.chipset_devices.push(ChipsetDeviceHandle {
+            name: "ipmi-kcs".to_owned(),
+            resource,
+        });
+        self
+    }
+
+    fn attach_hyperv_power_management(&mut self, platform_pm_timer_assist: bool) -> &mut Self {
+        let pm_timer_assist = platform_pm_timer_assist.then(|| PlatformResource.into_resource());
+        self.chipset_devices.push(ChipsetDeviceHandle {
+            name: "pm".to_owned(),
+            resource: HyperVPowerManagementDeviceHandle {
+                acpi_irq: DEFAULT_ACPI_IRQ,
+                pio_base: DEFAULT_PM_PIO_BASE,
+                pm_timer_assist,
+            }
+            .into_resource(),
+        });
+        self
+    }
+
+    fn attach_piix4_power_management(&mut self, platform_pm_timer_assist: bool) -> &mut Self {
+        let pm_timer_assist = platform_pm_timer_assist.then(|| PlatformResource.into_resource());
+        self.pci_chipset_devices.push(LegacyPciChipsetDeviceHandle {
+            name: "piix4-pm".to_string(),
+            resource: Piix4PowerManagementDeviceHandle { pm_timer_assist }.into_resource(),
+            pci_bus_name: LEGACY_CHIPSET_PCI_BUS_NAME.to_string(),
+            bdf: PIIX4_PM_BDF,
+        });
+        self
+    }
+
+    fn attach_uefi(&mut self, uefi: UefiManifest) -> &mut Self {
+        let UefiManifest {
+            config,
+            storage_quirks,
+            generation_id_recv,
+            nvram_storage,
+            vsm_config,
+            time_source,
+        } = uefi;
+        self.chipset_devices.push(ChipsetDeviceHandle {
+            name: "uefi".to_owned(),
+            resource: UefiDeviceHandle {
+                config,
+                storage_quirks,
+                generation_id_recv,
+                logger: PlatformResource.into_resource(),
+                nvram_storage,
+                watchdog_platform: PlatformResource.into_resource(),
+                vsm_config: vsm_config.then(|| PlatformResource.into_resource()),
+                time_source,
+            }
+            .into_resource(),
+        });
+        self
+    }
+
+    fn attach_i440bx_host_pci_bridge(&mut self) -> &mut Self {
+        self.pci_chipset_devices.push(LegacyPciChipsetDeviceHandle {
+            name: "440bx-host-pci-bridge".to_string(),
+            resource: I440BxHostPciBridgeDeviceHandle {
+                adjust_gpa_range: PlatformResource.into_resource(),
+            }
+            .into_resource(),
+            pci_bus_name: LEGACY_CHIPSET_PCI_BUS_NAME.to_string(),
+            bdf: I440BX_HOST_PCI_BRIDGE_BDF,
+        });
+        self.capabilities.with_i440bx_host_pci_bridge = true;
+        self
+    }
+
+    fn maybe_attach_arch_serial(
+        &mut self,
+        arch: MachineArch,
+        wait_for_rts: bool,
+        debugger_mode: [bool; 4],
+        register_missing: bool,
+        serial: Option<[Option<Resource<SerialBackendHandle>>; 4]>,
+    ) -> Result<&mut Self, ErrorInner> {
+        if let Some(serial) = serial {
+            match arch {
+                MachineArch::X86_64 => {
+                    self.attach_serial_16550(wait_for_rts, debugger_mode, serial);
+                }
+                MachineArch::Aarch64 => {
+                    if wait_for_rts {
+                        return Err(ErrorInner::WaitForRtsNotSupported);
+                    }
+                    self.attach_serial_pl011(debugger_mode, serial)?;
+                }
+            }
+        } else if register_missing && arch == MachineArch::X86_64 {
+            self.chipset_devices.push(ChipsetDeviceHandle {
+                name: "missing-serial".to_owned(),
+                resource: MissingDevHandle::new()
+                    .claim_pio("com1", 0x3f8..=0x3ff)
+                    .claim_pio("com2", 0x2f8..=0x2ff)
+                    .claim_pio("com3", 0x3e8..=0x3ef)
+                    .claim_pio("com4", 0x2e8..=0x2ef)
+                    .into_resource(),
+            });
+        }
+        Ok(self)
+    }
+
+    fn attach_debugcon(&mut self, port: u16, backend: Resource<SerialBackendHandle>) -> &mut Self {
+        self.chipset_devices.push(ChipsetDeviceHandle {
+            name: format!("debugcon-{port:#x?}"),
+            resource: SerialDebugconDeviceHandle { port, io: backend }.into_resource(),
+        });
+        self
+    }
+
+    fn attach_serial_16550(
+        &mut self,
+        wait_for_rts: bool,
+        debugger_mode: [bool; 4],
+        backends: [Option<Resource<SerialBackendHandle>>; 4],
+    ) -> &mut Self {
+        let devices = serial_16550_devices(wait_for_rts, debugger_mode, backends);
+
+        self.chipset_devices.extend(
+            zip(
+                ["serial-com1", "serial-com2", "serial-com3", "serial-com4"],
+                devices,
+            )
+            .map(|(name, device)| ChipsetDeviceHandle {
+                name: name.to_string(),
+                resource: device.into_resource(),
+            }),
+        );
+        self
+    }
+
+    fn attach_serial_pl011(
+        &mut self,
+        debugger_mode: [bool; 4],
+        backends: [Option<Resource<SerialBackendHandle>>; 4],
+    ) -> Result<&mut Self, ErrorInner> {
+        let [serial0, serial1] = serial_pl011_devices(debugger_mode, backends)?;
+        self.chipset_devices.extend([
+            ChipsetDeviceHandle {
+                name: "com1".to_string(),
+                resource: serial0.into_resource(),
+            },
+            ChipsetDeviceHandle {
+                name: "com2".to_string(),
+                resource: serial1.into_resource(),
+            },
+        ]);
+        Ok(self)
+    }
+
+    fn attach_missing_arch_ports(&mut self, arch: MachineArch, pcat_missing: bool) -> &mut Self {
+        if arch != MachineArch::X86_64 {
+            return self;
+        }
+
+        self.chipset_devices.extend([
+            // Some linux versions write to port 0xED as an IO delay mechanims.
+            ChipsetDeviceHandle {
+                name: "io-delay-0xed".to_owned(),
+                resource: MissingDevHandle::new()
+                    .claim_pio("delay", 0xed..=0xed)
+                    .into_resource(),
+            },
+            // some windows versions try to unconditionally access these IO ports.
+            ChipsetDeviceHandle {
+                name: "missing-vmware-backdoor".to_owned(),
+                resource: MissingDevHandle::new()
+                    .claim_pio("backdoor", 0x5658..=0x5659)
+                    .into_resource(),
+            },
+            // DOS games often unconditionally poll the gameport (e.g: Duke Nukem 1)
+            ChipsetDeviceHandle {
+                name: "missing-gameport".to_owned(),
+                resource: MissingDevHandle::new()
+                    .claim_pio("gameport", 0x201..=0x201)
+                    .into_resource(),
+            },
+            // Guests probe for an 8-bit SuperIO chip at the legacy index/data
+            // pair. These ports alias the top of the Hyper-V firmware devices'
+            // register window, which only decodes dword accesses, so the
+            // firmware devices leave them unclaimed.
+            ChipsetDeviceHandle {
+                name: "missing-superio".to_owned(),
+                resource: MissingDevHandle::new()
+                    .claim_pio("superio", 0x2e..=0x2f)
+                    .into_resource(),
+            },
+        ]);
+
+        if pcat_missing {
+            self.chipset_devices.extend([
+                ChipsetDeviceHandle {
+                    name: "missing-pic".to_owned(),
+                    resource: MissingDevHandle::new()
+                        .claim_pio("primary", 0x20..=0x21)
+                        .claim_pio("secondary", 0xa0..=0xa1)
+                        .into_resource(),
+                },
+                ChipsetDeviceHandle {
+                    name: "missing-pit".to_owned(),
+                    resource: MissingDevHandle::new()
+                        .claim_pio("main", 0x40..=0x43)
+                        .claim_pio("port61", 0x61..=0x61)
+                        .into_resource(),
+                },
+                ChipsetDeviceHandle {
+                    name: "missing-pci".to_owned(),
+                    resource: MissingDevHandle::new()
+                        .claim_pio("address", 0xcf8..=0xcfb)
+                        .claim_pio("data", 0xcfc..=0xcff)
+                        .into_resource(),
+                },
+                // Linux will probe 0x87 during boot to determine if there the DMA
+                // device is present
+                ChipsetDeviceHandle {
+                    name: "missing-dma".to_owned(),
+                    resource: MissingDevHandle::new()
+                        .claim_pio("io", 0x87..=0x87)
+                        .into_resource(),
+                },
+            ]);
+        }
+        self
+    }
+
+    fn attach_missing_pci_config_ports(&mut self, arch: MachineArch) -> &mut Self {
+        if arch == MachineArch::X86_64 {
+            self.chipset_devices.push(ChipsetDeviceHandle {
+                name: "missing-pci".to_owned(),
+                resource: MissingDevHandle::new()
+                    .claim_pio("address", 0xcf8..=0xcfb)
+                    .claim_pio("data", 0xcfc..=0xcff)
+                    .into_resource(),
+            });
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    fn no_serial_backends() -> [Option<Resource<SerialBackendHandle>>; 4] {
+        [(); 4].map(|_| None)
+    }
+
+    fn uefi_builder(arch: MachineArch) -> VmManifestBuilder {
+        VmManifestBuilder::new(BaseChipsetType::HypervGen2Uefi, arch).with_uefi(UefiManifest::new(
+            arch,
+            None,
+            None,
+            false,
+            LogLevel::default(),
+            None,
+            PlatformResource.into_resource(),
+            None,
+        ))
+    }
+
+    #[test]
+    fn serial_debugger_mode_builder_flag_defaults_false_and_can_enable() {
+        let builder = VmManifestBuilder::new(BaseChipsetType::HypervGen1, MachineArch::X86_64);
+        assert_eq!(builder.serial_debugger_mode, [false; 4]);
+
+        let builder = builder.with_serial_debugger_mode([true, false, false, true]);
+        assert_eq!(builder.serial_debugger_mode, [true, false, false, true]);
+    }
+
+    #[test]
+    fn ipmi_kcs_is_opt_in_and_uses_arch_specific_resource() {
+        for (arch, resource_id) in [
+            (MachineArch::X86_64, "ipmi-kcs-x64"),
+            (MachineArch::Aarch64, "ipmi-kcs-aarch64"),
+        ] {
+            let manifest = uefi_builder(arch).build().unwrap();
+            assert!(
+                manifest
+                    .chipset_devices
+                    .iter()
+                    .all(|device| device.name != "ipmi-kcs")
+            );
+
+            let manifest = uefi_builder(arch).with_ipmi_kcs().build().unwrap();
+            let ipmi_devices: Vec<_> = manifest
+                .chipset_devices
+                .iter()
+                .filter(|device| device.name == "ipmi-kcs")
+                .collect();
+
+            assert_eq!(ipmi_devices.len(), 1);
+            assert_eq!(ipmi_devices[0].resource.id(), resource_id);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn ipmi_kcs_rejects_non_uefi_boot() {
+        let _ = VmManifestBuilder::new(BaseChipsetType::HyperVGen2LinuxDirect, MachineArch::X86_64)
+            .with_ipmi_kcs();
+    }
+
+    #[test]
+    fn serial_debugger_mode_defaults_false_on_generated_handles() {
+        let serial_16550 = serial_16550_devices(false, [false; 4], no_serial_backends());
+        assert!(serial_16550.iter().all(|handle| !handle.debugger_mode));
+
+        let serial_pl011 = serial_pl011_devices([false; 4], no_serial_backends()).unwrap();
+        assert!(serial_pl011.iter().all(|handle| !handle.debugger_mode));
+    }
+
+    #[test]
+    fn serial_debugger_mode_is_independent_per_port() {
+        // One COM port in debugger mode, the rest normal.
+        let serial_16550 =
+            serial_16550_devices(true, [false, true, false, false], no_serial_backends());
+        assert!(serial_16550.iter().all(|handle| handle.wait_for_rts));
+        assert_eq!(
+            serial_16550.map(|handle| handle.debugger_mode),
+            [false, true, false, false]
+        );
+
+        // PL011 uses the first two entries independently.
+        let serial_pl011 =
+            serial_pl011_devices([true, false, false, false], no_serial_backends()).unwrap();
+        assert_eq!(
+            serial_pl011.map(|handle| handle.debugger_mode),
+            [true, false]
+        );
+    }
+}

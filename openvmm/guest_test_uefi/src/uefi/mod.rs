@@ -1,0 +1,32 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+mod action;
+mod hibernate;
+mod rt;
+mod splash;
+mod tests;
+
+use core::num::NonZeroU8;
+use splash::Splashes;
+use uefi::Status;
+use uefi::entry;
+use uefi::println;
+use uefi::system;
+
+#[entry]
+fn uefi_main() -> Status {
+    println!("UEFI vendor = {}", system::firmware_vendor());
+    println!("UEFI revision = {:x}", system::firmware_revision());
+
+    // Attempt to draw a pretty splash screen. Not always possible (e.g: when
+    // running UEFI on a VM without a gfx adapter - such as in CI).
+    splash::draw_splash(Splashes(NonZeroU8::new(1).unwrap()));
+
+    match action::selected_action() {
+        action::GuestAction::Hibernate => hibernate::hibernate(),
+        action::GuestAction::RunTests => tests::run_tests(),
+    }
+
+    Status::SUCCESS
+}

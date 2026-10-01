@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmbus_core"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hvdef.workspace = true
+inspect.workspace = true
+guid = { workspace = true, features = ["inspect", "mesh"] }
+mesh_protobuf.workspace = true
+open_enum.workspace = true
+
+bitfield-struct.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+[lints]
+workspace = true

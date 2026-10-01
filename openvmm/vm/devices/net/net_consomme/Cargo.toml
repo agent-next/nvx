@@ -1,0 +1,32 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "net_consomme"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+consomme.workspace = true
+net_backend.workspace = true
+net_backend_resources.workspace = true
+socket2.workspace = true
+
+vm_resource.workspace = true
+
+inspect.workspace = true
+inspect_counters.workspace = true
+mesh.workspace = true
+pal_async.workspace = true
+thiserror.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+guestmem.workspace = true
+
+[lints]
+workspace = true

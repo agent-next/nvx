@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "uidevices_resources"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+video_core.workspace = true
+vm_resource.workspace = true
+
+mesh.workspace = true
+
+[lints]
+workspace = true

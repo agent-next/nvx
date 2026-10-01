@@ -1,0 +1,19 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "hyperv_secure_boot_templates"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+firmware_uefi_custom_vars.workspace = true
+
+[build-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+hyperv_uefi_custom_vars_json.workspace = true
+
+[lints]
+workspace = true

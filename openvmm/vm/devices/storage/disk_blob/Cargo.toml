@@ -1,0 +1,42 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "disk_blob"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+disk_backend.workspace = true
+disk_backend_resources.workspace = true
+scsi_buffers.workspace = true
+vhd1_defs.workspace = true
+
+guestmem.workspace = true
+vm_resource.workspace = true
+
+inspect = { workspace = true, features = ["filepath"] }
+
+anyhow.workspace = true
+async-trait.workspace = true
+blocking.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper-tls.workspace = true
+hyper-util = { workspace = true, features = ["client", "client-legacy", "http1", "http2"] }
+once_cell.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+# tokio use is allowed in this crate only.
+# FUTURE: replace this with our own executor
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+disk_vhd1.workspace = true
+pal_async.workspace = true
+storage_tests.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmbfs"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vmbfs_resources.workspace = true
+vm_resource.workspace = true
+
+guestmem.workspace = true
+vmbus_async.workspace = true
+vmbus_channel.workspace = true
+vmcore.workspace = true
+
+guid.workspace = true
+inspect = { workspace = true, features = ["filepath"] }
+mesh.workspace = true
+open_enum.workspace = true
+task_control.workspace = true
+
+async-trait.workspace = true
+bitfield-struct.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "virt_support_gic"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+memory_range = { workspace = true, features = ["inspect"] }
+vm_topology.workspace = true
+
+aarch64defs.workspace = true
+inspect = { workspace = true, features = ["std"] }
+tracelimit.workspace = true
+
+parking_lot.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

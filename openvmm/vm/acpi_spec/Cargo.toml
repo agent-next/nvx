@@ -1,0 +1,23 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "acpi_spec"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+
+alloc = []
+std = ["alloc"]
+
+[dependencies]
+open_enum.workspace = true
+
+bitfield-struct.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+[lints]
+workspace = true

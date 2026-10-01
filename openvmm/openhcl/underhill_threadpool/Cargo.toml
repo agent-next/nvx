@@ -1,0 +1,23 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "underhill_threadpool"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cvm_tracing.workspace = true
+inspect = { workspace = true, features = ["std"] }
+loan_cell.workspace = true
+pal.workspace = true
+pal_async.workspace = true
+pal_uring.workspace = true
+
+fs-err.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

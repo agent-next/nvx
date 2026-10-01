@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "mesh"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+prost = ["mesh_protobuf/prost"]
+socket2 = ["mesh_protobuf/socket2"]
+
+[dependencies]
+mesh_channel.workspace = true
+mesh_derive.workspace = true
+mesh_node.workspace = true
+mesh_protobuf.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,106 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+use crate::common::CommonArch;
+use flowey::node::prelude::*;
+
+flowey_request! {
+    pub struct Request{
+        pub arches: Vec<CommonArch>,
+        pub done: WriteVar<SideEffect>,
+        /// If `None`, skip downloading OpenHCL IGVM release files.
+        pub release_artifact: Option<ReadVar<PathBuf>>,
+    }
+}
+
+new_simple_flow_node!(struct Node);
+
+impl SimpleFlowNode for Node {
+    type Request = Request;
+
+    fn imports(ctx: &mut ImportCtx<'_>) {
+        ctx.import::<crate::init_openvmm_magicpath_openhcl_sysroot::Node>();
+        ctx.import::<crate::init_openvmm_magicpath_openvmm_deps::Node>();
+        ctx.import::<crate::init_openvmm_magicpath_release_openhcl_igvm::resolve::Node>();
+        ctx.import::<crate::init_openvmm_magicpath_protoc::Node>();
+        ctx.import::<crate::init_openvmm_magicpath_uefi_mu_msvm::Node>();
+        ctx.import::<crate::init_openvmm_magicpath_virtio_win::Node>();
+    }
+
+    fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
+        let Request {
+            arches,
+            done,
+            release_artifact,
+        } = request;
+
+        let mut deps = vec![
+            ctx.reqv(crate::init_openvmm_magicpath_protoc::Request),
+            ctx.reqv(crate::init_openvmm_magicpath_virtio_win::Request),
+        ];
+
+        for arch in arches {
+            match arch {
+                CommonArch::X86_64 => {
+                    if matches!(ctx.platform(), FlowPlatform::Linux(_)) {
+                        deps.extend_from_slice(&[ctx
+                            .reqv(|v| crate::init_openvmm_magicpath_openhcl_sysroot::Request {
+                                arch: CommonArch::X86_64,
+                                path: v,
+                            })
+                            .into_side_effect()]);
+                    }
+                    deps.extend_from_slice(&[
+                        ctx.reqv(|done| crate::init_openvmm_magicpath_uefi_mu_msvm::Request {
+                            arch: CommonArch::X86_64,
+                            done,
+                        }),
+                        ctx.reqv(|done| crate::init_openvmm_magicpath_openvmm_deps::Request {
+                            arch: CommonArch::X86_64,
+                            done,
+                        }),
+                    ]);
+                }
+                CommonArch::Aarch64 => {
+                    if matches!(ctx.platform(), FlowPlatform::Linux(_)) {
+                        deps.extend_from_slice(&[ctx
+                            .reqv(|v| crate::init_openvmm_magicpath_openhcl_sysroot::Request {
+                                arch: CommonArch::Aarch64,
+                                path: v,
+                            })
+                            .into_side_effect()]);
+                    }
+                    deps.extend_from_slice(&[
+                        ctx.reqv(|done| crate::init_openvmm_magicpath_uefi_mu_msvm::Request {
+                            arch: CommonArch::Aarch64,
+                            done,
+                        }),
+                        ctx.reqv(|done| crate::init_openvmm_magicpath_openvmm_deps::Request {
+                            arch: CommonArch::Aarch64,
+                            done,
+                        }),
+                    ]);
+                }
+            }
+
+            if let Some(release_artifact) = &release_artifact {
+                deps.push(
+                    ctx.reqv(
+                        |v| crate::init_openvmm_magicpath_release_openhcl_igvm::resolve::Request {
+                            arch,
+                            release_version:
+                                crate::download_release_igvm_files_from_gh::OpenhclReleaseVersion::latest(),
+                            release_artifact: release_artifact.clone(),
+                            done: v,
+                        },
+                    )
+                    .into_side_effect(),
+                );
+            }
+        }
+
+        ctx.emit_side_effect_step(deps, [done]);
+
+        Ok(())
+    }
+}

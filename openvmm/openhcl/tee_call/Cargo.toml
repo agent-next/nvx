@@ -1,0 +1,25 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "tee_call"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+dev_snp_ohcl_tio_support = ["sev_guest_device/dev_snp_ohcl_tio_support"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hcl.workspace = true
+hvdef.workspace = true
+
+sev_guest_device.workspace = true
+tdx_guest_device.workspace = true
+x86defs.workspace = true
+
+static_assertions.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+
+[lints]
+workspace = true

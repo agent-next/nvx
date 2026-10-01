@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "hyperv_uefi_custom_vars_json"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+firmware_uefi_custom_vars.workspace = true
+
+guid = { workspace = true, features = ["mesh"] }
+serde_helpers.workspace = true
+
+base64.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror.workspace = true
+zerocopy.workspace = true
+[lints]
+workspace = true

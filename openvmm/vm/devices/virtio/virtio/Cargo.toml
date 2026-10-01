@@ -1,0 +1,43 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "virtio"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+device_emulators.workspace = true
+pci_core.workspace = true
+pci_resources.workspace = true
+virtio_resources.workspace = true
+virtio_spec.workspace = true
+
+chipset_device.workspace = true
+guestmem.workspace = true
+vmcore.workspace = true
+vm_resource.workspace = true
+
+inspect = { workspace = true, features = ["std"] }
+mesh.workspace = true
+pal_event.workspace = true
+pal_async.workspace = true
+tracelimit.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+[dev-dependencies]
+mesh.workspace = true
+pal_async.workspace = true
+task_control.workspace = true
+test_with_tracing.workspace = true
+
+futures.workspace = true
+
+[lints]
+workspace = true

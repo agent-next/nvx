@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "xtask_fuzz"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tracing-subscriber.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libfuzzer-sys.workspace = true
+
+[lints]
+workspace = true

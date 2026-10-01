@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmgs_resources"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vm_resource.workspace = true
+vmgs_format.workspace = true
+
+mesh.workspace = true
+
+[lints]
+workspace = true

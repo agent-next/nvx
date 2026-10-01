@@ -1,0 +1,25 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmbus_ring"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+guestmem_core.workspace = true
+
+inspect.workspace = true
+safeatomic.workspace = true
+
+thiserror.workspace = true
+zerocopy.workspace = true
+[dev-dependencies]
+criterion = { workspace = true, features = ["rayon", "cargo_bench_support"] }
+
+[[bench]]
+name = "ring"
+harness = false
+
+[lints]
+workspace = true

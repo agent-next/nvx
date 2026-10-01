@@ -1,0 +1,32 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "mesh_channel"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mesh_channel_core.workspace = true
+mesh_node.workspace = true
+mesh_protobuf = { workspace = true, features = ["std"] }
+
+futures.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["rayon", "cargo_bench_support", "async", "async_futures"] }
+futures-concurrency.workspace = true
+
+pal_async.workspace = true
+pal_event.workspace = true
+test_with_tracing.workspace = true
+
+[[bench]]
+name = "channel"
+harness = false
+
+[lints]
+workspace = true
