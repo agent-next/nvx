@@ -46,6 +46,7 @@
 #define EXEC_ENVIRONMENT_PRESENT 2U
 #define MAX_OUTPUT_BYTES (1024U * 1024U)
 #define OUTPUT_CHUNK_BYTES 32768U
+#define CONTAINER_BARRIER_ATTEMPTS 500U
 #define PORTB_CONSOLE 0xe9
 
 struct outer_record {
@@ -478,17 +479,48 @@ static int write_pid_to_cgroup(pid_t pid)
     return close(fd);
 }
 
-static int release_container_barrier(const char *path)
+/* Returns 0 after writing, 1 for an unreaped child exit, or -1 on failure. */
+static int release_container_barrier(const char *path, pid_t child)
 {
-    int fd = open(path, O_WRONLY | O_CLOEXEC);
-    int result;
+    unsigned int attempt;
 
-    if (fd < 0) {
-        return -1;
+    for (attempt = 0; attempt < CONTAINER_BARRIER_ATTEMPTS; ++attempt) {
+        int fd = open(path, O_WRONLY | O_CLOEXEC | O_NONBLOCK);
+
+        if (fd >= 0) {
+            int result = write_all(fd, "start\n", 6);
+
+            close(fd);
+            return result;
+        }
+        if (errno != ENXIO && errno != EINTR) {
+            return -1;
+        }
+        if (child > 0) {
+            siginfo_t information = {0};
+
+            if (waitid(
+                    P_PID,
+                    (id_t)child,
+                    &information,
+                    WEXITED | WNOHANG | WNOWAIT) != 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+            if (information.si_pid == child) {
+                return 1;
+            }
+        }
+        {
+            const struct timespec delay = {.tv_nsec = 10000000L};
+
+            nanosleep(&delay, NULL);
+        }
     }
-    result = write_all(fd, "start\n", 6);
-    close(fd);
-    return result;
+    errno = ETIMEDOUT;
+    return -1;
 }
 
 static void exec_direct(
@@ -500,9 +532,15 @@ static void exec_direct(
     size_t index = 0;
     size_t workload_index = 0;
 
-    setenv("HOME", config->home, 1);
-    setenv("USER", config->user, 1);
-    setenv("LOGNAME", config->user, 1);
+    if (setenv("HOME", config->home, 1) != 0 ||
+        setenv("USER", config->user, 1) != 0 ||
+        setenv("LOGNAME", config->user, 1) != 0) {
+        dprintf(
+            STDERR_FILENO,
+            "nvx-managed-agent: cannot configure workload environment: %s\n",
+            strerror(errno));
+        _exit(125);
+    }
     arguments[index++] = "setpriv";
     arguments[index++] = "--reuid";
     arguments[index++] = (char *)config->uid;
@@ -543,7 +581,13 @@ static void exec_sandbox(
     arguments[index++] = (char *)config->gid;
     arguments[index++] = (char *)config->user;
     arguments[index++] = (char *)config->home;
-    setenv("NVX_EXEC_CONFIG_FD", config_fd, 1);
+    if (setenv("NVX_EXEC_CONFIG_FD", config_fd, 1) != 0) {
+        dprintf(
+            STDERR_FILENO,
+            "nvx-managed-agent: cannot export execution configuration: %s\n",
+            strerror(errno));
+        _exit(125);
+    }
     while (workload_argv[workload_index] != NULL && index + 1 < MAX_ARGUMENTS + 10) {
         arguments[index++] = workload_argv[workload_index++];
     }
@@ -957,6 +1001,7 @@ static int run_exec(
     int output_limited = 0;
     int wait_status = 0;
     int child_exited = 0;
+    int launch_failed = 0;
 
     if (!config->direct) {
         unlink(barrier);
@@ -1023,11 +1068,19 @@ static int run_exec(
     close(exec_config_fd);
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
-    if (make_nonblocking(stdout_pipe[0]) != 0 ||
-        make_nonblocking(stderr_pipe[0]) != 0 ||
-        (!config->direct &&
-         (write_pid_to_cgroup(child) != 0 ||
-          release_container_barrier(barrier) != 0))) {
+    launch_failed = make_nonblocking(stdout_pipe[0]) != 0 ||
+                    make_nonblocking(stderr_pipe[0]) != 0;
+    if (!launch_failed && !config->direct) {
+        int barrier_result;
+
+        if (write_pid_to_cgroup(child) != 0) {
+            launch_failed = 1;
+        } else {
+            barrier_result = release_container_barrier(barrier, child);
+            launch_failed = barrier_result < 0;
+        }
+    }
+    if (launch_failed) {
         kill(-child, SIGKILL);
         waitpid(child, NULL, 0);
         close(stdout_pipe[0]);

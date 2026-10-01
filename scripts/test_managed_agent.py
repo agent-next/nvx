@@ -21,6 +21,7 @@ class ManagedAgentDecoderTests(unittest.TestCase):
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
         cls.executable = cls.root / "decoder"
+        cls.fault_executable = cls.root / "fault-injection"
         harness = cls.root / "decoder.c"
         harness.write_text(
             """
@@ -80,6 +81,102 @@ int main(int argc, char **argv) {
                 str(harness),
                 "-o",
                 str(cls.executable),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        fault_harness = cls.root / "fault-injection.c"
+        fault_harness.write_text(
+            """
+#define main nvx_agent_main
+#include "nvx-managed-agent.c"
+#undef main
+
+int __real_setenv(const char *, const char *, int);
+int __wrap_setenv(const char *name, const char *value, int overwrite) {
+    const char *failure = getenv("NVX_TEST_FAIL_SETENV");
+    if (failure != NULL && strcmp(name, failure) == 0) {
+        errno = ENOMEM;
+        return -1;
+    }
+    return __real_setenv(name, value, overwrite);
+}
+
+int __wrap_execv(const char *path, char *const argv[]) {
+    const char *marker = getenv("NVX_TEST_EXEC_MARKER");
+    (void)path;
+    (void)argv;
+    if (marker != NULL) {
+        int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) close(fd);
+    }
+    errno = ENOENT;
+    return -1;
+}
+
+int __wrap_execvp(const char *file, char *const argv[]) {
+    return __wrap_execv(file, argv);
+}
+
+int main(int argc, char **argv) {
+    if (argc == 3 && strcmp(argv[1], "--release-orphaned-barrier") == 0) {
+        pid_t child = fork();
+        if (child < 0) return 2;
+        if (child == 0) _exit(125);
+        int result = release_container_barrier(argv[2], child);
+        int status = 0;
+        if (waitpid(child, &status, 0) != child) return 2;
+        return result == 1 && WIFEXITED(status) ? 0 : 1;
+    }
+    if (argc == 3 && strcmp(argv[1], "--release-live-barrier") == 0) {
+        pid_t child = fork();
+        if (child < 0) return 2;
+        if (child == 0) {
+            char message[6];
+            int fd = open(argv[2], O_RDONLY | O_CLOEXEC);
+            if (fd < 0 || read(fd, message, sizeof(message)) != sizeof(message))
+                _exit(125);
+            close(fd);
+            _exit(memcmp(message, "start\\n", sizeof(message)) == 0 ? 0 : 125);
+        }
+        int result = release_container_barrier(argv[2], child);
+        int status = 0;
+        if (waitpid(child, &status, 0) != child) return 2;
+        return result == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
+    }
+    if (argc != 3) return 2;
+    struct agent_config config = {
+        .rootfs = "/rootfs",
+        .hostname = "sandbox",
+        .uid = "1000",
+        .gid = "1000",
+        .user = "workload",
+        .home = "/home/workload",
+        .direct = 0,
+    };
+    char *workload[] = {"/bin/true", NULL};
+    if (strcmp(argv[1], "--sandbox") == 0)
+        exec_sandbox(&config, "/unused", argv[2], workload);
+    if (strcmp(argv[1], "--direct") == 0)
+        exec_direct(&config, argv[2], workload);
+    return 2;
+}
+""",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                compiler,
+                "-std=c11",
+                "-I",
+                str(guest),
+                str(fault_harness),
+                "-Wl,--wrap=setenv",
+                "-Wl,--wrap=execv",
+                "-Wl,--wrap=execvp",
+                "-o",
+                str(cls.fault_executable),
             ],
             check=True,
             capture_output=True,
@@ -202,6 +299,58 @@ int main(int argc, char **argv) {
                 )
                 self.assertEqual(result.returncode, 125)
                 self.assertEqual(result.stdout, b"")
+
+    def test_sandbox_does_not_launch_when_descriptor_export_fails(self):
+        marker = self.root / "sandbox-launched"
+        result = subprocess.run(
+            [str(self.fault_executable), "--sandbox", "42"],
+            capture_output=True,
+            timeout=5,
+            env={
+                "NVX_TEST_FAIL_SETENV": "NVX_EXEC_CONFIG_FD",
+                "NVX_TEST_EXEC_MARKER": str(marker),
+            },
+        )
+        self.assertEqual(result.returncode, 125)
+        self.assertFalse(marker.exists())
+        self.assertIn(b"cannot export execution configuration", result.stderr)
+
+    def test_direct_does_not_launch_when_identity_export_fails(self):
+        marker = self.root / "direct-launched"
+        result = subprocess.run(
+            [str(self.fault_executable), "--direct", "42"],
+            capture_output=True,
+            timeout=5,
+            env={
+                "NVX_TEST_FAIL_SETENV": "HOME",
+                "NVX_TEST_EXEC_MARKER": str(marker),
+            },
+        )
+        self.assertEqual(result.returncode, 125)
+        self.assertFalse(marker.exists())
+        self.assertIn(b"cannot configure workload environment", result.stderr)
+
+    def test_parent_barrier_release_is_bounded_without_child_reader(self):
+        barrier = self.root / "orphaned-barrier"
+        barrier.unlink(missing_ok=True)
+        subprocess.run(["mkfifo", str(barrier)], check=True, timeout=5)
+        result = subprocess.run(
+            [str(self.fault_executable), "--release-orphaned-barrier", str(barrier)],
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual((result.returncode, result.stderr), (0, b""))
+
+    def test_parent_barrier_release_preserves_live_child_start(self):
+        barrier = self.root / "live-barrier"
+        barrier.unlink(missing_ok=True)
+        subprocess.run(["mkfifo", str(barrier)], check=True, timeout=5)
+        result = subprocess.run(
+            [str(self.fault_executable), "--release-live-barrier", str(barrier)],
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual((result.returncode, result.stderr), (0, b""))
 
 
 if __name__ == "__main__":
