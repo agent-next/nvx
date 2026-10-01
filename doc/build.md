@@ -180,6 +180,26 @@ the soft-lockup or hung-task detectors. Changing an archive hash or patch
 invalidates both source and object caches; changing the input configuration
 invalidates the object cache.
 
+The kernel keeps the code it generates at run time read-only. On x86, only
+`CONFIG_STRICT_MODULE_RWX` makes such memory read-only and executable
+(`CONFIG_ARCH_HAS_EXECMEM_ROX`), and it requires `CONFIG_MODULES`. Without it,
+the thunk pages of the Indirect Target Selection (ITS) mitigation stay writable
+and executable when the mitigation patches indirect branches at boot, which it
+does unless Spectre v2 uses retpolines. The kernel therefore supports modules
+but never builds or ships one:
+
+- the build fails if any option is set to `m`;
+- `CONFIG_MODPROBE_PATH` is empty, so the kernel never starts a module helper;
+- `CONFIG_TRIM_UNUSED_KSYMS` drops every symbol export, about 200 KB that would
+  otherwise push the kernel's data past the next 2 MiB boundary;
+- init writes 1 to `/proc/sys/kernel/modules_disabled` before anything else
+  runs.
+
+When the mitigation patches indirect branches, the read-only executable cache
+takes one 2 MiB block of guest memory. `CONFIG_DEBUG_WX` audits the kernel page
+tables at boot, and the `nvx-time` boot check fails if the audit reports a
+writable and executable mapping.
+
 ## CI debug kernel
 
 CI proves that snapshot restores never trip the kernel watchdogs with a debug

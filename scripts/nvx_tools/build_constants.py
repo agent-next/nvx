@@ -82,6 +82,21 @@ class KernelBuildConstants:
         "# CONFIG_HYPERV is not set",
         "# CONFIG_CPU_FREQ is not set",
     )
+    # x86 makes runtime-generated code, such as the ITS mitigation thunks,
+    # read-only only through STRICT_MODULE_RWX (ARCH_HAS_EXECMEM_ROX), which
+    # needs MODULES. No module is ever built or shipped: there is no autoload
+    # helper, no symbol is exported, and init disables module loading before
+    # anything else runs.
+    REQUIRED_HARDENING_CONFIG: Final = (
+        "CONFIG_STRICT_KERNEL_RWX=y",
+        "CONFIG_MODULES=y",
+        "CONFIG_STRICT_MODULE_RWX=y",
+        "CONFIG_ARCH_HAS_EXECMEM_ROX=y",
+        'CONFIG_MODPROBE_PATH=""',
+        "CONFIG_TRIM_UNUSED_KSYMS=y",
+        "CONFIG_MITIGATION_ITS=y",
+        "CONFIG_DEBUG_WX=y",
+    )
     DEBUG_WATCHDOG_CONFIG: Final = (
         "CONFIG_SOFTLOCKUP_DETECTOR=y",
         "CONFIG_DETECT_HUNG_TASK=y",

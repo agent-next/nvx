@@ -11,6 +11,7 @@ import json
 import lzma
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -158,6 +159,7 @@ def _write_release_fixture(
                 *KernelBuildConstants.REQUIRED_SHARED_STATUS_CONFIG,
                 *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
                 *KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
+                *KernelBuildConstants.REQUIRED_HARDENING_CONFIG,
             )
         )
         + "\n",
@@ -3691,6 +3693,7 @@ class BuildTests(unittest.TestCase):
                         *KernelBuildConstants.REQUIRED_SHARED_STATUS_CONFIG,
                         *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
                         *KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
+                        *KernelBuildConstants.REQUIRED_HARDENING_CONFIG,
                     )
                 )
                 + "\n",
@@ -4790,6 +4793,7 @@ class BuildTests(unittest.TestCase):
     def test_checked_in_config_meets_time_abi_kernel_contract(self):
         config = BuildConstants.REPO_ROOT / KernelBuildConstants.INPUT_CONFIG
         build._assert_time_abi_kernel_config(config)
+        build._assert_hardening_kernel_config(config)
         build._assert_watchdog_kernel_config(config, debug=False)
         configured = config.read_text(encoding="utf-8").splitlines()
         for removed in (
@@ -4820,6 +4824,36 @@ class BuildTests(unittest.TestCase):
                     )
                     with self.assertRaisesRegex(common.ScriptError, missing):
                         build._assert_time_abi_kernel_config(config)
+
+    def test_hardening_kernel_config_requires_every_setting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / ".config"
+            for missing in KernelBuildConstants.REQUIRED_HARDENING_CONFIG:
+                with self.subTest(missing=missing):
+                    config.write_text(
+                        "\n".join(
+                            setting
+                            for setting in KernelBuildConstants.REQUIRED_HARDENING_CONFIG
+                            if setting != missing
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(common.ScriptError, re.escape(missing)):
+                        build._assert_hardening_kernel_config(config)
+
+    def test_hardening_kernel_config_rejects_loadable_modules(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / ".config"
+            config.write_text(
+                "\n".join(
+                    (*KernelBuildConstants.REQUIRED_HARDENING_CONFIG, "CONFIG_FOO=m")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(common.ScriptError, "CONFIG_FOO=m"):
+                build._assert_hardening_kernel_config(config)
 
     def test_watchdog_kernel_config_separates_production_and_debug(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4920,6 +4954,7 @@ class BuildTests(unittest.TestCase):
                         *KernelBuildConstants.REQUIRED_SHARED_STATUS_CONFIG,
                         *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
                         *KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
+                        *KernelBuildConstants.REQUIRED_HARDENING_CONFIG,
                         "# CONFIG_DEBUG_KERNEL is not set",
                     )
                 )

@@ -116,7 +116,7 @@ ext4/EROFS root:
 - the xe9 and shared-status patches required by the microVM ABI.
 
 The kernel intentionally omits functionality found in a general Ubuntu kernel,
-including loadable modules, PCI, IPv6, user namespaces, fanotify, and
+including module loading, PCI, IPv6, user namespaces, fanotify, and
 SquashFS. Ubuntu support therefore means Ubuntu userland under the NVX kernel
 policy, not compatibility with every Ubuntu workload or host-integration
 feature.

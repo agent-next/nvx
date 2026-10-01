@@ -126,6 +126,24 @@ def _assert_time_abi_kernel_config(path: Path) -> None:
     )
 
 
+def _assert_hardening_kernel_config(path: Path) -> None:
+    _assert_kernel_config(
+        path,
+        KernelBuildConstants.REQUIRED_HARDENING_CONFIG,
+        "kernel configuration does not keep runtime code read-only: ",
+    )
+    modules = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("CONFIG_") and line.endswith("=m")
+    ]
+    if modules:
+        raise ScriptError(
+            "kernel configuration builds loadable modules, which are never "
+            "shipped: " + ", ".join(modules)
+        )
+
+
 def _assert_watchdog_kernel_config(path: Path, *, debug: bool) -> None:
     if debug:
         _assert_kernel_config(
@@ -154,6 +172,7 @@ def assert_required_kernel_config(path: Path, *, debug: bool = False) -> None:
     _assert_sandbox_kernel_config(path)
     _assert_shared_status_kernel_config(path)
     _assert_time_abi_kernel_config(path)
+    _assert_hardening_kernel_config(path)
     _assert_watchdog_kernel_config(path, debug=debug)
 
 
