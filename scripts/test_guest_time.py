@@ -521,6 +521,30 @@ class GuestTimeTests(unittest.TestCase):
         self.assertEqual(self.run_test("console", line, "sync"), line)
         self.assertEqual(self.run_test("console", line, "async"), "\n" + line)
 
+    def test_exhaustive_leaf_rules(self):
+        # X1 and X2: a leaf reads zero or the highest basic leaf's result,
+        # except the explicit zero leaves, which read zero.
+        out_of_range = ("0x00000d0b", "0x00000001", "0x00000002", "0x00000003")
+        zero = ("0", "0", "0", "0")
+
+        def leaf(number: str, value: tuple[str, ...]) -> str:
+            return self.run_test(
+                "exhaustive-leaf", number, *value, *out_of_range
+            ).strip()
+
+        self.assertEqual(leaf("0x40000006", zero), "pass")
+        self.assertEqual(leaf("0x40000010", out_of_range), "pass")
+        self.assertEqual(leaf("0x40000100", zero), "pass")
+        self.assertEqual(leaf("0x40000100", out_of_range), "pass")
+        explicit = leaf("0x40000081", out_of_range)
+        self.assertTrue(explicit.startswith("fail leaf 0x40000081 is "), explicit)
+        self.assertTrue(explicit.endswith("expected zero"), explicit)
+        # KVM's signature leaf moved to a higher base.
+        kvm = ("0x40000101", "0x4b4d564b", "0x564b4d56", "0x0000004d")
+        signature = leaf("0x40000100", kvm)
+        self.assertIn('(signature "KVMKVMKVM...")', signature)
+        self.assertTrue(signature.endswith("or the highest basic leaf"), signature)
+
     def timer_list(
         self,
         sections: list[tuple[int, str, int, str, int]],

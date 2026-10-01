@@ -1865,6 +1865,301 @@ static bool check_cpuinfo(struct checks *checks, const bool *selected,
     return cpuinfo_result(&parse);
 }
 
+// ---------------------------------------------------------------------------
+// Exhaustive check (CI only)
+// ---------------------------------------------------------------------------
+
+static int msr_write(int fd, uint32_t msr, uint64_t value)
+{
+    ssize_t count = pwrite(fd, &value, sizeof(value), (off_t)msr);
+
+    if (count == (ssize_t)sizeof(value))
+        return 0;
+    return count < 0 ? -errno : -EIO;
+}
+
+// The leaves that OpenVMM programs as explicit zeros.
+static bool explicit_zero_leaf(uint32_t leaf)
+{
+    return (leaf >= 0x40000006 && leaf <= 0x4000000f) ||
+           (leaf >= 0x40000080 && leaf <= 0x40000082);
+}
+
+// X1 and X2 for one CPUID result: all zeros or, except for an explicit zero
+// leaf, the Intel out-of-range result (the highest basic leaf's result for
+// the same subleaf).
+static bool exhaustive_leaf_ok(uint32_t leaf, const uint32_t value[4],
+                               const uint32_t out_of_range[4], char *detail,
+                               size_t size)
+{
+    char signature[13];
+
+    if (all_zero(value) ||
+        (!explicit_zero_leaf(leaf) &&
+         memcmp(value, out_of_range, 4 * sizeof(uint32_t)) == 0))
+        return true;
+    memcpy(signature, &value[1], 4);
+    memcpy(signature + 4, &value[2], 4);
+    memcpy(signature + 8, &value[3], 4);
+    signature[12] = '\0';
+    for (int index = 0; index < 12; index++) {
+        if (signature[index] < 0x20 || signature[index] > 0x7e)
+            signature[index] = '.';
+    }
+    snprintf(detail, size,
+             "leaf 0x%08" PRIx32 " is %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+             " %08" PRIx32 " (signature \"%s\"), expected zero%s",
+             leaf, value[0], value[1], value[2], value[3], signature,
+             explicit_zero_leaf(leaf) ? "" : " or the highest basic leaf");
+    return false;
+}
+
+struct exhaustive {
+    int failures;
+    uint64_t tsc_hz;
+    uint64_t lapic_hz;
+    struct checks cpuinfo;
+};
+
+static void exhaustive_report(struct exhaustive *state, const char *id, int cpu,
+                              bool passed, const char *detail)
+{
+    char escaped[DETAIL_MAX];
+
+    escape_text(detail, escaped, sizeof(escaped) - 1);
+    printf("NVX-TIME-ABI-EXHAUSTIVE: v=1 check=%s cpu=%d status=%s "
+           "detail=\"%s\"\n",
+           id, cpu, passed ? "pass" : "fail", escaped);
+    if (!passed)
+        state->failures++;
+}
+
+// X1 (every leaf 0x40000006..=0x400000ff) when STEP is 1, or X2 (every base
+// 0x40000100..=0x4000ff00) when STEP is 0x100, on the current CPU.
+static void exhaustive_leaves(struct exhaustive *state, const char *id, int cpu,
+                              uint32_t first, uint32_t last, uint32_t step,
+                              const uint32_t out_of_range[4])
+{
+    char detail[DETAIL_MAX] = "";
+    int failing = 0;
+    int count = 0;
+
+    for (uint32_t leaf = first; leaf <= last; leaf += step, count++) {
+        char reason[DETAIL_MAX];
+        uint32_t value[4];
+
+        cpuid(leaf, 0, value);
+        if (!exhaustive_leaf_ok(leaf, value, out_of_range, reason,
+                                sizeof(reason)) &&
+            failing++ == 0)
+            snprintf(detail, sizeof(detail), "%s", reason);
+    }
+    if (failing == 0) {
+        snprintf(detail, sizeof(detail), "%d %s read zero or the highest basic leaf",
+                 count, step == 1 ? "leaves" : "bases");
+    } else if (failing > 1) {
+        size_t length = strlen(detail);
+
+        snprintf(detail + length, sizeof(detail) - length, "; %d of %d fail",
+                 failing, count);
+    }
+    exhaustive_report(state, id, cpu, failing == 0, detail);
+}
+
+// X3: every C3 property on this CPU.
+static void exhaustive_x3(struct exhaustive *state, int fd, int cpu)
+{
+    static const uint32_t faulting[] = {0x40000000, 0x40000001, 0x40000020};
+    char detail[DETAIL_MAX];
+    uint64_t index = 0;
+    uint64_t tsc = 0;
+    uint64_t lapic = 0;
+    uint64_t control = 0;
+    uint64_t value;
+    bool ok = false;
+    int error;
+
+    if ((error = msr_read(fd, 0x40000002, &index)) != 0 ||
+        index != (uint64_t)cpu)
+        snprintf(detail, sizeof(detail),
+                 "MSR 0x40000002 (VP index) is %" PRIu64 " (error %d)", index,
+                 error);
+    else if ((error = msr_read(fd, 0x40000022, &tsc)) != 0 || tsc == 0 ||
+             (state->tsc_hz != 0 && tsc != state->tsc_hz))
+        snprintf(detail, sizeof(detail),
+                 "MSR 0x40000022 (TSC rate) is %" PRIu64
+                 " (error %d; first CPU %" PRIu64 ")",
+                 tsc, error, state->tsc_hz);
+    else if (state->cpuinfo.cpu_khz_known[cpu] &&
+             tsc / 1000 != state->cpuinfo.cpu_khz[cpu])
+        snprintf(detail, sizeof(detail),
+                 "floor(F / 1000) is %" PRIu64 " kHz but cpu MHz is %" PRIu64
+                 " kHz",
+                 tsc / 1000, state->cpuinfo.cpu_khz[cpu]);
+    else if ((error = msr_read(fd, 0x40000023, &lapic)) != 0 ||
+             (lapic != 1000000000 && lapic != 200000000) ||
+             (state->lapic_hz != 0 && lapic != state->lapic_hz))
+        snprintf(detail, sizeof(detail),
+                 "MSR 0x40000023 (LAPIC rate) is %" PRIu64
+                 " (error %d; first CPU %" PRIu64 ")",
+                 lapic, error, state->lapic_hz);
+    else if ((error = msr_read(fd, 0x40000118, &control)) != 0 || control != 1)
+        snprintf(detail, sizeof(detail),
+                 "MSR 0x40000118 is %" PRIu64 " (error %d)", control, error);
+    else
+        ok = true;
+    for (size_t item = 0; ok && item < ARRAY_SIZE(faulting); item++) {
+        error = msr_read(fd, faulting[item], &value);
+        if (error != -EIO) {
+            ok = false;
+            snprintf(detail, sizeof(detail),
+                     "MSR 0x%08" PRIx32 " read did not fail with EIO (error %d)",
+                     faulting[item], error);
+        }
+    }
+    if (ok) {
+        snprintf(detail, sizeof(detail),
+                 "vp_index=%d tsc_hz=%" PRIu64 " lapic_hz=%" PRIu64
+                 " invariant_control=1",
+                 cpu, tsc, lapic);
+        if (state->tsc_hz == 0) {
+            state->tsc_hz = tsc;
+            state->lapic_hz = lapic;
+        }
+    }
+    exhaustive_report(state, "X3", cpu, ok, detail);
+}
+
+// X4: MSR 0x40000118 accepts 0 and 1, each read back, and rejects 2. It is
+// left at 1, the value Linux wrote at boot, whatever the outcome.
+static void exhaustive_x4(struct exhaustive *state, int fd, int cpu)
+{
+    char detail[DETAIL_MAX] = "0 and 1 accepted, 2 rejected, left at 1";
+    uint64_t value = 0;
+    bool ok = true;
+    int error = 0;
+
+    for (uint64_t written = 0; ok && written <= 1; written++) {
+        if ((error = msr_write(fd, 0x40000118, written)) != 0 ||
+            (error = msr_read(fd, 0x40000118, &value)) != 0 ||
+            value != written) {
+            ok = false;
+            snprintf(detail, sizeof(detail),
+                     "after writing %" PRIu64 ", MSR 0x40000118 is %" PRIu64
+                     " (error %d)",
+                     written, value, error);
+        }
+    }
+    if (ok && (error = msr_write(fd, 0x40000118, 2)) != -EIO) {
+        ok = false;
+        snprintf(detail, sizeof(detail),
+                 "write of 2 to MSR 0x40000118 did not fail with EIO (error %d)",
+                 error);
+    }
+    (void)msr_write(fd, 0x40000118, 1);
+    if (ok && (msr_read(fd, 0x40000118, &value) != 0 || value != 1)) {
+        ok = false;
+        snprintf(detail, sizeof(detail),
+                 "MSR 0x40000118 is %" PRIu64 " after the check", value);
+    }
+    exhaustive_report(state, "X4", cpu, ok, detail);
+}
+
+// X5: writes to the identity MSRs that are read-only or absent fail. X6:
+// reads of IA32_TSC_ADJUST and IA32_TSC_DEADLINE fail.
+static void exhaustive_faults(struct exhaustive *state, int fd, int cpu,
+                              bool writes)
+{
+    static const uint32_t read_only[] = {0x40000000, 0x40000001, 0x40000002,
+                                         0x40000020, 0x40000022, 0x40000023};
+    static const uint32_t absent[] = {0x3b, 0x6e0};
+    const uint32_t *list = writes ? read_only : absent;
+    size_t length = writes ? ARRAY_SIZE(read_only) : ARRAY_SIZE(absent);
+    char detail[DETAIL_MAX];
+    bool ok = true;
+
+    snprintf(detail, sizeof(detail), "%zu %s fail with EIO", length,
+             writes ? "writes" : "reads");
+    for (size_t item = 0; ok && item < length; item++) {
+        uint64_t value = 0;
+        int error = writes ? msr_write(fd, list[item], 0)
+                           : msr_read(fd, list[item], &value);
+
+        if (error != -EIO) {
+            ok = false;
+            snprintf(detail, sizeof(detail),
+                     "%s MSR 0x%" PRIx32 " did not fail with EIO (error %d)",
+                     writes ? "write of 0 to" : "read of", list[item], error);
+        }
+    }
+    exhaustive_report(state, writes ? "X5" : "X6", cpu, ok, detail);
+}
+
+// The CI-only exhaustive check: X1 to X6 on every online CPU. It reports and
+// exits, never powers off, and production boots never run it.
+static int exhaustive_run(void)
+{
+    static const char *const ids[] = {"X1", "X2", "X3", "X4", "X5", "X6"};
+    struct cpuinfo_parse parse;
+    struct exhaustive state;
+    bool cpus[MAX_CPUS];
+    cpu_set_t original;
+    char text[256];
+    int online;
+
+    memset(&state, 0, sizeof(state));
+    if (read_text("/sys/devices/system/cpu/online", text, sizeof(text)) < 0 ||
+        (online = parse_cpu_list(text, cpus)) <= 0) {
+        printf("NVX-TIME-ABI-EXHAUSTIVE: v=1 status=fail cpus=0 failures=1\n");
+        return 1;
+    }
+    cpuinfo_init(&parse, &state.cpuinfo, cpus, false);
+    (void)for_each_file_line("/proc/cpuinfo", cpuinfo_line, &parse);
+    if (sched_getaffinity(0, sizeof(original), &original) != 0)
+        CPU_ZERO(&original);
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        char detail[DETAIL_MAX];
+        uint32_t basic[4];
+        uint32_t out_of_range[4];
+        char path[64];
+        int fd;
+
+        if (!cpus[cpu])
+            continue;
+        if (pin_to_cpu(cpu) != 0) {
+            for (size_t item = 0; item < ARRAY_SIZE(ids); item++)
+                exhaustive_report(&state, ids[item], cpu, false,
+                                  "cannot run on this CPU");
+            continue;
+        }
+        cpuid(0, 0, basic);
+        cpuid(basic[0], 0, out_of_range);
+        exhaustive_leaves(&state, "X1", cpu, 0x40000006, 0x400000ff, 1,
+                          out_of_range);
+        exhaustive_leaves(&state, "X2", cpu, 0x40000100, 0x4000ff00, 0x100,
+                          out_of_range);
+        snprintf(path, sizeof(path), "/dev/cpu/%d/msr", cpu);
+        fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            snprintf(detail, sizeof(detail), "open %s: %s", path,
+                     strerror(errno));
+            for (size_t item = 2; item < ARRAY_SIZE(ids); item++)
+                exhaustive_report(&state, ids[item], cpu, false, detail);
+            continue;
+        }
+        exhaustive_x3(&state, fd, cpu);
+        exhaustive_x4(&state, fd, cpu);
+        exhaustive_faults(&state, fd, cpu, true);
+        exhaustive_faults(&state, fd, cpu, false);
+        close(fd);
+    }
+    if (CPU_COUNT(&original) > 0)
+        (void)sched_setaffinity(0, sizeof(original), &original);
+    printf("NVX-TIME-ABI-EXHAUSTIVE: v=1 status=%s cpus=%d failures=%d\n",
+           state.failures == 0 ? "ok" : "fail", online, state.failures);
+    return state.failures == 0 ? 0 : 1;
+}
+
 // C6: `tsc` is current, and only tsc, refined-jiffies, or jiffies is
 // available.
 static bool check_clocksource_values(struct checks *checks, const char *current,
@@ -3515,6 +3810,22 @@ static int cmd_test(int argc, char **argv)
         console_write(argv[0]);
         return 0;
     }
+    if (strcmp(name, "exhaustive-leaf") == 0 && argc == 9) {
+        uint32_t value[4];
+        uint32_t out_of_range[4];
+        char detail[DETAIL_MAX];
+
+        for (int index = 0; index < 4; index++) {
+            value[index] = (uint32_t)strtoul(argv[1 + index], NULL, 0);
+            out_of_range[index] = (uint32_t)strtoul(argv[5 + index], NULL, 0);
+        }
+        if (exhaustive_leaf_ok((uint32_t)strtoul(argv[0], NULL, 0), value,
+                               out_of_range, detail, sizeof(detail)))
+            printf("pass\n");
+        else
+            printf("fail %s\n", detail);
+        return 0;
+    }
     if (strcmp(name, "boot-log") == 0)
         return test_lines(argc, argv, LINES_BOOT_LOG);
     if (strcmp(name, "syslog") == 0)
@@ -3580,6 +3891,7 @@ static int usage(void)
             "  restore-finish [--ack] [--new-cpus LIST]\n"
             "  sample\n"
             "  generation-id\n"
+            "  exhaustive\n"
             "  test NAME ARGUMENTS...\n");
     return 2;
 }
@@ -3624,5 +3936,7 @@ int main(int argc, char **argv)
         return cmd_sample();
     if (strcmp(command, "generation-id") == 0 && count == 1)
         return cmd_generation_id();
+    if (strcmp(command, "exhaustive") == 0 && count == 1)
+        return exhaustive_run();
     return usage();
 }

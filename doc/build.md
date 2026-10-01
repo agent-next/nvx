@@ -144,7 +144,9 @@ skew bound. `nvx-time` implements the time ABI's
 checks, the violation watcher, the restore packet v4 and time-sample parsers,
 the snapshot agent's time steps, and the wall-clock discipline. Its boot check
 also fails when the kernel's boot-time W+X audit reports a writable and
-executable mapping. The
+executable mapping. `nvx-time exhaustive` runs the CI-only exhaustive check
+(checks X1 to X6 on every online CPU); it reports and exits, and production
+boots never run it. The
 `--report-only` flag (or the `nvx_time_abi=report-only` kernel command-line
 token) reports violations without powering off, for runs against VMMs that
 predate the ABI. Both time tools are linked statically against musl
