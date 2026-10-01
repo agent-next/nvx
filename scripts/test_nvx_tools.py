@@ -527,7 +527,7 @@ class CliTests(unittest.TestCase):
             nvx.command_run(args)
 
         command = format_command.call_args.args[0]
-        self.assertEqual(command[command.index("--memory") + 1], "256M")
+        self.assertEqual(command[command.index("--memory") + 1], "512M")
         self.assertEqual(
             Path(command[command.index("--initrd") + 1]).name,
             "initramfs-ubuntu.cpio.gz",
@@ -3917,7 +3917,7 @@ class BuildTests(unittest.TestCase):
             ubuntu_guest.initramfs_name,
             "initramfs-ubuntu.cpio.gz",
         )
-        self.assertEqual(ubuntu_guest.default_memory_mib, 256)
+        self.assertEqual(ubuntu_guest.default_memory_mib, 512)
         self.assertFalse(ubuntu_guest.sandbox_control)
 
     def test_ubuntu_manifest_and_package_lock_match_build_pins(self):

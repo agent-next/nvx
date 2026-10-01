@@ -243,12 +243,15 @@ Initial descriptors:
 | Guest | Initramfs | Default memory | Sandbox control |
 | --- | --- | ---: | --- |
 | `alpine` | `initramfs.cpio.gz` | 128 MiB | yes |
-| `ubuntu` | `initramfs-ubuntu.cpio.gz` | 256 MiB initially | no |
+| `ubuntu` | `initramfs-ubuntu.cpio.gz` | 512 MiB | no |
 
-The Ubuntu memory default is an engineering starting point, not a permanent
-ABI. Ubuntu Base contains approximately 86 MiB of uncompressed regular-file
-payload before supplemental packages and NVX helpers. CI must measure the
-actual boot high-water mark before documenting a supported minimum.
+The Ubuntu memory default is an engineering choice, not a permanent ABI. The
+initramfs unpacks to about 100 MiB in about 6,700 files, and the kernel
+unpacks it into a tmpfs root capped at half of RAM. At 256 MiB the unpack
+fails (`Initramfs unpacking failed: write error`) and the guest boots with a
+truncated root that cannot take writes such as `/etc/machine-id`. The
+smallest size measured to unpack it completely is 320 MiB, and 512 MiB leaves
+room for the image to grow and for the workload.
 
 ### Common build operations
 
@@ -433,7 +436,8 @@ The Ubuntu initramfs boot remains identical to Alpine at the machine level:
 2. OpenVMM loads the selected Ubuntu initramfs as the Linux direct initrd.
 3. OpenVMM prepends its xe9/hvc console parameters and fixed virtio-mmio
    discovery.
-4. `/init` mounts procfs, sysfs, devtmpfs, and tmpfs.
+4. `/init` mounts procfs, sysfs, and devtmpfs, switches kernel module loading
+   off, and mounts tmpfs.
 5. `/init` configures loopback, optional static networking, and optional
    HostFs.
 6. `/init` handles an explicit `nvx_exec` workload or opens a root shell.

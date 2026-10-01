@@ -25,7 +25,7 @@ A successful Alpine boot prints both `ALPINE-MICROVM-BOOT-OK` and
 python3 scripts/nvx.py run --guest ubuntu
 ```
 
-Ubuntu defaults to 256 MiB and prints `NVX-GUEST-BOOT-OK: ubuntu`. It is
+Ubuntu defaults to 512 MiB and prints `NVX-GUEST-BOOT-OK: ubuntu`. It is
 Ubuntu userland with the NVX kernel, not a stock Ubuntu kernel or systemd VM.
 Exit cleanly from the guest with:
 
@@ -92,10 +92,11 @@ If the artifacts are already installed in the repository layout, use
 `openvmm/target/release/openvmm[.exe]`, `build/vmlinux`, and
 `build/initramfs.cpio.gz` instead of the paths above.
 
-For Ubuntu userland, use 256 MiB initially and select
+For Ubuntu userland, use 512 MiB and select
 `guest/initramfs-ubuntu.cpio.gz` or
-`build/initramfs-ubuntu.cpio.gz` as the initrd. The kernel path remains
-unchanged.
+`build/initramfs-ubuntu.cpio.gz` as the initrd. Below 320 MiB, the kernel
+cannot unpack the whole Ubuntu initramfs and boots a truncated root. The
+kernel path remains unchanged.
 
 Direct OpenVMM launches accept generic directional network defaults:
 
@@ -179,7 +180,7 @@ translations and additions:
 | `nvx.py run` | Direct OpenVMM option |
 | --- | --- |
 | `--guest alpine` | `--initrd .../initramfs.cpio.gz` on a fresh boot |
-| `--guest ubuntu` | `--initrd .../initramfs-ubuntu.cpio.gz` and a 256 MiB default on a fresh boot |
+| `--guest ubuntu` | `--initrd .../initramfs-ubuntu.cpio.gz` and a 512 MiB default on a fresh boot |
 | `--hypervisor auto` | `--hypervisor kvm` on Linux or `--hypervisor whp` on Windows |
 | `--memory-mib N` | `--memory NM` |
 | `--memory-capacity-mib N` | `--memory-capacity NM` on a fresh boot |
