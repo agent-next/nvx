@@ -124,11 +124,17 @@ Every CPU profile fixes these bits. A profile that violates them is rejected.
 | `0xa` | EAX, EBX, ECX, EDX | 0 (no PMU) |
 | `0x15`, `0x16` | EAX, EBX, ECX, EDX | 0, when within the maximum basic leaf |
 | `0x80000001` | EDX[27] RDTSCP | 1 |
-| `0x80000007` | EAX, EBX, ECX, EDX | 0, 0, 0, `0x00000100` (invariant TSC only) |
+| `0x80000007` | EAX, EBX, ECX, EDX | 0, 0, 0, `0x00000100` (invariant TSC only); on WHP, whether EDX[8] must be set is TBD(whp) |
 
 Leaves `0x15` and `0x16` are zeroed rather than synthesized. Linux takes both
 rates from the frequency MSRs, and zero leaves keep the profile's CPUID
 independent of any host's rate.
+
+Linux trusts the TSC because of `AccessTscInvariantControls`, not because of
+CPUID `0x80000007` EDX[8]; that bit only adds the `nonstop_tsc` flag. Until
+the WHP report settles whether WHP can and must expose it, a WHP profile may
+clear it, and WHP hosts qualify on measured invariance instead (see
+[Host qualification](#host-qualification)).
 
 ### Rates
 
@@ -210,12 +216,12 @@ guest-visible result is identical; only the mechanism differs.
 | No TSC scaling | Never `KVM_SET_TSC_KHZ`; every vCPU reports the host rate | No frequency override | No `ProcessorClockFrequency` partition property; the 1 GHz request is removed |
 | LAPIC rate `L` | In-kernel LAPIC at 1 GHz; `KVM_CAP_X86_APIC_BUS_CYCLES_NS` never set | `ApicFrequency` property, 200 MHz — TBD(mshv) | Offloaded APIC only, 200 MHz; the emulated APIC is rejected — TBD(whp) |
 | TSC-deadline and `TSC_ADJUST` hidden | CPUID bits cleared; `IA32_TSC_ADJUST` raises #GP | Feature-bank bits cleared and CPUID bits cleared | Feature-bank bits cleared and CPUID bits cleared — TBD(whp) |
-| Invariant TSC exposed | CPUID bit | `tsc_invariant_support` plus CPUID; hosts without it are rejected (`azure-azlinux-2`) | Azure WHP hosts report no invariant TSC to the L1 partition — TBD(whp): CPUID override and qualification evidence |
+| Invariant TSC exposed | CPUID bit | `tsc_invariant_support` plus CPUID; hosts without it are rejected (`azure-azlinux-2`) | Azure WHP hosts report no invariant TSC to the L1 partition; hosts qualify on the measured warp and rate stability, and whether the CPUID bit must be set is TBD(whp) |
 | No paravirtual or synthetic features | No KVM leaves; no KVM Hyper-V enlightenment enabled beyond MSR routing | Synthetic processor features limited to what MSR routing needs — TBD(mshv) | `--hv` stays rejected for the microVM |
 | Capture anchor: VP 0 TSC paired with a host time sample within 10 µs | VP 0 `IA32_TSC` read and host sample back to back — TBD(kvm) | TBD(mshv) | TBD(whp) |
-| Synchronized TSC set at one host instant | One `KVM_VCPU_TSC_OFFSET` value for every vCPU, computed from one host TSC read (Linux 5.16 or newer); no `IA32_TSC` writes | Freeze partition time, write the target to every created VP, thaw at release — TBD(mshv) | TBD(whp): suspend partition time and write the target to every VP |
-| Read-back before release | Every vCPU's `KVM_VCPU_TSC_OFFSET` equals the written value | Every created VP's TSC equals the target while time is frozen | TBD(whp) |
-| Live cross-vCPU skew after release at most 1 µs | Equal offsets: skew is the host's TSC skew, bounded by qualification | TBD(mshv) | TBD(whp): decision gate for RDTSC emulation |
+| Synchronized TSC set at one host instant | One `KVM_VCPU_TSC_OFFSET` value for every vCPU, computed from one host TSC read (Linux 5.16 or newer); no `IA32_TSC` writes | Freeze partition time, write the target to every created VP, thaw at release — TBD(mshv) | Suspend partition time, write the target to every VP, resume at release (first VP run or `WHvResumePartitionTime`); `TscVirtualOffset` is unusable (writes fail) |
+| Read-back before release | Every vCPU's `KVM_VCPU_TSC_OFFSET` equals the written value | Every created VP's TSC equals the target while time is frozen | Every VP's TSC equals the target while time is suspended; live reads cannot verify 1 µs (a register read takes 9.5 to 21 µs) |
+| Live cross-vCPU skew after release at most 1 µs | Equal offsets: skew is the host's TSC skew, bounded by qualification | TBD(mshv) | Raw partitions: at most 67 ns after resume on prometheus28, `azure-windows-1`, and `azure-windows-3`, with no drift; guest-level confirmation and the RDTSC-emulation decision are TBD(whp) |
 | VP instantiation | All `C` VPs exist before the set | The created prefix exists before the set; no VP is created after it | All `C` VPs exist before the set |
 | Partition capabilities | Derived from CPUID with the identity range masked: `hv1` and `kvm_clock` are false | Same | Same |
 | Unknown MSRs | #GP; the `MYSTERY_MSRS` stubs are TBD(profiles) | #GP from the hypervisor — TBD(mshv) | #GP; the `MYSTERY_MSRS` stubs are TBD(profiles) |
@@ -271,11 +277,11 @@ an explicit `--cpu-profile` must name the same profile.
    (`E_PROFILE_UNKNOWN`, `E_PROFILE_DIGEST`), and the recomputed effective
    CPUID equals the recorded one (`E_CPU_SURFACE`).
 
-Initial generations are Skylake-SP (family 6, model 85: the bare-metal hosts),
-Ice Lake-SP (6/106: the Xeon Platinum 8370C runners), and Emerald Rapids
-(6/207: the 8573C runners). Profile IDs, contents, whether one profile serves
-all backends of a generation, and the fate of the `MYSTERY_MSRS` stubs are
-TBD(profiles).
+Initial generations are `skylake-sp` (family 6, model 85: the bare-metal
+hosts), `icelake-sp` (6/106: the Xeon Platinum 8370C runners), and
+`emeraldrapids` (6/207: the 8573C runners). Profile IDs, contents, whether one
+profile serves all backends of a generation, and the fate of the
+`MYSTERY_MSRS` stubs are TBD(profiles).
 
 ## TSC rate policy and LAPIC rate rule
 
@@ -632,6 +638,27 @@ a running VP's TSC on every backend, and frozen time on MSHV and WHP thaws at
 an unobservable instant, so the guest forms the UTC and TSC pair itself
 through this bracket; its `CLOCK_REALTIME` is derived from the TSC.
 
+### Uncertainty bounds
+
+The guest accepts a pairing only if `epsilon` is within a bound, retries
+otherwise, and then fails with a stable code:
+
+| Use | Bound | Attempts | When every attempt exceeds the bound |
+| --- | --- | --- | --- |
+| Restore repair (packet bracket, then time samples) | 1 ms | 3 | `G_REPAIR_SAMPLE`: event and power-off with status 195 |
+| Initial synchronization at boot (time samples) | 1 ms | 3 | `G_CONFORMANCE_C12`: event and power-off with status 193 |
+| Discipline poll (time samples) | 50 µs | 3 | `G_SAMPLE_UNCERTAIN`: the poll is skipped and the code is recorded in the state file and on the console; never fatal |
+
+`epsilon` is half the round trip of one PMIO write exit plus two
+`CLOCK_REALTIME` reads, so it is expected to stay far below both bounds on
+every backend. The backend agents measure it:
+
+| Backend | Expected `epsilon` (p50 / p99) |
+| --- | --- |
+| KVM | TBD(kvm) |
+| MSHV | TBD(mshv) |
+| WHP | TBD(whp) |
+
 ### Generation counter and generation ID
 
 - The generation counter `g` is 0 in a cold-booted process and
@@ -667,13 +694,14 @@ CPUID and MSRs are read on every online CPU through `/dev/cpu/<n>/cpuid` and
 | `C2` | The [CPU time bits](#cpu-time-bits) | boot, restore (new CPUs) |
 | `C3` | MSR `0x40000002` equals the CPU's VP index; `0x40000022` equals `F` with `floor(F / 1000)` equal to the kernel's `cpu MHz` in kHz; `0x40000023` equals 1,000,000,000 or 200,000,000; `0x40000118` equals 1; reads of `0x40000000`, `0x40000001`, and `0x40000020` fail with `EIO` | boot; restore (CPU 0 `0x40000022` only) |
 | `C4` | The kernel log contains `Hypervisor detected: Microsoft Hyper-V`, `Hyper-V: privilege flags low 0x8860,`, `Hyper-V: LAPIC Timer Frequency: 0x989680` or `0x1e8480`, and `clocksource: Switched to clocksource tsc` as its last clocksource switch; it contains no record matching a watcher pattern other than `G_CLOCKSOURCE_SWITCH`, and none containing `Fast TSC calibration`, `Refined TSC clocksource calibration`, `kvm-clock`, or `APIC timer: using supplied frequency` | boot |
-| `C5` | `/proc/cpuinfo` flags as listed in [Clocksource, tick, and PIT](#clocksource-tick-and-pit) on every CPU | boot, restore (new CPUs) |
+| `C5` | `/proc/cpuinfo` flags as listed in [Clocksource, tick, and PIT](#clocksource-tick-and-pit) on every CPU (`nonstop_tsc` on WHP: TBD(whp)) | boot, restore (new CPUs) |
 | `C6` | `current_clocksource` is `tsc`; `available_clocksource` contains only `tsc`, `refined-jiffies`, and `jiffies` | boot, capture, restore |
 | `C7` | `/proc/timer_list`: every online CPU's tick device is `lapic` with `hrtimer_interrupt` in one-shot mode; no `pit` or `hpet` device; no broadcast device | boot, capture, restore (deferred) |
 | `C8` | `/sys/bus/vmbus` and `/sys/devices/system/cpu/cpufreq/policy0` are absent; `rcu_cpu_stall_suppress` is 0 and `rcu_cpu_stall_timeout` is 21 | boot |
 | `C9` | `/proc/cmdline` contains none of `tsc_early_khz=`, `lapic_timer_hz=`, `notsc`, `nolapic`, `nolapic_timer`, `tsc=unstable`, `hpet=force`, or `clocksource=` with a value other than `tsc` | boot |
 | `C10` | The time daemon is running and has recorded no violation; `/sys/kernel/rcu_stall_count` is 0 | capture, restore |
 | `C11` | Debug kernel only: `/proc/sys/kernel/soft_watchdog` is 1 and `/proc/sys/kernel/hung_task_timeout_secs` is nonzero | boot |
+| `C12` | A time sample within the [uncertainty bound](#uncertainty-bounds) is obtained, and the clock is stepped to host UTC | boot |
 
 Capture and restore checks never wait. The boot `C7` check and the deferred
 restore `C7` check may poll for at most 200 ms, because a CPU switches to
@@ -690,9 +718,10 @@ NVX-TIME-ABI: v=1 phase=<boot|capture|restore> status=ok cpus=<online> tsc_hz=<F
 
 On failure it prints `status=fail check=<ID> detail="<text>"` in the same
 format, emits a violation event with code `G_CONFORMANCE_<ID>`, and powers
-off with status 193. After the boot check passes, init takes one time sample
-and steps the clock to host UTC before any workload starts; this initial step
-is not counted as a discontinuity.
+off with status 193. The boot step of `C12` steps the clock before any
+workload starts and is not counted as a discontinuity. The only other line
+with this prefix is the non-fatal `phase=runtime status=uncertain` line of
+the [wall-clock discipline](#wall-clock-discipline).
 
 ### Violation watcher
 
@@ -811,7 +840,11 @@ The daemon keeps `CLOCK_REALTIME` on host UTC through the kernel's PLL:
 - **Cadence.** A poll every 16 s for the first four polls after the boot
   check or a restore, then every 64 s.
 - **Sample.** Up to three time samples per poll; keep the first with
-  `epsilon <= 50 µs`. Otherwise skip the poll and count a rejected sample.
+  `epsilon <= 50 µs`. Otherwise skip the poll, count a rejected sample, set
+  `last_sample_error=G_SAMPLE_UNCERTAIN`, and print
+  `NVX-TIME-ABI: v=1 phase=runtime status=uncertain code=G_SAMPLE_UNCERTAIN
+  epsilon_ns=<smallest>` on the console. The next accepted sample resets
+  `last_sample_error` to `none`.
   A sample whose `g` differs from the recorded `g` is discarded: a restore
   happened, and restore repair resets the discipline.
 - **Step.** If `|theta| >= 128 ms`, apply `ADJ_SETOFFSET | ADJ_NANO` with
@@ -849,6 +882,7 @@ atomically with `rename(2)` after every change. The sandbox agent bind-mounts
 | `uncertainty_ns` | Last accepted `epsilon` |
 | `frequency_ppb` | Current kernel frequency correction |
 | `samples`, `rejected_samples` | Sample counters |
+| `last_sample_error` | `none` or `G_SAMPLE_UNCERTAIN` |
 | `violations` | 0; a violation powers the guest off |
 
 Workloads that need prompt notice of a step can also arm a `timerfd` with
@@ -904,9 +938,12 @@ signals, and 255):
 
 | Status | Class | Guest codes |
 | ---: | --- | --- |
-| 193 | Conformance | `G_CONFORMANCE_C1` to `G_CONFORMANCE_C11` |
+| 193 | Conformance | `G_CONFORMANCE_C1` to `G_CONFORMANCE_C12` |
 | 194 | Runtime violation | `G_TSC_UNSTABLE`, `G_CLOCKSOURCE_UNSTABLE`, `G_CLOCKSOURCE_SWITCH`, `G_CLOCKSOURCE_SKEW`, `G_TSC_WARP`, `G_TSC_ADJUST`, `G_RCU_STALL`, `G_RCU_STARVED`, `G_SOFT_LOCKUP`, `G_HARD_LOCKUP`, `G_HUNG_TASK`, `G_UNCHECKED_MSR`, `G_KMSG_OVERRUN` |
 | 195 | Restore repair | `G_REPAIR_PACKET`, `G_REPAIR_GENERATION`, `G_REPAIR_SAMPLE`, `G_REPAIR_CLOCK`, `G_REPAIR_SUPPRESSION` |
+
+`G_SAMPLE_UNCERTAIN` is the only non-fatal guest code: the discipline records
+it and continues (see [Uncertainty bounds](#uncertainty-bounds)).
 
 A workload can exit with any 8-bit status, so a harness classifies a time
 failure by the status together with its `NVX-TIME-ABI-VIOLATION` event.
@@ -921,19 +958,28 @@ fail if any check fails. The time checks replace the `nonstop_tsc` check.
 | ID | Check |
 | --- | --- |
 | `H1` | The backend device or API is present and usable |
-| `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, and the profile that `auto` selects (`E_PROFILE_HOST_UNKNOWN` fails) |
+| `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, the generation name, and the profile that `auto` selects; an unmapped generation fails (`E_PROFILE_HOST_UNKNOWN`) |
 | `H3` | OpenVMM preflight in verification mode: profile support, identity routing, synchronized TSC set, no scaling, and both rates, without booting a guest |
 | `H4` | Host TSC rate stability: two 1 s measurements of the TSC against host monotonic time agree within 1 ppm and are within 100 ppm of `F_d` |
 | `H5` | Host cross-CPU TSC skew: a pinned-thread probe over all host CPU pairs, `max_abs_offset_ns <= 1000` |
 | `H6` | Guest warp probe: a microVM with the host's largest supported vCPU count up to 8 boots, passes the boot check, and reports `max_backward_ns` and `max_abs_offset_ns` at most 1,000 |
 | `H7` | Host UTC is synchronized: no `STA_UNSYNC` on Linux; a synchronized `w32tm` source on Windows |
-| `H8` | Runner only: the runner's `cpu-<generation>` label equals the fingerprinted generation |
 
-Runners carry exactly one generation label, `cpu-<generation>`, whose value is
-the profile's generation key: Skylake-SP, Ice Lake-SP (8370C), or Emerald
-Rapids (8573C); exact label values are TBD(profiles). Same-generation restore
-tests select runners by label. Labels are assigned when a runner is
-registered; agents never change runner registration.
+Qualification gates on these measured properties and on the profile's
+features. On WHP in particular, the warp probe (`H6`) and rate stability
+(`H4`) are the evidence for TSC invariance; whether WHP must also expose the
+CPUID invariant-TSC bit is TBD(whp).
+
+Generation names used in logs, reports, and job summaries are `skylake-sp`
+(family 6, model 85), `icelake-sp` (6/106), and `emeraldrapids` (6/207).
+`validate-runner` and `nvx.py doctor` detect the generation at run time and
+report it, together with the selected profile, `F_d`, `L`, and the skew
+metrics, in their log and the job summary; an unknown generation fails
+qualification explicitly. Runner labels are not used and runners are not
+re-registered: per-PR CI captures and restores on the same runner, and
+same-generation cross-VM restore is validated by the fleet restore matrix
+(`p6-restore-matrix`) on the registered hosts. Routing CI jobs by generation
+labels is optional future work.
 
 ## Performance expectations and acceptance gate
 
@@ -973,7 +1019,9 @@ at 1, 2, 4, and 8 vCPUs, plus the exhaustive CI check and the warp probe on
 every backend.
 
 **Restore matrix.** Every case runs with zero violations; rejected cases must
-fail with the listed code.
+fail with the listed code. Per-PR CI runs the same-host cases on one runner;
+the full matrix, including the cross-VM cases, runs on the registered hosts
+as the fleet restore matrix.
 
 | Case | Hosts | Expected |
 | --- | --- | --- |
@@ -983,6 +1031,7 @@ fail with the listed code.
 | Simulated host reboot: hooks `force-utc-downtime`, `boot-id-mismatch`, and `dest-rate-offset-ppm=+200`, then `-200` | One host per backend | Restored; `DOWNTIME_UTC` and `TEST_HOOKS` set; rate deviation reported |
 | Simulated rate beyond tolerance: `dest-rate-offset-ppm=+251` | One host per backend | `E_TSC_RATE_TOLERANCE` |
 | Downtime bounds: `downtime-add-s=2592001`; `force-utc-downtime` with `utc-offset-ms=-<n>`, `n` above the elapsed time | One host per backend | `E_DOWNTIME_EXCESSIVE`; `E_DOWNTIME_NEGATIVE` |
+| Sample uncertainty: `sample-delay-us=200`; then `sample-delay-us=3000` on restore and on cold boot | One host per backend | Restored, with `G_SAMPLE_UNCERTAIN` recorded and the guest running; `G_REPAIR_SAMPLE` (195); `G_CONFORMANCE_C12` (193) |
 | Across VMs of one generation | `azure-kvm-1` to `-2`; `azure-azlinux-3` to `-4`; `azure-windows-1` to `-2`; `azure-windows-3` to `-4` | Restored |
 | Across generations | `azure-windows-1` (8370C) to `-3` (8573C) | `E_CPU_GENERATION` |
 | Host without invariant TSC | `azure-azlinux-2` | Cold boot and restore rejected: `E_PROFILE_UNSUPPORTED` |
@@ -1013,6 +1062,7 @@ repeatable):
 | `dest-rate-offset-ppm=<n>` | Perturb the measured `F_d` used by the rate policy and the reported deviation; the TSC is never scaled |
 | `downtime-add-s=<n>` | Add `n` seconds to the measured `D` before the bounds check |
 | `utc-offset-ms=<n>` | Add `n` milliseconds to every destination UTC reading: the downtime sample, the packet, and time samples |
+| `sample-delay-us=<n>` | Delay the handling of the first `0xa5` write and of every `0xa7` write by `n` µs, which widens the guest's bracket |
 
 Every active hook is logged at warning level and sets `TEST_HOOKS` in the
 packet and in every time sample.
@@ -1072,9 +1122,12 @@ Migration impact:
   profile of their generation pins.
 - Hosts that fail qualification, such as `azure-azlinux-2`, cannot run
   microVMs until replaced.
-- Same-generation restore tests need `cpu-<generation>` runner labels.
+- Per-PR CI captures and restores on the same runner. Same-generation
+  cross-VM restore is validated by the fleet restore matrix on the
+  registered hosts, not in per-PR CI.
 - The `cold_start_clocksource` metric on KVM changes meaning (from
-  `kvm-clock` to `tsc`).
+  `kvm-clock` to `tsc`). The change is accepted without an exemption; a gate
+  failure on it is investigated as a regression.
 - Documentation updates: this document, [Snapshot and
   restore](snapshot-and-restore.md), [Machine and device
   ABI](machine-and-device-abi.md), [Cold boot](cold-boot.md), the
