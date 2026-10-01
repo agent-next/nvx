@@ -7033,7 +7033,6 @@ class BenchmarkTests(unittest.TestCase):
                 result = benchmark.capture_snapshot(
                     ["openvmm"],
                     snapshot,
-                    backend="whp",
                     processors=1,
                     timeout=5,
                     snapshot_profile=profiled,
@@ -7753,7 +7752,6 @@ class BenchmarkTests(unittest.TestCase):
     def test_prepare_snapshot_capture_stages_waiting_controller(self):
         script = benchmark.prepare_snapshot_capture_script(
             4,
-            backend="whp",
             teardown_mode="guest-exit",
             network_gateway="10.0.0.1",
             ioapic_irq=10,
@@ -7772,19 +7770,13 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertIn("IFS= read -r trigger\n", script)
         self.assertIn("echo NVX-SNAPSHOT-DISPATCHED\n", script)
-        self.assertIn('while [ "$(cat "$clock_path")" = tsc-early ]', script)
-        self.assertIn(
-            "SMP-CLOCKSOURCE-FAIL expected=stable actual=$current_clocksource",
-            script,
-        )
         self.assertIn(
             "/sbin/nvx-snapshot\necho OPENVMM-SNAPSHOT-RESTORE-OK\nnvx-exit 0\n",
             script,
         )
         host_terminated = benchmark.prepare_snapshot_capture_script(
-            4, backend="kvm", teardown_mode="host-terminate"
+            4, teardown_mode="host-terminate"
         )
-        self.assertNotIn("clock_tries", host_terminated)
         self.assertNotIn("nvx-exit 0", host_terminated)
         self.assertTrue(
             script.endswith(
@@ -7795,24 +7787,18 @@ class BenchmarkTests(unittest.TestCase):
             )
         )
 
-    def test_mshv_and_whp_capture_after_linux_leaves_tsc_early(self):
-        wait = benchmark.stable_clocksource_wait_script()
-        for backend, waits in (("mshv", True), ("whp", True), ("kvm", False)):
-            with self.subTest(backend=backend):
-                script = benchmark.prepare_snapshot_capture_script(
-                    1, backend=backend, teardown_mode="guest-exit"
-                )
-                probe = script.split("<<'NVX_SMP_PROBE_SCRIPT'\n", 1)[1]
-                probe = probe.split("NVX_SMP_PROBE_SCRIPT\n", 1)[0]
-                self.assertEqual(probe.startswith(wait), waits)
-                self.assertEqual("SMP-CLOCKSOURCE-FAIL expected=stable" in probe, waits)
-                if waits:
-                    # The wait and its check run before the probe completes, so
-                    # the host requests the snapshot only after tsc-early is gone.
-                    self.assertLess(
-                        probe.index("SMP-CLOCKSOURCE-FAIL"),
-                        probe.index("NVX-SMP-PROBE-OK"),
-                    )
+    def test_capture_does_not_wait_for_a_clocksource(self):
+        # The time ABI registers the tsc clocksource at device_initcall on
+        # every backend, so no capture waits for Linux to leave tsc-early.
+        script = benchmark.prepare_snapshot_capture_script(
+            1, teardown_mode="guest-exit"
+        )
+        probe = script.split("<<'NVX_SMP_PROBE_SCRIPT'\n", 1)[1]
+        probe = probe.split("NVX_SMP_PROBE_SCRIPT\n", 1)[0]
+        self.assertEqual(probe, benchmark.smp_probe_script(1, exit_guest=False))
+        for text in ("clocksource", "tsc-early", "clock_tries"):
+            self.assertNotIn(text, script)
+        self.assertFalse(hasattr(benchmark, "stable_clocksource_wait_script"))
 
     def test_output_marker_must_be_a_complete_line(self):
         marker = benchmark.RESTORE_MARKER
@@ -8221,9 +8207,9 @@ class BenchmarkTests(unittest.TestCase):
             "capture_snapshot",
             return_value=(1.0, 1.0, 1.0, 1024),
         ) as capture:
-            benchmark.benchmark_snapshot_capture(args, "whp", ["openvmm"])
+            benchmark.benchmark_snapshot_capture(args, ["openvmm"])
 
-        self.assertEqual(capture.call_args.kwargs["backend"], "whp")
+        self.assertNotIn("backend", capture.call_args.kwargs)
         self.assertEqual(capture.call_args.kwargs["processors"], 8)
         self.assertEqual(capture.call_args.kwargs["teardown_mode"], "guest-exit")
 
@@ -8542,7 +8528,6 @@ class BenchmarkTests(unittest.TestCase):
             with patch.object(benchmark, "capture_snapshot", side_effect=capture):
                 result = benchmark.benchmark_snapshot_capture(
                     args,
-                    "kvm",
                     ["openvmm"],
                     retained_snapshot_path=retained,
                 )

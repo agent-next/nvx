@@ -6,8 +6,6 @@ fail() {
     exit "$code"
 }
 
-@SELECT_CLOCKSOURCE@
-@VALIDATE_CLOCKSOURCE@
 generation_id_before="$(/sbin/nvx-port-io read-generation-id 233 234)" ||
     fail 48
 [ "${#generation_id_before}" -eq 32 ] || fail 49

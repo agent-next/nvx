@@ -33,7 +33,6 @@ from .benchmark import (
     record_adversarial_openvmm_pid,
     smp_probe_script,
     snapshot_restore_command,
-    stable_clocksource_wait_script,
     workload_boot_command,
 )
 from .benchmark import (
@@ -252,7 +251,6 @@ def capture_snapshot(
     command: Sequence[str],
     snapshot_path: Path,
     *,
-    backend: str,
     timeout: float,
     windows_cpus: set[int] | None = None,
     processors: int | None = None,
@@ -267,7 +265,6 @@ def capture_snapshot(
     return _capture_snapshot(
         command,
         snapshot_path,
-        backend=backend,
         timeout=timeout,
         windows_cpus=windows_cpus,
         processors=processors,
@@ -306,44 +303,6 @@ def _stage_script(
         f"cat >{path} <<'{delimiter}'\n".encode()
         + script.encode()
         + f"{delimiter}\nsh {path}\n".encode()
-    )
-
-
-def _snapshot_core_script(backend: str) -> str:
-    if backend == "kvm":
-        select_clocksource = (
-            "clock_tries=0\n"
-            "while ! grep -qw kvm-clock "
-            "/sys/devices/system/clocksource/clocksource0/available_clocksource "
-            "&& [ $clock_tries -lt 100 ]; do\n"
-            "    sleep 0.05\n"
-            "    clock_tries=$((clock_tries + 1))\n"
-            "done\n"
-            "grep -qw kvm-clock "
-            "/sys/devices/system/clocksource/clocksource0/available_clocksource "
-            "|| fail 46\n"
-            "echo kvm-clock >"
-            "/sys/devices/system/clocksource/clocksource0/current_clocksource"
-        )
-        validate_clocksource = (
-            '[ "$(cat /sys/devices/system/clocksource/clocksource0/'
-            'current_clocksource)" = kvm-clock ] || fail 46'
-        )
-    elif backend == "whp":
-        select_clocksource = stable_clocksource_wait_script()
-        validate_clocksource = (
-            '[ "$(cat /sys/devices/system/clocksource/clocksource0/'
-            'current_clocksource)" != tsc-early ] || fail 46'
-        )
-    elif backend == "mshv":
-        select_clocksource = ":"
-        validate_clocksource = ":"
-    else:
-        raise ValueError(f"unsupported snapshot-core backend {backend!r}")
-    return (
-        _read_script("snapshot-core.sh.in")
-        .replace("@SELECT_CLOCKSOURCE@", select_clocksource)
-        .replace("@VALIDATE_CLOCKSOURCE@", validate_clocksource)
     )
 
 
@@ -1056,7 +1015,6 @@ def run_console_exit(
             capture_snapshot(
                 [*boot_command, "--snapshot-destination", str(snapshot_path)],
                 snapshot_path,
-                backend=backend,
                 timeout=timeout,
                 processors=processors,
                 post_restore_script=_render_script(
@@ -2262,7 +2220,6 @@ def run_smp_snapshot(
         capture_snapshot(
             [*boot_command, "--snapshot-destination", str(snapshot_path)],
             snapshot_path,
-            backend=backend,
             timeout=timeout,
             processors=processors,
             post_restore_script=smp_probe_script(processors, exit_guest=False),
@@ -2464,7 +2421,6 @@ def run_restore_processors(
         capture_snapshot(
             [*boot_command, "--snapshot-destination", str(snapshot_path)],
             snapshot_path,
-            backend=backend,
             timeout=timeout,
             processors=boot_online,
             post_restore_script=script,
@@ -2555,7 +2511,6 @@ def run_restore_memory(
                 str(snapshot_path),
             ],
             snapshot_path,
-            backend=backend,
             timeout=timeout,
             processors=1,
             post_restore_script=_read_script("restore-memory.sh"),
@@ -2654,7 +2609,7 @@ def run_snapshot_core(
                 process,
                 "/tmp/nvx-snapshot-core",
                 "NVX_SNAPSHOT_CORE",
-                _snapshot_core_script(backend),
+                _read_script("snapshot-core.sh"),
             )
             source = process.wait(timeout)
         if source.returncode != 0:

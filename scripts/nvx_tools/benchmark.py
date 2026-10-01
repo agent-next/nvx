@@ -54,9 +54,6 @@ BASE_TUNING = (
 # The cold-start clocksource variant selects the only clocksource the time ABI
 # allows, on every backend.
 COLD_START_CLOCKSOURCE = "clocksource=tsc"
-CLOCKSOURCE_CURRENT_PATH = (
-    "/sys/devices/system/clocksource/clocksource0/current_clocksource"
-)
 KVM_RESULT_PREFIX = "OPENVMM_KVM_RESULT="
 KVM_E2E_RESULT_PREFIX = "OPENVMM_KVM_E2E_RESULT="
 KVM_RESTORE_RESULT_PREFIX = "OPENVMM_KVM_RESTORE_RESULT="
@@ -1805,21 +1802,6 @@ def format_sample_summary(samples: Sequence[float], *, unit: str = "ms") -> str:
     )
 
 
-def stable_clocksource_wait_script() -> str:
-    """Wait up to five seconds for Linux to replace its tsc-early clocksource."""
-    return "\n".join(
-        (
-            f"clock_path={CLOCKSOURCE_CURRENT_PATH}",
-            "clock_tries=0",
-            'while [ "$(cat "$clock_path")" = tsc-early ] '
-            '&& [ "$clock_tries" -lt 100 ]; do',
-            "    sleep 0.05",
-            "    clock_tries=$((clock_tries + 1))",
-            "done",
-        )
-    )
-
-
 def network_gateway(spec: str) -> str:
     try:
         interface = ipaddress.IPv4Interface(spec)
@@ -3268,33 +3250,17 @@ def smp_probe_script(
 def prepare_snapshot_capture_script(
     processors: int,
     *,
-    backend: str,
     teardown_mode: str,
     network_gateway: str | None = None,
     ioapic_irq: int | None = None,
     post_restore_script: str | None = None,
 ) -> str:
-    clocksource_ready = ""
-    # Until Linux replaces tsc-early, its periodic tick doesn't recover the
-    # jiffies that a restore's downtime skips. The clocksource watchdog can then
-    # compare tsc-early with jiffies across the restore and mark the TSC
-    # unstable. KVM guests leave tsc-early almost immediately after boot.
-    if backend in ("mshv", "whp"):
-        clocksource_ready = (
-            stable_clocksource_wait_script()
-            + "\n"
-            + 'current_clocksource="$(cat "$clock_path")"\n'
-            + '[ "$current_clocksource" != tsc-early ] || { '
-            + 'echo "SMP-CLOCKSOURCE-FAIL expected=stable '
-            + 'actual=$current_clocksource"; exit 80; }\n'
-        )
     probe = smp_probe_script(
         processors,
         exit_guest=False,
         network_gateway=network_gateway,
         ioapic_irq=ioapic_irq,
     )
-    probe = clocksource_ready + probe
     capture = _render_benchmark_script(
         "snapshot-capture-controller.sh.in",
         SMP_PROBE_PATH=SMP_PROBE_PATH,
@@ -3689,7 +3655,6 @@ def _benchmark_shell_snapshot_restore(
             str(snapshot_path),
         ],
         snapshot_path,
-        backend=backend,
         timeout=args.timeout,
         windows_cpus=windows_cpus,
         processors=args.processors,
@@ -4413,7 +4378,6 @@ def capture_snapshot(
     command: Sequence[str],
     snapshot_path: Path,
     *,
-    backend: str,
     timeout: float,
     windows_cpus: set[int] | None = None,
     processors: int | None = None,
@@ -4520,7 +4484,6 @@ def capture_snapshot(
                     interaction.write_input(
                         prepare_snapshot_capture_script(
                             processors,
-                            backend=backend,
                             teardown_mode=teardown_mode,
                             network_gateway=smp_network_gateway,
                             ioapic_irq=smp_ioapic_irq,
@@ -4631,7 +4594,6 @@ def summarize_snapshot_samples(
 
 def benchmark_snapshot_capture(
     args: argparse.Namespace,
-    backend: str,
     boot_command: Sequence[str],
     *,
     windows_cpus: set[int] | None = None,
@@ -4663,7 +4625,6 @@ def benchmark_snapshot_capture(
                 capture_snapshot(
                     [*boot_command, "--snapshot-destination", str(snapshot_path)],
                     snapshot_path,
-                    backend=backend,
                     timeout=args.timeout,
                     windows_cpus=windows_cpus,
                     processors=args.processors,
@@ -4787,7 +4748,6 @@ def benchmark_snapshot_restore(
                 str(generated_snapshot_path),
             ],
             generated_snapshot_path,
-            backend=hypervisor,
             timeout=args.timeout,
             windows_cpus=windows_cpus,
             processors=args.processors,
@@ -4949,7 +4909,6 @@ def benchmark_snapshot_profile_matrix(
             boot_command = make_boot_command(memory_mib)
             capture = benchmark_snapshot_capture(
                 profile_args,
-                backend,
                 boot_command,
                 windows_cpus=windows_cpus,
                 retained_snapshot_path=snapshot_path,
@@ -5417,7 +5376,6 @@ def run_kvm_worker(args: argparse.Namespace) -> int:
             snapshot_path = Path(temp_dir) / "snapshot"
             snapshot_capture = benchmark_snapshot_capture(
                 args,
-                "kvm",
                 boot_command,
                 retained_snapshot_path=snapshot_path,
             )
@@ -5443,7 +5401,7 @@ def run_kvm_worker(args: argparse.Namespace) -> int:
         return 0
     if args.suite == "snapshot":
         print("Benchmarking OpenVMM/KVM snapshot capture", flush=True)
-        result = benchmark_snapshot_capture(args, "kvm", boot_command)
+        result = benchmark_snapshot_capture(args, boot_command)
         print_snapshot_summary("kvm", result)
         print(
             KVM_SNAPSHOT_RESULT_PREFIX + json.dumps(result, separators=(",", ":")),
@@ -5731,7 +5689,6 @@ def run_native_linux(args: argparse.Namespace) -> int:
             if run_snapshot:
                 result = benchmark_snapshot_capture(
                     args,
-                    backend,
                     boot_command,
                     retained_snapshot_path=retained_snapshot_path,
                 )
@@ -6234,7 +6191,6 @@ def run_benchmark(args: argparse.Namespace) -> int:
             print("Benchmarking OpenVMM/WHP snapshot capture", flush=True)
             whp_snapshot = benchmark_snapshot_capture(
                 args,
-                "whp",
                 whp_command(
                     boot_binaries["whp"],
                     kernel,

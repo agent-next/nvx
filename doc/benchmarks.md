@@ -319,11 +319,9 @@ CI runs `test-microvm --scenario smp-lapic --processors 1 2 4 8` before acceptan
 This repeats the normal SMP probe with `lapic=notscdeadline`, covering the counting
 LAPIC even on hosts that normally use TSC-deadline timers. The ordinary `smp` scenario
 retains the default timer selection.
-MSHV and WHP captures wait for Linux to replace the transitional `tsc-early` clocksource with
-its stable selected clocksource before starting this SMP validation. Until that switch, Linux
-uses a periodic tick that doesn't recover the jiffies skipped by a restore's downtime. The
-clocksource watchdog can then compare `tsc-early` with jiffies across the restore and mark the
-TSC unstable. KVM guests leave `tsc-early` almost immediately after boot.
+Captures do not wait for a clocksource: under the time ABI, Linux registers the `tsc`
+clocksource at `device_initcall`, before any guest work, so no capture can observe the
+transitional `tsc-early` window.
 The coordinator stages the probe and a capture controller in guest memory. The
 controller runs the first probe, blocks in `read`, and invokes `nvx-snapshot` when the
 host sends the trigger. The controller always emits `NVX-SNAPSHOT-DISPATCHED` immediately before

@@ -526,10 +526,7 @@ class RunnerWiringTests(unittest.TestCase):
                     RuntimeError, f"^snapshot source {expected}"
                 ):
                     benchmark.capture_snapshot(
-                        KVM_BOOT,
-                        Path(temporary) / "snapshot",
-                        backend="kvm",
-                        timeout=5,
+                        KVM_BOOT, Path(temporary) / "snapshot", timeout=5
                     )
             log_path = Path(temporary) / "process.log"
             with patch.object(
@@ -595,7 +592,6 @@ class RunnerWiringTests(unittest.TestCase):
                     benchmark.capture_snapshot(
                         KVM_BOOT,
                         Path(temporary) / "snapshot",
-                        backend="kvm",
                         timeout=5,
                     )
 

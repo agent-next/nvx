@@ -1364,19 +1364,18 @@ class MicrovmTests(unittest.TestCase):
         console.close()
         connected.close.assert_called_once_with()
 
-    def test_snapshot_core_script_selects_backend_clocksource(self):
-        kvm = microvm_tests._snapshot_core_script("kvm")
-        whp = microvm_tests._snapshot_core_script("whp")
-        mshv = microvm_tests._snapshot_core_script("mshv")
+    def test_snapshot_core_script_handles_no_clocksource(self):
+        # The time ABI fixes the clocksource on every backend, so snapshot-core
+        # neither selects nor waits for one.
+        script = microvm_tests._read_script("snapshot-core.sh")
 
-        self.assertIn("echo kvm-clock", kvm)
-        self.assertIn('current_clocksource)" != tsc-early', whp)
-        self.assertNotIn("@SELECT_CLOCKSOURCE@", mshv)
-        self.assertIn("/sbin/nvx-reseed", mshv)
-        self.assertIn("/sbin/nvx-reseed --sample", mshv)
-        self.assertIn("NVX-SNAPSHOT-GENERATION-ID-", mshv)
-        self.assertIn("NVX-SNAPSHOT-UUID-", mshv)
-        self.assertIn("NVX-SNAPSHOT-TEMP-ID-", mshv)
+        for text in ("clocksource", "kvm-clock", "tsc-early", "@SELECT", "@VALIDATE"):
+            self.assertNotIn(text, script)
+        self.assertIn("/sbin/nvx-reseed", script)
+        self.assertIn("/sbin/nvx-reseed --sample", script)
+        self.assertIn("NVX-SNAPSHOT-GENERATION-ID-", script)
+        self.assertIn("NVX-SNAPSHOT-UUID-", script)
+        self.assertIn("NVX-SNAPSHOT-TEMP-ID-", script)
 
     def test_smp_worker_requires_bounded_local_timer_progress(self):
         shell = _posix_shell()
@@ -1439,58 +1438,6 @@ class MicrovmTests(unittest.TestCase):
                         (root / "result").read_text(encoding="ascii").split(),
                         ["1", "101", "1"],
                     )
-
-    def test_snapshot_core_whp_waits_for_stable_clocksource(self):
-        shell = _posix_shell()
-        if shell is None:
-            self.skipTest("POSIX shell is unavailable")
-        clocksource_script = microvm_tests._snapshot_core_script("whp").split(
-            "generation_id_before=", 1
-        )[0]
-        for ready_after, stable_source, expected_returncode, expected_waits in (
-            (0, "tsc", 0, 0),
-            (2, "refined-jiffies", 0, 2),
-            (101, "tsc", 46, 100),
-        ):
-            with self.subTest(
-                ready_after=ready_after,
-                stable_source=stable_source,
-            ):
-                result = subprocess.run(
-                    [shell, "-s"],
-                    input=(
-                        "clock_waits=0\n"
-                        "cat() {\n"
-                        f'    if [ "$clock_waits" -ge {ready_after} ]; then\n'
-                        f"        echo {stable_source}\n"
-                        "    else\n"
-                        "        echo tsc-early\n"
-                        "    fi\n"
-                        "}\n"
-                        "sleep() { clock_waits=$((clock_waits + 1)); }\n"
-                        "nvx_exit() {\n"
-                        '    echo "NVX-CLOCKSOURCE-WAITS-$clock_waits"\n'
-                        '    exit "$1"\n'
-                        "}\n"
-                        + clocksource_script.replace("nvx-exit", "nvx_exit")
-                        + 'echo "NVX-CLOCKSOURCE-WAITS-$clock_waits"\n'
-                    ),
-                    text=True,
-                    capture_output=True,
-                    timeout=5,
-                    check=False,
-                )
-
-                self.assertEqual(
-                    result.returncode,
-                    expected_returncode,
-                    result.stdout + result.stderr,
-                )
-                self.assertIn(
-                    f"NVX-CLOCKSOURCE-WAITS-{expected_waits}\n", result.stdout
-                )
-                if expected_returncode:
-                    self.assertIn("NVX-SNAPSHOT-CORE-FAIL code=46", result.stdout)
 
     def test_snapshot_core_waits_for_no_destination_marker_line_before_exit(self):
         events: list[tuple[str, bytes | str | None]] = []
