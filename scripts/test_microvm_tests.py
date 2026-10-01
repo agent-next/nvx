@@ -932,6 +932,13 @@ class MicrovmTests(unittest.TestCase):
             '/sbin/nvx-time capture "$capture_request" "$generation_id" "$entropy"',
             snapshot,
         )
+        # An untiered restore with nothing to activate finishes inside the
+        # capture helper (metadata 2), so no second process starts.
+        self.assertIn(
+            '[ "$snapshot_tier" = legacy ] && finish_option=--finish', snapshot
+        )
+        self.assertIn('${finish_option:+"$finish_option"}', snapshot)
+        self.assertIn("2) stall_detectors_suppressed=false ;;", snapshot)
         self.assertIn(
             'generation_id=$(/sbin/nvx-reseed "$entropy" "$generation_id")',
             snapshot,
@@ -1100,6 +1107,52 @@ class MicrovmTests(unittest.TestCase):
             stdout, "memory 0\nNVX-POST-RESTORE-OK: tier=legacy\npending=false\n"
         )
         self.assertEqual(calls, "restore-finish --new-cpus none\n")
+
+    def test_capture_metadata_2_leaves_no_restore_work_to_the_shell(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        snapshot = (
+            Path(__file__).parents[1] / "guest" / "common" / "nvx-snapshot"
+        ).read_text(encoding="utf-8")
+        start = snapshot.index('case "${1:-}" in\n    0) ;;')
+        dispatch = snapshot[start : snapshot.index("\nesac\n", start) + 6]
+        generation_id = "0123456789abcdef0123456789abcdef"
+
+        def dispatch_metadata(metadata: str) -> tuple[int, str]:
+            result = subprocess.run(
+                [shell, "-s"],
+                input=(
+                    "set -eu\n"
+                    "stall_detectors_suppressed=true\n"
+                    'post_restore() { echo "post_restore $*"; }\n'
+                    'fail_closed() { echo "fail_closed $*"; exit 1; }\n'
+                    f"set -- {metadata}\n"
+                    f"{dispatch}"
+                    'echo "suppressed=$stall_detectors_suppressed"\n'
+                ),
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            return result.returncode, result.stdout
+
+        # No restore: the cleanup trap restores the stall detectors.
+        self.assertEqual(dispatch_metadata("0"), (0, "suppressed=true\n"))
+        # nvx-time finished the restore and handed it to the daemon.
+        self.assertEqual(
+            dispatch_metadata(f"2 4 0 0 {generation_id}"),
+            (0, "suppressed=false\n"),
+        )
+        self.assertEqual(
+            dispatch_metadata(f"1 4 2 0 {generation_id}"),
+            (0, f"post_restore 4 2 0 {generation_id}\nsuppressed=false\n"),
+        )
+        self.assertEqual(
+            dispatch_metadata("3"),
+            (1, "fail_closed snapshot capture metadata is invalid\n"),
+        )
 
     def test_console_log_persists_buffered_and_completed_output(self):
         with tempfile.TemporaryDirectory() as temporary:

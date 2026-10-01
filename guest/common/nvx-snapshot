@@ -391,8 +391,8 @@ post_restore() {
     finish_restore "$packet_flags"
 }
 
-# Restore steps 11 to 13: the restore checks, the acknowledgement when the
-# host gated its input, and the daemon's grace-period release, which runs off
+# Restore steps 12 and 13: the acknowledgement when the host gated its input,
+# then the daemon's restore checks and grace-period release, which run off
 # the restore latency path. A second argument of "quiet" omits the stage and
 # completion lines of a plain untiered restore.
 finish_restore() {
@@ -483,8 +483,14 @@ if [ "$scratch_policy" = fresh ]; then
 else
     capture_request=1
 fi
+# An untiered restore with nothing to activate needs no shell work before
+# the acknowledgement, so nvx-time finishes it and reports 2: no second
+# process starts on the restore path.
+finish_option=
+[ "$snapshot_tier" = legacy ] && finish_option=--finish
 capture_metadata=$(
-    /sbin/nvx-time capture "$capture_request" "$generation_id" "$entropy"
+    /sbin/nvx-time capture "$capture_request" "$generation_id" "$entropy" \
+        ${finish_option:+"$finish_option"}
 ) || fail_closed "failed to request snapshot capture"
 # The metadata is a list of integers and one hexadecimal ID.
 # shellcheck disable=SC2086
@@ -496,5 +502,6 @@ case "${1:-}" in
         shift
         post_restore "$@"
         ;;
+    2) stall_detectors_suppressed=false ;;
     *) fail_closed "snapshot capture metadata is invalid" ;;
 esac
