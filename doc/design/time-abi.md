@@ -112,7 +112,7 @@ No leaf returns Hyper-V feature data, a `VS#1` interface signature at
 (step `0x100`) carries a KVM, Xen, VMware, or other hypervisor signature, so
 Linux selects only the Hyper-V platform.
 
-### Synthetic MSRs
+### MSRs
 
 OpenVMM serves the identity MSR range `0x40000000..=0x400001ff` identically
 on every backend:
@@ -133,6 +133,14 @@ on any backend. Clearing it after setting it is accepted.
 The CPU time bits hide two architectural timer MSRs, and every backend makes
 them raise #GP: `IA32_TSC_ADJUST` (`0x3b`) and `IA32_TSC_DEADLINE`
 (`0x6e0`).
+
+The legacy P6 L2-cache MSRs (`0x88..=0x8a`, `0x116`, `0x118..=0x11b`, and
+`0x11e`) also raise #GP on every backend, as MSHV's hypervisor already
+makes them do; no profile pins them. KVM and WHP stub them only for Windows
+booting from the PCAT BIOS, and standard-machine partitions keep those
+stubs. Linux 6.18 never accesses them. A fault on an MSR that the guest
+kernel accesses unchecked logs `unchecked MSR access error`, which the boot
+check (`C4`) and the violation watcher (`G_UNCHECKED_MSR`) reject.
 
 ### CPU time bits
 
@@ -263,7 +271,7 @@ settled cell on the registered hosts.
 | Live cross-vCPU skew after release at most 1 µs | Equal offsets: skew is the host's TSC skew, bounded by qualification. Measured at most 63 ns | Measured 0 warps; offsets within 516 ns on dual-socket bare metal and 195 ns on Azure, both bounded by the probe's round trip | Measured at most 70 ns over 60 s on prometheus28, 8370C, and 8573C hosts |
 | VP instantiation | All `C` VPs exist before the set | Every instantiated VP is bound, which creates it, before the set; no VP is created after it | All `C` VPs exist before the set |
 | Partition capabilities, so that the identity leaves never enable the Hyper-V emulator or its saved-state elements | Derived from CPUID with the hypervisor range masked: `hv1` and `kvm_clock` are false | Same | Same |
-| Unknown MSRs | #GP, including the legacy L2-cache MSR stubs (see [CPU profiles](#cpu-profiles)) | #GP from the hypervisor | #GP, including the legacy L2-cache MSR stubs |
+| Unknown MSRs | #GP, including the legacy L2-cache MSR stubs (see [MSRs](#msrs)) | #GP from the hypervisor | #GP, including the legacy L2-cache MSR stubs |
 | Removed | `KVM_GET_CLOCK`/`KVM_SET_CLOCK` in the microVM downtime path, kvmclock MSR state, leaf `0x15` synthesis, `KVM_SET_TSC_KHZ`, restore-time `IA32_TSC` writes | BSP-copy TSC alignment, exact-rate equality, leaf `0x15` synthesis | 1 GHz request and fallback, `RestoredTsc` and its RDTSC, RDTSCP, and `IA32_TSC` exits, leaf `0x15` synthesis |
 
 **KVM common offset.** Restoring each VP's `IA32_TSC` is unreliable on KVM.
@@ -441,11 +449,8 @@ PKU, UMIP, and FDP_EXCPTN_ONLY (KVM only), FLUSH_L1D (not on WHP), and the
 AMD-alias speculation bits in `0x80000008` EBX (KVM only; Intel guests use
 the `7.0` EDX equivalents, which every backend presents).
 
-No profile pins the legacy P6 L2-cache MSRs (`0x88..=0x8a`, `0x116`,
-`0x118..=0x11b`, and `0x11e`) that the KVM and WHP backends stub for Windows
-booting from the PCAT BIOS. A microVM boots its kernel directly and never
-probes them, so on a time ABI partition they raise #GP on every backend, as
-MSHV's hypervisor already does.
+No profile pins the legacy P6 L2-cache MSRs; they raise #GP on every
+backend (see [MSRs](#msrs)).
 
 ## TSC rate policy and LAPIC rate rule
 
