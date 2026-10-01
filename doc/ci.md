@@ -63,6 +63,15 @@ probe also powers the guest off with status 97. Restore-processor logs record
 OpenVMM's `time ABI rates declared` event, which reports the identity MSR
 route, the TSC synchronization method, the native and declared TSC rates, and
 the rate deviation from the snapshot.
+The `restore-downtime` scenario covers the time ABI's long-downtime case. It
+captures four snapshots, at 1 and 8 vCPUs, each with and without
+`rcupdate.rcu_expedited=1`, then waits 30 s, longer than the guest's 21 s RCU
+stall timeout, and restores each one. Every restored guest must run the warp
+probe, print its `NVX-TIME-ABI ... phase=restore status=ok` line within 30 s of
+the restore marker, report `/sys/kernel/rcu_stall_count` as 0 two seconds
+later, and show an uptime of at least 30 s, which proves that monotonic time
+advanced by the downtime. The captures share one downtime window, so the
+scenario adds about a minute per backend.
 
 Every job that uses the `validate-runner` action first qualifies its runner
 for the time ABI with `nvx.py doctor --checks H1 H2 H4 --no-openvmm

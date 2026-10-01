@@ -81,6 +81,7 @@ MICROVM_TEST_SCENARIOS = (
     "l3-l4-egress-policy",
     "managed-lifecycle",
     "network-snapshot",
+    "restore-downtime",
     "restore-memory",
     "restore-processors",
     "sandbox-blocks",
@@ -154,6 +155,18 @@ RESTORE_PROCESSORS_FAILURE_MARKER = b"NVX-RESTORE-PROCESSORS-FAIL"
 # console line; targets that log while the guest runs, such as virt_kvm's
 # hidden-MSR #GPs, could split a marker in the merged console stream.
 TIME_ABI_RESTORE_LOG_FILTER = "off,openvmm_core::worker::dispatch::time_abi=info"
+# The guest finishes a restore after the RCU grace-period release, which gives
+# up after rcu_cpu_stall_timeout (21 s), and the deferred C7 check.
+TIME_ABI_RESTORE_FINISH_SECONDS = 30.0
+# The spec's long-downtime case: longer than the 21 s RCU stall timeout, at 1
+# and 8 vCPUs, with and without expedited grace periods.
+RESTORE_DOWNTIME_SECONDS = 30.0
+RESTORE_DOWNTIME_PROCESSORS = (1, 8)
+RESTORE_DOWNTIME_COMPLETION_MARKER = b"NVX-RESTORE-DOWNTIME-OK"
+RESTORE_DOWNTIME_PATH = "/tmp/nvx-restore-downtime"
+# Gives the RCU stall detector time to report a stall that the release of
+# the stall suppression exposed.
+RESTORE_DOWNTIME_SETTLE_SECONDS = 2
 OUTCOME_TOP_LEVEL_FIELDS = frozenset(
     {
         "schema_version",
@@ -2437,6 +2450,89 @@ def run_restore_processors(
                 )
 
 
+def run_restore_downtime(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Restore snapshots after a downtime longer than the RCU stall timeout.
+
+    Every snapshot is captured first, so one shared downtime window covers
+    them all. The restored guest must finish its time ABI restore, report no
+    RCU stall, and show that monotonic time advanced by the downtime.
+    """
+    cases = [
+        (processors, expedited)
+        for processors in RESTORE_DOWNTIME_PROCESSORS
+        for expedited in (False, True)
+    ]
+    check = _render_script(
+        "restore-downtime.sh.in",
+        SETTLE_SECONDS=str(RESTORE_DOWNTIME_SETTLE_SECONDS),
+        MIN_UPTIME_SECONDS=str(int(RESTORE_DOWNTIME_SECONDS)),
+    )
+    environment = {"OPENVMM_LOG": TIME_ABI_RESTORE_LOG_FILTER}
+    with tempfile.TemporaryDirectory(prefix="nvx-restore-downtime-") as temporary:
+        snapshots: list[tuple[str, int, Path]] = []
+        for processors, expedited in cases:
+            name = f"{processors}-vcpu" + ("-expedited" if expedited else "")
+            cmdline = "quiet loglevel=0" + (
+                " rcupdate.rcu_expedited=1" if expedited else ""
+            )
+            snapshot_path = Path(temporary) / name
+            boot_command = workload_boot_command(
+                executable,
+                backend,
+                kernel,
+                initrd,
+                memory_mib,
+                cmdline,
+                processors=processors,
+            )
+            # The restored guest keeps running after the restore marker so the
+            # harness can wait for the daemon's restore marker.
+            capture_snapshot(
+                [*boot_command, "--snapshot-destination", str(snapshot_path)],
+                snapshot_path,
+                timeout=timeout,
+                processors=processors,
+                teardown_mode="host-terminate",
+                post_restore_script=warp_probe_script(),
+                log_path=output_dir / f"restore-downtime-{name}-capture.log",
+            )
+            snapshots.append((name, processors, snapshot_path))
+        restore_after = time.monotonic() + RESTORE_DOWNTIME_SECONDS
+        for name, processors, snapshot_path in snapshots:
+            time.sleep(max(0.0, restore_after - time.monotonic()))
+            context = f"{name} restore after a {RESTORE_DOWNTIME_SECONDS:g} s downtime"
+            with OpenvmmProcess(
+                snapshot_restore_command(
+                    executable,
+                    backend,
+                    snapshot_path,
+                    processors=processors,
+                ),
+                output_dir / f"restore-downtime-{name}.log",
+                environment=environment,
+            ) as process:
+                process.wait_for_line(RESTORE_MARKER, timeout)
+                process.wait_for_time_abi("restore", TIME_ABI_RESTORE_FINISH_SECONDS)
+                _stage_script(
+                    process, RESTORE_DOWNTIME_PATH, "NVX_RESTORE_DOWNTIME", check
+                )
+                process.wait_for_line(RESTORE_DOWNTIME_COMPLETION_MARKER, timeout)
+                result = process.wait(timeout)
+            if result.returncode != 0:
+                error = process.time_abi.exit_error(result.returncode)
+                raise RuntimeError(f"{context}: {error}")
+            _check_restore_warp(result.output, processors=processors, context=context)
+
+
 def run_restore_memory(
     executable: Path,
     kernel: Path,
@@ -4229,6 +4325,20 @@ def run(args: argparse.Namespace) -> int:
             initrd,
             args.backend,
             args.processors,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "restore-downtime" in scenarios:
+        print(
+            "Running microVM long-downtime restore correctness on "
+            f"OpenVMM/{args.backend}"
+        )
+        run_restore_downtime(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
             memory_mib=args.memory_mib,
             timeout=args.timeout,
             output_dir=output_dir,

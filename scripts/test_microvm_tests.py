@@ -4,6 +4,7 @@
 import argparse
 import json
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -2750,6 +2751,169 @@ class MicrovmTests(unittest.TestCase):
             "--- OpenVMM output ---\ntail",
         )
         self.assertIs(raised.exception.__cause__, failure)
+
+    def test_restore_downtime_shares_one_window_and_waits_for_the_restore_marker(
+        self,
+    ):
+        clock = [100.0]
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        fake_time = MagicMock()
+        fake_time.monotonic.side_effect = lambda: clock[0]
+        fake_time.sleep.side_effect = sleep
+        results = [
+            openvmm_process.OpenvmmProcessResult(0, _warp_probe_output(processors))
+            for processors in (1, 1, 8, 8)
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            with (
+                patch.object(
+                    microvm_tests,
+                    "workload_boot_command",
+                    return_value=["openvmm", "boot"],
+                ) as boot_command,
+                patch.object(microvm_tests, "capture_snapshot") as capture,
+                patch.object(microvm_tests, "OpenvmmProcess") as process,
+                patch.object(microvm_tests, "time", fake_time),
+            ):
+                active = process.return_value.__enter__.return_value
+                active.wait.side_effect = results
+                microvm_tests.run_restore_downtime(
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initrd"),
+                    "kvm",
+                    memory_mib=128,
+                    timeout=60,
+                    output_dir=output_dir,
+                )
+
+        self.assertEqual(
+            [
+                (call.args[5], call.kwargs["processors"])
+                for call in boot_command.call_args_list
+            ],
+            [
+                ("quiet loglevel=0", 1),
+                ("quiet loglevel=0 rcupdate.rcu_expedited=1", 1),
+                ("quiet loglevel=0", 8),
+                ("quiet loglevel=0 rcupdate.rcu_expedited=1", 8),
+            ],
+        )
+        for call in capture.call_args_list:
+            self.assertEqual(call.kwargs["teardown_mode"], "host-terminate")
+            self.assertEqual(
+                call.kwargs["post_restore_script"], time_abi.warp_probe_script()
+            )
+        # Every capture precedes one shared 30 s window.
+        self.assertEqual(sleeps, [30.0, 0.0, 0.0, 0.0])
+        self.assertEqual(
+            [call.args[1].name for call in process.call_args_list],
+            [
+                "restore-downtime-1-vcpu.log",
+                "restore-downtime-1-vcpu-expedited.log",
+                "restore-downtime-8-vcpu.log",
+                "restore-downtime-8-vcpu-expedited.log",
+            ],
+        )
+        for call in process.call_args_list:
+            self.assertEqual(
+                call.kwargs["environment"],
+                {"OPENVMM_LOG": "off,openvmm_core::worker::dispatch::time_abi=info"},
+            )
+            self.assertIn("--restore-snapshot", call.args[0])
+        self.assertEqual(
+            active.wait_for_time_abi.call_args_list[0].args, ("restore", 30.0)
+        )
+        self.assertEqual(
+            [call.args[0] for call in active.wait_for_line.call_args_list[:2]],
+            [benchmark.RESTORE_MARKER, b"NVX-RESTORE-DOWNTIME-OK"],
+        )
+        staged = active.send_bytes.call_args_list[0].args[0].decode()
+        self.assertIn("sleep 2\n", staged)
+        self.assertIn("minimum=30\n", staged)
+
+    def test_restore_downtime_rejects_a_failed_check_or_warp_probe(self):
+        fatal = "[E_TSC_SYNC_UNSUPPORTED] failed to launch vm worker"
+        cases = (
+            (
+                openvmm_process.OpenvmmProcessResult(99, b""),
+                None,
+                "downtime: OpenVMM exited with status 99$",
+            ),
+            (
+                openvmm_process.OpenvmmProcessResult(1, b""),
+                fatal,
+                f"downtime: OpenVMM exited with status 1: {re.escape(fatal)}$",
+            ),
+            (
+                openvmm_process.OpenvmmProcessResult(
+                    0, _warp_probe_output(1).replace(b"conclusive=1", b"conclusive=0")
+                ),
+                None,
+                "1-vcpu restore after a 0 s downtime: .*inconclusive",
+            ),
+        )
+        for result, fatal_error, message in cases:
+            with self.subTest(message=message):
+                with tempfile.TemporaryDirectory() as temporary:
+                    with (
+                        patch.object(microvm_tests, "capture_snapshot"),
+                        patch.object(microvm_tests, "OpenvmmProcess") as process,
+                        patch.object(microvm_tests, "RESTORE_DOWNTIME_SECONDS", 0.0),
+                    ):
+                        active = process.return_value.__enter__.return_value
+                        active.wait.return_value = result
+                        active.time_abi = time_abi.TimeAbiMonitor()
+                        active.time_abi.fatal = fatal_error
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            microvm_tests.run_restore_downtime(
+                                Path("openvmm"),
+                                Path("vmlinux"),
+                                Path("initrd"),
+                                "mshv",
+                                memory_mib=128,
+                                timeout=60,
+                                output_dir=Path(temporary),
+                            )
+
+    def test_restore_downtime_script_rejects_stalls_and_a_frozen_clock(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        script = microvm_tests._render_script(
+            "restore-downtime.sh.in", SETTLE_SECONDS="0", MIN_UPTIME_SECONDS="30"
+        ).replace("nvx-exit", "nvx_exit")
+        for stalls, uptime, expected in (
+            ("0", "41", 0),
+            ("1", "41", 98),
+            ("0", "12", 99),
+        ):
+            with self.subTest(stalls=stalls, uptime=uptime):
+                result = subprocess.run(
+                    [shell],
+                    input=(
+                        "sleep() { :; }\n"
+                        f"cat() {{ printf '%s\\n' '{stalls}'; }}\n"
+                        f"cut() {{ printf '%s\\n' '{uptime}'; }}\n"
+                        'nvx_exit() { printf "NVX-EXIT %s\\n" "$1"; }\n' + script
+                    ),
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertIn(f"NVX-EXIT {expected}", result.stdout)
+                self.assertEqual(
+                    "NVX-RESTORE-DOWNTIME-OK" in result.stdout.splitlines(),
+                    expected == 0,
+                )
 
     def test_removed_tsc_guards_stay_removed(self):
         # The warp probe replaced the restore-tsc-sync guard, its
