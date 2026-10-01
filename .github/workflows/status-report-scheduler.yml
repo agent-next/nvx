@@ -1,0 +1,22 @@
+name: Verus status report scheduler
+
+on:
+  schedule:
+    - cron: "24 22 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  discussions: read
+  copilot-requests: write
+
+concurrency:
+  group: status-report-verus-dev-scheduler
+  cancel-in-progress: false
+
+jobs:
+  status-report:
+    if: github.repository == 'microsoft/nvx'
+    uses: microsoft/nvx/.github/workflows/status-report.lock.yml@verus/dev
+    secrets: inherit
