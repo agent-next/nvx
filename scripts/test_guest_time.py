@@ -514,6 +514,13 @@ class GuestTimeTests(unittest.TestCase):
         )
         self.assertEqual(syslog([*lines, own_event]), ["ok"])
 
+    def test_daemon_lines_start_on_a_fresh_console_line(self):
+        # The daemon prints the restore marker and runtime events while a
+        # shell may be in the middle of a line (its prompt, for example).
+        line = "NVX-TIME-ABI: v=1 phase=restore status=ok\n"
+        self.assertEqual(self.run_test("console", line, "sync"), line)
+        self.assertEqual(self.run_test("console", line, "async"), "\n" + line)
+
     def timer_list(
         self,
         sections: list[tuple[int, str, int, str, int]],

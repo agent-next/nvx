@@ -147,6 +147,9 @@ static bool g_report_only;
 static bool g_test;
 static uint32_t g_generation;
 static bool g_ports;
+// Set in the daemon. Its lines can arrive while a shell or workload is in the
+// middle of a console line, so each one starts with a newline.
+static bool g_async_output;
 
 // ---------------------------------------------------------------------------
 // Small utilities
@@ -477,8 +480,13 @@ static void escape_text(const char *text, char *out, size_t limit)
 
 static void console_write(const char *line)
 {
+    char buffer[EVENT_MAX + 128];
     int fd = g_test ? -1 : open("/dev/console", O_WRONLY | O_NOCTTY | O_CLOEXEC);
 
+    if (g_async_output) {
+        snprintf(buffer, sizeof(buffer), "\n%s", line);
+        line = buffer;
+    }
     if (fd < 0) {
         (void)write_all(g_test ? STDOUT_FILENO : STDERR_FILENO, line,
                         strlen(line));
@@ -593,6 +601,8 @@ static void emit_event(const char *code, const char *source, enum phase phase,
         close(fd);
     }
     if (enable_ports() == 0) {
+        if (g_async_output)
+            outb('\n', PORTB_DATA);
         for (const char *c = line; *c != '\0'; c++)
             outb((unsigned char)*c, PORTB_DATA);
     }
@@ -2710,6 +2720,7 @@ static int start_daemon(int kmsg, uint64_t tsc_hz, uint64_t lapic_hz,
         daemon.tsc_hz = tsc_hz;
         daemon.lapic_hz = lapic_hz;
         daemon.last_accepted_ns = last_accepted_ns;
+        g_async_output = true;
         (void)setsid();
         if (null >= 0) {
             (void)dup2(null, STDIN_FILENO);
@@ -3499,6 +3510,11 @@ static int cmd_test(int argc, char **argv)
     }
     if (strcmp(name, "kmsg") == 0)
         return test_lines(argc, argv, LINES_KMSG);
+    if (strcmp(name, "console") == 0 && argc == 2) {
+        g_async_output = strcmp(argv[1], "async") == 0;
+        console_write(argv[0]);
+        return 0;
+    }
     if (strcmp(name, "boot-log") == 0)
         return test_lines(argc, argv, LINES_BOOT_LOG);
     if (strcmp(name, "syslog") == 0)
