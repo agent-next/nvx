@@ -170,7 +170,10 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         def copyfile(
             source: Path | str, destination: Path | str
         ) -> Path | str:
-            if evidence_failure and Path(destination).parent == output_dir:
+            if (
+                evidence_failure
+                and Path(destination) == output_dir / "public-exec-openvmm.log"
+            ):
                 raise OSError("injected evidence failure")
             return real_copyfile(source, destination)
 
@@ -391,20 +394,34 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         self.assertFalse(fixture_root.exists())
 
     def test_public_acceptance_preserves_test_and_cleanup_failures(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "unexpected output.*cleanup.*stop failed",
-            ) as raised:
-                self._run_acceptance(
-                    Path(temporary),
-                    bad_pwd_output=True,
-                    stop_returncode=9,
-                )
-        self.assertIn("10 bytes omitted", str(raised.exception))
-        self.assertLess(
-            len(str(raised.exception)), managed_exec_tests.DIAGNOSTIC_LIMIT + 512
-        )
+        commands: list[list[str]] = []
+        fixture_root: Path | None = None
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "unexpected output.*cleanup.*stop failed",
+                ) as raised:
+                    self._run_acceptance(
+                        Path(temporary),
+                        bad_pwd_output=True,
+                        stop_returncode=9,
+                        command_log=commands,
+                    )
+            fixture_root = Path(
+                commands[0][commands[0].index("--state-dir") + 1]
+            ).parent
+            self.assertIn("10 bytes omitted", str(raised.exception))
+            self.assertLess(
+                len(str(raised.exception)), managed_exec_tests.DIAGNOSTIC_LIMIT + 512
+            )
+        finally:
+            if fixture_root is None and commands:
+                fixture_root = Path(
+                    commands[0][commands[0].index("--state-dir") + 1]
+                ).parent
+            if fixture_root is not None and fixture_root.exists():
+                shutil.rmtree(fixture_root)
 
     def test_public_acceptance_rejects_malformed_outcome_packet(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -495,15 +512,22 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
 
     def test_evidence_failure_still_deprovisions_stopped_sandbox(self):
         with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
             commands: list[list[str]] = []
             with self.assertRaisesRegex(RuntimeError, "injected evidence failure"):
                 self._run_acceptance(
-                    Path(temporary),
+                    root,
                     evidence_failure=True,
                     command_log=commands,
                 )
+            records = json.loads(
+                (root / "results" / "public-exec-checks.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
         self.assertIn("deprovision", [command[3] for command in commands])
+        self.assertEqual(records[-1]["operation"], "deprovision")
         fixture_root = Path(
             commands[0][commands[0].index("--state-dir") + 1]
         ).parent

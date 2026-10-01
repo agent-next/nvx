@@ -225,17 +225,32 @@ def run_managed_exec_configuration(
                 )
 
         def persist_evidence() -> None:
+            errors: list[Exception] = []
             for name in ("openvmm.log", "outcome.json"):
                 source = state / name
                 if source.is_file():
-                    shutil.copyfile(source, output_dir / f"public-exec-{name}")
+                    try:
+                        shutil.copyfile(source, output_dir / f"public-exec-{name}")
+                    except Exception as error:
+                        errors.append(error)
             for name in ("exit-outcome.json", "timeout-outcome.json"):
                 source = root / name
                 if source.is_file():
-                    shutil.copyfile(source, output_dir / f"public-exec-{name}")
-            (output_dir / "public-exec-checks.json").write_text(
-                json.dumps(checks, indent=2) + "\n", encoding="utf-8"
-            )
+                    try:
+                        shutil.copyfile(source, output_dir / f"public-exec-{name}")
+                    except Exception as error:
+                        errors.append(error)
+            try:
+                (output_dir / "public-exec-checks.json").write_text(
+                    json.dumps(checks, indent=2) + "\n", encoding="utf-8"
+                )
+            except Exception as error:
+                errors.append(error)
+            if errors:
+                raise RuntimeError(
+                    "public managed evidence persistence failed: "
+                    f"{_format_errors(errors)}"
+                ) from errors[0]
 
         invoke(
             "provision",
