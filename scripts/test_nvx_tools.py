@@ -5119,6 +5119,10 @@ class BuildTests(unittest.TestCase):
             "CONFIG_X86_INTEL_PSTATE=y",
             "CONFIG_SCHED_MC_PRIO=y",
             "CONFIG_HYPERV=y",
+            "CONFIG_KVM_GUEST=y",
+            "CONFIG_PARAVIRT_CLOCK=y",
+            "CONFIG_HALTPOLL_CPUIDLE=y",
+            "CONFIG_ARCH_CPUIDLE_HALTPOLL=y",
         ):
             with self.subTest(removed=removed):
                 self.assertNotIn(removed, configured)

@@ -80,6 +80,7 @@ class KernelBuildConstants:
         "CONFIG_HYPERVISOR_GUEST=y",
         "CONFIG_PARAVIRT=y",
         "# CONFIG_HYPERV is not set",
+        "# CONFIG_KVM_GUEST is not set",
         "# CONFIG_CPU_FREQ is not set",
     )
     # x86 makes runtime-generated code, such as the ITS mitigation thunks,

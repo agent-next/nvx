@@ -173,14 +173,16 @@ The native kernel build caches the verified and patched source under
 generated config as `build/vmlinux.config`, and fails if ACPI is enabled,
 PVH remains enabled, or the MP-table, APIC, IOAPIC, and command-line
 virtio-mmio requirements are missing. It also enforces the time-ABI settings:
-`CONFIG_HYPERVISOR_GUEST` and `CONFIG_PARAVIRT` stay on, while `CONFIG_HYPERV`
-and `CONFIG_CPU_FREQ` stay off. Without cpufreq, `intel_pstate` cannot probe
-MSRs the microVM does not implement, so no `#GP` traces are printed with
-interrupts disabled during boot. `CONFIG_SCHED_MC_PRIO` is off as well because
-it selects both cpufreq and `intel_pstate`. Production kernels must not enable
-the soft-lockup or hung-task detectors. Changing an archive hash or patch
-invalidates both source and object caches; changing the input configuration
-invalidates the object cache.
+`CONFIG_HYPERVISOR_GUEST` and `CONFIG_PARAVIRT` stay on, while `CONFIG_HYPERV`,
+`CONFIG_KVM_GUEST`, and `CONFIG_CPU_FREQ` stay off. The guest identifies the
+hypervisor only through the time ABI's Hyper-V identity, so the KVM guest code,
+kvmclock, and the haltpoll idle driver would be dead code. Without cpufreq,
+`intel_pstate` cannot probe MSRs the microVM does not implement, so no `#GP`
+traces are printed with interrupts disabled during boot. `CONFIG_SCHED_MC_PRIO`
+is off as well because it selects both cpufreq and `intel_pstate`. Production
+kernels must not enable the soft-lockup or hung-task detectors. Changing an
+archive hash or patch invalidates both source and object caches; changing the
+input configuration invalidates the object cache.
 
 The kernel keeps the code it generates at run time read-only. On x86, only
 `CONFIG_STRICT_MODULE_RWX` makes such memory read-only and executable
