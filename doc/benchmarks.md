@@ -305,6 +305,11 @@ console-timed capture results, restore results without prequeued guest exit, mis
 any guest-exit teardown timeout. With at least ten samples, it also rejects snapshot-generation
 series whose p50 is more than 25% above p25; this prevents a transient host stall from entering
 performance history without hiding a uniformly slower product result.
+Every launch is scanned for the guest's time ABI output as in the
+[microVM correctness jobs](ci.md): a cold boot must print a passing `NVX-TIME-ABI` boot line
+before `ALPINE-MICROVM-BOOT-OK`, and a violation event or a time ABI power-off fails the run.
+The scan parses output the harness already reads, so it adds nothing to the measured intervals;
+the guest's boot check is part of `openvmm_cold_start`.
 Lifecycle capture runs a deterministic affinity-pinned worker on every vCPU
 before the snapshot request. Explicit correctness scenarios also stage a post-restore probe.
 The capture probe is outside the snapshot-generation timing interval. Each worker proves that it

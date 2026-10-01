@@ -77,6 +77,9 @@ CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
 )
 # Guest boot markers that init prints after the time ABI boot check.
 GUEST_BOOT_MARKERS = ("ALPINE-MICROVM-BOOT-OK", "NVX-GUEST-BOOT-OK:")
+# Init runs the boot check before any other guest work, so a cold boot whose
+# guest reaches its shell without the boot marker is not conformant.
+REQUIRE_BOOT_MARKER = True
 _MAX_PENDING_LINE = 64 * 1024
 
 
@@ -241,12 +244,15 @@ class TimeAbiMonitor:
 
     ``feed`` raises TimeAbiFailure as soon as a completed line carries a
     violation event or a failed conformance check, so a scenario fails fast
-    with the guest's own explanation instead of a marker timeout.
+    with the guest's own explanation instead of a marker timeout. On a cold
+    boot it also fails when the guest reaches its shell without a valid
+    boot marker.
     """
 
     def __init__(self, command: Sequence[str] = ()) -> None:
         self.backend = _command_option(command, "--hypervisor")
         self.cold_boot = is_cold_boot_command(command)
+        self.require_boot_marker = REQUIRE_BOOT_MARKER and self.cold_boot
         self.boot: dict[str, str] | None = None
         self.restores: list[dict[str, str]] = []
         self.uncertain: list[dict[str, str]] = []
@@ -300,6 +306,8 @@ class TimeAbiMonitor:
             f" {marker}" in line for marker in GUEST_BOOT_MARKERS
         ):
             self.guest_booted = True
+            if self.require_boot_marker:
+                self.require_boot("the guest boot marker")
         if not line.startswith(MARKER_PREFIX):
             return
         try:
@@ -365,11 +373,6 @@ class TimeAbiMonitor:
             online_cpus=online_cpus,
         )
         return self.boot
-
-    def require_boot_if_booted(self) -> None:
-        """Require the boot marker once a cold-booted guest reached its shell."""
-        if self.cold_boot and self.guest_booted:
-            self.require_boot("the guest boot marker")
 
 
 def warp_probe_command(*, cpus: str | None = None) -> str:

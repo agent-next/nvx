@@ -151,7 +151,6 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(monitor.require_boot("test", online_cpus=4)["cpus"], "4")
         self.assertEqual(len(monitor.uncertain), 1)
         self.assertEqual(monitor.restores[0]["generation"], "1")
-        monitor.require_boot_if_booted()
 
     def test_fails_fast_on_violation_events_and_failed_checks(self):
         monitor = TimeAbiMonitor(KVM_BOOT)
@@ -172,31 +171,36 @@ class MonitorTests(unittest.TestCase):
                 b"NVX-TIME-ABI: v=1 phase=boot status=maybe\n"
             )
 
-    def test_ignores_report_only_lines_but_reports_them_when_the_marker_is_missing(
-        self,
-    ):
+    def test_rejects_a_report_only_boot_when_the_guest_reaches_its_shell(self):
         monitor = TimeAbiMonitor(KVM_BOOT)
         monitor.feed(
             b"NVX-TIME-REPORT-VIOLATION: v=1 code=G_TSC_WARP source=watcher "
             b'phase=boot generation=0 boottime_ns=1 detail="x"\n'
             b"NVX-TIME-REPORT: v=1 phase=boot status=fail cpus=1 failures=3\n"
-            b"NVX-GUEST-BOOT-OK: alpine\n"
         )
         self.assertTrue(monitor.report_only)
         with self.assertRaisesRegex(TimeAbiFailure, "report-only"):
-            monitor.require_boot_if_booted()
+            monitor.feed(b"NVX-GUEST-BOOT-OK: alpine\n")
 
-    def test_requires_the_boot_marker_only_for_cold_boots_that_reached_the_shell(
-        self,
-    ):
+    def test_requires_a_valid_boot_marker_only_for_cold_boots(self):
+        with self.assertRaisesRegex(
+            TimeAbiFailure,
+            "did not print the NVX-TIME-ABI boot marker before the guest boot "
+            "marker; the guest image or OpenVMM does not implement time ABI v1",
+        ):
+            TimeAbiMonitor(KVM_BOOT).feed(b"NVX-GUEST-BOOT-OK: alpine\n")
+        mismatched = BOOT_LINE.replace("lapic_hz=1000000000", "lapic_hz=200000000")
         monitor = TimeAbiMonitor(KVM_BOOT)
-        monitor.require_boot_if_booted()
-        monitor.feed(b"NVX-GUEST-BOOT-OK: alpine\n")
-        with self.assertRaisesRegex(TimeAbiFailure, "does not implement time ABI"):
-            monitor.require_boot_if_booted()
-        restore = TimeAbiMonitor(MSHV_RESTORE)
-        restore.feed(b" ALPINE-MICROVM-BOOT-OK: 3.22.1\n")
-        restore.require_boot_if_booted()
+        monitor.feed(mismatched.encode())
+        with self.assertRaisesRegex(TimeAbiFailure, "is not the kvm rate"):
+            monitor.feed(b" ALPINE-MICROVM-BOOT-OK: 3.22.1\n")
+        # Restores and launches without a kernel never print a boot marker.
+        TimeAbiMonitor(MSHV_RESTORE).feed(b" ALPINE-MICROVM-BOOT-OK: 3.22.1\n")
+        TimeAbiMonitor(["openvmm"]).feed(b"NVX-GUEST-BOOT-OK: alpine\n")
+        with patch.object(time_abi, "REQUIRE_BOOT_MARKER", False):
+            legacy = TimeAbiMonitor(KVM_BOOT)
+        legacy.feed(b"NVX-GUEST-BOOT-OK: alpine\n")
+        self.assertTrue(legacy.guest_booted)
 
     def test_validates_boot_marker_fields_against_the_backend(self):
         cases = (
@@ -581,6 +585,20 @@ class RunnerWiringTests(unittest.TestCase):
                 benchmark.run_guest_script(
                     KVM_BOOT, "true\n", b"DONE", timeout=5, boot_marker=b"BOOT"
                 )
+
+    def test_cold_boot_runners_require_the_boot_marker(self):
+        boot = benchmark.BOOT_MARKER + b": 3.22.1\n"
+        interaction = FakeInteraction([boot, b"DONE\n"], 0)
+        with patch.object(benchmark, "InteractiveProcess", return_value=interaction):
+            with self.assertRaisesRegex(RuntimeError, "NVX-TIME-ABI boot marker"):
+                benchmark.run_guest_script(KVM_BOOT, "true\n", b"DONE", timeout=5)
+        self.assertEqual(interaction.writes, [])
+        conformant = FakeInteraction([BOOT_LINE.encode(), boot, b"DONE\n"], 0)
+        with patch.object(benchmark, "InteractiveProcess", return_value=conformant):
+            result = benchmark.run_guest_script(KVM_BOOT, "true\n", b"DONE", timeout=5)
+        self.assertIn("phase=boot status=ok", result["text"])
+        with self.assertRaisesRegex(RuntimeError, "NVX-TIME-ABI boot marker"):
+            self._measure([boot, benchmark.RESTORE_MARKER + b"\n"], 0, KVM_BOOT)
 
     def test_capture_snapshot_classifies_a_failed_capture_check(self):
         interaction = FakeInteraction([b"booting\n"], 193)

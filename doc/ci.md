@@ -25,7 +25,13 @@ Ubuntu initramfs. Failure logs from the NVX layer are uploaded per backend.
 Every harness launch, in the tests and the benchmarks, scans the OpenVMM
 console for the guest's [time ABI](design/time-abi.md) output. An
 `NVX-TIME-ABI-VIOLATION` event or a failed `NVX-TIME-ABI` conformance line
-fails the scenario at once with the guest's code and detail. An OpenVMM exit
+fails the scenario at once with the guest's code and detail. A cold boot whose
+guest reaches its boot marker without a passing `NVX-TIME-ABI` boot line also
+fails at once: init runs the boot check before any other guest work, so a
+missing line means the guest image or OpenVMM does not implement the ABI. The
+line must report ABI version 1, generation 0, a plausible TSC rate, and the
+backend's LAPIC rate; a report-only boot (`NVX-TIME-REPORT`) is never accepted.
+Restores carry no boot line. An OpenVMM exit
 status of 193, 194, or 195 is reported as the guest's time ABI conformance,
 runtime-violation, or restore-repair power-off, together with the event that
 preceded it, instead of as a generic exit status.
