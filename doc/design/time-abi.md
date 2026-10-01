@@ -1266,7 +1266,7 @@ fail if any check fails. The time checks replace the `nonstop_tsc` check.
 | `H1` | The backend device or API is present and usable |
 | `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, the generation name, and the profile that `auto` selects; an unmapped generation fails (`E_PROFILE_HOST_UNKNOWN`). `openvmm --hypervisor <backend> --cpu-fingerprint <path>` writes the fingerprint (`openvmm-cpu-fingerprint/v1`), checks it against the generation's profile, and prints one `NVX-CPU-PROFILE:` line (`E_PROFILE_HOST_UNKNOWN`, `E_PROFILE_UNSUPPORTED`). The host's invariant TSC (`constant_tsc` and `nonstop_tsc` on Linux, the CPUID bit on Windows) is reported as evidence only |
 | `H3` | OpenVMM preflight in verification mode: profile support, identity routing, synchronized TSC set, no scaling, and both rates, without booting a guest |
-| `H4` | TSC rate stability against the host's monotonic clock (see [Rate stability](#rate-stability-h4)) |
+| `H4` | TSC rate stability against the host's monotonic clock (see [Rate stability](#rate-stability-h4)). On a Linux host the detail also reports the host clocksource, as evidence only |
 | `H5` | Host cross-CPU TSC skew: a pinned-thread probe over all host CPU pairs, `max_abs_offset_ns <= 1000` |
 | `H6` | Guest warp probe on the qualification schedule (see [Warp schedules](#warp-schedules-h6-and-ci)) |
 | `H7` | Host UTC is synchronized: no `STA_UNSYNC` on Linux; a synchronized `w32tm` source on Windows |
@@ -1292,7 +1292,8 @@ uncertainty `u_i`, the two samples' uncertainties divided by the interval;
   run `H3`), `|r - F_d|` is at most 100 ppm of `F_d`.
 
 The detail reports `r`, its deviation from `F_d` in ppm, the agreement, the
-largest `u_i`, and the clock. An invariant TSC agrees with the host clock far
+largest `u_i`, the clock, and, on Linux, the host clocksource, which never
+gates. An invariant TSC agrees with the host clock far
 inside 1 ppm: 0.001 to 0.089 ppm over 1 s windows on the eleven CI runners,
 and 0.000 ppm with a residual of at most 0.07 µs over 118 s on the WHP hosts.
 A TSC that stops, slows, or is rescaled across idle misses the bound by
@@ -1322,16 +1323,25 @@ of the warps in #265:
 Qualification gates alike on every backend, on measured properties only: the
 CPU profile (`H2`, `H3`), rate stability (`H4`), and the idle-scheduled warp
 probe (`H6`, and the CI schedule in every microVM job). The host OS's
-invariant-TSC bit and the Linux host clocksource are recorded as evidence
-and never gate. Azure's WHP and nested MSHV hosts hide the bit from their
-guests, and the profile exposes it anyway, so `H4` and `H6` measure what the
-bit promises. MSHV roots and Azure KVM hosts run
-`hyperv_clocksource_tsc_page`, and KVM rewrites per-vCPU TSC offsets only on
-a host that marked its TSC unstable without that clocksource, which `H6`
-measures. `azure-azlinux-2` (8370C), whose host OS lacks the bit and which
-showed the #265 warps, is out of rotation and unqualified because our
-account cannot run guests there, not because of this rule; its host-level
-warp probe saw backward steps of at most 2.1 ns.
+invariant-TSC bit and the host clocksource are recorded as evidence and never
+gate, on any backend:
+
+- Azure's WHP and nested MSHV hosts hide the invariant-TSC bit from their
+  guests, and the profile exposes it anyway, so `H4` and `H6` measure what the
+  bit promises.
+- MSHV roots and Azure KVM hosts run `hyperv_clocksource_tsc_page`, not
+  `tsc`. The guest has no kvmclock, so no guest clock derives from the host
+  clocksource, and the downtime comes from host monotonic time and UTC, whose
+  accuracy does not depend on it.
+- KVM rewrites a vCPU's TSC offset whenever it loads the vCPU on a host that
+  marked its TSC unstable, unless the host clocksource is
+  `hyperv_clocksource_tsc_page`. `H6` measures the warps that this would
+  cause.
+
+`azure-azlinux-2` (8370C), whose host OS lacks the bit and which showed the
+#265 warps, is out of rotation and unqualified because our account cannot run
+guests there, not because of this rule; its host-level warp probe saw
+backward steps of at most 2.1 ns.
 
 ### Generations and runner placement
 
