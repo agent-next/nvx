@@ -58,9 +58,11 @@ def _read_exec_outcome(
     typed_outcome = (
         cast(dict[str, object], outcome) if isinstance(outcome, dict) else {}
     )
+    outcome_status_code = typed_outcome.get("status_code")
     if (
-        schema_version != 1
+        not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
+        or schema_version != 1
         or not isinstance(operation_id, str)
         or len(operation_id) != 32
         or any(character not in "0123456789abcdef" for character in operation_id)
@@ -68,8 +70,9 @@ def _read_exec_outcome(
         or set(typed_outcome) != {"operation", "category", "status_code"}
         or typed_outcome.get("operation") != "exec"
         or typed_outcome.get("category") != category
-        or typed_outcome.get("status_code") != status_code
-        or isinstance(typed_outcome.get("status_code"), bool)
+        or not isinstance(outcome_status_code, int)
+        or isinstance(outcome_status_code, bool)
+        or outcome_status_code != status_code
     ):
         raise RuntimeError("public exec outcome has unexpected typed fields")
     return cast(dict[str, Any], typed)
@@ -146,8 +149,9 @@ def run_managed_exec_configuration(
         raise ScriptError("Ubuntu layer manifest must contain a UUID string")
     output_dir.mkdir(parents=True, exist_ok=True)
     checks: list[dict[str, object]] = []
-    with tempfile.TemporaryDirectory(prefix="nvx-public-exec-") as temporary:
-        root = Path(temporary)
+    root = Path(tempfile.mkdtemp(prefix="nvx-public-exec-"))
+    preservation_reported = False
+    try:
         state = root / "state"
         scratch = root / "scratch.ext4"
         shutil.copyfile(scratch_template, scratch)
@@ -247,6 +251,7 @@ def run_managed_exec_configuration(
         started = False
         acceptance_error: Exception | None = None
         cleanup_errors: list[Exception] = []
+        deprovisioned = False
         try:
             invoke("start")
             started = True
@@ -385,12 +390,28 @@ def run_managed_exec_configuration(
                 cleanup_errors.append(error)
             try:
                 invoke("deprovision")
+                deprovisioned = True
             except Exception as error:
                 cleanup_errors.append(error)
             try:
                 persist_evidence()
             except Exception as error:
                 cleanup_errors.append(error)
+            if deprovisioned:
+                try:
+                    shutil.rmtree(root)
+                except Exception as error:
+                    cleanup_errors.append(error)
+            else:
+                preserved_path = _bounded_text(
+                    str(root).encode("utf-8", errors="replace")
+                )
+                preservation_reported = True
+                cleanup_errors.append(
+                    RuntimeError(
+                        f"managed fixture preserved for recovery: {preserved_path}"
+                    )
+                )
         if acceptance_error is not None:
             if cleanup_errors:
                 raise RuntimeError(
@@ -402,5 +423,15 @@ def run_managed_exec_configuration(
             raise RuntimeError(
                 f"public managed cleanup failed: {_format_errors(cleanup_errors)}"
             ) from cleanup_errors[0]
-        if not scratch.is_file() or not distro.is_file():
+        if not scratch_template.is_file() or not distro.is_file():
             raise RuntimeError("managed cleanup removed a supplied workload artifact")
+    except Exception as error:
+        if root.exists() and not preservation_reported:
+            preserved_path = _bounded_text(
+                str(root).encode("utf-8", errors="replace")
+            )
+            raise RuntimeError(
+                f"{error}; managed fixture preserved for recovery: "
+                f"{preserved_path}"
+            ) from error
+        raise

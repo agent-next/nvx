@@ -288,6 +288,12 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     cast(dict[str, object], payload["outcome"])["extra"] = "unexpected"
                 elif outcome_mutation == "missing-outcome":
                     del cast(dict[str, object], payload["outcome"])["category"]
+                elif outcome_mutation == "float-schema":
+                    payload["schema_version"] = 1.0
+                elif outcome_mutation == "float-status":
+                    cast(dict[str, object], payload["outcome"])[
+                        "status_code"
+                    ] = float(returncode)
                 report.write_text(
                     json.dumps(payload),
                     encoding="utf-8",
@@ -381,6 +387,8 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         self.assertEqual(exit_outcome["outcome"]["status_code"], 7)
         self.assertEqual(timeout_outcome["outcome"]["category"], "timeout")
         self.assertEqual(timeout_outcome["outcome"]["status_code"], 124)
+        fixture_root = Path(state_directories.pop()).parent
+        self.assertFalse(fixture_root.exists())
 
     def test_public_acceptance_preserves_test_and_cleanup_failures(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -411,6 +419,8 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             "missing-top-level",
             "extra-outcome",
             "missing-outcome",
+            "float-schema",
+            "float-status",
         ):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
                 with self.assertRaisesRegex(
@@ -494,6 +504,10 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 )
 
         self.assertIn("deprovision", [command[3] for command in commands])
+        fixture_root = Path(
+            commands[0][commands[0].index("--state-dir") + 1]
+        ).parent
+        self.assertFalse(fixture_root.exists())
 
     def test_failed_start_deprovisions_safely_stopped_sandbox(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -506,14 +520,19 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 )
 
         self.assertIn("deprovision", [command[3] for command in commands])
+        fixture_root = Path(
+            commands[0][commands[0].index("--state-dir") + 1]
+        ).parent
+        self.assertFalse(fixture_root.exists())
 
     def test_failed_stop_attempts_guarded_deprovision(self):
         with tempfile.TemporaryDirectory() as temporary:
             commands: list[list[str]] = []
             with self.assertRaisesRegex(
                 RuntimeError,
-                "stop failed.*sandbox must be stopped before deprovision",
-            ):
+                "stop failed.*sandbox must be stopped before deprovision.*"
+                "managed fixture preserved for recovery",
+            ) as raised:
                 self._run_acceptance(
                     Path(temporary),
                     stop_returncode=9,
@@ -521,6 +540,14 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 )
 
         self.assertIn("deprovision", [command[3] for command in commands])
+        fixture_root = Path(
+            commands[0][commands[0].index("--state-dir") + 1]
+        ).parent
+        self.assertIn(str(fixture_root), str(raised.exception))
+        self.assertTrue((fixture_root / "state" / "openvmm.log").is_file())
+        self.assertTrue((fixture_root / "scratch.ext4").is_file())
+        shutil.rmtree(fixture_root)
+        self.assertFalse(fixture_root.exists())
 
 
 class GuestIdentityScriptTests(unittest.TestCase):
