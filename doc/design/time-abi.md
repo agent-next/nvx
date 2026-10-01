@@ -345,15 +345,17 @@ at most 1 µs, that is `F_s / 1,000,000` cycles. Linux no longer checks this
 4. **Backend live skew.** Each backend shows that live skew stays within the
    bound after release (TBD per backend; WHP is a decision gate).
 
-The guest warp probe reports, for every ordered pair of online CPUs:
+The guest warp probe (`nvx-time-probe warp` in the fleet tooling) runs two
+tests on every pair of online CPUs, each for at least 100 ms per pair:
 
-- `max_warp_ns`: the largest backward step observed when one CPU reads its
-  TSC after observing the other CPU's latest TSC through a shared cache line,
-  over at least 1,000,000 handoffs per pair; and
-- `max_offset_ns`: the pairwise offset estimated by ping-pong exchanges,
-  taking each pair's minimum round trip.
+- `max_backward_ns`: the largest backward TSC step observed when the two CPUs
+  alternately read the TSC under a shared spinlock (the Linux
+  `check_tsc_warp` method); a lower bound on skew; and
+- `max_abs_offset_ns`: the largest pairwise offset estimated by ping-pong
+  rounds, `t2 - (t1 + t3) / 2` at the round with the minimum round trip.
 
-Both must be at most 1,000 ns. Cycle values convert to nanoseconds with `F`.
+Both must be at most 1,000 ns, and no pair may stall for more than 2 s.
+Cycle values convert to nanoseconds with `F`.
 
 ## Downtime semantics and source selection
 
@@ -922,8 +924,8 @@ fail if any check fails. The time checks replace the `nonstop_tsc` check.
 | `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, and the profile that `auto` selects (`E_PROFILE_HOST_UNKNOWN` fails) |
 | `H3` | OpenVMM preflight in verification mode: profile support, identity routing, synchronized TSC set, no scaling, and both rates, without booting a guest |
 | `H4` | Host TSC rate stability: two 1 s measurements of the TSC against host monotonic time agree within 1 ppm and are within 100 ppm of `F_d` |
-| `H5` | Host cross-CPU TSC skew: a pinned-thread probe over all host CPU pairs, `max_offset_ns <= 1000` |
-| `H6` | Guest warp probe: a microVM with the host's largest supported vCPU count up to 8 boots, passes the boot check, and reports `max_warp_ns` and `max_offset_ns` at most 1,000 |
+| `H5` | Host cross-CPU TSC skew: a pinned-thread probe over all host CPU pairs, `max_abs_offset_ns <= 1000` |
+| `H6` | Guest warp probe: a microVM with the host's largest supported vCPU count up to 8 boots, passes the boot check, and reports `max_backward_ns` and `max_abs_offset_ns` at most 1,000 |
 | `H7` | Host UTC is synchronized: no `STA_UNSYNC` on Linux; a synchronized `w32tm` source on Windows |
 | `H8` | Runner only: the runner's `cpu-<generation>` label equals the fingerprinted generation |
 
