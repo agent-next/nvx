@@ -16,6 +16,13 @@ from .common import ScriptError, artifact_path, require_file
 DIAGNOSTIC_LIMIT = 4096
 DEFAULT_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 DEFAULT_TERM = "linux"
+FORBIDDEN_DEFAULT_ENVIRONMENT_NAMES = {
+    "EMPTY",
+    "COMPLEX",
+    "SECOND",
+    "ORDER",
+    "NVX_EXEC_CONFIG_FD",
+}
 
 
 def _bounded_text(value: bytes) -> str:
@@ -102,6 +109,14 @@ def _read_environment(output: bytes) -> dict[str, str]:
             raise RuntimeError("public managed environment returned a duplicate entry")
         environment[decoded_name] = decoded_value
     return environment
+
+
+def _default_environment_matches(
+    environment: dict[str, str], required: dict[str, str]
+) -> bool:
+    return all(environment.get(name) == value for name, value in required.items()) and (
+        environment.keys().isdisjoint(FORBIDDEN_DEFAULT_ENVIRONMENT_NAMES)
+    )
 
 
 def _format_errors(errors: list[Exception]) -> str:
@@ -279,9 +294,9 @@ def run_managed_exec_configuration(
                 "USER": workload_name,
                 "LOGNAME": workload_name,
             }
-            if default_environment.stderr or _read_environment(
-                default_environment.stdout
-            ) != expected_defaults:
+            if default_environment.stderr or not _default_environment_matches(
+                _read_environment(default_environment.stdout), expected_defaults
+            ):
                 raise RuntimeError(
                     "public managed environment did not match workload defaults"
                 )

@@ -139,6 +139,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         default_environment: bytes = (
             b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
             b"TERM=linux\nHOME=/nonexistent\nUSER=nobody\nLOGNAME=nobody\n"
+            b"SHLVL=1\nnvx_workload_uid=65534\nnvx_hostname=nvx\n"
         ),
         evidence_failure: bool = False,
         command_log: list[list[str]] | None = None,
@@ -414,11 +415,15 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             "HOME": "/nonexistent",
             "USER": "nobody",
             "LOGNAME": "nobody",
+            "SHLVL": "1",
+            "nvx_workload_uid": "65534",
         }
+        required_names = ("PATH", "TERM", "HOME", "USER", "LOGNAME")
         mutations = [
             *[
                 (f"wrong-{name}", {**valid, name: f"wrong-{value}"})
                 for name, value in valid.items()
+                if name in required_names
             ],
             *[
                 (
@@ -429,9 +434,18 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                         if name != missing
                     },
                 )
-                for missing in valid
+                for missing in required_names
             ],
-            ("leaked-key", {**valid, "SECOND": "inline value"}),
+            *[
+                (f"leaked-{name}", {**valid, name: "leaked"})
+                for name in (
+                    "EMPTY",
+                    "COMPLEX",
+                    "SECOND",
+                    "ORDER",
+                    "NVX_EXEC_CONFIG_FD",
+                )
+            ],
         ]
         for mutation, environment in mutations:
             output = "".join(
@@ -444,6 +458,18 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     self._run_acceptance(
                         Path(temporary), default_environment=output
                     )
+
+    def test_public_acceptance_allows_unrelated_bootstrap_environment(self):
+        environment = (
+            b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
+            b"TERM=linux\nHOME=/nonexistent\nUSER=nobody\nLOGNAME=nobody\n"
+            b"SHLVL=1\nnvx_layer=distro\nnvx_workload_uid=65534\n"
+            b"nvx_workload_gid=65534\nnvx_hostname=nvx\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            self._run_acceptance(
+                Path(temporary), default_environment=environment
+            )
 
     def test_evidence_failure_still_deprovisions_stopped_sandbox(self):
         with tempfile.TemporaryDirectory() as temporary:
