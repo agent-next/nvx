@@ -249,54 +249,87 @@ timestamp read.
 
 ## CPU profiles
 
-A CPU profile is the complete guest-visible CPU surface for one CPU
-generation. Profiles are pinned in the OpenVMM source tree, derived by
-intersecting host fingerprints (the Firecracker `cpu-template-helper`
-workflow), and immutable once released: any change creates a new revision ID.
+A CPU profile is the complete guest-visible CPU surface for one vendor, CPU
+generation, and backend. The guest sees only profile values, never host
+passthrough, except for a fixed, code-defined set of VMM-owned fields and the
+fields the time ABI owns. Profiles are data: derived mechanically by
+intersecting host fingerprints (`openvmm --cpu-fingerprint`, the Firecracker
+`cpu-template-helper` workflow), reviewed, checked in at
+`vmm_core/cpu_profile/profiles/<id>.json`, embedded in the OpenVMM binary,
+and immutable once released. A normative change creates a new revision;
+released revisions are never deleted, so old snapshots stay restorable.
+Profiles are per backend because MSHV and WHP gate features through
+processor feature banks that a CPUID table cannot express, and cross-backend
+restore is rejected anyway.
 
-**Format.** A profile has these fields, in a canonical, deterministic
-encoding defined by OpenVMM's `cpu_profile` crate:
+**Format.** Schema `openvmm-cpu-profile/v1`, a canonical JSON document (keys
+sorted by UTF-8 bytes, no whitespace, numbers as hexadecimal strings):
 
 | Field | Content |
 | --- | --- |
-| `id` | `<vendor>-<generation>-v<revision>`, lowercase |
+| `id` | `<vendor>.<generation>.<backend>.v<revision>`, each component `[a-z0-9-]+`, for example `intel.icelake-sp.kvm.v1` |
 | `vendor` | The 12-byte CPUID vendor string |
-| `generation` | Allowed `(family, model)` display signatures; stepping is unconstrained |
-| `cpuid` | Every basic and extended leaf and subleaf the guest can observe, with exact register values and a mask of topology fields that OpenVMM synthesizes from the machine topology |
-| `xcr0`, `xss` | Exposed XSAVE feature masks |
-| `xsave_components` | Exact offset, size, and alignment of every enabled component |
-| `physical_address_width` | Guest physical address width |
-| `msrs` | Pinned MSR values the guest can read, such as `IA32_ARCH_CAPABILITIES` |
+| `cpus` | Allowed `(family, model, stepping range)` display signatures; stepping ranges separate model 85's Skylake-SP (0 to 4), Cascade Lake, and Cooper Lake |
+| `backend` | `kvm`, `mshv`, or `whp` |
+| `cpuid` | A dense table of every leaf and subleaf in `[0, max basic]` and `[0x80000000, max extended]` with a value and a mask per register; mask bit 1 pins the value, mask bit 0 marks a VMM-owned bit |
+| `xsave` | `xcr0` and `xss` masks the guest may enable, and the size, offset, and flags of every enabled component |
+| `msrs` | Pinned MSR values with masks, such as `IA32_ARCH_CAPABILITIES` and `IA32_PERF_CAPABILITIES` (0, no vPMU) |
+| `feature_banks` | MSHV and WHP only: processor feature banks 0 and 1 and the XSAVE feature bank |
+| `provenance` | Source fingerprint surface digests (informative) |
+| `digest` | `sha256:` and the SHA-256 of the canonical document without `digest`, `description`, and `provenance` |
 
-The profile digest is the SHA-256 of the canonical encoding. Profile content
-outside the topology mask is host-independent, so the effective guest CPUID
-is a pure function of the profile, the topology, and the time ABI.
+VMM-owned bits are a code table, not profile data: APIC IDs and logical
+counts, `OSXSAVE`, `OSPKE`, x2APIC, the XSAVE sizes for the current XCR0 and
+XSS, and cache-sharing counts; the topology leaves `0xB`, `0x1F`,
+`0x8000001E`, and `0x80000026` are absent from profiles. The time ABI owns
+`0x40000000..=0x4fffffff`, `0x15`, and `0x16`, which profiles exclude, and
+every profile pins the [CPU time bits](#cpu-time-bits). Invariant TSC and
+ARAT are pinned set and exempt from host-support verification, because
+nested Azure hypervisors hide them from fingerprints; host qualification
+measures them instead. Profiles also pin policy zeros (VMX and SVM, SGX, PT,
+RDT, PCONFIG, and the other features listed by the profiles' generator).
+`IA32_UCODE_REV` is not pinned in v1. The effective guest CPUID is a pure
+function of the profile, the VM topology, and the time ABI.
 
-**Selection.** A cold boot uses `--cpu-profile <id>`, or `auto`, which maps
-the host's `(vendor, family, model)` to exactly one pinned profile. An
-unmapped host is rejected (`E_PROFILE_HOST_UNKNOWN`); host CPUID passthrough
-does not exist. A restore always uses the profile embedded in the snapshot;
-an explicit `--cpu-profile` must name the same profile.
+**Selection.** A microVM always has a profile. A cold boot uses
+`--cpu-profile <id>`, or `auto` (the default), which selects the highest
+revision of the single profile whose backend is the running backend and
+whose `cpus` cover the host's vendor, family, model, and stepping as the
+VMM's host OS sees them (the L1 view on Azure). No match, or matches in more
+than one generation, is `E_PROFILE_HOST_UNKNOWN`, naming the host's
+signature and the available IDs; host CPUID passthrough does not exist. A
+restore always uses the profile recorded in the snapshot; an explicit
+`--cpu-profile` must name the same profile.
 
-**Verification.** At partition creation, for cold boot and restore:
+**Verification.** At partition creation, for cold boot and restore, OpenVMM
+reports every violation at once, naming the leaf, subleaf, register, and bit:
 
-1. The profile satisfies the [CPU time bits](#cpu-time-bits)
-   (`E_PROFILE_TIME_BITS`).
-2. The host's `(vendor, family, model)` is in the profile's generation
-   (`E_CPU_GENERATION`).
-3. The backend supports every feature bit the profile sets, every numeric
-   limit is within the backend's, the XSAVE layout matches exactly, and every
-   pinned MSR value can be presented (`E_PROFILE_UNSUPPORTED`, naming the
-   first missing leaf, register, and bit).
-4. On restore only: this OpenVMM pins a profile with the same ID and digest
-   (`E_PROFILE_UNKNOWN`, `E_PROFILE_DIGEST`), and the recomputed effective
-   CPUID equals the recorded one (`E_CPU_SURFACE`).
+1. The profile is valid: schema, digest, density, the VMM-owned mask table,
+   and the [CPU time bits](#cpu-time-bits) (`E_PROFILE_TIME_BITS`; a catalog
+   profile that fails is a build defect caught by unit tests).
+2. The backend is the profile's (`E_BACKEND_MISMATCH`), and the host's
+   vendor, family, model, and stepping are in `cpus` (`E_CPU_GENERATION`).
+3. The backend supports the profile (`E_PROFILE_UNSUPPORTED`): every set
+   feature bit is a supported bit, every limit (maximum leaves, address
+   widths) is within the backend's, every enabled XSAVE component has the
+   same size, offset, and flags, XCR0 and XSS are subsets, every pinned MSR
+   value can be presented (an `ARCH_CAPABILITIES` immunity the host lacks is
+   a violation), and on MSHV and WHP the profile's banks are subsets of the
+   host's. Time-ABI-owned bits and bits the backend emulates (the
+   hypervisor bit, KVM's in-kernel x2APIC) are exempt.
+4. On restore only: this OpenVMM pins a profile with the same ID and digest,
+   and the recorded document hashes to it (`E_PROFILE_UNKNOWN`,
+   `E_PROFILE_DIGEST`), and the recomputed effective CPUID equals the
+   recorded one (`E_CPU_SURFACE`). The effective-CPUID record replaces the
+   exact-equality CPU contract.
 
-Initial generations are `skylake-sp` (family 6, model 85: the bare-metal
-hosts), `icelake-sp` (6/106: the Xeon Platinum 8370C runners), and
-`emeraldrapids` (6/207: the 8573C runners). Profile IDs, contents, whether one
-profile serves all backends of a generation, and the fate of the
-`MYSTERY_MSRS` stubs are TBD(profiles).
+The initial catalog has eight profiles: `intel.skylake-sp.kvm.v1`,
+`intel.skylake-sp.mshv.v1`, `intel.skylake-sp.whp.v1` (family 6, model 85,
+steppings 0 to 4: the bare-metal hosts), `intel.icelake-sp.kvm.v1`,
+`intel.icelake-sp.mshv.v1`, `intel.icelake-sp.whp.v1` (6/106: the Xeon
+Platinum 8370C runners), `intel.emeraldrapids.mshv.v1`, and
+`intel.emeraldrapids.whp.v1` (6/207: the 8573C runners; no KVM host exists).
+Their contents and the fate of the `MYSTERY_MSRS` stubs are TBD(profiles).
 
 ## TSC rate policy and LAPIC rate rule
 
@@ -367,8 +400,10 @@ at most 1 µs, that is `F_s / 1,000,000` cycles. Linux no longer checks this
    516 ns on MSHV (dual-socket bare metal, bounded by the probe's round
    trip), and at most 70 ns on WHP.
 
-The guest warp probe (`nvx-time-probe warp` in the fleet tooling) runs two
-tests on every pair of online CPUs, each for at least 100 ms per pair:
+The guest warp probe (`nvx-time-probe warp`, built from
+`guest/common/nvx-time-probe.c` and installed as `/sbin/nvx-time-probe`)
+runs two tests on every pair of online CPUs, each for at least 100 ms per
+pair:
 
 - `max_backward_ns`: the largest backward TSC step observed when the two CPUs
   alternately read the TSC under a shared spinlock (the Linux
@@ -480,7 +515,9 @@ In the worker, with every VP stopped:
 
     (`E_TSC_TARGET_OVERFLOW` if it exceeds 64 bits). The backend writes
     `TSC_target` to every instantiated VP at that instant. Per-VP TSC values
-    from saved VP state are superseded and never applied afterwards.
+    from saved VP state are superseded and never applied afterwards. The
+    restore anchor's pairing is logged above 10 µs but not bounded: a pairing
+    error shifts every VP's TSC alike, by at most that amount.
 13. Read back: every instantiated VP holds the synchronized value as defined
     by its backend (`E_TSC_SYNC_READBACK`).
 14. Advance every VP's counting-mode LAPIC timer by `D` at `L`, and set every
@@ -589,7 +626,10 @@ driver polls `0xea` and reads `0xe9` from a timer thread; a sample on the
 console stream could interleave with input bytes. The window is not saved
 state: restore empties it. Guest users of selectors `0xa5`, `0xa6`, and
 `0xa7` serialize their transactions with an exclusive `flock` on
-`/run/nvx/portb.lock`.
+`/run/nvx/portb.lock`. The snapshot agent holds it from its capture request
+through repair step 8, and a discipline poll holds it from its first sample
+to the published state, so a capture may wait for an in-flight poll, which
+is bounded by three samples and two `adjtimex` calls.
 
 ### Restore packet
 
@@ -630,6 +670,12 @@ restore; every other field is sealed before the first restored VP runs (step
 packet; the packet is authoritative. `ACK_REQUIRED` replaces the guest's
 inference of gating from the tier and targets, so an untiered guest never
 writes `0x605` after an ungated restore.
+
+A VM process exposes at most one packet, and reading its last byte consumes
+it: status bits 1 to 4 clear and later `0xa5` writes select nothing. A guest
+that is captured again in the same process, including after a rejected
+capture, therefore never sees the earlier packet. It also ignores a packet
+whose `g` equals its recorded `g`.
 
 ### Time sample
 
@@ -705,12 +751,13 @@ and the managed agent.
 
 Init runs the boot check immediately after mounting `/proc`, `/sys`, and
 `/dev`, before any other guest work, and starts the daemon only if it passes.
-CPUID and MSRs are read on every online CPU through `/dev/cpu/<n>/cpuid` and
-`/dev/cpu/<n>/msr`.
+CPUID is executed on every online CPU (the checker pins itself to each CPU in
+turn), and MSRs are read through `/dev/cpu/<n>/msr`. A CPU's VP index is its
+Linux CPU number, because CPUs come online as a prefix in APIC-ID order.
 
 | ID | Check | Phases |
 | --- | --- | --- |
-| `C1` | Identity leaves `0x40000000..=0x40000005` equal the [identity table](#hypervisor-identity), with `C` equal to the number of possible CPUs; `0x40000006` and `0x40000081` follow the out-of-range rule; no base `0x40000100..=0x4000ff00` carries `KVMKVMKVM` | boot, restore (new CPUs) |
+| `C1` | Identity leaves `0x40000000..=0x40000005` equal the [identity table](#hypervisor-identity), with `C` equal to the number of possible CPUs; the explicit zero leaves `0x40000006..=0x4000000f` and `0x40000080..=0x40000082` are zero; at boot, on one CPU, no base `0x40000100..=0x4000ff00` carries `KVMKVMKVM` | boot, restore (new CPUs) |
 | `C2` | The [CPU time bits](#cpu-time-bits) | boot, restore (new CPUs) |
 | `C3` | MSR `0x40000002` equals the CPU's VP index; `0x40000022` equals `F` with `floor(F / 1000)` equal to the kernel's `cpu MHz` in kHz; `0x40000023` equals 1,000,000,000 or 200,000,000; `0x40000118` equals 1; reads of `0x40000000`, `0x40000001`, and `0x40000020` fail with `EIO` | boot; restore (CPU 0 `0x40000022` only) |
 | `C4` | The kernel log contains `Hypervisor detected: Microsoft Hyper-V`, `Hyper-V: privilege flags low 0x8860,`, `Hyper-V: LAPIC Timer Frequency: 0x989680` or `0x1e8480`, and `clocksource: Switched to clocksource tsc` as its last clocksource switch; it contains no record matching a watcher pattern other than `G_CLOCKSOURCE_SWITCH`, and none containing `Fast TSC calibration`, `Refined TSC clocksource calibration`, `kvm-clock`, or `APIC timer: using supplied frequency` | boot |
@@ -719,7 +766,7 @@ CPUID and MSRs are read on every online CPU through `/dev/cpu/<n>/cpuid` and
 | `C7` | `/proc/timer_list`: every online CPU's tick device is `lapic` with `hrtimer_interrupt` in one-shot mode; no `pit` or `hpet` device; no broadcast device | boot, capture, restore (deferred) |
 | `C8` | `/sys/bus/vmbus` and `/sys/devices/system/cpu/cpufreq/policy0` are absent; `rcu_cpu_stall_suppress` is 0 and `rcu_cpu_stall_timeout` is 21 | boot |
 | `C9` | `/proc/cmdline` contains none of `tsc_early_khz=`, `lapic_timer_hz=`, `notsc`, `nolapic`, `nolapic_timer`, `tsc=unstable`, `hpet=force`, or `clocksource=` with a value other than `tsc` | boot |
-| `C10` | The time daemon is running and has recorded no violation; `/sys/kernel/rcu_stall_count` is 0 | capture, restore |
+| `C10` | The time daemon is running and has recorded no violation; `/sys/kernel/rcu_stall_count` is 0; at boot, the state file is published and the daemon started | boot, capture, restore |
 | `C11` | Debug kernel only: `/proc/sys/kernel/soft_watchdog` is 1 and `/proc/sys/kernel/hung_task_timeout_secs` is nonzero | boot |
 | `C12` | A time sample within the [uncertainty bound](#uncertainty-bounds) is obtained, and the clock is stepped to host UTC | boot |
 
@@ -743,6 +790,14 @@ off with status 193. The boot step of `C12` steps the clock before any
 workload starts and is not counted as a discontinuity. The only other line
 with this prefix is the non-fatal `phase=runtime status=uncertain` line of
 the [wall-clock discipline](#wall-clock-discipline).
+
+**Report-only mode (test only).** The kernel token `nvx_time_abi=report-only`
+makes the checks and the watcher report instead of powering off, so the guest
+can be evaluated under an OpenVMM that does not implement the time ABI. It
+prints `NVX-TIME-REPORT` and `NVX-TIME-REPORT-VIOLATION` lines with the same
+fields, and its marker ends with ` failures=<n>`. These prefixes are reserved
+for this mode; production images never set the token, and harnesses never
+accept a report-only boot as conformant.
 
 ### Violation watcher
 
@@ -779,10 +834,10 @@ NVX-TIME-ABI-VIOLATION: v=1 code=<code> source=<conformance|watcher|repair> phas
 ```
 
 The guest writes it to `/dev/kmsg` at priority 2, to the portb data port
-`0xe9` through `/dev/port`, and to the console. Consumers treat identical
-lines as one event. The guest then writes the status to the shutdown port
-`0x604` through `nvx-exit`, whose first byte becomes the OpenVMM process exit
-status.
+`0xe9` (through `/dev/port` or `outb`), and to the console. Consumers treat
+identical lines as one event. The guest then writes the status to the
+shutdown port `0x604` (directly, or through `nvx-exit`); its first byte
+becomes the OpenVMM process exit status.
 
 ### Snapshot agent
 
@@ -864,7 +919,8 @@ The daemon keeps `CLOCK_REALTIME` on host UTC through the kernel's PLL:
   `epsilon <= 50 µs`. Otherwise skip the poll, count a rejected sample, set
   `last_sample_error=G_SAMPLE_UNCERTAIN`, and print
   `NVX-TIME-ABI: v=1 phase=runtime status=uncertain code=G_SAMPLE_UNCERTAIN
-  epsilon_ns=<smallest>` on the console. The next accepted sample resets
+  epsilon_ns=<smallest>` on the console, with `epsilon_ns=none` when no
+  attempt produced a valid sample. The next accepted sample resets
   `last_sample_error` to `none`.
   A sample whose `g` differs from the recorded `g` is discarded: a restore
   happened, and restore repair resets the discipline.
@@ -923,13 +979,13 @@ code.
 | --- | --- | --- |
 | `E_SNAPSHOT_VERSION` | Manifest version is not 6; the snapshot must be recaptured | Restore |
 | `E_MANIFEST_TIME` | Time contract missing or malformed, `time_abi_version` not 1, or tolerance not 250 | Restore |
-| `E_BACKEND_MISMATCH` | Snapshot taken on another backend | Restore |
-| `E_PROFILE_UNKNOWN` | Profile ID not pinned in this OpenVMM | Restore |
-| `E_PROFILE_DIGEST` | Embedded, recorded, and pinned profile digests disagree, or the effective-CPUID digest is wrong | Restore |
-| `E_PROFILE_HOST_UNKNOWN` | `--cpu-profile auto` maps the host to no profile | Cold boot |
-| `E_PROFILE_TIME_BITS` | The profile violates the CPU time bits | Cold boot, restore |
-| `E_CPU_GENERATION` | Host CPU generation not in the profile | Cold boot, restore |
-| `E_PROFILE_UNSUPPORTED` | Backend lacks a feature, limit, XSAVE layout, or MSR value of the profile | Cold boot, restore |
+| `E_BACKEND_MISMATCH` | Snapshot taken on another backend, or a profile for another backend | Cold boot, restore |
+| `E_PROFILE_UNKNOWN` | Profile ID not pinned in this OpenVMM | Cold boot, restore |
+| `E_PROFILE_DIGEST` | Recorded, embedded, and pinned profile digests disagree, or the effective-CPUID digest is wrong | Restore |
+| `E_PROFILE_HOST_UNKNOWN` | `--cpu-profile auto` maps the host to no profile, or to profiles of more than one generation | Cold boot |
+| `E_PROFILE_TIME_BITS` | The profile is invalid or violates the CPU time bits | Cold boot, restore |
+| `E_CPU_GENERATION` | Host CPU vendor, family, model, or stepping not in the profile | Cold boot, restore |
+| `E_PROFILE_UNSUPPORTED` | Backend lacks a feature, limit, XSAVE layout, MSR value, or feature-bank bit of the profile, or the host is not qualified | Cold boot, restore |
 | `E_CPU_SURFACE` | Recomputed effective CPUID differs from the recorded one | Restore |
 | `E_IDENTITY_ROUTING` | Backend cannot deliver the identity CPUID or MSRs | Cold boot, restore |
 | `E_TSC_SYNC_UNSUPPORTED` | Backend lacks the synchronized TSC set | Cold boot, restore |
