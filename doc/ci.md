@@ -149,6 +149,27 @@ pull requests run the GitHub-hosted validation jobs but do not execute code on
 the Azure runner fleet. A maintainer must stage an external contribution on a
 trusted repository branch before running the backend matrices.
 
+## Rust crate
+
+The required `aci-edge-sandboxes` job checks the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) on
+GitHub-hosted Ubuntu and Windows runners through the
+[`check-aci-edge-sandboxes`](../.github/actions/check-aci-edge-sandboxes/action.yml) action. The action
+runs rustfmt, Clippy with warnings denied, and rustdoc, all on the Rust
+toolchain that MXC pins. It also runs the unit, mock, and fake-OpenVMM
+integration tests, checks the declared minimum Rust version, and cross-checks
+the macOS build that MXC compiles. The fake-OpenVMM tests drive the real
+OpenVMM backend through its control protocol without a hypervisor.
+
+Each `nvx-microvm-tests-{kvm,mshv,whp}` job then runs
+`nvx.py test-aci-edge-sandboxes` on its self-hosted runner. This command drives a
+complete provision, start, exec, stop, start, and deprovision cycle of the
+Alpine guest with the crate's OpenVMM backend. It also checks cancellation,
+that guest state lasts only until a stop, that a start terminates the VM of an
+interrupted earlier start, host path mappings, and egress rules. On failure
+it keeps the OpenVMM log under `build/test-results/aci-edge-sandboxes-<backend>`, which is
+uploaded with the other microVM logs. Changes under `aci_edge_sandboxes/` therefore trigger
+the backend matrices.
+
 ## Adversarial campaigns
 
 The separate

@@ -36,6 +36,7 @@ python3 scripts/nvx.py performance gate --help
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
 | `test-openvmm` | Run self-contained OpenVMM microVM control-plane tests. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
+| `test-aci-edge-sandboxes` | Run the `aci_edge_sandboxes` Rust crate lifecycle test on a real hypervisor. |
 | `test-adversarial` | Run a brokered Copilot-driven adversarial campaign. |
 | `build` | Build the guest artifacts and OpenVMM. |
 | `download` | Download and install the latest matching GitHub release. |
@@ -225,6 +226,26 @@ default. Ubuntu rejects the Alpine-control-only `sandbox-blocks` and
 scenario, and the sandbox-control-dependent `snapshot-tiers` scenario. The
 command requires `build/vmlinux`, the selected initramfs, and
 `openvmm/target/release/openvmm[.exe]`.
+
+### `test-aci-edge-sandboxes`
+
+```text
+python3 scripts/nvx.py test-aci-edge-sandboxes
+    --backend {kvm,mshv,whp}
+    [--output-dir PATH]
+    [--cargo CARGO]
+```
+
+Runs the ignored `openvmm_e2e` tests of the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md)
+against a real hypervisor. The tests start sandboxes with `build/vmlinux` and
+the Alpine initramfs, whose userland the workloads use directly, and run
+workloads. They check the workload identity, timeouts, and cancellation, that
+guest state lasts until a stop, and that a start terminates the VM of an
+interrupted earlier start before deprovisioning. They also map temporary host
+directories read-only, read-write, and denied, and check egress defaults and
+rules against the network gateway, which needs no Internet access. The command requires
+Cargo and `openvmm/target/release/openvmm[.exe]`, and writes the OpenVMM log to
+`--output-dir` (default `build/test-results/aci_edge_sandboxes`) when the test fails.
 
 ### `test-adversarial`
 

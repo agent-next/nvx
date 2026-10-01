@@ -33,6 +33,7 @@ from unittest.mock import MagicMock, call, patch
 sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
 from nvx_tools import (  # noqa: E402
+    aci_edge_sandboxes_tests,
     archive,
     benchmark,
     build,
@@ -1751,7 +1752,7 @@ class CiTests(unittest.TestCase):
 
 class CiConfigurationTests(unittest.TestCase):
     def test_required_ci_result_policy(self):
-        always_successful = {"quality", "openvmm-changes"}
+        always_successful = {"quality", "aci-edge-sandboxes", "openvmm-changes"}
         builds = set(ci.REQUIRED_CI_BUILD_JOBS)
         openvmm_tests = set(ci.REQUIRED_CI_OPENVMM_TEST_JOBS)
         openvmm_artifact_tests = set(ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS)
@@ -5670,6 +5671,120 @@ class ManagedAgentStopTests(unittest.TestCase):
         kind, request_id, status, body = self._request("-", 5, b"abc")
         self.assertEqual((kind, request_id, status), (0xFF, 42, 22))
         self.assertEqual(body, b"invalid-request")
+
+
+class AciSandboxRunnerTests(unittest.TestCase):
+    def _artifacts(self, root: Path) -> dict[str, Path]:
+        names = {
+            KernelBuildConstants.BINARY_NAME: b"kernel",
+            AlpineBuildConstants.INITRAMFS_NAME: b"initrd",
+            "openvmm": b"vmm",
+        }
+        paths: dict[str, Path] = {}
+        for name, contents in names.items():
+            paths[name] = root / name
+            paths[name].write_bytes(contents)
+        return paths
+
+    def _environment(self, root: Path, paths: dict[str, Path]) -> dict[str, str]:
+        def artifact(name: str) -> Path:
+            return root / name
+
+        def openvmm() -> Path:
+            return paths["openvmm"]
+
+        with (
+            patch.object(aci_edge_sandboxes_tests, "artifact_path", artifact),
+            patch.object(aci_edge_sandboxes_tests, "openvmm_binary_path", openvmm),
+        ):
+            return aci_edge_sandboxes_tests.e2e_environment(
+                "kvm", root / "state", root / "out"
+            )
+
+    def test_cli_registers_the_lifecycle_test(self):
+        args = nvx.parse_args(["test-aci-edge-sandboxes", "--backend", "mshv"])
+
+        self.assertEqual(args.backend, "mshv")
+        self.assertEqual(args.cargo, "cargo")
+        self.assertFalse(hasattr(args, "scratch_template"))
+        self.assertIs(args.handler, aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes)
+
+    def test_environment_resolves_repository_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self._artifacts(root)
+            environment = self._environment(root, paths)
+
+            self.assertEqual(environment["ACI_EDGE_SANDBOXES_E2E_HYPERVISOR"], "kvm")
+            self.assertEqual(
+                Path(environment["ACI_EDGE_SANDBOXES_E2E_OPENVMM"]), paths["openvmm"].resolve()
+            )
+            self.assertEqual(
+                Path(environment["ACI_EDGE_SANDBOXES_E2E_INITRD"]),
+                paths[AlpineBuildConstants.INITRAMFS_NAME].resolve(),
+            )
+            self.assertEqual(
+                Path(environment["ACI_EDGE_SANDBOXES_E2E_STATE_ROOT"]),
+                (root / "state").resolve(),
+            )
+            self.assertFalse(
+                any(name.startswith("ACI_EDGE_SANDBOXES_E2E_DISTRO") for name in environment)
+            )
+            self.assertNotIn("ACI_EDGE_SANDBOXES_E2E_SCRATCH", environment)
+
+    def test_environment_requires_the_alpine_initramfs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self._artifacts(root)
+            paths[AlpineBuildConstants.INITRAMFS_NAME].unlink()
+            with self.assertRaisesRegex(common.ScriptError, "Alpine initramfs"):
+                self._environment(root, paths)
+
+    def test_command_runs_only_the_ignored_lifecycle_test(self):
+        command = aci_edge_sandboxes_tests.e2e_command("cargo")
+
+        self.assertEqual(command[:2], ["cargo", "test"])
+        self.assertEqual(
+            Path(command[command.index("--manifest-path") + 1]),
+            BuildConstants.REPO_ROOT / "aci_edge_sandboxes" / "Cargo.toml",
+        )
+        self.assertIn("--locked", command)
+        self.assertEqual(command[command.index("--test") + 1], "openvmm_e2e")
+        self.assertEqual(command[-2:], ["--ignored", "--nocapture"])
+
+    def test_handler_returns_the_test_status(self):
+        observed: list[str] = []
+
+        def fake_run(
+            command: list[str], *, env: dict[str, str], check: bool
+        ) -> subprocess.CompletedProcess[bytes]:
+            self.assertFalse(check)
+            self.assertEqual(command, aci_edge_sandboxes_tests.e2e_command("cargo"))
+            observed.append(env["ACI_EDGE_SANDBOXES_E2E_STATE_ROOT"])
+            return subprocess.CompletedProcess(command, 3)
+
+        def fake_environment(
+            backend: str, state_root: Path, output_dir: Path
+        ) -> dict[str, str]:
+            self.assertEqual(backend, "whp")
+            return {"ACI_EDGE_SANDBOXES_E2E_STATE_ROOT": os.fspath(state_root)}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            args = argparse.Namespace(
+                backend="whp",
+                output_dir=Path(temporary) / "results",
+                cargo="cargo",
+            )
+            with (
+                patch.object(aci_edge_sandboxes_tests, "validate_openvmm_test_backend"),
+                patch.object(aci_edge_sandboxes_tests, "e2e_environment", fake_environment),
+                patch.object(aci_edge_sandboxes_tests.subprocess, "run", fake_run),
+            ):
+                self.assertEqual(aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes(args), 3)
+            self.assertTrue((Path(temporary) / "results").is_dir())
+
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(Path(observed[0]).name, "state")
 
 
 class SandboxTests(unittest.TestCase):

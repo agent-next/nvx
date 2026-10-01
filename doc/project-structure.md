@@ -87,6 +87,7 @@ nvx/
 |   |   |-- collect_alpine_sources.py Alpine source collection
 |   |   |-- collect_ubuntu_sources.py Ubuntu source collection
 |   |   |-- guests.py           Typed guest descriptors
+|   |   |-- aci_edge_sandboxes_tests.py     Real-hypervisor aci_edge_sandboxes lifecycle test harness
 |   |   |-- ubuntu.py           Verified Ubuntu rootfs and EROFS preparation
 |   |   `-- create_linux_source_archive.py Linux source packaging
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
