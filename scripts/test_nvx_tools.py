@@ -3,6 +3,7 @@
 
 import argparse
 import ast
+import errno
 import hashlib
 import http.client
 import http.server
@@ -5360,6 +5361,168 @@ class SandboxSmokeShareTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
 
 
+class ManagedAgentCgroupTests(unittest.TestCase):
+    SOURCE = Path(__file__).parents[1] / "guest" / "common" / "nvx-managed-agent.c"
+
+    def setUp(self):
+        if sys.platform != "linux":
+            self.skipTest("the managed agent requires Linux")
+        compiler = shutil.which("cc") or shutil.which("gcc")
+        if compiler is None:
+            self.skipTest("C compiler is unavailable")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.cgroup = root / "cgroup"
+        self.cgroup.mkdir()
+        (self.cgroup / "cgroup.procs").touch()
+        self.execution = self.cgroup / "nvx-exec"
+        self.execution.mkdir()
+        self.events = self.execution / "cgroup.events"
+        self.events.write_bytes(b"populated 0\nfrozen 0\n")
+        (self.execution / "cgroup.kill").touch()
+        source = root / "cgroup-test.c"
+        source.write_text(
+            f"""#define CGROUP_ROOT {json.dumps(str(self.cgroup))}
+#define main managed_agent_main
+#include {json.dumps(str(self.SOURCE))}
+#undef main
+int main(int argc, char **argv)
+{{
+    int result;
+    if (argc != 2) {{
+        return 2;
+    }}
+    errno = 0;
+    if (strcmp(argv[1], "retry") == 0) {{
+        struct control_session session = {{.fd = STDOUT_FILENO}};
+        struct agent_config config = {{.direct = 1}};
+        char *command[] = {{"/bin/true", NULL}};
+        result = run_exec(&session, &config, 42, 0, command);
+        return result == 0 ? run_exec(&session, &config, 43, 0, command) : result;
+    }}
+    if (strcmp(argv[1], "population") == 0) {{
+        result = exec_cgroup_populated();
+    }} else if (strcmp(argv[1], "settle") == 0) {{
+        result = settle_exec_cgroup();
+    }} else {{
+        return 2;
+    }}
+    printf("%d %d\\n", result, errno);
+    return 0;
+}}
+""",
+            encoding="utf-8",
+        )
+        self.helper = root / "cgroup-test"
+        flags = [
+            flag
+            for flag in InitramfsBuildConstants.STATIC_HELPER_CFLAGS
+            if flag != "-static"
+        ]
+        result = subprocess.run(
+            [compiler, *flags, "-o", str(self.helper), str(source)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _check(self, mode: str) -> tuple[int, int]:
+        result = subprocess.run(
+            [str(self.helper), mode],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value, status = result.stdout.split()
+        return int(value), int(status)
+
+    def _assert_further_exec_refused(self):
+        result = subprocess.run(
+            [str(self.helper), "retry"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        frames = result.stdout
+        for expected_id in (42, 43):
+            outer = ManagedAgentStopTests.OUTER
+            app = ManagedAgentStopTests.APP
+            *_, length = outer.unpack(frames[: outer.size])
+            frame = frames[outer.size : outer.size + length]
+            _, _, kind, _, request_id, status, payload_len = app.unpack(
+                frame[: app.size]
+            )
+            payload = frame[app.size :]
+            self.assertEqual((kind, request_id, status), (0xFF, expected_id, 125))
+            self.assertEqual(payload_len, len(payload))
+            self.assertEqual(payload, b"containment-failed")
+            frames = frames[outer.size + length :]
+        self.assertEqual(frames, b"")
+
+    def test_population_requires_a_valid_unique_field(self):
+        for value in (0, 1):
+            with self.subTest(value=value):
+                self.events.write_text(f"populated {value}\nfrozen 0\n")
+                self.assertEqual(self._check("population")[0], value)
+        for contents in (
+            b"",
+            b"frozen 0\n",
+            b"populated 0",
+            b"populated 2\n",
+            b"populated 01\n",
+            b"populated 0\npopulated 1\n",
+            b"populated 0\n\x00frozen 0\n",
+        ):
+            with self.subTest(contents=contents):
+                self.events.write_bytes(contents)
+                self.assertEqual(self._check("population"), (-1, errno.EPROTO))
+        self.events.write_bytes(b"populated 0\n" + b"x" * 256)
+        self.assertEqual(self._check("population"), (-1, errno.EOVERFLOW))
+
+    def test_missing_and_unreadable_events_are_errors(self):
+        self.events.unlink()
+        self.assertEqual(self._check("population"), (-1, errno.ENOENT))
+        self._assert_further_exec_refused()
+        self.events.mkdir()
+        self.assertEqual(self._check("population"), (-1, errno.EISDIR))
+        self._assert_further_exec_refused()
+
+    def test_settlement_verifies_emptiness(self):
+        self.assertEqual(self._check("settle")[0], 0)
+        self.assertEqual((self.execution / "cgroup.kill").read_bytes(), b"1")
+
+    def test_settlement_does_not_hide_kill_or_verification_failures(self):
+        self.events.write_bytes(b"populated 1\n")
+        (self.execution / "cgroup.kill").unlink()
+        self.assertEqual(self._check("settle"), (-1, errno.ENOENT))
+        self._assert_further_exec_refused()
+        (self.execution / "cgroup.kill").touch()
+        self.events.unlink()
+        self.assertEqual(self._check("settle"), (-1, errno.ENOENT))
+        self._assert_further_exec_refused()
+
+    def test_populated_cgroup_at_deadline_is_not_settled(self):
+        self.events.write_bytes(b"populated 1\n")
+        started = time.monotonic()
+        self.assertEqual(self._check("settle"), (-1, errno.ETIMEDOUT))
+        self.assertGreaterEqual(time.monotonic() - started, 1.9)
+        self._assert_further_exec_refused()
+
+    def test_malformed_events_refuse_further_exec_until_verified_empty(self):
+        self.events.write_bytes(b"frozen 0\n")
+        self.assertEqual(self._check("settle"), (-1, errno.EPROTO))
+        self._assert_further_exec_refused()
+        self.events.write_bytes(b"populated 0\nfrozen 0\n")
+        self.assertEqual(self._check("population")[0], 0)
+        self.assertEqual(self._check("settle")[0], 0)
+
+
 class ManagedAgentStopTests(unittest.TestCase):
     SOURCE = Path(__file__).parents[1] / "guest" / "common" / "nvx-managed-agent.c"
     OUTER = struct.Struct("<4sHBB16sQQI")
@@ -5420,8 +5583,13 @@ class ManagedAgentStopTests(unittest.TestCase):
         if process.poll() is None:
             process.kill()
         process.wait(timeout=5)
+        if process.stderr is not None:
+            process.stderr.close()
 
-    def test_sandbox_agent_returns_to_init_agent_after_stop(self):
+    def _open_session(
+        self, rootfs: str
+    ) -> tuple[subprocess.Popen[bytes], int, bytes, float]:
+        """Starts an agent and completes the attach and reset handshake."""
         if sys.platform != "linux":
             self.skipTest("the managed agent requires a Linux pseudo-terminal")
         import pty
@@ -5433,7 +5601,7 @@ class ManagedAgentStopTests(unittest.TestCase):
             [
                 str(self.agent),
                 os.ttyname(slave),
-                "/run/nvx/rootfs",
+                rootfs,
                 "nvx-sandbox",
                 "65534",
                 "65534",
@@ -5452,6 +5620,29 @@ class ManagedAgentStopTests(unittest.TestCase):
         os.write(master, self._record(3, instance, 7))
         record_type, sequence, credit = self._read_record(master, deadline)
         self.assertEqual((record_type, sequence, len(credit)), (4, 0, 4))
+        return process, master, instance, deadline
+
+    def _request(
+        self, rootfs: str, kind: int, payload: bytes = b""
+    ) -> tuple[int, int, int, bytes]:
+        """Sends one request to a fresh agent; returns the kind, request ID, status, and payload of its answer."""
+        _, master, instance, deadline = self._open_session(rootfs)
+        frame = self.APP.pack(b"NVXC", 1, kind, 0, 42, 0, len(payload)) + payload
+        os.write(master, self._record(5, instance, 8, frame))
+        self.assertEqual(self._read_record(master, deadline)[0], 9)
+        record_type, _, answer = self._read_record(master, deadline)
+        self.assertEqual(record_type, 5)
+        _, _, answered, _, request_id, status, length = self.APP.unpack(
+            answer[: self.APP.size]
+        )
+        body = answer[self.APP.size :]
+        self.assertEqual(length, len(body))
+        return answered, request_id, status, body
+
+    def test_sandbox_agent_returns_to_init_agent_after_stop(self):
+        if sys.platform != "linux":
+            self.skipTest("the managed agent requires a Linux pseudo-terminal")
+        process, master, instance, deadline = self._open_session("/run/nvx/rootfs")
         stop = self.APP.pack(b"NVXC", 1, 3, 0, 42, 0, 0)
         os.write(master, self._record(5, instance, 8, stop))
         self.assertEqual(self._read_record(master, deadline)[0], 9)
@@ -5462,6 +5653,23 @@ class ManagedAgentStopTests(unittest.TestCase):
 
         _, stderr = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 0, stderr)
+
+    def test_agent_advertises_the_control_features_of_its_mode(self):
+        cancel, host_mappings, workload_account, exec_cgroup = 1, 2, 4, 8
+        for rootfs, expected in (
+            # Only the direct agent maps host paths and gives each workload a cgroup.
+            ("-", cancel | host_mappings | workload_account | exec_cgroup),
+            ("/run/nvx/rootfs", cancel | workload_account),
+        ):
+            with self.subTest(rootfs=rootfs):
+                kind, request_id, status, body = self._request(rootfs, 5)
+                self.assertEqual((kind, request_id, status), (0x81, 42, 0))
+                self.assertEqual(struct.unpack("<I", body), (expected,))
+
+    def test_agent_refuses_a_features_request_with_a_payload(self):
+        kind, request_id, status, body = self._request("-", 5, b"abc")
+        self.assertEqual((kind, request_id, status), (0xFF, 42, 22))
+        self.assertEqual(body, b"invalid-request")
 
 
 class SandboxTests(unittest.TestCase):
