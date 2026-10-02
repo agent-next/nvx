@@ -807,10 +807,13 @@ def check_guest_warp(context: DoctorContext) -> CheckResult:
             return CheckResult("H6", False, f"vcpus={count}: {first}")
         boots.append(boot)
         rounds.extend(count_rounds)
+        # The boot check's wall time and, where the guest reports it, its CPU
+        # time, which the spec budgets; both are evidence only.
+        cpu_us = f" boot_cpu_us={boot['cpu_us']}" if "cpu_us" in boot else ""
         runs.append(
             f"vcpus={count} rounds={len(count_rounds)} "
             f"idle_gaps_s={','.join(count_gaps) or 'none'} "
-            f"boot_elapsed_us={boot.get('elapsed_us', '?')}"
+            f"boot_elapsed_us={boot.get('elapsed_us', '?')}{cpu_us}"
         )
 
     def worst(name: str) -> int:

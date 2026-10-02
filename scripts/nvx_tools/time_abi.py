@@ -33,6 +33,23 @@ LAPIC_HZ: Mapping[str, int] = {
 }
 MIN_TSC_HZ = 500_000_000
 MAX_TSC_HZ = 10_000_000_000
+# doc/design/time-abi.md, "Performance": each backend has a CPU-time
+# (cpu_us) budget per phase (boot, capture, and restore): a base plus an
+# increment per additional online CPU, in microseconds. These are the spec's
+# bare-metal floors from the guest's v7 measurements; its final values are the
+# larger of those and the Azure maxima. This table is the one place the
+# harness reads them. The checks' wall time (elapsed_us) has no budget. CI
+# reports both and gates on neither: the performance gate is the A/B
+# comparison outside CI.
+CHECK_CPU_BUDGET_US: Mapping[str, Mapping[str, tuple[int, int]]] = {
+    "kvm": {"boot": (6_000, 2_000), "capture": (1_000, 400), "restore": (5_000, 1_500)},
+    "mshv": {"boot": (3_000, 500), "capture": (1_000, 400), "restore": (1_500, 500)},
+    "whp": {
+        "boot": (5_000, 1_000),
+        "capture": (1_000, 400),
+        "restore": (20_000, 2_000),
+    },
+}
 WARP_BOUND_NS = 1000
 WARP_PROBE_PATH = "/sbin/nvx-time-probe"
 WARP_SUMMARY_PREFIX = "NVX-TIME-PROBE warp "
@@ -202,6 +219,15 @@ def parse_violation(line: str) -> dict[str, str] | None:
     if "code" not in fields:
         raise ValueError(f"time ABI violation lacks a code: {line!r}")
     return fields
+
+
+def check_cpu_budget_us(backend: str, phase: str, cpus: int) -> int | None:
+    """Return the CPU-time budget of one time ABI ``phase`` check at ``cpus`` CPUs."""
+    budget = CHECK_CPU_BUDGET_US.get(backend, {}).get(phase)
+    if budget is None or cpus < 1:
+        return None
+    base, per_cpu = budget
+    return base + per_cpu * (cpus - 1)
 
 
 def describe_exit_status(returncode: int | None) -> str | None:

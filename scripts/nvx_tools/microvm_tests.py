@@ -60,11 +60,13 @@ from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .openvmm_process import OpenvmmProcess, TcpConsole
 from .time_abi import (
     ABI_VERSION,
+    CHECK_CPU_BUDGET_US,
     WARP_PROBE_COMPLETION_MARKER,
     WARP_PROBE_FAILURE_MARKER,
     WARP_SUMMARY_PREFIX,
     TimeAbiFailure,
     TimeAbiMonitor,
+    check_cpu_budget_us,
     check_warp_probe,
     describe_exit_status,
     parse_fields,
@@ -1218,17 +1220,21 @@ def _check_exhaustive_report(text: str, *, processors: int) -> None:
         raise RuntimeError("time ABI exhaustive check: " + "; ".join(problems))
 
 
-def time_abi_evidence(output_dir: Path) -> dict[str, str]:
+def time_abi_evidence(output_dir: Path, backend: str | None = None) -> dict[str, str]:
     """Sum up the time ABI evidence in the guest logs of one run.
 
     nvx-time status prints every recorded phase, oldest first, and then its
     runtime line, so a restored guest repeats its source's boot and capture
     lines. Only each query's newest phase line counts: one boot per cold-boot
-    query and one restore per post-restore query.
+    query and one restore per post-restore query. Where the guest reports a
+    check's CPU time (cpu_us), the evidence also counts the checks over
+    ``backend``'s CPU-time budget for their phase; it never gates on either.
     """
     offsets: list[int] = []
     backward: list[int] = []
     elapsed: dict[str, list[int]] = {"boot": [], "capture": [], "restore": []}
+    cpu: dict[str, list[int]] = {"boot": [], "capture": [], "restore": []}
+    over_budget: dict[str, int] = {"boot": 0, "capture": 0, "restore": 0}
     exhaustive: list[str] = []
     stalls: list[str] = []
     for path in sorted(output_dir.rglob("*.log")):
@@ -1260,11 +1266,23 @@ def time_abi_evidence(output_dir: Path) -> dict[str, str]:
                         continue
                     last, newest = newest, None
                     if (
-                        last is not None
-                        and last["status"] == "ok"
-                        and last["phase"] in elapsed
+                        last is None
+                        or last["status"] != "ok"
+                        or last["phase"] not in elapsed
                     ):
-                        elapsed[last["phase"]].append(int(last["elapsed_us"]))
+                        continue
+                    phase = last["phase"]
+                    elapsed[phase].append(int(last["elapsed_us"]))
+                    if "cpu_us" in last:
+                        cpu_us = int(last["cpu_us"])
+                        cpu[phase].append(cpu_us)
+                        budget = (
+                            None
+                            if backend is None
+                            else check_cpu_budget_us(backend, phase, int(last["cpus"]))
+                        )
+                        if budget is not None and cpu_us > budget:
+                            over_budget[phase] += 1
             except (KeyError, ValueError):
                 continue
     evidence: dict[str, str] = {}
@@ -1276,6 +1294,10 @@ def time_abi_evidence(output_dir: Path) -> dict[str, str]:
         if values:
             evidence[f"{phase}_markers"] = str(len(values))
             evidence[f"{phase}_elapsed_us"] = f"{min(values)}-{max(values)}"
+        if cpu[phase]:
+            evidence[f"{phase}_cpu_us"] = f"{min(cpu[phase])}-{max(cpu[phase])}"
+            if backend is not None and phase in CHECK_CPU_BUDGET_US.get(backend, {}):
+                evidence[f"{phase}_cpu_over_budget"] = str(over_budget[phase])
     if exhaustive:
         evidence["exhaustive"] = ",".join(exhaustive)
     if stalls:
@@ -1287,7 +1309,7 @@ def report_time_abi_evidence(
     output_dir: Path, *, backend: str, guest: str, debug_kernel: bool
 ) -> str | None:
     """Print the run's evidence line and add it to the GitHub job summary."""
-    evidence = time_abi_evidence(output_dir)
+    evidence = time_abi_evidence(output_dir, backend)
     if not evidence:
         return None
     fields = {

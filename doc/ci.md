@@ -110,7 +110,14 @@ for failed jobs: the number of warp probe runs with their worst
 `max_abs_offset_ns` and `max_backward_ns`, the count and `elapsed_us` range of
 the newest check that each `nvx-time status` query reported (boot after a cold
 boot, restore after a restore), the exhaustive check's summary, and the
-`restore-downtime` stall counts.
+`restore-downtime` stall counts. Where the guest reports a check's CPU time
+(`cpu_us`), the line also gives its range and how many checks exceed the
+backend's [CPU-time budget](design/time-abi.md#performance-expectations-and-acceptance-gate)
+for their phase, which the spec sets from guest measurements.
+`CHECK_CPU_BUDGET_US` in `scripts/nvx_tools/time_abi.py` holds the budgets, one
+per backend and phase. `elapsed_us` is wall time, including waits behind the
+workload, and has no budget. CI gates on neither: the performance gate is the
+A/B comparison outside CI.
 
 The `nvx-microvm-debug-{kvm,mshv,whp}` jobs run
 `test-microvm --debug-kernel` on the CI debug kernel (`build/vmlinux-debug`,

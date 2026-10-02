@@ -135,6 +135,22 @@ class FieldParsingTests(unittest.TestCase):
             ["intel.skylake-sp.v1", "intel.icelake-sp.v1", "intel.emeraldrapids.v1"],
         )
 
+    def test_computes_the_checks_cpu_time_budget(self):
+        # The spec's bare-metal floors: a base plus an increment per additional
+        # CPU, one budget per backend and phase.
+        for backend in ("kvm", "mshv", "whp"):
+            self.assertEqual(
+                set(time_abi.CHECK_CPU_BUDGET_US[backend]),
+                {"boot", "capture", "restore"},
+            )
+        self.assertEqual(time_abi.check_cpu_budget_us("kvm", "boot", 1), 6_000)
+        self.assertEqual(time_abi.check_cpu_budget_us("mshv", "restore", 8), 5_000)
+        self.assertEqual(time_abi.check_cpu_budget_us("whp", "capture", 2), 1_400)
+        self.assertEqual(time_abi.check_cpu_budget_us("whp", "restore", 1), 20_000)
+        self.assertIsNone(time_abi.check_cpu_budget_us("hvf", "boot", 1))
+        self.assertIsNone(time_abi.check_cpu_budget_us("kvm", "runtime", 1))
+        self.assertIsNone(time_abi.check_cpu_budget_us("kvm", "boot", 0))
+
 
 class MonitorTests(unittest.TestCase):
     def test_classifies_commands(self):
@@ -1537,7 +1553,9 @@ class DoctorTests(unittest.TestCase):
             return " ALPINE-MICROVM-BOOT-OK: 3.22.1\n" + line + STATUS_OK
 
         smp = boot(8) + warp_output(pairs=28) * 4 + warp_output(pairs=28, offset=60)
-        single = boot(1) + warp_output(pairs=0, offset=0)
+        # A newer guest also reports the boot check's CPU time.
+        single = boot(1).replace("elapsed_us=1873", "elapsed_us=1873 cpu_us=1100")
+        single += warp_output(pairs=0, offset=0)
         with (
             patch.object(doctor.os, "cpu_count", return_value=8),
             patch.object(
@@ -1548,8 +1566,14 @@ class DoctorTests(unittest.TestCase):
         ):
             result = doctor.check_guest_warp(context)
         self.assertTrue(result.passed, result.detail)
-        self.assertIn("vcpus=8 rounds=5 idle_gaps_s=0.1,1,5,1", result.detail)
-        self.assertIn("vcpus=1 rounds=1 idle_gaps_s=none", result.detail)
+        self.assertIn(
+            "vcpus=8 rounds=5 idle_gaps_s=0.1,1,5,1 boot_elapsed_us=1873;",
+            result.detail,
+        )
+        self.assertIn(
+            "vcpus=1 rounds=1 idle_gaps_s=none boot_elapsed_us=1873 boot_cpu_us=1100",
+            result.detail,
+        )
         self.assertEqual(context.facts["guest_warp_ns"], "60")
         (smp_call, single_call) = run.call_args_list
         for call, processors, gaps in (

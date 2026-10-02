@@ -3259,6 +3259,46 @@ class MicrovmTests(unittest.TestCase):
             },
         )
 
+    def test_time_abi_evidence_reports_cpu_time_against_the_budget(self):
+        def query(phase: str, cpus: int, cpu_us: int | None) -> str:
+            cpu = "" if cpu_us is None else f" cpu_us={cpu_us}"
+            generation = 0 if phase == "boot" else 1
+            return (
+                f"NVX-TIME-ABI: v=1 phase={phase} status=ok cpus={cpus} "
+                f"tsc_hz=2793437000 lapic_hz=1000000000 generation={generation} "
+                f"elapsed_us=25000{cpu}\r\n"
+                f"NVX-TIME-ABI: v=1 phase=runtime status=synchronized "
+                f"generation={generation} discontinuities={generation} offset_ns=0 "
+                "uncertainty_ns=900 rejected_samples=0 last_sample_error=none\r\n"
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            # Within KVM's budget (20 ms for a boot at 8 CPUs), over it (5 ms
+            # for a restore at 1 CPU), and an older image without cpu_us, which
+            # only reports elapsed_us.
+            (output_dir / "smp-8.log").write_text(query("boot", 8, 4600))
+            (output_dir / "restore-1.log").write_text(query("restore", 1, 5500))
+            (output_dir / "restore-8.log").write_text(query("restore", 8, 2000))
+            (output_dir / "older.log").write_text(query("boot", 1, None))
+            evidence = microvm_tests.time_abi_evidence(output_dir, "kvm")
+            unknown = microvm_tests.time_abi_evidence(output_dir)
+            # Each phase has its own budget: a larger restore budget absorbs
+            # the 1-CPU restore.
+            phased = {**time_abi.CHECK_CPU_BUDGET_US["kvm"], "restore": (6_000, 0)}
+            with patch.dict(time_abi.CHECK_CPU_BUDGET_US, {"kvm": phased}):
+                per_phase = microvm_tests.time_abi_evidence(output_dir, "kvm")
+        self.assertEqual(evidence["boot_markers"], "2")
+        self.assertEqual(evidence["boot_cpu_us"], "4600-4600")
+        self.assertEqual(evidence["boot_cpu_over_budget"], "0")
+        self.assertEqual(evidence["restore_cpu_us"], "2000-5500")
+        self.assertEqual(evidence["restore_cpu_over_budget"], "1")
+        self.assertEqual(per_phase["restore_cpu_over_budget"], "0")
+        self.assertEqual(per_phase["boot_cpu_over_budget"], "0")
+        # Without a backend there is no budget to compare with.
+        self.assertEqual(unknown["restore_cpu_us"], "2000-5500")
+        self.assertNotIn("restore_cpu_over_budget", unknown)
+
     def test_time_abi_evidence_line_goes_to_the_log_and_the_job_summary(self):
         with tempfile.TemporaryDirectory() as temporary:
             output_dir = Path(temporary) / "out"
