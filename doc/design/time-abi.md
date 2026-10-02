@@ -1475,32 +1475,37 @@ A host probe compares the TSC with two host clocks:
 
 A sample reads the TSC between two reads of a clock and keeps the tightest of
 up to 64 such brackets. Its uncertainty is half the bracket plus half the
-clock's resolution. A clock's resolution is the larger of its reported
-resolution and, when two consecutive reads return the same value, the
-smallest step observed between consecutive reads. Hyper-V's reference TSC
-page clock (`hyperv_clocksource_tsc_page`), the clocksource of MSHV roots and
-the Azure MSHV runners, advances the Linux clocks in 100 ns steps, although
-`clock_getres` reports 1 ns. `QueryPerformanceCounter`'s resolution is one
-10 MHz tick.
+clock's resolution. The probe reads each clock 100,000 times back to back.
+If two consecutive reads ever return the same value, the clock is coarser
+than one read, and its resolution is the larger of the reported resolution
+and the smallest nonzero step between consecutive reads: 100 ns for Hyper-V's
+reference TSC page clock (`hyperv_clocksource_tsc_page`), the clocksource of
+MSHV roots and the Azure MSHV runners, which `clock_getres` reports as 1 ns,
+and one 10 MHz tick (100 ns) for `QueryPerformanceCounter`. A clock that
+advances on every read keeps its reported resolution, because its smallest
+step is then only the time one read takes (for example
+`CLOCK_MONOTONIC_RAW` on a host whose clocksource is `tsc`).
 
 The probe sleeps between samples, so the host's CPUs can idle: 3 samples 1 s
 apart in `validate-runner`, and 13 samples 10 s apart (120 s) in `doctor`.
 For each interval between consecutive samples, it computes against the
 undisciplined clock the rate `r_i`, in TSC cycles per second, and its
-uncertainty `u_i`, the two samples' uncertainties divided by the interval.
-`r` is the rate over the whole window against the disciplined clock. The
-check passes if:
+relative uncertainty `u_i`, the two samples' uncertainties divided by the
+interval. `r` is the rate over the whole window against the disciplined
+clock. The check passes if:
 
-- every `u_i` is at most 0.25 ppm of `r`; otherwise the measurement is
+- every `u_i` is at most 0.25 ppm; otherwise the measurement is
   inconclusive and fails;
-- the interval rates agree within 1 ppm of `r` (largest minus smallest); and
+- the interval rates agree within 1 ppm (largest minus smallest, relative to
+  their whole-window rate against the same clock); and
 - where `F_d` is known (in `doctor`, and in the `validate-runner` jobs that
   run `H3`), `|r - F_d|` is at most 100 ppm of `F_d`.
 
 The probe's output names both clocks, each with its role (rate or
-stability), resolution, and observed step. The detail reports `r`, its
-deviation from `F_d` in ppm, the agreement, the largest `u_i`, the stability
-clock, and, on Linux, the host clocksource, which never gates.
+stability), reported resolution, and observed step. The detail reports `r`,
+its deviation from `F_d` in ppm, the agreement, the largest `u_i`, both
+clocks and the undisciplined clock's measured resolution, and, on Linux, the
+host clocksource, which never gates.
 
 Interval agreement uses the undisciplined clock because chrony's frequency
 updates move `CLOCK_MONOTONIC`'s rate between seconds, on Azure through the
@@ -1519,8 +1524,10 @@ Hyper-V PTP clock:
 - The WHP hosts show 0.000 ppm with a residual of at most 0.07 µs over 118 s.
 
 A TSC that stops, slows, or is rescaled across idle misses the bound by
-orders of magnitude, where the host's clocksource is independent of the TSC:
-the Hyper-V reference page, the HPET, or `QueryPerformanceCounter` in a VM.
+orders of magnitude where the host's clocksource does not follow the TSC's
+steps: the Hyper-V reference page and `QueryPerformanceCounter` in a VM,
+which the hypervisor computes from the TSC but keeps continuous when it
+corrects TSC offsets, or the HPET, which has its own oscillator.
 Where the host clocksource is `tsc` itself (the Azure KVM runners and
 prometheus32), every kernel clock derives from the TSC, so no host clock can
 catch a TSC step; the guest warp probe (`H6` and the CI schedule) is the
