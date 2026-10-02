@@ -1058,30 +1058,55 @@ NVX-TIME-ABI-EXHAUSTIVE: v=1 status=<ok|fail> cpus=<online> failures=<n>
 **Status command.** Checks print nothing on success; they record their
 result in the [state file](#wall-clock-discipline). `/sbin/nvx-time status`
 prints it on demand: CI scenarios and the matrix driver run it over the
-console when they need evidence, and production paths never do. It waits
-until no check is pending (the asynchronous boot checks, or a restore's
-deferred work), for at most 30 s. It then prints the marker of the last
-completed check and the runtime line:
+console when they need evidence, outside measured paths, and production
+paths never do. It waits until no recorded check is pending, for at most
+30 s. A missing state file or boot record counts as pending, because every
+boot runs the boot check, and step 8 of the [snapshot agent](#snapshot-agent)
+records the restore check as pending before the workload resumes, so a
+`status` run after a restore always waits for that restore's deferred work.
+It then prints one line per recorded phase, in the order boot, capture, and
+restore, then the runtime line:
 
 ```text
-NVX-TIME-ABI: v=1 phase=<boot|capture|restore> status=ok cpus=<online> tsc_hz=<F> lapic_hz=<L> generation=<g> elapsed_us=<duration>
+NVX-TIME-ABI: v=1 phase=<boot|capture|restore> status=<ok|pending> cpus=<n> tsc_hz=<F> lapic_hz=<L> generation=<g> elapsed_us=<duration>
 NVX-TIME-ABI: v=1 phase=runtime status=<synchronized|unsynchronized> generation=<g> discontinuities=<n> offset_ns=<theta> uncertainty_ns=<epsilon> rejected_samples=<n> last_sample_error=<none|G_SAMPLE_UNCERTAIN>
 ```
 
-It exits with status 0. If a check is still pending after 30 s, the first
-line reports `status=pending`, without `elapsed_us`, and the exit status is
-1. At boot, `elapsed_us` covers the checks and the daemon start. At restore,
-it covers steps 6 to 12 of the [snapshot agent](#snapshot-agent) and the
-step 11 checks, but not the grace period wait or the deferred `C7`. A failed
-check prints no marker: it emits the violation event with code
-`G_CONFORMANCE_<ID>` (`G_KERNEL_WX` for `K1`) and powers off with status 193.
+Each phase line reports its own check:
+
+- `cpus` is the number of online CPUs the check covered.
+- `generation` is `g` when the check ran: 0 for boot, the capture's `g` for
+  capture, and at least 1 for a restore.
+- The capture line comes from the checks before the capture request (step
+  1), which the snapshot carries, so a restored guest still reports it.
+- `status` reports the latest capture, which in a restored guest is the
+  capture that produced its snapshot, and the restore of this process: a
+  restored process never captures, and every restore is a new process.
+- The runtime line describes the guest at the time `status` runs.
+
+No other line uses the `NVX-TIME-ABI:` prefix, so a harness can parse every
+line by its `phase`.
+
+`status` exits with status 0 when every phase line reports `ok`. If a check
+is still pending after 30 s, its line reports `status=pending`, without
+`elapsed_us`, and the exit status is 1.
+
+At boot, `elapsed_us` covers the checks and the daemon start; at capture,
+the step 1 checks of the [snapshot agent](#snapshot-agent). At restore, it
+covers steps 6 to 12 and the step 11 checks, but not the grace period wait
+or the deferred `C7`.
+
+A failed check prints no marker: it emits the violation event with code
+`G_CONFORMANCE_<ID>` (`G_KERNEL_WX` for `K1`) and powers off with status 193,
+so `status` never reports a failure.
 
 **Report-only mode (test only).** The kernel token `nvx_time_abi=report-only`
 makes the checks and the watcher report instead of powering off, so the guest
 can be evaluated under an OpenVMM that does not implement the time ABI.
-Violations print `NVX-TIME-REPORT-VIOLATION` lines with the event's fields,
-and `nvx-time status` prints its marker with the `NVX-TIME-REPORT` prefix and
-` failures=<n>` appended. These prefixes are reserved for this mode;
+Violations print `NVX-TIME-REPORT-VIOLATION` lines with the event's fields.
+`nvx-time status` prints its phase lines with the `NVX-TIME-REPORT` prefix,
+`status=fail` for a failed check, and ` failures=<n>` appended, and it exits
+with status 1 if any check failed. These prefixes are reserved for this mode;
 production images never set the token, and harnesses never accept a
 report-only boot as conformant.
 
@@ -1140,7 +1165,8 @@ builds the soft-lockup and hung-task detectors.
 Before the capture request:
 
 1. Run the capture checks (`C6`, `C7`, `C10`). They do not wait and print
-   nothing.
+   nothing; they record `capture_status=ok` in the state file, which the
+   snapshot carries.
 2. Save `/sys/module/rcupdate/parameters/rcu_cpu_stall_suppress` and write 1.
 3. Debug: save and zero `/proc/sys/kernel/soft_watchdog` and
    `/proc/sys/kernel/hung_task_timeout_secs`.
@@ -1167,7 +1193,9 @@ acknowledgement.
    `time = theta`, then `ADJ_FREQUENCY | ADJ_STATUS` with
    `freq = -rate_deviation` (clamped to ±500 ppm) and
    `status = STA_PLL | STA_NANO` (`G_REPAIR_CLOCK`). Record the restore
-   discontinuity and the new `g`.
+   discontinuity and the new `g`, with `restore_status=pending` and
+   `restore_generation=g` in the same state-file update, so that
+   `nvx-time status` waits for this restore.
 9. Run the existing processor and memory activation.
 10. Run the existing entropy and identity repair for the tier. The RTC-based
     wall-clock refresh is removed; `instance-checkpoint` restores also get
@@ -1272,10 +1300,10 @@ every change, and `nvx-time status` reads it. The sandbox agent bind-mounts
 | --- | --- |
 | `version` | 1 |
 | `generation` | `g` |
-| `check_phase` | `boot`, `capture`, or `restore`: the last conformance check |
-| `check_status` | `pending` while it runs, then `ok`; a failed check powers the guest off |
-| `check_cpus` | Online CPUs the check covered |
-| `check_elapsed_us` | Its duration, as `elapsed_us` in the [status command](#conformance-checks-and-the-nvx-time-abi-marker) |
+| `boot_status`, `capture_status`, `restore_status` | `pending` while the phase's check runs, then `ok`; absent until the phase first runs (a failed check powers the guest off). The capture keys hold the latest capture, and the restore keys this process's restore |
+| `boot_cpus`, `capture_cpus`, `restore_cpus` | Online CPUs the check covered |
+| `boot_elapsed_us`, `capture_elapsed_us`, `restore_elapsed_us` | Its duration, as `elapsed_us` in the [status command](#conformance-checks-and-the-nvx-time-abi-marker) |
+| `capture_generation`, `restore_generation` | `g` when the check ran (the boot check's is 0) |
 | `tsc_hz`, `lapic_hz` | `F` and `L` |
 | `discontinuities` | Wall-clock discontinuities since cold boot: restores plus discipline steps |
 | `last_discontinuity` | `none`, `restore`, or `step` |
@@ -1522,8 +1550,10 @@ parser; four-byte portb reads; and the generation counter.
 all 18 registered hosts, plus the exhaustive CI check and the warp probe on
 every backend. Production paths print no marker, so CI scenarios and the
 matrix driver run `/sbin/nvx-time status` over the console after shell-ready
-and after every restore, and require its `phase=boot` or `phase=restore`
-marker with `status=ok` and the expected `generation`. The fleet runs them on
+and after every restore. They require exit status 0 and, after a restore, a
+`phase=restore` line with `status=ok`, the restored `generation`, and `cpus`
+equal to the online CPUs; after a cold boot, a `phase=boot` line with
+`generation=0`. The fleet runs them on
 the hosts our SSH account can use,
 which for KVM are prometheus32 and `azure-kvm-5` and for MSHV prometheus30
 and `azure-azlinux-5`: the account cannot open `/dev/kvm` or `/dev/mshv` on
