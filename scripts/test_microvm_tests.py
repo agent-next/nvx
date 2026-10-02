@@ -103,6 +103,39 @@ def _restore_status_output(
     ).encode()
 
 
+def _canceled_capture_output(
+    backend: str,
+    *,
+    rcu: str | None = "0",
+    restored: bool = False,
+    generation: int = 0,
+    status: int | None = 0,
+) -> bytes:
+    """Return what the guest prints for the checks after a released snapshot
+    request: the status query's lines, then the RCU suppression flag."""
+    rates = f"tsc_hz=2793437000 lapic_hz={time_abi.LAPIC_HZ[backend]}"
+    lines = [
+        f"NVX-TIME-ABI: v=1 phase=boot status=ok cpus=1 {rates} "
+        f"generation={generation} elapsed_us=2390"
+    ]
+    if restored:
+        lines.append(
+            f"NVX-TIME-ABI: v=1 phase=restore status=ok cpus=1 {rates} "
+            "generation=1 elapsed_us=310"
+        )
+    lines.append(
+        "NVX-TIME-ABI: v=1 phase=runtime status=synchronized generation=0 "
+        "discontinuities=0 offset_ns=-1200 uncertainty_ns=900 rejected_samples=0 "
+        "last_sample_error=none"
+    )
+    if status is not None:
+        lines.append(f"NVX-TIME-STATUS-EXIT status={status}")
+    if rcu is not None:
+        lines.append(f"NVX-CANCELED-CAPTURE-RCU {rcu}")
+    lines.append("NVX-CANCELED-CAPTURE-DONE")
+    return "".join(f"{line}\r\n" for line in lines).encode()
+
+
 def _restore_processors_measure(
     backend: str,
     *,
@@ -1540,11 +1573,15 @@ class MicrovmTests(unittest.TestCase):
     def test_snapshot_core_waits_for_no_destination_marker_line_before_exit(self):
         events: list[tuple[str, bytes | str | None]] = []
         marker = b"NVX-SNAPSHOT-NO-DESTINATION-OK"
+        command = ["openvmm", "--hypervisor", "whp", "--kernel", "vmlinux"]
 
         class StopAfterNoDestination(Exception):
             pass
 
         class FakeProcess:
+            def __init__(self) -> None:
+                self.console = bytearray(b"NVX-SNAPSHOT-NO-DESTINATION-OK\r\n")
+
             def __enter__(self):
                 return self
 
@@ -1556,6 +1593,10 @@ class MicrovmTests(unittest.TestCase):
             ) -> None:
                 return None
 
+            @property
+            def output(self) -> bytes:
+                return bytes(self.console)
+
             def wait_for(self, expected: bytes, _timeout: float) -> None:
                 events.append(("wait_for", expected))
 
@@ -1565,14 +1606,16 @@ class MicrovmTests(unittest.TestCase):
             def send_line(self, line: str) -> None:
                 events.append(("send_line", line))
 
+            def send_bytes(self, data: bytes) -> None:
+                events.append(("send_bytes", data.decode()))
+                self.console.extend(_canceled_capture_output("whp"))
+
             def wait(self, _timeout: float) -> openvmm_process.OpenvmmProcessResult:
                 events.append(("wait", None))
                 return openvmm_process.OpenvmmProcessResult(0, marker + b"\n")
 
         with (
-            patch.object(
-                microvm_tests, "workload_boot_command", return_value=["openvmm"]
-            ),
+            patch.object(microvm_tests, "workload_boot_command", return_value=command),
             patch.object(microvm_tests, "OpenvmmProcess", return_value=FakeProcess()),
             patch.object(
                 microvm_tests.tempfile,
@@ -1597,10 +1640,76 @@ class MicrovmTests(unittest.TestCase):
                 ("wait_for", microvm_tests.BOOT_MARKER),
                 ("send_line", "nvx-snapshot; echo NVX-SNAPSHOT-NO-DESTINATION-OK"),
                 ("wait_for_line", marker),
+                ("send_bytes", microvm_tests.canceled_capture_checks()),
+                ("wait_for_line", microvm_tests.CANCELED_CAPTURE_DONE_MARKER),
                 ("send_line", "nvx-exit 0"),
                 ("wait", None),
             ],
         )
+
+    def test_canceled_capture_checks_query_status_and_rcu_suppression(self):
+        script = microvm_tests.canceled_capture_checks()
+        self.assertTrue(script.startswith(time_abi.status_script()))
+        self.assertIn(
+            "$(cat /sys/module/rcupdate/parameters/rcu_cpu_stall_suppress)", script
+        )
+        # The command never contains a whole marker, so the console's echo of
+        # it, wrapped or not, can't stand in for the guest's answers.
+        for marker in (
+            microvm_tests.CANCELED_CAPTURE_RCU_PREFIX,
+            microvm_tests.CANCELED_CAPTURE_DONE_MARKER,
+        ):
+            self.assertNotIn(marker.decode().strip(), script)
+        # The shell prints both markers whole.
+        shell = shutil.which("sh")
+        if shell is None:
+            self.skipTest("no POSIX shell")
+        answers = subprocess.run(
+            [shell, "-c", script.removeprefix(time_abi.status_script())],
+            capture_output=True,
+            check=True,
+        ).stdout
+        lines = answers.splitlines()
+        self.assertEqual(lines[-1], microvm_tests.CANCELED_CAPTURE_DONE_MARKER)
+        self.assertTrue(lines[0].startswith(microvm_tests.CANCELED_CAPTURE_RCU_PREFIX))
+
+    def test_canceled_capture_requires_generation_zero_and_no_suppression(self):
+        command = ["openvmm", "--hypervisor", "kvm", "--kernel", "vmlinux"]
+        echoed = (
+            b'~ # echo "NVX-""CANCELED-CAPTURE-RCU $(cat /sys/module/rcupdate/'
+            b'parameters/rcu_cpu_stall_suppress)"; echo "NVX-""CANCELED-CAPTURE-DONE"\r\n'
+        )
+        microvm_tests.check_canceled_capture(
+            echoed + _canceled_capture_output("kvm"), command
+        )
+        for output, message in (
+            (_canceled_capture_output("kvm", rcu="1"), "rcu_cpu_stall_suppress is '1'"),
+            (
+                _canceled_capture_output("kvm", restored=True),
+                "reported a restore at generation=1",
+            ),
+            (
+                _canceled_capture_output("kvm", generation=1),
+                "generation=1 is not 0 at cold boot",
+            ),
+            (_canceled_capture_output("kvm", status=1), "nvx-time status exited 1"),
+            (
+                _canceled_capture_output("kvm", status=None),
+                "nvx-time status did not finish",
+            ),
+            (
+                _canceled_capture_output("kvm", rcu=None),
+                "expected exactly one b'NVX-CANCELED-CAPTURE-RCU ' marker, found 0",
+            ),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(RuntimeError, re.escape(message)) as raised:
+                    microvm_tests.check_canceled_capture(output, command)
+                self.assertTrue(
+                    str(raised.exception).startswith(
+                        "after the released snapshot request: "
+                    )
+                )
 
     def test_snapshot_marker_parsers_require_single_well_formed_values(self):
         output = b"PREFIX-12\r\nPAIR-4-5\n"

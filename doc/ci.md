@@ -103,6 +103,14 @@ every CPU, a summary with `status=ok`, the requested CPU count, and no
 failures, and exit status 0; a failure lists each failing check with the
 guest's detail. The guest command fits on one console line, so the console's
 echo of it ends before the check prints.
+The `snapshot-core` scenario first sends a snapshot request to a guest that
+OpenVMM launched without a snapshot destination. OpenVMM releases the request,
+so it returns in the source, which must continue exactly once. Before the
+request, the guest's snapshot agent saved and overrode the stall detectors'
+settings, and it must restore them when the request returns
+(`nvx-time cancel-capture`). Afterwards, `nvx-time status` must exit 0 with a
+passing boot line at generation 0 and no restore line, and
+`/sys/module/rcupdate/parameters/rcu_cpu_stall_suppress` must read 0.
 
 At the end of a passing run, `test-microvm` prints one `NVX-TIME-ABI-EVIDENCE:`
 line and adds it to the GitHub job summary, because CI keeps the guest logs only

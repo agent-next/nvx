@@ -61,6 +61,7 @@ from .openvmm_process import OpenvmmProcess, TcpConsole
 from .time_abi import (
     ABI_VERSION,
     CHECK_CPU_BUDGET_US,
+    STATUS_TIMEOUT_SECONDS,
     WARP_PROBE_COMPLETION_MARKER,
     WARP_PROBE_FAILURE_MARKER,
     WARP_SUMMARY_PREFIX,
@@ -2912,6 +2913,60 @@ def run_restore_memory(
                 )
 
 
+CANCELED_CAPTURE_RCU_PREFIX = b"NVX-CANCELED-CAPTURE-RCU "
+CANCELED_CAPTURE_DONE_MARKER = b"NVX-CANCELED-CAPTURE-DONE"
+RCU_STALL_SUPPRESS_PATH = "/sys/module/rcupdate/parameters/rcu_cpu_stall_suppress"
+
+
+def canceled_capture_checks() -> str:
+    """Return the guest checks after a snapshot request that OpenVMM released:
+    the time ABI status, then whether RCU stall detection is still suppressed."""
+    rcu = CANCELED_CAPTURE_RCU_PREFIX.decode()
+    done = CANCELED_CAPTURE_DONE_MARKER.decode()
+    # A quote pair splits each marker, so the console's echo of the command,
+    # which the tty may wrap, never contains it.
+    return (
+        status_script()
+        + f'echo "{rcu[:4]}""{rcu[4:]}$(cat {RCU_STALL_SUPPRESS_PATH})"; '
+        + f'echo "{done[:4]}""{done[4:]}"\n'
+    )
+
+
+def check_canceled_capture(output: bytes, command: Sequence[str]) -> None:
+    """Check that a released snapshot request left the source as it was.
+
+    The snapshot agent saves and overrides the stall detectors' settings
+    before the request; when the request returns in the source, it removes its
+    barriers and restores the saved values (nvx-time cancel-capture). The
+    source then reports a passing status at generation 0 with no restore, and
+    RCU stall detection is no longer suppressed.
+    """
+    context = "after the released snapshot request"
+    monitor = TimeAbiMonitor(command)
+    try:
+        monitor.feed(output)
+        monitor.finish()
+        monitor.require_status("its checks finished")
+        monitor.require_boot("its checks finished")
+    except TimeAbiFailure as error:
+        raise RuntimeError(f"{context}: {error}") from error
+    if monitor.restores:
+        raise RuntimeError(
+            f"{context}: nvx-time status reported a restore at "
+            f"generation={monitor.restores[-1].get('generation')}, but the "
+            "request returned in the source"
+        )
+    try:
+        value = _single_marker_value(output, CANCELED_CAPTURE_RCU_PREFIX)
+    except RuntimeError as error:
+        raise RuntimeError(f"{context}: {error}") from error
+    if value != b"0":
+        raise RuntimeError(
+            f"{context}: rcu_cpu_stall_suppress is {value.decode(errors='replace')!r}, "
+            "not 0: the snapshot agent did not restore the value it saved"
+        )
+
+
 def run_snapshot_core(
     executable: Path,
     kernel: Path,
@@ -2938,6 +2993,12 @@ def run_snapshot_core(
         process.wait_for(BOOT_MARKER, timeout)
         process.send_line("nvx-snapshot; echo NVX-SNAPSHOT-NO-DESTINATION-OK")
         process.wait_for_line(no_destination_marker, timeout)
+        checks_start = len(process.output)
+        process.send_bytes(canceled_capture_checks().encode())
+        process.wait_for_line(
+            CANCELED_CAPTURE_DONE_MARKER, max(timeout, STATUS_TIMEOUT_SECONDS)
+        )
+        check_canceled_capture(process.output[checks_start:], no_destination_command)
         process.send_line("nvx-exit 0")
         result = process.wait(timeout)
     if result.returncode != 0:
