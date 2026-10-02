@@ -632,7 +632,8 @@ impl<S: Read + Write + Pending> Session<'_, S> {
                     return self.send_some(APP_ERROR, request_id, 125, b"launch-failed");
                 }
                 _ => {
-                    let message = format!("aci-edge-sandboxes-fake-openvmm: unknown command {name}\n");
+                    let message =
+                        format!("aci-edge-sandboxes-fake-openvmm: unknown command {name}\n");
                     self.send(APP_STDERR, request_id, 0, message.as_bytes())?;
                     return self.send_some(APP_EXIT, request_id, 127, b"exit");
                 }

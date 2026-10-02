@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aci_edge_sandboxes::openvmm::{OpenVmmBackend, OpenVmmConfig, resolve_guest_path as guest_path};
+use aci_edge_sandboxes::openvmm::{
+    OpenVmmBackend, OpenVmmConfig, resolve_guest_path as guest_path,
+};
 use aci_edge_sandboxes::{
     Access, AciSandbox, EgressPolicy, ErrorCode, ExecOutcome, ExecOutput, ExecRequest,
     FilesystemPolicy, NetworkPolicy, NetworkRule, Protocol, ProvisionRequest, SandboxId,
@@ -25,8 +27,9 @@ use aci_edge_sandboxes::{
 mod support;
 
 fn variable(name: &str) -> String {
-    env::var(name)
-        .unwrap_or_else(|_| panic!("{name} must be set; run scripts/nvx.py test-aci-edge-sandboxes"))
+    env::var(name).unwrap_or_else(|_| {
+        panic!("{name} must be set; run scripts/nvx.py test-aci-edge-sandboxes")
+    })
 }
 
 /// Stops and deprovisions the sandbox and keeps the OpenVMM log when the test fails.
@@ -70,13 +73,17 @@ fn shell(nvx: &AciSandbox, sandbox_id: &SandboxId, command_line: &str) -> ExecOu
 fn client(name: &str) -> (AciSandbox, Arc<OpenVmmBackend>) {
     let state_root = env::var("ACI_EDGE_SANDBOXES_E2E_STATE_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| env::temp_dir().join(format!("aci-edge-sandboxes-e2e-{}", std::process::id())))
+        .unwrap_or_else(|_| {
+            env::temp_dir().join(format!("aci-edge-sandboxes-e2e-{}", std::process::id()))
+        })
         .join(name);
     let config = OpenVmmConfig::new(
         variable("ACI_EDGE_SANDBOXES_E2E_OPENVMM"),
         variable("ACI_EDGE_SANDBOXES_E2E_KERNEL"),
         variable("ACI_EDGE_SANDBOXES_E2E_INITRD"),
-        variable("ACI_EDGE_SANDBOXES_E2E_HYPERVISOR").parse().unwrap(),
+        variable("ACI_EDGE_SANDBOXES_E2E_HYPERVISOR")
+            .parse()
+            .unwrap(),
         state_root,
     );
     let backend = Arc::new(OpenVmmBackend::new(config).unwrap());
@@ -239,7 +246,9 @@ fn openvmm_lifecycle_on_a_real_hypervisor() {
         variable("ACI_EDGE_SANDBOXES_E2E_OPENVMM"),
         variable("ACI_EDGE_SANDBOXES_E2E_KERNEL"),
         variable("ACI_EDGE_SANDBOXES_E2E_INITRD"),
-        variable("ACI_EDGE_SANDBOXES_E2E_HYPERVISOR").parse().unwrap(),
+        variable("ACI_EDGE_SANDBOXES_E2E_HYPERVISOR")
+            .parse()
+            .unwrap(),
         &state_root,
     );
     let backend = Arc::new(OpenVmmBackend::new(config).unwrap());
@@ -338,9 +347,13 @@ fn openvmm_lifecycle_on_a_real_hypervisor() {
     assert_eq!(leftover.stdout, b"none\n");
 
     assert!(
-        shell(&nvx, &sandbox_id, "printf kept > /tmp/aci_edge_sandboxes-e2e")
-            .outcome
-            .success()
+        shell(
+            &nvx,
+            &sandbox_id,
+            "printf kept > /tmp/aci_edge_sandboxes-e2e"
+        )
+        .outcome
+        .success()
     );
     assert_eq!(
         shell(&nvx, &sandbox_id, "cat /tmp/aci_edge_sandboxes-e2e").stdout,

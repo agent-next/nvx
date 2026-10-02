@@ -5754,7 +5754,9 @@ class AciSandboxRunnerTests(unittest.TestCase):
         self.assertEqual(args.backend, "mshv")
         self.assertEqual(args.cargo, "cargo")
         self.assertFalse(hasattr(args, "scratch_template"))
-        self.assertIs(args.handler, aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes)
+        self.assertIs(
+            args.handler, aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes
+        )
 
     def test_environment_resolves_repository_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -5764,7 +5766,8 @@ class AciSandboxRunnerTests(unittest.TestCase):
 
             self.assertEqual(environment["ACI_EDGE_SANDBOXES_E2E_HYPERVISOR"], "kvm")
             self.assertEqual(
-                Path(environment["ACI_EDGE_SANDBOXES_E2E_OPENVMM"]), paths["openvmm"].resolve()
+                Path(environment["ACI_EDGE_SANDBOXES_E2E_OPENVMM"]),
+                paths["openvmm"].resolve(),
             )
             self.assertEqual(
                 Path(environment["ACI_EDGE_SANDBOXES_E2E_INITRD"]),
@@ -5775,7 +5778,10 @@ class AciSandboxRunnerTests(unittest.TestCase):
                 (root / "state").resolve(),
             )
             self.assertFalse(
-                any(name.startswith("ACI_EDGE_SANDBOXES_E2E_DISTRO") for name in environment)
+                any(
+                    name.startswith("ACI_EDGE_SANDBOXES_E2E_DISTRO")
+                    for name in environment
+                )
             )
             self.assertNotIn("ACI_EDGE_SANDBOXES_E2E_SCRATCH", environment)
 
@@ -5824,10 +5830,14 @@ class AciSandboxRunnerTests(unittest.TestCase):
             )
             with (
                 patch.object(aci_edge_sandboxes_tests, "validate_openvmm_test_backend"),
-                patch.object(aci_edge_sandboxes_tests, "e2e_environment", fake_environment),
+                patch.object(
+                    aci_edge_sandboxes_tests, "e2e_environment", fake_environment
+                ),
                 patch.object(aci_edge_sandboxes_tests.subprocess, "run", fake_run),
             ):
-                self.assertEqual(aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes(args), 3)
+                self.assertEqual(
+                    aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes(args), 3
+                )
             self.assertTrue((Path(temporary) / "results").is_dir())
 
         self.assertEqual(len(observed), 1)

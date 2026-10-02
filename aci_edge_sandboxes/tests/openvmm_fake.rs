@@ -837,7 +837,8 @@ fn filesystem_and_network_policies_reach_openvmm() {
     assert!(maps.iter().any(|token| token.ends_with(",ro")));
     assert!(maps.iter().any(|token| token.ends_with(",rw")));
 
-    let guest = aci_edge_sandboxes::openvmm::resolve_guest_path(&base.join("work").join("out")).unwrap();
+    let guest =
+        aci_edge_sandboxes::openvmm::resolve_guest_path(&base.join("work").join("out")).unwrap();
     assert!(
         state_json(&fixture, &sandbox_id, "sandbox.json")["filesystem"]["binds"]
             .as_array()
