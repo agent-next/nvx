@@ -487,8 +487,9 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
      each read at subleaf 0 if subleaf-independent. The backend reads them
      with the governed leaves, a few reads more. The supported surface of
      step 3 cannot serve: it derives from the root's CPUID, which shows
-     values that a guest does not see there, such as Intel PT's `0x14.1` and
-     RDT's `0xF.1` and `0x10.1` to `0x10.3`, so it would fail sound hosts.
+     values that a guest does not see there, so it would fail sound hosts.
+     On the Skylake-SP hosts, the MSHV and WHP roots read Intel PT's
+     `0x14.1` as non-zero, while every probe partition reads it as zero.
    - KVM answers reserved entries from the effective CPUID itself, so it
      needs no check.
 
