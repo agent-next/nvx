@@ -11,7 +11,9 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Callable
+from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
 
@@ -262,6 +264,171 @@ class GuestSymlinkTests(unittest.TestCase):
             self.skipTest(f"NT symbolic links are unavailable: {error}")
         with self.assertRaisesRegex(RuntimeError, "not a WSL-style link"):
             microvm_tests.assert_guest_symlink(followable, str(self.target))
+
+
+def _vfs_capabilities(magic: int, permitted: int, size: int = 20) -> bytes:
+    words = [magic, permitted, 0, 0, 0, 0][: size // 4]
+    return b"".join(word.to_bytes(4, "little") for word in words)
+
+
+class FilesystemOwnerTests(unittest.TestCase):
+    CAP_SETGID = 1 << 6
+    CAP_SETUID = 1 << 7
+
+    def setUp(self):
+        self.output_dir = Path(self._temporary().name)
+
+    def _temporary(self) -> tempfile.TemporaryDirectory[str]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        return temporary
+
+    def _run(self, platform: str, **patches: object) -> None:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(microvm_tests, "sys", SimpleNamespace(platform=platform))
+            )
+            # Hosts that run the suite as root give the export to a non-root owner.
+            stack.enter_context(patch.object(microvm_tests.os, "chown", create=True))
+            for name, value in patches.items():
+                stack.enter_context(patch.object(microvm_tests, name, value))
+            microvm_tests.run_filesystem_owner(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initramfs.cpio.gz"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=self.output_dir,
+            )
+
+    def test_file_capabilities_must_make_setuid_and_setgid_effective(self):
+        both = self.CAP_SETUID | self.CAP_SETGID
+        grants = microvm_tests.file_capabilities_grant_identity
+        self.assertTrue(grants(_vfs_capabilities(0x0200_0001, both)))
+        # Version 3 appends the namespace root ID.
+        self.assertTrue(grants(_vfs_capabilities(0x0300_0001, both, size=24)))
+        self.assertFalse(grants(_vfs_capabilities(0x0200_0000, both)))
+        self.assertFalse(grants(_vfs_capabilities(0x0200_0001, self.CAP_SETUID)))
+        self.assertFalse(grants(_vfs_capabilities(0x0200_0001, self.CAP_SETGID)))
+        self.assertFalse(grants(b"\x01\x00\x00\x02"))
+
+    def test_non_linux_hosts_reject_caller_identity_before_boot(self):
+        rejected = MagicMock()
+        guest = MagicMock()
+        self._run(
+            "win32",
+            _expect_rejected_before_boot=rejected,
+            run_guest_script=guest,
+        )
+
+        command = rejected.call_args.args[0]
+        self.assertEqual(command[command.index("--mount-owner") + 1], "caller")
+        self.assertTrue(command[command.index("--mount") + 1].startswith("/mnt/share,"))
+        self.assertEqual(rejected.call_args.args[1], b"requires a Linux host")
+        guest.assert_not_called()
+
+    def test_unprivileged_linux_hosts_fail_requests_with_eperm(self):
+        rejected = MagicMock()
+        guest = MagicMock()
+        self._run(
+            "linux",
+            _expect_rejected_before_boot=rejected,
+            run_guest_script=guest,
+            openvmm_has_identity_capabilities=MagicMock(return_value=False),
+        )
+
+        root_export = rejected.call_args.args[0]
+        self.assertIn("/mnt/share,/,ro", root_export)
+        self.assertEqual(root_export[root_export.index("--mount-owner") + 1], "caller")
+        self.assertEqual(rejected.call_args.args[1], b"non-root user and group")
+        command, script, marker = guest.call_args.args
+        self.assertEqual(command[command.index("--mount-owner") + 1], "caller")
+        self.assertEqual(marker, microvm_tests.FILESYSTEM_OWNER_DENIED_MARKER)
+        self.assertIn("Operation not permitted", script)
+
+    def test_unprivileged_linux_hosts_reject_host_changes(self):
+        def guest(command: list[str], *_args: object, **_kwargs: object) -> None:
+            share = Path(command[command.index("--mount") + 1].split(",")[1])
+            (share / "guest-file").write_bytes(b"created as OpenVMM\n")
+
+        with self.assertRaisesRegex(RuntimeError, "changed the host"):
+            self._run(
+                "linux",
+                _expect_rejected_before_boot=MagicMock(),
+                run_guest_script=MagicMock(side_effect=guest),
+                openvmm_has_identity_capabilities=MagicMock(return_value=False),
+            )
+
+    def _run_mapped(self, owners: dict[str, tuple[int, int]]) -> MagicMock:
+        captured: dict[str, tuple[int, int]] = {}
+
+        def guest(command: list[str], script: str, *_args: object, **_kw: object):
+            share = Path(command[command.index("--mount") + 1].split(",")[1])
+            status = share.stat()
+            captured["export"] = (status.st_uid, status.st_gid)
+            for name in ("root-directory", "caller-directory"):
+                (share / name).mkdir()
+            for name in ("root-file", "caller-file", "caller-directory/nested"):
+                (share / name).write_bytes(b"guest\n")
+
+        original_lstat = Path.lstat
+
+        def lstat(path: Path) -> object:
+            relative = path.relative_to(path.parents[0]).as_posix()
+            if path.parent.name == "caller-directory":
+                relative = f"caller-directory/{relative}"
+            if relative not in owners:
+                return original_lstat(path)
+            owner = (
+                captured["export"] if owners[relative] == (-1, -1) else owners[relative]
+            )
+            return SimpleNamespace(st_uid=owner[0], st_gid=owner[1])
+
+        guest_mock = MagicMock(side_effect=guest)
+        with patch.object(Path, "lstat", lstat):
+            self._run(
+                "linux",
+                _expect_rejected_before_boot=MagicMock(),
+                run_guest_script=guest_mock,
+                openvmm_has_identity_capabilities=MagicMock(return_value=True),
+            )
+        return guest_mock
+
+    def _expected_owners(self) -> dict[str, tuple[int, int]]:
+        # (-1, -1) stands for the owner of the export root, which the guest
+        # mock observes.
+        export = (-1, -1)
+        caller = microvm_tests.FILESYSTEM_OWNER_CALLER
+        return {
+            "root-file": export,
+            "root-directory": export,
+            "caller-file": caller,
+            "caller-directory": caller,
+            "caller-directory/nested": caller,
+        }
+
+    def test_privileged_linux_hosts_map_callers_and_squash_root(self):
+        guest = self._run_mapped(self._expected_owners())
+
+        command, script, marker = guest.call_args.args
+        self.assertEqual(marker, microvm_tests.FILESYSTEM_OWNER_MAPPED_MARKER)
+        self.assertEqual(command[command.index("--mount-owner") + 1], "caller")
+        self.assertNotRegex(script, r"@[A-Z_]+@")
+        self.assertIn('--reuid="$uid"', script)
+        self.assertIn("as_user 4242 4243 sh -c", script)
+        self.assertIn("as_user 4244 4244 sh -c", script)
+
+    def test_privileged_linux_hosts_reject_wrong_owners(self):
+        for name in ("root-file", "caller-directory/nested"):
+            owners = self._expected_owners()
+            # For example, a file created as the OpenVMM process.
+            owners[name] = (54321, 54321)
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(RuntimeError, f"guest-created {name}"),
+            ):
+                self._run_mapped(owners)
 
 
 class ControlSessionTests(unittest.TestCase):
@@ -3053,6 +3220,7 @@ class MicrovmTests(unittest.TestCase):
 
         for scenario in (
             "console-snapshot",
+            "filesystem-owner",
             "sandbox-blocks",
             "scratch-snapshot",
             "snapshot-tiers",

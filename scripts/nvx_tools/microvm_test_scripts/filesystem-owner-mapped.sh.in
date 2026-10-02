@@ -1,0 +1,54 @@
+set -eu
+fail() {
+    code="$1"
+    echo "NVX-FILESYSTEM-OWNER-FAIL code=$code"
+    nvx-exit "$code"
+    exit "$code"
+}
+as_user() {
+    uid=$1
+    gid=$2
+    shift 2
+    setpriv --reuid="$uid" --regid="$gid" --clear-groups "$@"
+}
+
+grep -q ' /mnt/share virtiofs ' /proc/mounts || fail 140
+[ "$(cat /mnt/share/host-marker)" = NVX-HOST-OWNED ] || fail 141
+
+# Guest root is squashed to the owner of the export root.
+printf 'root\n' >/mnt/share/root-file || fail 142
+mkdir /mnt/share/root-directory || fail 143
+[ "$(stat -c %u:%g /mnt/share/root-file)" = @EXPORT_OWNER@ ] || fail 144
+[ "$(stat -c %u:%g /mnt/share/root-directory)" = @EXPORT_OWNER@ ] || fail 145
+
+# Squashed root cannot give files to root or create device nodes.
+if chown 0:0 /mnt/share/root-file 2>/dev/null; then
+    fail 146
+fi
+if chgrp 0 /mnt/share/root-file 2>/dev/null; then
+    fail 147
+fi
+if mknod /mnt/share/device c 1 3 2>/dev/null; then
+    fail 148
+fi
+
+# A non-root caller owns what it creates, including inside its own directory.
+# The final chmod lets an unprivileged host harness remove the directory.
+as_user @CALLER_UID@ @CALLER_GID@ sh -c '
+    printf "caller\n" >/mnt/share/caller-file &&
+        mkdir /mnt/share/caller-directory &&
+        printf "nested\n" >/mnt/share/caller-directory/nested &&
+        chmod 0777 /mnt/share/caller-directory
+' || fail 149
+[ "$(stat -c %u:%g /mnt/share/caller-file)" = @CALLER_UID@:@CALLER_GID@ ] || fail 150
+[ "$(stat -c %u:%g /mnt/share/caller-directory/nested)" = @CALLER_UID@:@CALLER_GID@ ] ||
+    fail 151
+
+# Host permissions apply to each caller.
+if as_user @OTHER_UID@ @OTHER_GID@ sh -c 'printf other >>/mnt/share/caller-file' 2>/dev/null; then
+    fail 152
+fi
+[ "$(cat /mnt/share/caller-file)" = caller ] || fail 153
+
+echo NVX-FILESYSTEM-OWNER-MAPPED-OK
+nvx-exit 0

@@ -106,10 +106,37 @@ shows that `stop` unmounted the share and overlay first. Linux/KVM runs the
 broader Ubuntu SMP, managed lifecycle, network snapshot, blockless snapshot,
 and workload-identity set.
 
+Caller-owned shares (`--mount-owner caller`) need `CAP_SETUID` and
+`CAP_SETGID`, which OpenVMM cannot obtain on the persistent runners because
+they deliberately have no `sudo`. CI therefore checks each side where it can
+run:
+
+- On the persistent Linux runners, the default `filesystem-owner` scenario
+  and a caller-owned Ubuntu sandbox (`nvx-sandbox-smoke --arg eperm`) verify
+  that every guest request fails with `EPERM`, that the host share is
+  unchanged, and that a root-owned export is rejected before boot. On WHP,
+  the scenario verifies that OpenVMM rejects `--mount-owner caller` before
+  boot.
+- `openvmm-privileged-tests` runs `nvx.py test-openvmm-privileged` on an
+  ephemeral GitHub-hosted Ubuntu runner. It builds the `fuse`, `lxutil`, and
+  `virtiofs` unit tests and runs the ignored `caller_identity` tests through
+  `sudo`. They dispatch real FUSE requests and check host ownership, root
+  squash, the denied privileged operations, and credential restoration.
+- `nvx-caller-identity-kvm` runs the statically linked musl OpenVMM on an
+  ephemeral GitHub-hosted runner with KVM enabled through a udev rule and
+  `cap_setuid,cap_setgid=ep` file capabilities. The `filesystem-owner`
+  scenario boots Alpine as root and checks root squash and caller mapping on
+  the host. Ubuntu caller-owned sandboxes then run one-shot, managed, and with
+  OpenVMM as root under `sudo`. Every file that the workload creates must be
+  owned by UID/GID 65534 rather than by the runner or root.
+
+Both GitHub-hosted jobs are required checks and gate development releases.
+
 OpenVMM release executables and provenance are built once by the independently
 addressable `build-openvmm-linux-gnu`, `build-openvmm-linux-musl`, and
 `build-openvmm-windows-msvc` producer jobs. KVM workloads and MSHV microVM tests
-consume the GNU artifact, MSHV platform workloads consume the musl artifact,
+consume the GNU artifact, MSHV platform workloads and the GitHub-hosted
+caller-identity job consume the musl artifact,
 and WHP workloads consume the Windows MSVC artifact. Each workload can start
 after its compatible OpenVMM producer and the shared guest-artifact job finish,
 without waiting for unrelated OpenVMM targets.

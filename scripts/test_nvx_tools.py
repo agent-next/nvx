@@ -1405,6 +1405,118 @@ class CiTests(unittest.TestCase):
 
             run_checked.assert_not_called()
 
+    def test_openvmm_test_executables_are_read_from_cargo_messages(self):
+        messages = b"\n".join(
+            [
+                b'{"reason":"compiler-artifact","profile":{"test":true},'
+                b'"executable":"/target/debug/deps/lxutil-1"}',
+                b'{"reason":"compiler-artifact","profile":{"test":false},'
+                b'"executable":"/target/debug/build-script"}',
+                b'{"reason":"compiler-artifact","profile":{"test":true},'
+                b'"executable":null}',
+                b'{"reason":"build-finished","success":true}',
+                b"not json",
+                b'{"reason":"compiler-artifact","profile":{"test":true},'
+                b'"executable":"/target/debug/deps/lxutil-1"}',
+                b'{"reason":"compiler-artifact","profile":{"test":true},'
+                b'"executable":"/target/debug/deps/virtiofs-2"}',
+            ]
+        )
+        self.assertEqual(
+            ci.openvmm_test_executables(messages),
+            (
+                Path("/target/debug/deps/lxutil-1"),
+                Path("/target/debug/deps/virtiofs-2"),
+            ),
+        )
+
+    def _privileged_test_run(
+        self,
+        listings: dict[str, bytes],
+        *,
+        platform: str = "linux",
+    ) -> tuple[MagicMock, Path]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        openvmm = Path(temporary.name) / "openvmm"
+        openvmm.mkdir()
+        (openvmm / "Cargo.toml").touch()
+        messages = b"\n".join(
+            b'{"reason":"compiler-artifact","profile":{"test":true},'
+            b'"executable":"/target/' + name.encode() + b'"}'
+            for name in listings
+        )
+
+        def capture(
+            command: list[str | Path], **_kwargs: object
+        ) -> common.CommandResult:
+            if command[0] == "cargo":
+                stdout = messages
+            else:
+                stdout = listings[Path(command[0]).name]
+            return common.CommandResult(
+                args=tuple(str(argument) for argument in command),
+                returncode=0,
+                stdout=stdout,
+                stderr=b"",
+            )
+
+        def tool(name: str) -> str:
+            return name
+
+        with (
+            patch.object(OpenVMMBuildConstants, "DIRECTORY", openvmm),
+            patch.object(ci, "sys", MagicMock(platform=platform)),
+            patch.object(ci, "require_tool", side_effect=tool),
+            patch.object(ci, "run_capture", side_effect=capture),
+            patch.object(ci, "run_checked") as run_checked,
+        ):
+            ci.run_openvmm_privileged_tests()
+        return run_checked, openvmm
+
+    def test_openvmm_privileged_tests_build_as_user_and_run_with_sudo(self):
+        run_checked, openvmm = self._privileged_test_run(
+            {
+                "fuse-1": b"",
+                "lxutil-2": b"unix::identity::tests::caller_identity_x: test\n",
+                "virtiofs-3": b"microvm::linux::caller_identity_y: test\n",
+            }
+        )
+
+        packages = ["-p", "fuse", "-p", "lxutil", "-p", "virtiofs"]
+        self.assertEqual(
+            run_checked.call_args_list,
+            [
+                call(
+                    ["cargo", "xflowey", "restore-packages", "--no-compat-igvm"],
+                    cwd=openvmm,
+                ),
+                call(
+                    ["cargo", "test", "--locked", "--lib", "--no-run", *packages],
+                    cwd=openvmm,
+                ),
+                *(
+                    call(
+                        [
+                            "sudo",
+                            "--non-interactive",
+                            Path(f"/target/{name}"),
+                            "--ignored",
+                            "caller_identity",
+                        ],
+                        cwd=openvmm,
+                    )
+                    for name in ("lxutil-2", "virtiofs-3")
+                ),
+            ],
+        )
+
+    def test_openvmm_privileged_tests_require_selected_tests_and_linux(self):
+        with self.assertRaisesRegex(common.ScriptError, "were found"):
+            self._privileged_test_run({"fuse-1": b"", "lxutil-2": b""})
+        with self.assertRaisesRegex(common.ScriptError, "require a Linux host"):
+            self._privileged_test_run({}, platform="win32")
+
     def test_openvmm_tests_use_nvx_guest_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2304,6 +2416,78 @@ class CiConfigurationTests(unittest.TestCase):
         for job_name in ("platform-kvm", "platform-mshv", "platform-whp"):
             self.assertIn(job_name, performance_gate_job)
             self.assertIn(f"needs.{job_name}.result", performance_gate_job)
+
+    def test_ci_covers_caller_identity_with_and_without_capabilities(self):
+        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
+        workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
+        caller_workflow = (workflows / "run-nvx-caller-identity-tests.yml").read_text(
+            encoding="utf-8"
+        )
+        microvm_workflow = (workflows / "run-nvx-microvm-tests.yml").read_text(
+            encoding="utf-8"
+        )
+        same_repository = (
+            "github.event.pull_request.head.repo.full_name == github.repository"
+        )
+
+        # Persistent runners have no sudo, so the privileged unit tests and the
+        # end-to-end checks with capabilities run on GitHub-hosted runners.
+        privileged = _workflow_job(workflow, "openvmm-privileged-tests")
+        self.assertIn("runs-on: ubuntu-latest", privileged)
+        self.assertIn(same_repository, privileged)
+        self.assertIn("needs.openvmm-changes.outputs.run-tests == 'true'", privileged)
+        self.assertIn("uses: ./.github/actions/checkout-openvmm", privileged)
+        self.assertIn("ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}", privileged)
+        self.assertIn("run: python3 scripts/nvx.py test-openvmm-privileged", privileged)
+        self.assertNotIn("validate-runner", privileged)
+
+        caller = _workflow_job(workflow, "nvx-caller-identity-kvm")
+        self.assertIn(
+            "needs: [artifacts, build-openvmm-linux-musl, openvmm-changes]", caller
+        )
+        self.assertIn(same_repository, caller)
+        self.assertIn("needs.build-openvmm-linux-musl.result == 'success'", caller)
+        self.assertIn(
+            "uses: ./.github/workflows/run-nvx-caller-identity-tests.yml", caller
+        )
+        self.assertIn("openvmm-artifact: openvmm-linux-musl", caller)
+        self.assertIn(
+            "run-nvx-caller-identity-tests", _workflow_job(workflow, "openvmm-changes")
+        )
+        for job_name in ("release", "performance-persist", "required-status-check"):
+            job = _workflow_job(workflow, job_name)
+            for required in ("openvmm-privileged-tests", "nvx-caller-identity-kvm"):
+                with self.subTest(job=job_name, required=required):
+                    self.assertIn(f"      - {required}", job)
+                    self.assertIn(f"needs.{required}.result", job)
+
+        self.assertIn("runs-on: ubuntu-latest", caller_workflow)
+        self.assertNotIn("validate-runner", caller_workflow)
+        self.assertIn('KERNEL=="kvm", GROUP="kvm", MODE="0666"', caller_workflow)
+        self.assertIn(
+            "sudo setcap cap_setuid,cap_setgid=ep openvmm/target/release/openvmm",
+            caller_workflow,
+        )
+        self.assertIn('test "$(id -u)" != 0', caller_workflow)
+        self.assertIn("--scenario filesystem-owner", caller_workflow)
+        self.assertIn("            --mount-owner caller\n", caller_workflow)
+        self.assertIn("--arg caller", caller_workflow)
+        self.assertIn("sudo python3 scripts/nvx.py sandbox", caller_workflow)
+        self.assertIn("python3 scripts/nvx.py sandbox provision", caller_workflow)
+        self.assertIn('[ "${owner}" != 65534:65534 ]', caller_workflow)
+
+        # Without capabilities, a persistent runner checks that every request
+        # fails with EPERM instead of running as the OpenVMM user.
+        step_name = (
+            "      - name: Run Ubuntu sandbox caller-identity fail-closed test on Linux"
+        )
+        self.assertIn(step_name, microvm_workflow)
+        step = microvm_workflow.split(step_name, 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn("if: runner.os != 'Windows'", step)
+        self.assertIn('test "$(id -u)" != 0', step)
+        self.assertIn("--mount-owner caller", step)
+        self.assertIn("--arg eperm", step)
+        self.assertIn('test "$(ls -A "${share}")" = nvx-host-marker', step)
 
     def test_ci_runs_openvmm_tests_and_unit_tests_on_each_backend(self):
         workflow = (

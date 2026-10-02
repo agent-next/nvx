@@ -292,6 +292,45 @@ jobs:
           python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
           rm -rf "${share}" "${scratch}" "${outside}"
 
+      - name: Run Ubuntu sandbox caller-identity fail-closed test on Linux
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Persistent runners have no sudo, so OpenVMM lacks CAP_SETUID and
+          # CAP_SETGID here and must fail every guest request with EPERM rather
+          # than act as its own user. The GitHub-hosted caller-identity job
+          # covers ownership and root squash with those capabilities.
+          test "$(id -u)" != 0
+          if command -v getcap >/dev/null 2>&1; then
+            test -z "$(getcap openvmm/target/release/openvmm)"
+          fi
+          uuid=$(
+            python3 -c 'import json; print(json.load(open("build/ubuntu-distro.erofs.manifest.json", encoding="utf-8"))["uuid"])'
+          )
+          scratch="build/ubuntu-caller-${{ inputs.backend }}.ext4"
+          share="build/ubuntu-caller-share-${{ inputs.backend }}"
+          cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
+          rm -rf "${share}"
+          mkdir -p "${share}"
+          printf 'host-to-guest\n' >"${share}/nvx-host-marker"
+          chmod 0777 "${share}"
+          python3 scripts/nvx.py sandbox \
+            --hypervisor "${{ inputs.backend }}" \
+            --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
+            --scratch "${scratch}" \
+            --mount "/workspace,${share},rw" \
+            --mount-owner caller \
+            --entrypoint /sbin/nvx-sandbox-smoke \
+            --arg /workspace \
+            --arg eperm \
+            --workload-user 65534:65534 \
+            --memory-mib 256
+          # No request reached the host as the OpenVMM user.
+          test "$(ls -A "${share}")" = nvx-host-marker
+          test "$(cat "${share}/nvx-host-marker")" = host-to-guest
+          rm -rf "${share}" "${scratch}"
+
       - name: Run Ubuntu sandbox layer smoke test on Windows
         if: runner.os == 'Windows'
         shell: powershell

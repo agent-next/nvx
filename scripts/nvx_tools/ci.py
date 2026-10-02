@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import sys
 import zipfile
 from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 from .build_constants import (
     AlpineBuildConstants,
@@ -36,9 +39,11 @@ REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "build-openvmm-windows-msvc": "BUILD_WINDOWS_MSVC_RESULT",
     "openvmm-vmm-tests": "VMM_TESTS_RESULT",
     "openvmm-unit-tests": "UNIT_TESTS_RESULT",
+    "openvmm-privileged-tests": "PRIVILEGED_TESTS_RESULT",
     "nvx-microvm-tests-kvm": "MICROVM_KVM_RESULT",
     "nvx-microvm-tests-mshv": "MICROVM_MSHV_RESULT",
     "nvx-microvm-tests-whp": "MICROVM_WHP_RESULT",
+    "nvx-caller-identity-kvm": "CALLER_IDENTITY_KVM_RESULT",
     "platform-kvm": "PLATFORM_KVM_RESULT",
     "platform-mshv": "PLATFORM_MSHV_RESULT",
     "platform-whp": "PLATFORM_WHP_RESULT",
@@ -49,13 +54,14 @@ REQUIRED_CI_BUILD_JOBS = (
     "build-openvmm-linux-musl",
     "build-openvmm-windows-msvc",
 )
-REQUIRED_CI_OPENVMM_TEST_JOBS = ("openvmm-unit-tests",)
+REQUIRED_CI_OPENVMM_TEST_JOBS = ("openvmm-unit-tests", "openvmm-privileged-tests")
 # OpenVMM VMM tests boot the NVX guest artifacts, which only workload runs build.
 REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS = ("openvmm-vmm-tests",)
 REQUIRED_CI_MICROVM_TEST_JOBS = (
     "nvx-microvm-tests-kvm",
     "nvx-microvm-tests-mshv",
     "nvx-microvm-tests-whp",
+    "nvx-caller-identity-kvm",
 )
 REQUIRED_CI_ARTIFACT_JOB = "artifacts"
 REQUIRED_CI_PLATFORM_JOBS = (
@@ -75,6 +81,10 @@ OPENVMM_UNIT_TEST_EXCLUDED_PACKAGES = (
     "vmm_test_macros",
     "flowey_core",
 )
+# Unit tests that need CAP_SETUID and CAP_SETGID are ignored by default and named
+# for the virtio-fs caller identity that they exercise.
+OPENVMM_PRIVILEGED_TEST_PACKAGES = ("fuse", "lxutil", "virtiofs")
+OPENVMM_PRIVILEGED_TEST_FILTER = "caller_identity"
 
 
 def required_ci_expected_results(
@@ -387,6 +397,90 @@ def run_openvmm_unit_tests() -> None:
         ],
         cwd=OpenVMMBuildConstants.DIRECTORY,
     )
+
+
+def openvmm_test_executables(cargo_messages: bytes) -> tuple[Path, ...]:
+    """Return the test executables reported by `cargo test --message-format=json`."""
+    executables: list[Path] = []
+    for line in cargo_messages.decode("utf-8", errors="replace").splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(message, dict):
+            continue
+        typed = cast(dict[str, object], message)
+        profile = typed.get("profile")
+        executable = typed.get("executable")
+        if (
+            typed.get("reason") == "compiler-artifact"
+            and isinstance(profile, dict)
+            and cast(dict[str, object], profile).get("test") is True
+            and isinstance(executable, str)
+        ):
+            executables.append(Path(executable))
+    return tuple(dict.fromkeys(executables))
+
+
+def run_openvmm_privileged_tests() -> None:
+    """Run the OpenVMM unit tests that need CAP_SETUID and CAP_SETGID as root.
+
+    Cargo builds the tests as the invoking user, and only the selected test
+    processes run through `sudo`.
+    """
+    if sys.platform != "linux":
+        raise ScriptError("privileged OpenVMM unit tests require a Linux host")
+    require_file(
+        OpenVMMBuildConstants.DIRECTORY / "Cargo.toml", "initialized OpenVMM submodule"
+    )
+    cargo = require_tool("cargo")
+    sudo = require_tool("sudo")
+    run_checked(
+        [cargo, "xflowey", "restore-packages", "--no-compat-igvm"],
+        cwd=OpenVMMBuildConstants.DIRECTORY,
+    )
+    build = [cargo, "test", "--locked", "--lib", "--no-run"]
+    for package in OPENVMM_PRIVILEGED_TEST_PACKAGES:
+        build.extend(("-p", package))
+    run_checked(build, cwd=OpenVMMBuildConstants.DIRECTORY)
+    messages = run_capture(
+        [*build, "--message-format=json"], cwd=OpenVMMBuildConstants.DIRECTORY
+    )
+    require_success(messages, "OpenVMM privileged unit test discovery")
+
+    selected: list[Path] = []
+    for executable in openvmm_test_executables(messages.stdout):
+        listing = run_capture(
+            [
+                executable,
+                "--list",
+                "--ignored",
+                "--format",
+                "terse",
+                OPENVMM_PRIVILEGED_TEST_FILTER,
+            ]
+        )
+        require_success(listing, f"{executable.name} privileged test listing")
+        if any(
+            line.endswith(": test")
+            for line in listing.stdout.decode("utf-8", errors="replace").splitlines()
+        ):
+            selected.append(executable)
+    if not selected:
+        raise ScriptError(
+            f"no ignored {OPENVMM_PRIVILEGED_TEST_FILTER} OpenVMM unit tests were found"
+        )
+    for executable in selected:
+        run_checked(
+            [
+                sudo,
+                "--non-interactive",
+                executable,
+                "--ignored",
+                OPENVMM_PRIVILEGED_TEST_FILTER,
+            ],
+            cwd=OpenVMMBuildConstants.DIRECTORY,
+        )
 
 
 def run_openvmm_tests(backend: str) -> None:

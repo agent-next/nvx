@@ -45,6 +45,15 @@ Denied-filesystem coverage verifies listing suppression, allowed writes,
 direct and parent-relative denial, symlink/junction alias denial, guest-created
 links into the denied subtree, a second
 virtio-fs mount, and pre-boot rejection of unsafe path policies.
+Caller-owner coverage depends on OpenVMM's privileges. With `CAP_SETUID` and
+`CAP_SETGID`, it verifies that guest root is squashed to the export owner,
+that a non-root guest caller owns what it creates, including inside its own
+directory, and that guest root cannot change a file's owner or group to root
+or create a device node. Without them, every guest request must fail with
+`EPERM` and leave the host unchanged. On every Linux host, a root-owned
+export is rejected before boot; on WHP, the policy itself is rejected before
+boot. The persistent runners have no `sudo`, so the privileged checks run on
+ephemeral GitHub-hosted runners.
 The native suite targets KVM, MSHV, and WHP; a passing run on one backend is
 not a fresh result for the others.
 Coverage also includes
@@ -73,6 +82,8 @@ broker state machine and its save and restore, peer-identity and capability
 admission for local endpoints, workload identity and lifecycle ownership,
 the bounded outcome-report schema, egress-policy enforcement in the endpoint
 and virtio-net layers, the virtio-fs microVM profile and denied-path policy,
+the virtio-fs caller identity, which fails closed without privileges and runs
+its ownership and privilege-drop tests as root,
 state-unit quiesce and rollback, management exclusion at the snapshot
 boundary, management-RPC guest-exit propagation, output-drain completion and
 failures, and backend TSC repair. Hardware-dependent clock tests still require

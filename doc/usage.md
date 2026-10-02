@@ -34,6 +34,7 @@ python3 scripts/nvx.py performance gate --help
 | `setup-cross-os-cache` | Install GNU tar and zstd for GitHub Actions cross-OS caches. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
+| `test-openvmm-privileged` | Run the OpenVMM unit tests that need `CAP_SETUID` and `CAP_SETGID` through `sudo` on Linux. |
 | `test-openvmm` | Run self-contained OpenVMM microVM control-plane tests. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
 | `test-adversarial` | Run a brokered Copilot-driven adversarial campaign. |
@@ -193,6 +194,18 @@ Runs the OpenVMM workspace's unit-test binaries with cargo-nextest's `agent`
 profile and the `ci` feature. Packages that require specialized test harnesses
 are excluded, along with all fuzz crates reported by OpenVMM's `xtask`.
 Afterward, runs the workspace doctests with Cargo.
+
+### `test-openvmm-privileged`
+
+```console
+python3 scripts/nvx.py test-openvmm-privileged
+```
+
+Linux only. Builds the `fuse`, `lxutil`, and `virtiofs` unit tests as the
+current user, then runs only their ignored `caller_identity` tests through
+`sudo --non-interactive`. These tests switch thread credentials to check
+virtio-fs caller ownership, root squash, and privilege dropping, so they need
+`CAP_SETUID` and `CAP_SETGID`. The command fails if no such test is found.
 
 ### `test-openvmm`
 

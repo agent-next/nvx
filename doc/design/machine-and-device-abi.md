@@ -353,17 +353,25 @@ create untracked host state.
 Read-only mode rejects mutation in the host device before invoking host
 filesystem operations; read-write mode exposes only the supported common host
 contract.
+The owner policy selects the host identity for guest operations. `vmm`, the
+default, uses the OpenVMM process. `caller`, on Linux only, performs each
+request with the filesystem UID and GID from its FUSE header, no supplementary
+groups, and no effective capabilities. UID 0 and GID 0 are squashed to the
+owner of the export root, which must not be root. A request that cannot switch
+identities fails with `EPERM`. Windows rejects `caller` before boot.
 Denied host paths are canonicalized into a bounded, non-overlapping relative
 set and enforced before HostFs operations. Prefix checks hide complete
 subtrees, while denied root device/inode identities block hard-link, junction,
 and bind-mount aliases. The policy is unchanged by a second guest mount.
 
 The exported directory is external live state, not part of the VM snapshot.
-An active capture saves its exact canonical host path, denied-path set, FUSE negotiation, node
+An active capture saves its exact canonical host path, denied-path set, owner
+policy, FUSE negotiation, node
 and handle allocation, aliases (including those of symbolic links), lookup
 counts, directory snapshots and cookies, and the identities needed to reopen
 objects. Restore requires the same path,
-target, mode, denied-path set, root identity, and reopenable objects. A dormant capture instead
+target, mode, denied-path set, owner policy, root identity, and reopenable
+objects. The default owner policy keeps the encoding of earlier snapshots. A dormant capture instead
 saves explicit unattached state and may restore with no attachment or bind a
 new HostFs backend. The resumed guest then mounts tag `microvm` explicitly;
 the cold-boot mount hook has already run. Snapshots without this capability

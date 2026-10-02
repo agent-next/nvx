@@ -109,7 +109,7 @@ jobs:
             run_workloads "At least one non-documentation file changed between \`${BASE_SHA}\` and \`${HEAD_SHA}\`."
           fi
 
-          relevant_paths='^(openvmm($|/)|\.github/workflows/(ci|build-openvmm-binary|run-nvx-microvm-tests|run-platform)\.yml$|\.github/actions/(build-guest-artifacts|build-openvmm|checkout-openvmm|sccache|setup-curl|validate-nvx|validate-runner)/|scripts/nvx\.py$|scripts/nvx_tools/|scripts/setup/|kernel/|alpine/|guest/|ubuntu/|docker/Dockerfile$|SOURCE-MANIFEST\.json$)'
+          relevant_paths='^(openvmm($|/)|\.github/workflows/(ci|build-openvmm-binary|run-nvx-microvm-tests|run-nvx-caller-identity-tests|run-platform)\.yml$|\.github/actions/(build-guest-artifacts|build-openvmm|checkout-openvmm|sccache|setup-curl|validate-nvx|validate-runner)/|scripts/nvx\.py$|scripts/nvx_tools/|scripts/setup/|kernel/|alpine/|guest/|ubuntu/|docker/Dockerfile$|SOURCE-MANIFEST\.json$)'
           if grep -Eq "${relevant_paths}" "${changed_files}"; then
             run_tests "At least one OpenVMM test input changed between \`${BASE_SHA}\` and \`${HEAD_SHA}\`."
           else
@@ -703,6 +703,49 @@ jobs:
             ${{ format('{0}/cargo-home/git', runner.temp) }}
           key: openvmm-cargo-v1-${{ runner.os }}-${{ runner.arch }}-unit-tests-${{ hashFiles('openvmm/Cargo.lock') }}
 
+  openvmm-privileged-tests:
+    name: OpenVMM privileged tests / Linux / GitHub-hosted
+    needs: [openvmm-changes]
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.draft == false
+        ) &&
+        (
+          github.event_name == 'push' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        ) &&
+        (
+          needs.openvmm-changes.result != 'success' ||
+          needs.openvmm-changes.outputs.run-tests == 'true'
+        )
+      }}
+    # Persistent runners deliberately have no sudo, so the virtio-fs caller
+    # identity tests that need CAP_SETUID and CAP_SETGID run on an ephemeral
+    # GitHub-hosted runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Checkout OpenVMM
+        uses: ./.github/actions/checkout-openvmm
+        with:
+          ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
+
+      - name: Set up retrying curl
+        uses: ./.github/actions/setup-curl
+
+      - name: Run privileged OpenVMM unit tests
+        shell: bash
+        run: python3 scripts/nvx.py test-openvmm-privileged
+
   nvx-microvm-tests-kvm:
     name: NVX microVM tests / Linux / KVM
     needs: [artifacts, build-openvmm-linux-gnu, openvmm-changes]
@@ -795,6 +838,33 @@ jobs:
       openvmm-artifact: openvmm-windows-msvc
     secrets:
       OPENVMM_DEPLOY_KEY: ${{ secrets.OPENVMM_DEPLOY_KEY }}
+
+  nvx-caller-identity-kvm:
+    name: NVX caller identity / Linux / KVM
+    needs: [artifacts, build-openvmm-linux-musl, openvmm-changes]
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.draft == false
+        ) &&
+        (
+          github.event_name == 'push' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        ) &&
+        needs.artifacts.result == 'success' &&
+        needs.build-openvmm-linux-musl.result == 'success' &&
+        (
+          needs.openvmm-changes.result != 'success' ||
+          needs.openvmm-changes.outputs.run-tests == 'true'
+        )
+      }}
+    # The statically linked binary runs on any GitHub-hosted Linux image.
+    uses: ./.github/workflows/run-nvx-caller-identity-tests.yml
+    with:
+      openvmm-artifact: openvmm-linux-musl
 
   platform-kvm:
     name: Platform / Linux / KVM / Virtual machine
@@ -916,9 +986,11 @@ jobs:
       - quality
       - openvmm-vmm-tests
       - openvmm-unit-tests
+      - openvmm-privileged-tests
       - nvx-microvm-tests-kvm
       - nvx-microvm-tests-mshv
       - nvx-microvm-tests-whp
+      - nvx-caller-identity-kvm
       - platform-kvm
       - platform-mshv
       - platform-whp
@@ -938,6 +1010,10 @@ jobs:
           needs.openvmm-unit-tests.result == 'skipped'
         ) &&
         (
+          needs.openvmm-privileged-tests.result == 'success' ||
+          needs.openvmm-privileged-tests.result == 'skipped'
+        ) &&
+        (
           needs.nvx-microvm-tests-kvm.result == 'success' ||
           needs.nvx-microvm-tests-kvm.result == 'skipped'
         ) &&
@@ -948,6 +1024,10 @@ jobs:
         (
           needs.nvx-microvm-tests-whp.result == 'success' ||
           needs.nvx-microvm-tests-whp.result == 'skipped'
+        ) &&
+        (
+          needs.nvx-caller-identity-kvm.result == 'success' ||
+          needs.nvx-caller-identity-kvm.result == 'skipped'
         ) &&
         needs.platform-kvm.result == 'success' &&
         needs.platform-mshv.result == 'success' &&
@@ -1007,9 +1087,11 @@ jobs:
       - build-openvmm-windows-msvc
       - openvmm-vmm-tests
       - openvmm-unit-tests
+      - openvmm-privileged-tests
       - nvx-microvm-tests-kvm
       - nvx-microvm-tests-mshv
       - nvx-microvm-tests-whp
+      - nvx-caller-identity-kvm
       - platform-kvm
       - platform-mshv
       - platform-whp
@@ -1042,9 +1124,11 @@ jobs:
           BUILD_WINDOWS_MSVC_RESULT: ${{ needs.build-openvmm-windows-msvc.result }}
           VMM_TESTS_RESULT: ${{ needs.openvmm-vmm-tests.result }}
           UNIT_TESTS_RESULT: ${{ needs.openvmm-unit-tests.result }}
+          PRIVILEGED_TESTS_RESULT: ${{ needs.openvmm-privileged-tests.result }}
           MICROVM_KVM_RESULT: ${{ needs.nvx-microvm-tests-kvm.result }}
           MICROVM_MSHV_RESULT: ${{ needs.nvx-microvm-tests-mshv.result }}
           MICROVM_WHP_RESULT: ${{ needs.nvx-microvm-tests-whp.result }}
+          CALLER_IDENTITY_KVM_RESULT: ${{ needs.nvx-caller-identity-kvm.result }}
           PLATFORM_KVM_RESULT: ${{ needs.platform-kvm.result }}
           PLATFORM_MSHV_RESULT: ${{ needs.platform-mshv.result }}
           PLATFORM_WHP_RESULT: ${{ needs.platform-whp.result }}
@@ -1061,9 +1145,11 @@ jobs:
     needs:
       - openvmm-vmm-tests
       - openvmm-unit-tests
+      - openvmm-privileged-tests
       - nvx-microvm-tests-kvm
       - nvx-microvm-tests-mshv
       - nvx-microvm-tests-whp
+      - nvx-caller-identity-kvm
       - platform-kvm
       - platform-mshv
       - platform-whp
@@ -1082,6 +1168,10 @@ jobs:
           needs.openvmm-unit-tests.result == 'skipped'
         ) &&
         (
+          needs.openvmm-privileged-tests.result == 'success' ||
+          needs.openvmm-privileged-tests.result == 'skipped'
+        ) &&
+        (
           needs.nvx-microvm-tests-kvm.result == 'success' ||
           needs.nvx-microvm-tests-kvm.result == 'skipped'
         ) &&
@@ -1092,6 +1182,10 @@ jobs:
         (
           needs.nvx-microvm-tests-whp.result == 'success' ||
           needs.nvx-microvm-tests-whp.result == 'skipped'
+        ) &&
+        (
+          needs.nvx-caller-identity-kvm.result == 'success' ||
+          needs.nvx-caller-identity-kvm.result == 'skipped'
         ) &&
         needs.platform-kvm.result == 'success' &&
         needs.platform-mshv.result == 'success' &&

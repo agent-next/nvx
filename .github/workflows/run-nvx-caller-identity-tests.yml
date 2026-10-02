@@ -1,0 +1,171 @@
+name: Run NVX caller identity tests
+
+on:
+  workflow_call:
+    inputs:
+      openvmm-artifact:
+        description: Base name of the statically linked Linux OpenVMM artifacts
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: NVX caller identity / Linux / KVM / GitHub-hosted
+    # Persistent runners deliberately have no sudo, so OpenVMM cannot gain the
+    # CAP_SETUID and CAP_SETGID that `--mount-owner caller` needs there. This
+    # ephemeral runner grants them and exposes nested KVM.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-artifacts
+          path: build
+
+      - name: Download OpenVMM executable
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.openvmm-artifact }}-executable
+          path: openvmm/target/release
+
+      - name: Download OpenVMM provenance
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.openvmm-artifact }}-provenance
+          path: build
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-nvx-kvm.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
+      - name: Grant OpenVMM caller-identity capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x openvmm/target/release/openvmm
+          sudo setcap cap_setuid,cap_setgid=ep openvmm/target/release/openvmm
+          getcap openvmm/target/release/openvmm | grep -q 'cap_setgid,cap_setuid=ep'
+          # The workflow runs as an unprivileged user; only OpenVMM holds the
+          # capabilities, as in a file-capability deployment.
+          test "$(id -u)" != 0
+
+      - name: Run caller-identity microVM scenario
+        shell: bash
+        run: >-
+          python3 scripts/nvx.py test-microvm
+          --backend kvm
+          --scenario filesystem-owner
+          --output-dir build/test-results/caller-identity
+
+      - name: Run Ubuntu sandbox caller-identity smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          uuid=$(
+            python3 -c 'import json; print(json.load(open("build/ubuntu-distro.erofs.manifest.json", encoding="utf-8"))["uuid"])'
+          )
+          share="build/ubuntu-caller-share"
+          scratch="build/ubuntu-caller.ext4"
+          logs="build/test-results/caller-identity"
+          prepare() {
+            # The guest owns what it creates, so removing it needs root.
+            sudo rm -rf "${share}"
+            mkdir -p "${share}/nvx-denied" "${share}/nvx-links"
+            printf 'host-to-guest\n' >"${share}/nvx-host-marker"
+            printf 'secret\n' >"${share}/nvx-denied/secret"
+            chmod 0777 "${share}" "${share}/nvx-links"
+            sudo rm -f "${scratch}"
+            cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
+          }
+          # Files that the workload creates belong to its UID and GID, not to
+          # the runner user that owns the share or to root.
+          check_workload_owner() {
+            for path in nvx-guest-marker nvx-guest-directory \
+              nvx-guest-directory/nvx-nested nvx-tool nvx-links/nvx-tool \
+              nvx-links/absolute nvx-links/outside nvx-links/denied; do
+              owner="$(stat -c %u:%g "${share}/${path}")"
+              if [ "${owner}" != 65534:65534 ]; then
+                echo "::error::${path} is owned by ${owner}, not the workload" >&2
+                exit 1
+              fi
+            done
+            test "$(stat -c %u:%g "${share}")" = "$(id -u):$(id -g)"
+            test "$(cat "${share}/nvx-denied/secret")" = secret
+          }
+          sandbox_args=(
+            --hypervisor kvm
+            --layer "distro,build/ubuntu-distro.erofs,${uuid}"
+            --scratch "${scratch}"
+            --mount "/workspace,${share},rw"
+            --mount-deny nvx-denied
+            --mount-owner caller
+            --workload-user 65534:65534
+          )
+
+          # OpenVMM with file capabilities, one-shot.
+          prepare
+          python3 scripts/nvx.py sandbox "${sandbox_args[@]}" \
+            --entrypoint /sbin/nvx-sandbox-smoke \
+            --arg /workspace \
+            --arg caller \
+            --memory-mib 256
+          check_workload_owner
+
+          # OpenVMM with file capabilities, managed lifecycle.
+          prepare
+          state=$(mktemp -d)
+          cleanup() {
+            if [ -f "${state}/runtime.json" ]; then
+              python3 scripts/nvx.py sandbox stop --state-dir "${state}" --timeout 30 || true
+            fi
+            mkdir -p "${logs}"
+            cp "${state}/openvmm.log" "${logs}/managed-caller-openvmm.log" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          python3 scripts/nvx.py sandbox provision --state-dir "${state}" "${sandbox_args[@]}"
+          python3 -c 'import json, sys; config = json.load(open(sys.argv[1], encoding="utf-8")); assert config["mount"]["owner"] == "caller", config' "${state}/config.json"
+          python3 scripts/nvx.py sandbox start --state-dir "${state}"
+          python3 scripts/nvx.py sandbox exec \
+            --state-dir "${state}" \
+            --entrypoint /sbin/nvx-sandbox-smoke \
+            --arg /workspace \
+            --arg caller
+          python3 scripts/nvx.py sandbox stop --state-dir "${state}"
+          python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
+          check_workload_owner
+
+          # OpenVMM as root: switching the filesystem UID away from root must
+          # not leave files owned by root.
+          prepare
+          sudo python3 scripts/nvx.py sandbox "${sandbox_args[@]}" \
+            --entrypoint /sbin/nvx-sandbox-smoke \
+            --arg /workspace \
+            --arg caller \
+            --memory-mib 256
+          check_workload_owner
+          sudo rm -rf "${share}" "${scratch}"
+
+      - name: Upload caller-identity diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nvx-caller-identity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/test-results/caller-identity
+          if-no-files-found: warn
+          retention-days: 7

@@ -45,6 +45,7 @@ from nvx_tools.ci import (
     OPENVMM_TEST_BACKENDS,
     REQUIRED_CI_RESULT_ENVIRONMENTS,
     required_ci_failures,
+    run_openvmm_privileged_tests,
     run_openvmm_tests,
     run_openvmm_unit_tests,
     setup_cross_os_cache,
@@ -235,6 +236,10 @@ def command_test_openvmm(args: argparse.Namespace) -> None:
 
 def command_test_openvmm_unit(_: argparse.Namespace) -> None:
     run_openvmm_unit_tests()
+
+
+def command_test_openvmm_privileged(_: argparse.Namespace) -> None:
+    run_openvmm_privileged_tests()
 
 
 def command_build(args: argparse.Namespace) -> None:
@@ -729,6 +734,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="run OpenVMM unit and documentation tests",
     )
     openvmm_unit_tests.set_defaults(handler=command_test_openvmm_unit)
+
+    openvmm_privileged_tests = subparsers.add_parser(
+        "test-openvmm-privileged",
+        help=(
+            "run the OpenVMM unit tests that need CAP_SETUID and CAP_SETGID "
+            "through sudo (Linux)"
+        ),
+    )
+    openvmm_privileged_tests.set_defaults(handler=command_test_openvmm_privileged)
 
     openvmm_tests = subparsers.add_parser(
         "test-openvmm",

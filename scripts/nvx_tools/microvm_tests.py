@@ -65,6 +65,7 @@ MICROVM_TEST_SCENARIOS = (
     "directional-network-policy",
     "denied-filesystem-paths",
     "endpoint-policy-snapshot",
+    "filesystem-owner",
     "filesystem-snapshot",
     "guest-boot",
     "guest-identity",
@@ -88,7 +89,13 @@ MICROVM_TEST_SCENARIOS = (
     "workload-identity",
 )
 UBUNTU_UNSUPPORTED_SCENARIOS = frozenset(
-    ("console-snapshot", "sandbox-blocks", "scratch-snapshot", "snapshot-tiers")
+    (
+        "console-snapshot",
+        "filesystem-owner",
+        "sandbox-blocks",
+        "scratch-snapshot",
+        "snapshot-tiers",
+    )
 )
 MICROVM_PROCESSOR_COUNTS = (1, 2, 4, 8)
 MICROVM_TEST_SCRIPTS_DIR = Path(__file__).with_name("microvm_test_scripts")
@@ -130,6 +137,16 @@ FILESYSTEM_DORMANT_BEFORE_MARKER = b"NVX-FILESYSTEM-DORMANT-BEFORE"
 FILESYSTEM_DORMANT_ATTACHED_MARKER = b"NVX-FILESYSTEM-DORMANT-ATTACHED"
 FILESYSTEM_LIVE_BEFORE_MARKER = b"NVX-FILESYSTEM-LIVE-BEFORE"
 FILESYSTEM_LIVE_AFTER_MARKER = b"NVX-FILESYSTEM-LIVE-AFTER"
+FILESYSTEM_OWNER_MAPPED_MARKER = b"NVX-FILESYSTEM-OWNER-MAPPED-OK"
+FILESYSTEM_OWNER_DENIED_MARKER = b"NVX-FILESYSTEM-OWNER-DENIED-OK"
+# Guest identities for the caller-owner scenario, which no test host is expected
+# to use. The export owner applies when the harness itself runs as root.
+FILESYSTEM_OWNER_CALLER = (4242, 4243)
+FILESYSTEM_OWNER_OTHER_CALLER = (4244, 4244)
+FILESYSTEM_OWNER_EXPORT = (4240, 4241)
+# CAP_SETGID and CAP_SETUID in a VFS file-capability permitted set.
+_IDENTITY_CAPABILITY_BITS = (1 << 6) | (1 << 7)
+_VFS_CAP_FLAGS_EFFECTIVE = 0x1
 NETWORK_BEFORE_MARKER = b"NVX-NETWORK-BEFORE"
 NETWORK_INVALIDATED_MARKER = b"NVX-NETWORK-OLD-FLOW-INVALIDATED"
 NETWORK_AFTER_MARKER = b"NVX-NETWORK-AFTER"
@@ -2197,6 +2214,172 @@ def run_denied_filesystem_paths(
                 )
 
 
+def file_capabilities_grant_identity(data: bytes) -> bool:
+    """Returns whether `security.capability` makes CAP_SETUID and CAP_SETGID effective."""
+    # struct vfs_cap_data starts with magic_etc and the low permitted word.
+    if len(data) < 8:
+        return False
+    magic, permitted = struct.unpack_from("<II", data)
+    return (
+        magic & _VFS_CAP_FLAGS_EFFECTIVE != 0
+        and permitted & _IDENTITY_CAPABILITY_BITS == _IDENTITY_CAPABILITY_BITS
+    )
+
+
+def openvmm_has_identity_capabilities(executable: Path) -> bool:
+    """Returns whether OpenVMM runs with CAP_SETUID and CAP_SETGID on this host."""
+    if sys.platform != "linux":
+        return False
+    if os.geteuid() == 0:
+        return True
+    try:
+        data = os.getxattr(executable, "security.capability")
+    except OSError:
+        return False
+    return file_capabilities_grant_identity(data)
+
+
+def _expect_rejected_before_boot(
+    command: Sequence[str],
+    expected: bytes,
+    *,
+    timeout: float,
+    log_path: Path,
+    description: str,
+) -> None:
+    with OpenvmmProcess(command, log_path) as process:
+        result = process.wait(timeout)
+    if (
+        result.returncode == 0
+        or expected not in result.output
+        or BOOT_MARKER in result.output
+    ):
+        raise RuntimeError(f"{description} was not rejected before boot")
+
+
+def run_filesystem_owner(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Check `--mount-owner caller` on the host's OpenVMM privilege level.
+
+    Windows rejects the policy before boot. On Linux, OpenVMM either performs each
+    guest request as the caller with root squashed to the export owner, or, without
+    CAP_SETUID and CAP_SETGID, fails every request with EPERM.
+    """
+    with tempfile.TemporaryDirectory(
+        prefix="nvx-filesystem-owner-",
+        # An unprivileged harness cannot always remove guest-owned entries.
+        ignore_cleanup_errors=True,
+    ) as temporary:
+        root = Path(temporary) / "share"
+        root.mkdir()
+        # Every guest caller may create entries at the top of the export.
+        os.chmod(root, 0o777)
+        marker = root / "host-marker"
+        marker.write_bytes(b"NVX-HOST-OWNED\n")
+        command = workload_boot_command(
+            executable,
+            backend,
+            kernel,
+            initrd,
+            memory_mib,
+            "quiet loglevel=0",
+            mount=f"/mnt/share,{root},rw",
+        )
+        command.extend(("--mount-owner", "caller"))
+        if sys.platform != "linux":
+            _expect_rejected_before_boot(
+                command,
+                b"requires a Linux host",
+                timeout=timeout,
+                log_path=output_dir / "filesystem-owner-unsupported.log",
+                description="caller identity on a non-Linux host",
+            )
+            return
+
+        system_root = os.stat("/")
+        if system_root.st_uid == 0 and system_root.st_gid == 0:
+            root_owned = workload_boot_command(
+                executable,
+                backend,
+                kernel,
+                initrd,
+                memory_mib,
+                "quiet loglevel=0",
+                mount="/mnt/share,/,ro",
+            )
+            root_owned.extend(("--mount-owner", "caller"))
+            _expect_rejected_before_boot(
+                root_owned,
+                b"non-root user and group",
+                timeout=timeout,
+                log_path=output_dir / "filesystem-owner-root-export.log",
+                description="a caller-identity export owned by root",
+            )
+
+        status = root.stat()
+        if status.st_uid == 0 or status.st_gid == 0:
+            # Guest root is squashed to the export owner, which must not be root.
+            os.chown(root, *FILESYSTEM_OWNER_EXPORT)
+            status = root.stat()
+        export_owner = (status.st_uid, status.st_gid)
+
+        if not openvmm_has_identity_capabilities(executable):
+            run_guest_script(
+                command,
+                _read_script("filesystem-owner-denied.sh"),
+                FILESYSTEM_OWNER_DENIED_MARKER,
+                timeout=timeout,
+                log_path=output_dir / "filesystem-owner-denied.log",
+            )
+            # No request ran as the OpenVMM identity.
+            if sorted(os.listdir(root)) != ["host-marker"]:
+                raise RuntimeError("a denied caller-identity request changed the host")
+            if marker.read_bytes() != b"NVX-HOST-OWNED\n":
+                raise RuntimeError("a denied caller-identity request changed the host")
+            return
+
+        caller_uid, caller_gid = FILESYSTEM_OWNER_CALLER
+        run_guest_script(
+            command,
+            _render_script(
+                "filesystem-owner-mapped.sh.in",
+                CALLER_UID=str(caller_uid),
+                CALLER_GID=str(caller_gid),
+                OTHER_UID=str(FILESYSTEM_OWNER_OTHER_CALLER[0]),
+                OTHER_GID=str(FILESYSTEM_OWNER_OTHER_CALLER[1]),
+                EXPORT_OWNER=f"{export_owner[0]}:{export_owner[1]}",
+            ),
+            FILESYSTEM_OWNER_MAPPED_MARKER,
+            timeout=timeout,
+            log_path=output_dir / "filesystem-owner-mapped.log",
+        )
+        for name, owner in (
+            ("root-file", export_owner),
+            ("root-directory", export_owner),
+            ("caller-file", FILESYSTEM_OWNER_CALLER),
+            ("caller-directory", FILESYSTEM_OWNER_CALLER),
+            ("caller-directory/nested", FILESYSTEM_OWNER_CALLER),
+        ):
+            entry = (root / name).lstat()
+            if (entry.st_uid, entry.st_gid) != owner:
+                raise RuntimeError(
+                    f"guest-created {name} is owned by {entry.st_uid}:{entry.st_gid} "
+                    f"instead of {owner[0]}:{owner[1]}"
+                )
+        if os.path.lexists(root / "device"):
+            raise RuntimeError("squashed guest root created a host device node")
+        if marker.read_bytes() != b"NVX-HOST-OWNED\n":
+            raise RuntimeError("a caller-identity request changed a host-owned file")
+
+
 def run_sandbox_blocks(
     executable: Path,
     kernel: Path,
@@ -4235,6 +4418,17 @@ def run(args: argparse.Namespace) -> int:
     if "denied-filesystem-paths" in scenarios:
         print(f"Running microVM denied filesystem paths on OpenVMM/{args.backend}")
         run_denied_filesystem_paths(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "filesystem-owner" in scenarios:
+        print(f"Running microVM caller filesystem identity on OpenVMM/{args.backend}")
+        run_filesystem_owner(
             executable,
             kernel,
             initrd,
