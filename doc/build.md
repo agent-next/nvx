@@ -145,9 +145,9 @@ checks, the violation watcher, the restore packet v4 and time-sample parsers,
 the snapshot agent's time steps, and the wall-clock discipline. Before
 shell-ready it only steps the clock to host UTC; the other boot checks run in
 the background, and the production console shows no time ABI line except a
-violation event. `nvx-time status` prints the last check's marker and the
-runtime state on demand, after waiting for pending checks, for CI and test
-harnesses. Its boot check
+violation event. `nvx-time status` prints every recorded check (boot, capture,
+and restore) and the runtime state on demand, after waiting for pending
+checks, for CI and test harnesses. Its boot check
 also fails when the kernel's boot-time W+X audit reports a writable and
 executable mapping. `nvx-time exhaustive` runs the CI-only exhaustive check
 (checks X1 to X6 on every online CPU); it reports and exits, and production
