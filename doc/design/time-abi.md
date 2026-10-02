@@ -1759,10 +1759,11 @@ wiring v7m on the production kernel (`vmlinux-lockstep`), with at least
 | MSHV | 3 + 0.75 | 1 + 0.4 | 2.5 + 0.5 | prometheus30 and `azure-azlinux-5`, 128 and 512 MiB |
 | WHP | 20 + 1.5 | 1 + 0.4 | 35 + 6 | prometheus28 and the 8370C and 8573C runners, 512 MiB |
 
-The fleet matrix driver enforces the budgets during validation. CI reports
-each phase against its budget (`<phase>_cpu_over_budget`) but does not gate
-on it, because the A/B gate above covers latency. The checks' CPU time also
-counts the host stalls of their first touches of restored RAM:
+Fleet validation records every sample's `cpu_us` and checks each one
+against these budgets. CI reports each phase against its budget
+(`<phase>_cpu_over_budget`) but does not gate on it, because the A/B gate
+above covers latency. The checks' CPU time also counts the host stalls of
+their first touches of restored RAM:
 
 - WHP's restore checks fault in its lazily registered copy-on-write RAM,
   which the workload would otherwise do. Their cost grows with guest memory:
@@ -1874,9 +1875,10 @@ matrix driver run `/sbin/nvx-time status` over the console after shell-ready
 and after every restore. They require exit status 0 and, after a restore, a
 `phase=restore` line with `status=ok`, the restored `generation`, and `cpus`
 equal to the online CPUs; after a cold boot, a `phase=boot` line with
-`generation=0`. During fleet validation (`p6`), the matrix driver also
-requires each phase's `cpu_us` to be within the backend's budget for that
-phase in [Performance expectations](#performance-expectations-and-acceptance-gate);
+`generation=0`. During fleet validation (`p6`), the matrix driver records
+each phase's `cpu_us`, and every recorded sample must be within the
+backend's budget for that phase in
+[Performance expectations](#performance-expectations-and-acceptance-gate);
 CI reports it without gating on it. The fleet runs them on
 the hosts our SSH account can use,
 which for KVM are prometheus32 and `azure-kvm-5` and for MSHV prometheus30
