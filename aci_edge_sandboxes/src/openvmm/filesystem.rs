@@ -677,8 +677,12 @@ mod tests {
             sources,
             [("config.json", true), ("out", false), ("src", true)]
         );
-        let target = guest_path(&base.join("work/out")).unwrap();
-        assert!(mapping.binds.iter().any(|bind| bind.target == target));
+        let target = guest_path(&canonical(&base.join("work/out"))).unwrap();
+        assert!(
+            mapping.binds.iter().any(|bind| bind.target == target),
+            "missing canonical guest target {target:?} in {:?}",
+            mapping.binds
+        );
 
         let arguments = openvmm_arguments(&mapping);
         assert_eq!(arguments[0], "--mount");
@@ -780,6 +784,17 @@ mod tests {
             mapping.binds[0].target,
             guest_path(&canonical(&base.join("work").join("src"))).unwrap()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolved_guest_paths_canonicalize_temp_directory_case_aliases() {
+        let directory = root();
+        let path = directory.path().join("work").join("out");
+        let upper = PathBuf::from(path.to_str().unwrap().to_uppercase());
+        let expected = guest_path(&canonical(&path)).unwrap();
+        assert_ne!(guest_path(&upper), Some(expected.clone()));
+        assert_eq!(resolve_guest_path(&upper), Some(expected));
     }
 
     #[test]
