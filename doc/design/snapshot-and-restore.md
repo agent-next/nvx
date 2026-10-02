@@ -46,7 +46,9 @@ tier, clone/resume, and fresh/paired scratch combinations are rejected. For
 paired scratch, the guest snapshot helper first freezes the workload cgroup
 with a bounded wait, calls `sync`, and freezes the mounted filesystem. Its
 fresh-scratch mode instead requires scratch to be unmounted. A rejected capture
-thaws every guest-owned barrier; failure to thaw terminates the VM.
+thaws every guest-owned barrier and then releases the stall-detector
+suppression ([snapshot agent](time-abi.md#snapshot-agent)); failure to thaw or
+release terminates the VM.
 
 1. gate host input and defer completion of the snapshot-port write;
 2. stop the vCPU at the I/O boundary while completing the write, so saved state

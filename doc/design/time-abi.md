@@ -1308,15 +1308,23 @@ Before the capture request:
    `C10`), which do not wait and print nothing; they record
    `capture_status=ok` in the state file, which the snapshot carries.
 2. Save `/sys/module/rcupdate/parameters/rcu_cpu_stall_suppress` and write 1.
+   Values that an earlier request saved and never restored refuse the
+   capture.
 3. Debug: save and zero `/proc/sys/kernel/soft_watchdog` and
    `/proc/sys/kernel/hung_task_timeout_secs`.
 4. Apply the existing freezer and scratch barriers.
 5. Write the capture request to `0x605`.
 
-If the write returns without a restore (no destination or a rejected
-capture), the agent removes the barriers and then restores the values saved
-in steps 2 and 3. Otherwise, the restored process runs these steps. Steps 6
-to 10 and 12 are the readiness path: nothing else runs before the
+A committed capture terminates the source, so the write returns in the
+source VM only when the capture had no destination or failed before its
+commit point and OpenVMM resumed the guest. Step 6's status read tells the
+cases apart: bit 1 is clear in the source, which has no restore packet and
+keeps its generation, and set in a restored process, whose packet carries
+the next `g`. Reads of `0x605` return `0xff`; a capture reports no status.
+In the source, the agent removes the barriers and then restores the values
+saved in steps 2 and 3 (`nvx-time cancel-capture`); if any of these fails,
+it powers the guest off with status 1. A restored process runs these steps.
+Steps 6 to 10 and 12 are the readiness path: nothing else runs before the
 acknowledgement.
 
 6. Read the status from `0xea`. Bit 1 is always set after a restore.
@@ -1854,6 +1862,7 @@ can use as the fleet restore matrix.
 | Backend that cannot offer invariant TSC to its guests, on a host OS that sees it | `azure-windows-1` to `-4`, `azure-azlinux-5` | Restored; the guest has `constant_tsc` and `nonstop_tsc`; `H4` and `H6` pass |
 | Across backends | prometheus32 (KVM) to prometheus30 (MSHV) | `E_BACKEND_MISMATCH` |
 | Pre-v1 snapshot | Any | `E_SNAPSHOT_VERSION` |
+| Failed capture: a request without a destination; then, in one VM, a request whose destination the host created after launch (a rejected preflight), the destination's removal, and a second request | One host per backend; CI's `snapshot-core` covers the request without a destination | Each failed request returns in the same VM with status bit 1 clear, `rcu_cpu_stall_suppress` back to its saved value, and `nvx-time status` passing at `generation=0`, with no violation; the second request captures, which step 2 of the snapshot agent refuses while the first request's saved values remain, and its snapshot restores |
 | Processor activation from one boot-online CPU to 2, 4, and 8 | All backends | Restored; warp probe passes |
 | Every tier and an untiered snapshot, restored more than once | All backends | Restored; each restore of a snapshot captured at `g = 0` carries `g = 1` and a new generation ID. OpenVMM cannot capture a restored process, so unit tests cover the generation arithmetic beyond one restore, including `E_GENERATION_EXHAUSTED` |
 
