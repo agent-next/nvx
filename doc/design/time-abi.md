@@ -1838,7 +1838,7 @@ after the acknowledgement, outside these phases. `nvx-time status` reports
 checks. On
 every cold boot and restore, the worker logs `time ABI CPU checks passed`
 with `recorded_cpuid_us`, `presented_cpuid_us`, and `profile_support_us`.
-Their sum per restore at one vCPU is about 0.16 ms on bare-metal MSHV and
+Their sum per restore at one vCPU is about 0.15 ms on bare-metal MSHV and
 0.12 ms nested, and 0.87 ms on bare-metal WHP and 1.6 to 1.9 ms nested, about
 95% of it WHP's per-leaf read-back. OpenVMM's comparison and unlisted-entry
 check take 40 to 66 µs of each.
