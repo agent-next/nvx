@@ -421,17 +421,18 @@ KVM answers them from the effective CPUID: zero, Intel's out-of-range result
 (the highest basic leaf's) above the maximum basic leaf, or, past the last
 topology level, an invalid level with the x2APIC ID. WHP passes them through
 from its own guest view. MSHV registers a zero result for each one that the
-host's CPUID enumerates (15 or 16 per partition, about 65 µs) and passes the
-rest through. It keeps those results: without them, a subleaf that no result
-names reads the hypervisor's own value, which OpenVMM does not control.
-Verification keeps host features out of every entry passed through, at no
-run-time cost: profile verification fails a host whose hypervisor presents a
-non-zero entry outside the profile's tables (`E_CPU_UNLISTED`, verification
-step 6). A zero result for each such entry would instead add tens of
-registrations to every WHP partition setup, about 1 ms per restore. Under the
-time ABI, WHP's hardware sweep of VP 0 (subleaves 0 to 63 of every indexed
-leaf and four leaves past each maximum) reads zero at every reserved entry,
-including Intel PT's `0x14.1`, which the Skylake-SP roots show as non-zero.
+host's CPUID enumerates (15 on prometheus30 and 13 on azure-azlinux-5, about
+50 to 60 µs) and passes the rest through. It keeps those results: without
+them, a subleaf that no result names reads the hypervisor's own value, which
+OpenVMM does not control. Verification keeps host features out of every entry
+passed through, at no run-time cost: profile verification fails a host whose
+hypervisor presents a non-zero entry outside the profile's tables
+(`E_CPU_UNLISTED`, verification step 6). A zero result for each such entry
+would instead add tens of registrations to every WHP partition setup, about
+1 ms per restore. Under the time ABI, WHP's hardware sweep of VP 0
+(subleaves 0 to 63 of every indexed leaf and four leaves past each maximum)
+reads zero at every reserved entry, including Intel PT's `0x14.1`, which the
+Skylake-SP roots show as non-zero.
 MSHV's sweep reads zero with its zero results registered, and so do its far
 probes, where the hypervisor answers by itself: subleaves 64 to 255 of every
 indexed leaf, the leaves past the sweep up to `0xff` and `0x800000ff`, the
@@ -1698,7 +1699,7 @@ The backends add their own CPUID work:
   surface and the unlisted-entry candidates, without the hypervisor range,
   which neither uses (`cpu_profile::cpuid::enumerate_basic_and_extended`).
   Every CPUID instruction exits in a Hyper-V root, so a full enumeration
-  costs 70 to 91 µs on the bare-metal roots and 0.23 to 0.31 ms on Azure's
+  costs 70 to 100 µs on the bare-metal roots and 0.23 to 0.31 ms on Azure's
   nested roots; skipping the range saves about a fifth. KVM takes its
   surface from `KVM_GET_SUPPORTED_CPUID` and does not enumerate.
 - MSHV reads VP 0's report in one rep `HvCallGetVpCpuidValues`: 73 µs p50 on
