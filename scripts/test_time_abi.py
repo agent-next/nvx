@@ -136,7 +136,7 @@ class FieldParsingTests(unittest.TestCase):
         )
 
     def test_computes_the_checks_cpu_time_budget(self):
-        # The spec's bare-metal floors: a base plus an increment per additional
+        # The spec's final budgets: a base plus an increment per additional
         # CPU, one budget per backend and phase.
         for backend in ("kvm", "mshv", "whp"):
             self.assertEqual(
@@ -144,9 +144,15 @@ class FieldParsingTests(unittest.TestCase):
                 {"boot", "capture", "restore"},
             )
         self.assertEqual(time_abi.check_cpu_budget_us("kvm", "boot", 1), 6_000)
-        self.assertEqual(time_abi.check_cpu_budget_us("mshv", "restore", 8), 5_000)
+        self.assertEqual(time_abi.check_cpu_budget_us("kvm", "restore", 8), 17_250)
+        self.assertEqual(time_abi.check_cpu_budget_us("mshv", "boot", 4), 5_250)
+        self.assertEqual(time_abi.check_cpu_budget_us("mshv", "restore", 8), 6_000)
         self.assertEqual(time_abi.check_cpu_budget_us("whp", "capture", 2), 1_400)
-        self.assertEqual(time_abi.check_cpu_budget_us("whp", "restore", 1), 20_000)
+        self.assertEqual(time_abi.check_cpu_budget_us("whp", "restore", 1), 35_000)
+        # The spec's binding WHP cells: boot at 2 vCPUs (17.03 ms measured)
+        # and restore at 4 (42.20 ms).
+        self.assertEqual(time_abi.check_cpu_budget_us("whp", "boot", 2), 21_500)
+        self.assertEqual(time_abi.check_cpu_budget_us("whp", "restore", 4), 53_000)
         self.assertIsNone(time_abi.check_cpu_budget_us("hvf", "boot", 1))
         self.assertIsNone(time_abi.check_cpu_budget_us("kvm", "runtime", 1))
         self.assertIsNone(time_abi.check_cpu_budget_us("kvm", "boot", 0))

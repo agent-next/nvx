@@ -33,21 +33,21 @@ LAPIC_HZ: Mapping[str, int] = {
 }
 MIN_TSC_HZ = 500_000_000
 MAX_TSC_HZ = 10_000_000_000
-# doc/design/time-abi.md, "Performance": each backend has a CPU-time
-# (cpu_us) budget per phase (boot, capture, and restore): a base plus an
-# increment per additional online CPU, in microseconds. These are the spec's
-# bare-metal floors from the guest's v7 measurements; its final values are the
-# larger of those and the Azure maxima. This table is the one place the
-# harness reads them. The checks' wall time (elapsed_us) has no budget. CI
-# reports both and gates on neither: the performance gate is the A/B
-# comparison outside CI.
+# doc/design/time-abi.md, "Performance expectations and acceptance gate",
+# "cpu_us budgets": each backend has a CPU-time (cpu_us) budget per phase
+# (boot, capture, and restore): a base plus an increment per additional online
+# CPU, in microseconds, held per sample. These are the spec's final values: the
+# larger of the bare-metal and Azure maxima of v7m on vmlinux-lockstep, with at
+# least 20% headroom. This table is the one place the harness reads them. The
+# checks' wall time (elapsed_us) has no budget. CI reports both and gates on
+# neither: the performance gate is the A/B comparison outside CI.
 CHECK_CPU_BUDGET_US: Mapping[str, Mapping[str, tuple[int, int]]] = {
-    "kvm": {"boot": (6_000, 2_000), "capture": (1_000, 400), "restore": (5_000, 1_500)},
-    "mshv": {"boot": (3_000, 500), "capture": (1_000, 400), "restore": (1_500, 500)},
+    "kvm": {"boot": (6_000, 2_000), "capture": (1_000, 400), "restore": (5_000, 1_750)},
+    "mshv": {"boot": (3_000, 750), "capture": (1_000, 400), "restore": (2_500, 500)},
     "whp": {
-        "boot": (5_000, 1_000),
+        "boot": (20_000, 1_500),
         "capture": (1_000, 400),
-        "restore": (20_000, 2_000),
+        "restore": (35_000, 6_000),
     },
 }
 WARP_BOUND_NS = 1000
