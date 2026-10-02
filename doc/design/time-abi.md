@@ -1412,24 +1412,37 @@ fail if any check fails. The time checks replace the `nonstop_tsc` check.
 | `H1` | The backend device or API is present and usable |
 | `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, the generation name, and the profile that `auto` selects; an unmapped generation fails (`E_PROFILE_HOST_UNKNOWN`). `openvmm --hypervisor <backend> --cpu-fingerprint <path>` writes the fingerprint (`openvmm-cpu-fingerprint/v1`), checks it against the generation's profile, and prints one `NVX-CPU-PROFILE:` line (`E_PROFILE_HOST_UNKNOWN`, `E_PROFILE_UNSUPPORTED`). The host's invariant TSC (`constant_tsc` and `nonstop_tsc` on Linux, the CPUID bit on Windows) is reported as evidence only |
 | `H3` | OpenVMM preflight in verification mode: profile support, identity routing, synchronized TSC set, no scaling, and both rates, without booting a guest |
-| `H4` | TSC rate stability against the host's monotonic clock (see [Rate stability](#rate-stability-h4)). On a Linux host the detail also reports the host clocksource, as evidence only |
+| `H4` | TSC rate stability against the host's clocks: interval agreement against an undisciplined clock (`CLOCK_MONOTONIC_RAW` or `QueryPerformanceCounter`) and the whole-window rate against `F_d` on the disciplined one (see [Rate stability](#rate-stability-h4)). On a Linux host the detail also reports the host clocksource, as evidence only |
 | `H5` | Host cross-CPU TSC skew: a pinned-thread probe over all host CPU pairs, `max_abs_offset_ns <= 1000` |
 | `H6` | Guest warp probe on the qualification schedule (see [Warp schedules](#warp-schedules-h6-and-ci)) |
 | `H7` | Host UTC is synchronized: no `STA_UNSYNC` on Linux; a synchronized `w32tm` source on Windows |
 
 ### Rate stability (`H4`)
 
-A host probe compares the TSC with the host's monotonic clock:
-`CLOCK_MONOTONIC` on Linux, which is never stepped and runs at the rate time
-synchronization disciplines, and `QueryPerformanceCounter` on Windows. A
-sample reads the TSC between two reads of that clock, keeping the tightest
-of up to 64 such brackets; its uncertainty is half the bracket plus half the
-clock's resolution. The probe sleeps between samples, so the host's CPUs can
-idle: 3 samples 1 s apart in `validate-runner`, and 13 samples 10 s apart
-(120 s) in `doctor`. For each interval between consecutive samples it
-computes the rate `r_i`, in TSC cycles per second of the clock, and its
-uncertainty `u_i`, the two samples' uncertainties divided by the interval;
-`r` is the rate over the whole window. The check passes if:
+A host probe compares the TSC with two host clocks:
+
+- **Interval agreement and conclusiveness** use a clock that time
+  synchronization never steers: `CLOCK_MONOTONIC_RAW` on Linux and
+  `QueryPerformanceCounter` on Windows.
+- **The whole-window rate**, checked against `F_d`, uses the disciplined
+  `CLOCK_MONOTONIC` on Linux, which is never stepped and runs at the true
+  rate, and `QueryPerformanceCounter` on Windows.
+
+A sample reads the TSC between two reads of a clock and keeps the tightest of
+up to 64 such brackets. Its uncertainty is half the bracket plus half the
+clock's resolution. The resolution is measured, not taken from
+`clock_getres`: it is the smallest step the clock is observed to take, for
+example 100 ns for the Hyper-V reference TSC page clock
+(`hyperv_clocksource_tsc_page`), which `clock_getres` reports as 1 ns, and
+one 10 MHz tick for `QueryPerformanceCounter`.
+
+The probe sleeps between samples, so the host's CPUs can idle: 3 samples 1 s
+apart in `validate-runner`, and 13 samples 10 s apart (120 s) in `doctor`.
+For each interval between consecutive samples, it computes against the
+undisciplined clock the rate `r_i`, in TSC cycles per second, and its
+uncertainty `u_i`, the two samples' uncertainties divided by the interval.
+`r` is the rate over the whole window against the disciplined clock. The
+check passes if:
 
 - every `u_i` is at most 0.25 ppm of `r`; otherwise the measurement is
   inconclusive and fails;
@@ -1438,16 +1451,35 @@ uncertainty `u_i`, the two samples' uncertainties divided by the interval;
   run `H3`), `|r - F_d|` is at most 100 ppm of `F_d`.
 
 The detail reports `r`, its deviation from `F_d` in ppm, the agreement, the
-largest `u_i`, the clock, and, on Linux, the host clocksource, which never
-gates. An invariant TSC agrees with the host clock far
-inside 1 ppm: 0.001 to 0.089 ppm over 1 s windows on the eleven CI runners,
-and 0.000 ppm with a residual of at most 0.07 µs over 118 s on the WHP hosts.
+largest `u_i`, both clocks and their measured resolutions, and, on Linux, the
+host clocksource, which never gates.
+
+Interval agreement uses the undisciplined clock because chrony steers
+`CLOCK_MONOTONIC`'s rate every few seconds, on Azure through the Hyper-V PTP
+clock:
+
+- Against `CLOCK_MONOTONIC`, the short schedule failed 3 of 9 runs on the
+  Azure MSHV runners. The agreement reached 12.2 ppm, and 30 1-s intervals
+  spread by up to 2.7 ppm while chrony's frequency moved by up to 2.7 ppm.
+- Against `CLOCK_MONOTONIC_RAW` and `QueryPerformanceCounter`, 35
+  short-schedule runs on the Azure KVM, MSHV, and WHP runners agree within
+  0.000 to 0.050 ppm, with the largest `u_i` between 0.04 and 0.106 ppm. The
+  long schedule agrees within 0.002 ppm on prometheus30, where
+  `CLOCK_MONOTONIC` gave 0.402 ppm.
+- The WHP hosts show 0.000 ppm with a residual of at most 0.07 µs over 118 s.
+
 A TSC that stops, slows, or is rescaled across idle misses the bound by
-orders of magnitude. The 100 ppm bound keeps the guest's wall-clock
-discipline, which steers at most 500 ppm, clear of the TSC's error plus a
-restore's rate deviation of up to 250 ppm. On Windows the clock derives from
-the same TSC, so the deviation compares `F_d` with the host's own
-calibration.
+orders of magnitude, where the host's clocksource is independent of the TSC:
+the Hyper-V reference page, the HPET, or `QueryPerformanceCounter` in a VM.
+Where the host clocksource is `tsc` itself (the Azure KVM runners and
+prometheus32), every kernel clock derives from the TSC, so no host clock can
+catch a TSC step; the guest warp probe (`H6` and the CI schedule) is the
+detector there.
+
+The 100 ppm bound keeps the guest's wall-clock discipline, which steers at
+most 500 ppm, clear of the TSC's error plus a restore's rate deviation of up
+to 250 ppm. On Windows the clock derives from the same TSC, so the deviation
+compares `F_d` with the host's own calibration.
 
 ### Warp schedules (`H6` and CI)
 
