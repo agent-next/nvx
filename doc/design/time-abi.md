@@ -1203,7 +1203,8 @@ path, whose cost the restore latency gate already measures, so `cpu_us` is
 the background cost to the workload. The NVX kernel does not charge
 interrupt time to it (`CONFIG_IRQ_TIME_ACCOUNTING`), but it still scales with
 the host processor's clock: a host idling at a low frequency runs the checks
-more slowly. The fleet matrix driver checks `cpu_us` against the budget in
+more slowly. The fleet matrix driver checks `cpu_us` against the backend's
+budget for the phase in
 [Performance expectations](#performance-expectations-and-acceptance-gate)
 during validation; CI reports it without gating on it.
 
@@ -1695,7 +1696,7 @@ Expected effects:
 | Invariant TSC from the profile where the backend cannot offer it to guests (Azure MSHV and WHP) | Removes each AP's delay calibration of about 150 ms: an 8-vCPU cold boot takes 299 ms instead of 1,385 ms on Azure MSHV, and cold boots are 0.2 to 1.1 s faster at 2 to 8 vCPUs on Azure WHP |
 | Fixed restore work: the restore clock (0.7 to 1.1 ms), restore verification, and the backend preflight | A one-vCPU WHP restore is at parity on Azure 8370C runners (p50 −0.6 ms) and about 2 ms slower on bare metal, where no emulation cost is recovered; the counting LAPIC accounts for at most 0.75 ms of it |
 | MSHV VP creation | Serialized at about 14 ms per application processor on bare metal (27 and 85 ms at 4 and 8 vCPUs); the frozen synchronized TSC set adds 40 to 170 µs for 1 to 4 VPs and no per-VP serialized work |
-| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their wall time (`elapsed_us`, not budgeted) and CPU time (`cpu_us`). The same `cpu_us` budget holds for the boot, capture, and restore checks. The fleet matrix driver enforces it during validation; CI reports each phase against it (`<phase>_cpu_over_budget`) but does not gate on it, because the A/B gate above covers latency. The budget is TBD(guest) for every backend, provisionally 2.5 ms at one vCPU plus 0.75 ms per additional vCPU on KVM and MSHV and 5 ms plus 1.5 ms on WHP. Wiring v6 measured boot medians of 1.6 to 3.0 ms on MSHV, 3.6 to 5.0 ms on KVM (prometheus32 idles at 800 MHz, which slows the delayed checks), and 2.3 to 6.6 ms on WHP at 1 to 8 vCPUs, with captures under 2 ms everywhere. The values are set from the next guest build, which counts only step 13 at restore and runs with `CONFIG_IRQ_TIME_ACCOUNTING` |
+| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their wall time (`elapsed_us`, not budgeted) and CPU time (`cpu_us`). Each backend has a `cpu_us` budget per phase (boot, capture, and restore), because WHP's restore checks also pay the first-touch faults of its lazily registered copy-on-write RAM, which the workload would otherwise pay. The fleet matrix driver enforces the budgets during validation; CI reports each phase against its budget (`<phase>_cpu_over_budget`) but does not gate on it, because the A/B gate above covers latency. The budgets are TBD(guest): the next guest build's maxima plus headroom. Provisionally they are 2.5 ms at one vCPU plus 0.75 ms per additional vCPU on KVM and MSHV and 5 ms plus 1.5 ms on WHP. Wiring v6 measured boot medians of 1.6 to 3.0 ms on MSHV, 3.6 to 5.0 ms on KVM (prometheus32 idles at 800 MHz, which slows the delayed checks), and 2.3 to 6.6 ms on WHP at 1 to 8 vCPUs, with captures under 2 ms everywhere; WHP restores measured 22 to 30 ms on bare metal and 29 to 45 ms nested. The next guest build counts only step 13 at restore and runs with `CONFIG_IRQ_TIME_ACCOUNTING` |
 | Counting LAPIC instead of TSC-deadline on KVM | Different timer-programming exits; covered by the gate |
 | v1 profiles without `ITS_NO` | Linux's ITS mitigation at boot, about 6 ms of a one-vCPU cold boot where the host's KVM advertises `ITS_NO` (bare-metal prometheus32: +6.3 [5.5, 7.3] ms against the same build booted with `indirect_target_selection=off`). The gated Azure KVM, MSHV, and WHP guests were already mitigated and are unchanged; restore is unaffected |
 | The profile's CPU view at 2 or more vCPUs on KVM | Slower multi-vCPU cold boots, not gated and not yet explained: +8.0 [4.5, 15.5] ms at 2 vCPUs on prometheus32, where `msr_init` waits about one 10 ms tick for CPU 1, and about +25 ms at 2 vCPUs on azure-kvm-5 |
@@ -1788,8 +1789,8 @@ and after every restore. They require exit status 0 and, after a restore, a
 `phase=restore` line with `status=ok`, the restored `generation`, and `cpus`
 equal to the online CPUs; after a cold boot, a `phase=boot` line with
 `generation=0`. During fleet validation (`p6`), the matrix driver also
-requires each phase's `cpu_us` to be within the budget in
-[Performance expectations](#performance-expectations-and-acceptance-gate);
+requires each phase's `cpu_us` to be within the backend's budget for that
+phase in [Performance expectations](#performance-expectations-and-acceptance-gate);
 CI reports it without gating on it. The fleet runs them on
 the hosts our SSH account can use,
 which for KVM are prometheus32 and `azure-kvm-5` and for MSHV prometheus30
