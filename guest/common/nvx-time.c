@@ -34,6 +34,7 @@
 
 #define _GNU_SOURCE
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -122,6 +123,10 @@
 #define SLOW_TIME_CONSTANT 6
 #define TIMER_LIST_WAIT_NS (200 * NSEC_PER_MSEC)
 #define DEFAULT_STALL_TIMEOUT_S 21
+// The asynchronous boot checks and restore step 13 run at SCHED_IDLE for
+// 100 ms, then at normal priority, which bounds the fail-fast window under a
+// CPU-bound workload.
+#define IDLE_BOUND_NS (100 * NSEC_PER_MSEC)
 // nvx-time status and pre-capture wait at most 30 s for pending checks.
 #define STATUS_WAIT_NS (30 * NSEC_PER_SEC)
 #define STATUS_POLL_NS (10 * NSEC_PER_MSEC)
@@ -1240,6 +1245,7 @@ static const struct watch_rule k_watch_rules[] = {
     {"G_HARD_LOCKUP", {"Watchdog detected hard LOCKUP", NULL}, {NULL}},
     {"G_HUNG_TASK", {"INFO: task ", " blocked for more than "}, {NULL}},
     {"G_UNCHECKED_MSR", {"unchecked MSR access error", NULL}, {NULL}},
+    {"G_APIC_ID_MISMATCH", {"APIC ID mismatch", NULL}, {NULL}},
 };
 
 // Returns the code of the first rule whose substrings all appear in MESSAGE.
@@ -2471,11 +2477,11 @@ static pid_t daemon_pid(void)
     return (pid_t)pid;
 }
 
-// The asynchronous boot checks and restore step 12 run at idle priority, so
-// that on few vCPUs they never take a CPU from the workload; the watcher and
-// the discipline keep normal priority. musl does not implement
-// sched_setscheduler(), so this uses the per-thread system call: PID 0 is
-// the calling thread.
+// The asynchronous boot checks and restore step 13 start at idle priority, so
+// that on few vCPUs they never take a CPU from the workload, and continue at
+// normal priority after IDLE_BOUND_NS; the watcher and the discipline keep
+// normal priority. musl does not implement sched_setscheduler(), so this uses
+// the per-thread system call: PID 0 is the calling thread.
 static void set_idle_priority(pid_t pid, bool idle)
 {
     struct sched_param param = {0};
@@ -2484,17 +2490,103 @@ static void set_idle_priority(pid_t pid, bool idle)
                   &param);
 }
 
-// Restore steps 11 and 12 on the readiness path: the acknowledgement when the
-// host gated its input, then hand step 12 to DAEMON. Returns -1, without
-// acknowledging, when no daemon runs; 1 when the daemon vanished after the
-// acknowledgement. The caller has enabled the ports when ACK is set.
-static int signal_restore(pid_t daemon, bool ack)
+// Raises every thread of this process to normal priority, twice, so that a
+// thread an idle thread created during the first pass is raised too.
+static void promote_threads(void)
 {
+    for (int pass = 0; pass < 2; pass++) {
+        DIR *tasks = opendir("/proc/self/task");
+        struct dirent *entry;
+
+        if (tasks == NULL)
+            return;
+        while ((entry = readdir(tasks)) != NULL) {
+            long tid = strtol(entry->d_name, NULL, 10);
+
+            if (tid > 0)
+                set_idle_priority((pid_t)tid, false);
+        }
+        closedir(tasks);
+    }
+}
+
+// A normal-priority thread that raises the boot checker's idle threads when
+// the checks still run IDLE_BOUND_NS after they started.
+struct promoter {
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t stop;
+    struct timespec deadline;
+    bool stopped;
+};
+
+static void *promoter_run(void *argument)
+{
+    struct promoter *promoter = argument;
+    bool stopped;
+    int result = 0;
+
+    pthread_mutex_lock(&promoter->lock);
+    while (!promoter->stopped && result == 0)
+        result = pthread_cond_timedwait(&promoter->stop, &promoter->lock,
+                                        &promoter->deadline);
+    stopped = promoter->stopped;
+    pthread_mutex_unlock(&promoter->lock);
+    if (!stopped)
+        promote_threads();
+    return NULL;
+}
+
+// Starts PROMOTER, at the caller's priority, for checks that started at
+// START_NS. Returns true when it runs.
+static bool promoter_start(struct promoter *promoter, int64_t start_ns)
+{
+    int64_t deadline = start_ns + IDLE_BOUND_NS;
+    pthread_condattr_t attributes;
+    bool ready;
+
+    promoter->stopped = false;
+    promoter->deadline.tv_sec = deadline / NSEC_PER_SEC;
+    promoter->deadline.tv_nsec = deadline % NSEC_PER_SEC;
+    if (pthread_condattr_init(&attributes) != 0)
+        return false;
+    ready = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0 &&
+            pthread_cond_init(&promoter->stop, &attributes) == 0;
+    pthread_condattr_destroy(&attributes);
+    return ready && pthread_mutex_init(&promoter->lock, NULL) == 0 &&
+           pthread_create(&promoter->thread, NULL, promoter_run, promoter) ==
+               0;
+}
+
+static void promoter_stop(struct promoter *promoter)
+{
+    pthread_mutex_lock(&promoter->lock);
+    promoter->stopped = true;
+    pthread_cond_signal(&promoter->stop);
+    pthread_mutex_unlock(&promoter->lock);
+    pthread_join(promoter->thread, NULL);
+}
+
+// Restore steps 12 and 13 on the readiness path: the acknowledgement when the
+// host gated its input, then hand step 13 to DAEMON, with the readiness
+// path's duration since START_NS (CLOCK_MONOTONIC), in microseconds, in the
+// signal. Returns -1, without acknowledging, when no daemon runs; 1 when the
+// daemon vanished after the acknowledgement. The caller has enabled the ports
+// when ACK is set.
+static int signal_restore(pid_t daemon, bool ack, int64_t start_ns)
+{
+    union sigval value;
+    int64_t elapsed_us;
+
     if (daemon <= 0 || kill(daemon, 0) != 0)
         return -1;
     if (ack)
         outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
-    return kill(daemon, SIGUSR1) == 0 ? 0 : 1;
+    elapsed_us = (clock_ns(CLOCK_MONOTONIC) - start_ns) / NSEC_PER_USEC;
+    value.sival_int = (int)(elapsed_us < 0         ? 0
+                            : elapsed_us > INT_MAX ? INT_MAX
+                                                   : elapsed_us);
+    return sigqueue(daemon, SIGUSR1, value) == 0 ? 0 : 1;
 }
 
 // C10: the daemon runs, has recorded no violation, and no stall was counted.
@@ -2862,8 +2954,11 @@ struct daemon {
     int polls;
     int64_t last_accepted_ns;
     pid_t worker_pid;
+    int64_t worker_promote_ns;
     int64_t worker_deadline_ns;
     bool suppression_released;
+    bool restore_pending;
+    int64_t readiness_us;
 };
 
 static void watcher_consume(void *context, const char *message)
@@ -3075,13 +3170,17 @@ static int parse_restore_record(const char *text, unsigned long long *generation
     return parse_new_cpus(cpus, new_cpus);
 }
 
-// Restore step 12, fail-fast: the restore checks, the grace-period release,
-// the saved watchdog settings, the deferred C7, and the restore check's
-// record. A child of the daemon runs it at SCHED_IDLE, and the daemon
-// releases the suppression itself at the stall timeout; restore-finish runs it
-// inline, with its own deadline (WITH_DEADLINE), in report-only mode when no
-// daemon runs. Returns 0, or 1 when a report-only release failed.
-static int restore_work(const bool *new_cpus, int new_count, bool with_deadline)
+// Restore step 13, fail-fast: the step 11 restore checks, the grace-period
+// release, the saved watchdog settings, the deferred C7, and the restore
+// check's record. A child of the daemon runs it at SCHED_IDLE, and the daemon
+// raises it to normal priority after 100 ms and releases the suppression
+// itself at the stall timeout; restore-finish runs it inline, with its own
+// deadline (WITH_DEADLINE), in report-only mode when no daemon runs. The
+// recorded duration is READINESS_US, the readiness path's, plus the checks',
+// without the grace period wait or C7. Returns 0, or 1 when a report-only
+// release failed.
+static int restore_work(const bool *new_cpus, int new_count, bool with_deadline,
+                        int64_t readiness_us)
 {
     int64_t start = clock_ns(CLOCK_MONOTONIC);
     int64_t timeout_s = DEFAULT_STALL_TIMEOUT_S;
@@ -3107,20 +3206,19 @@ static int restore_work(const bool *new_cpus, int new_count, bool with_deadline)
     if (suppression_restore(detail, sizeof(detail), true) != 0)
         fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
                    PHASE_RESTORE, "%s", detail);
-    start = clock_ns(CLOCK_MONOTONIC);
     check_timer_list(&checks, TIMER_LIST_WAIT_NS);
-    elapsed += clock_ns(CLOCK_MONOTONIC) - start;
     if (record_check(PHASE_RESTORE, "ok", checks.online_count,
-                     elapsed / NSEC_PER_USEC, 0, 0, checks.failures) != 0)
+                     readiness_us + elapsed / NSEC_PER_USEC, 0, 0,
+                     checks.failures) != 0)
         check_failed(&checks, "C10", "cannot record the restore check: %s",
                      strerror(errno));
     return released ? 0 : 1;
 }
 
-// Starts restore step 12 after the acknowledgement, in a child at
+// Starts restore step 13 after the acknowledgement, in a child at
 // SCHED_IDLE, so the watcher and the discipline keep normal priority; the
-// fork itself also runs at SCHED_IDLE.
-static void start_restore(struct daemon *daemon)
+// fork itself also runs at SCHED_IDLE. READINESS_US comes with the signal.
+static void start_restore(struct daemon *daemon, int64_t readiness_us)
 {
     bool new_cpus[MAX_CPUS] = {false};
     struct time_state state;
@@ -3156,7 +3254,7 @@ static void start_restore(struct daemon *daemon)
     set_idle_priority(0, true);
     pid = fork();
     if (pid == 0)
-        _exit(restore_work(new_cpus, new_count, false));
+        _exit(restore_work(new_cpus, new_count, false, readiness_us));
     set_idle_priority(0, false);
     if (pid < 0) {
         fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
@@ -3165,6 +3263,7 @@ static void start_restore(struct daemon *daemon)
         return;
     }
     daemon->worker_pid = pid;
+    daemon->worker_promote_ns = clock_ns(CLOCK_MONOTONIC) + IDLE_BOUND_NS;
     daemon->worker_deadline_ns =
         clock_ns(CLOCK_MONOTONIC) + timeout_s * NSEC_PER_SEC;
     daemon->suppression_released = false;
@@ -3192,6 +3291,7 @@ static void reap_children(struct daemon *daemon)
         if (pid != daemon->worker_pid)
             continue;
         daemon->worker_pid = 0;
+        daemon->worker_promote_ns = 0;
         // A failing worker powered the guest off itself, or reported in
         // report-only mode; a crash leaves the suppression to the daemon.
         if (!WIFEXITED(status)) {
@@ -3200,7 +3300,7 @@ static void reap_children(struct daemon *daemon)
                        PHASE_RESTORE, "the restore work ended with signal %d",
                        WTERMSIG(status));
         }
-        // Step 12 ends by restarting the discipline at the fast cadence.
+        // Step 13 ends by restarting the discipline at the fast cadence.
         daemon->polls = 0;
         (void)arm_timer(daemon);
     }
@@ -3213,10 +3313,19 @@ static void handle_signals(struct daemon *daemon)
     while (read(daemon->signals, &info, sizeof(info)) == sizeof(info)) {
         if (info.ssi_signo == SIGTERM)
             _exit(0);
-        if (info.ssi_signo == SIGUSR1)
-            start_restore(daemon);
-        else if (info.ssi_signo == SIGCHLD)
-            reap_children(daemon);
+        // sigqueue() carries the readiness path's duration in microseconds.
+        if (info.ssi_signo == SIGUSR1) {
+            daemon->restore_pending = true;
+            daemon->readiness_us =
+                info.ssi_code == SI_QUEUE ? info.ssi_int : 0;
+        }
+    }
+    // The previous restore's worker can end just before a capture, and the
+    // signalfd returns SIGUSR1 before SIGCHLD: reap before starting.
+    reap_children(daemon);
+    if (daemon->restore_pending && daemon->worker_pid == 0) {
+        daemon->restore_pending = false;
+        start_restore(daemon, daemon->readiness_us);
     }
 }
 
@@ -3246,6 +3355,20 @@ static int daemon_setup(struct daemon *daemon)
     return 0;
 }
 
+// Returns the poll timeout in milliseconds until DEADLINE_NS, or -1 when
+// DEADLINE_NS is 0, for none.
+static int poll_timeout_until(int64_t deadline_ns)
+{
+    int64_t remaining;
+
+    if (deadline_ns == 0)
+        return -1;
+    remaining = deadline_ns - clock_ns(CLOCK_MONOTONIC);
+    return remaining <= 0
+               ? 0
+               : (int)((remaining + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC);
+}
+
 static void daemon_loop(struct daemon *daemon)
 {
     for (;;) {
@@ -3253,16 +3376,14 @@ static void daemon_loop(struct daemon *daemon)
                                 {daemon->signals, POLLIN, 0},
                                 {daemon->timer, POLLIN, 0}};
         bool waiting = daemon->worker_pid > 0 && !daemon->suppression_released;
-        int timeout = -1;
+        bool idle = daemon->worker_pid > 0 && daemon->worker_promote_ns != 0;
+        int timeout = poll_timeout_until(idle ? daemon->worker_promote_ns : 0);
+        int deadline =
+            poll_timeout_until(waiting ? daemon->worker_deadline_ns : 0);
+        int64_t now;
 
-        if (waiting) {
-            int64_t remaining =
-                daemon->worker_deadline_ns - clock_ns(CLOCK_MONOTONIC);
-
-            timeout = remaining <= 0 ? 0
-                                     : (int)((remaining + NSEC_PER_MSEC - 1) /
-                                             NSEC_PER_MSEC);
-        }
+        if (timeout < 0 || (deadline >= 0 && deadline < timeout))
+            timeout = deadline;
         if (poll(fds, ARRAY_SIZE(fds), timeout) < 0 && errno != EINTR) {
             sleep(1);
             continue;
@@ -3280,8 +3401,15 @@ static void daemon_loop(struct daemon *daemon)
             discipline_poll(daemon);
             arm_timer(daemon);
         }
+        now = clock_ns(CLOCK_MONOTONIC);
+        // Step 13 continues at normal priority 100 ms after the ack.
+        if (daemon->worker_pid > 0 && daemon->worker_promote_ns != 0 &&
+            now >= daemon->worker_promote_ns) {
+            daemon->worker_promote_ns = 0;
+            set_idle_priority(daemon->worker_pid, false);
+        }
         if (daemon->worker_pid > 0 && !daemon->suppression_released &&
-            clock_ns(CLOCK_MONOTONIC) >= daemon->worker_deadline_ns)
+            now >= daemon->worker_deadline_ns)
             release_suppression(daemon);
     }
 }
@@ -3386,21 +3514,23 @@ static void boot_foreground(struct checks *checks, void *context)
     check_debug_watchdogs(checks);
 }
 
-// The asynchronous boot checks: every boot check but C12, at SCHED_IDLE
-// after shell-ready, and fail-fast. When they pass, the checker becomes the
-// daemon and records the boot check, whose duration adds C12's (C12_NS).
-// It never returns.
+// The asynchronous boot checks: every boot check but C12, after shell-ready,
+// fail-fast, at SCHED_IDLE for at most IDLE_BOUND_NS. When they pass, the
+// checker becomes the daemon and records the boot check, whose duration adds
+// C12's (C12_NS) and the daemon's start. It never returns.
 static void boot_checker(const struct boot_sample *sample, int64_t c12_ns,
                          int c12_failures)
 {
     int64_t start = clock_ns(CLOCK_MONOTONIC);
     int null = open("/dev/null", O_RDWR | O_CLOEXEC);
     struct boot_log_job log_job;
+    struct promoter promoter;
     struct side_job sides[3];
     struct daemon daemon;
     struct checks checks;
     struct boot_log log;
     bool started = false;
+    bool promoting;
     int kmsg;
 
     g_async_output = true;
@@ -3413,6 +3543,7 @@ static void boot_checker(const struct boot_sample *sample, int64_t c12_ns,
     }
     if (chdir("/") != 0)
         _exit(1);
+    promoting = promoter_start(&promoter, start);
     set_idle_priority(0, true);
     if (checks_init(&checks, PHASE_BOOT) != 0) {
         check_failed(&checks, "C1", "cannot read the CPU sets");
@@ -3451,6 +3582,9 @@ static void boot_checker(const struct boot_sample *sample, int64_t c12_ns,
                      "cpu 0: floor(F / 1000) is %" PRIu64
                      " kHz but cpu MHz is %" PRIu64 " kHz",
                      checks.tsc_hz / 1000, checks.cpu_khz[0]);
+    // The daemon blocks its signals in its only thread.
+    if (promoting)
+        promoter_stop(&promoter);
     if (kmsg >= 0) {
         started = become_daemon(&daemon, kmsg, sample->accepted_ns) == 0;
         if (!started)
@@ -3661,6 +3795,7 @@ struct repair_record {
     int64_t epsilon;
     int64_t step_realtime_ns;
     int64_t frequency;
+    int64_t elapsed_us;
 };
 
 static void apply_repair(struct time_state *state, const void *context)
@@ -3685,11 +3820,13 @@ static void apply_repair(struct time_state *state, const void *context)
     state->samples++;
     snprintf(state->last_sample_error, sizeof(state->last_sample_error),
              "none");
-    // The daemon's step 12 runs the restore check after the acknowledgement.
+    // The daemon's step 13 runs the restore checks after the acknowledgement.
+    // Until then, check_elapsed_us is the readiness path up to the clock
+    // step, at last_step_realtime_ns.
     snprintf(state->check_phase, sizeof(state->check_phase), "restore");
     snprintf(state->check_status, sizeof(state->check_status), "pending");
     state->check_cpus = 0;
-    state->check_elapsed_us = 0;
+    state->check_elapsed_us = repair->elapsed_us;
 }
 
 static int repair_failed(const char *code, const char *detail)
@@ -3700,13 +3837,15 @@ static int repair_failed(const char *code, const char *detail)
 
 // Restore steps 6 to 8: read the packet with four-byte reads, validate it,
 // and set the wall clock from its bracketed UTC, then write the entropy to
-// ENTROPY_FD, the caller's file at ENTROPY_PATH. The caller holds the portb
-// lock. With FINISH (untiered) and a DAEMON, a restore with no processors or
-// memory to activate needs no shell work before the acknowledgement, so
-// steps 11 and 12 start here too and no second helper process starts; the
-// metadata then begins with 2 instead of 1.
+// ENTROPY_FD, the caller's file at ENTROPY_PATH. START_NS is when the capture
+// request returned. The caller holds the portb lock. With FINISH (untiered)
+// and a DAEMON, a restore with no processors or memory to activate needs no
+// shell work before the acknowledgement, so steps 12 and 13 start here too
+// and no second helper process starts; the metadata then begins with 2
+// instead of 1.
 static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
-                          int entropy_fd, bool finish, pid_t daemon)
+                          int entropy_fd, int64_t start_ns, bool finish,
+                          pid_t daemon)
 {
     static uint8_t body[PACKET_MAX_SIZE];
     static struct restore_packet packet;
@@ -3772,6 +3911,7 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
         return repair_failed("G_REPAIR_CLOCK", detail);
     }
     repair.step_realtime_ns = clock_ns(CLOCK_REALTIME);
+    repair.elapsed_us = (clock_ns(CLOCK_MONOTONIC) - start_ns) / NSEC_PER_USEC;
     repair.packet = &packet;
     // The entropy goes to the caller in every case, an untiered restore's
     // too; the file already exists, empty, so only its bytes are written.
@@ -3789,11 +3929,11 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
     }
     format_hex(packet.entropy, GENERATION_ID_SIZE, id);
     // A plain untiered restore needs no shell work: this helper also
-    // acknowledges and hands step 12 to the daemon.
+    // acknowledges and hands step 13 to the daemon.
     if (finish && daemon > 0 && packet.online_vp_count == 0 &&
         packet.range_count == 0 && (packet.flags & PACKET_MEMORY_TARGET) == 0) {
-        finished = signal_restore(daemon,
-                                  (packet.flags & PACKET_ACK_REQUIRED) != 0);
+        finished = signal_restore(
+            daemon, (packet.flags & PACKET_ACK_REQUIRED) != 0, start_ns);
         if (finished > 0)
             fail_fatal(STATUS_CONFORMANCE, "G_CONFORMANCE_C10", "conformance",
                        PHASE_RESTORE, "the time daemon is not running");
@@ -3819,6 +3959,7 @@ static int cmd_capture(int argc, char **argv)
     char detail[DETAIL_MAX];
     char *end;
     long request;
+    int64_t start;
     unsigned status;
     pid_t daemon = -1;
     int entropy_fd;
@@ -3864,6 +4005,7 @@ static int cmd_capture(int argc, char **argv)
         return 1;
     }
     outb((unsigned char)request, PORT_SNAPSHOT);
+    start = clock_ns(CLOCK_MONOTONIC);
     status = inb(PORTB_STATUS);
     if ((status & PORTB_PACKET_AVAILABLE) == 0) {
         close(lock);
@@ -3872,15 +4014,17 @@ static int cmd_capture(int argc, char **argv)
         puts("0");
         return 0;
     }
-    result = repair_restore(previous_id, argv[2], entropy_fd, argc == 4,
+    result = repair_restore(previous_id, argv[2], entropy_fd, start, argc == 4,
                             daemon);
     close(lock);
     return result;
 }
 
-// Restore steps 11 and 12 after the shell's activation and identity work: the
-// acknowledgement when the packet asked for one, then the daemon runs step 12
-// asynchronously. The record tells it which CPUs activation onlined.
+// Restore steps 12 and 13 after the shell's activation and identity work: the
+// acknowledgement when the packet asked for one, then the daemon runs step 13
+// asynchronously. The record tells it which CPUs activation onlined. The
+// readiness path started check_elapsed_us before the helper's clock step, at
+// last_step_realtime_ns.
 static int cmd_restore_finish(int argc, char **argv)
 {
     bool new_cpus[MAX_CPUS] = {false};
@@ -3888,6 +4032,7 @@ static int cmd_restore_finish(int argc, char **argv)
     struct time_state state;
     struct checks checks;
     char text[256];
+    int64_t start;
     bool ack = false;
     int new_count = 0;
     int signaled;
@@ -3921,7 +4066,10 @@ static int cmd_restore_finish(int argc, char **argv)
         fprintf(stderr, "nvx-time: ioperm: %s\n", strerror(errno));
         return 1;
     }
-    signaled = signal_restore(daemon_pid(), ack);
+    start = clock_ns(CLOCK_MONOTONIC) -
+            (clock_ns(CLOCK_REALTIME) - state.last_step_realtime_ns) -
+            state.check_elapsed_us * NSEC_PER_USEC;
+    signaled = signal_restore(daemon_pid(), ack, start);
     if (signaled == 0)
         return 0;
     if (signaled > 0 || !g_report_only) {
@@ -3933,7 +4081,8 @@ static int cmd_restore_finish(int argc, char **argv)
     // Report-only runs may lack the daemon; finish the restore here.
     if (ack)
         outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
-    (void)restore_work(new_cpus, new_count, true);
+    (void)restore_work(new_cpus, new_count, true,
+                       (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC);
     return 0;
 }
 
@@ -4334,6 +4483,73 @@ static int test_parallel(int argc, char **argv)
     return 0;
 }
 
+// A thread that an idle thread starts, so it is idle too; it waits until the
+// test ends.
+struct test_thread {
+    pthread_mutex_t lock;
+    pthread_cond_t changed;
+    pid_t tid;
+    bool done;
+};
+
+static void *test_thread_run(void *argument)
+{
+    struct test_thread *thread = argument;
+
+    pthread_mutex_lock(&thread->lock);
+    thread->tid = (pid_t)syscall(SYS_gettid);
+    pthread_cond_broadcast(&thread->changed);
+    while (!thread->done)
+        pthread_cond_wait(&thread->changed, &thread->lock);
+    pthread_mutex_unlock(&thread->lock);
+    return NULL;
+}
+
+// Prints the policies of an idle caller and of the idle thread it started
+// once a promoter fires 50 ms later, then the caller's policy after a
+// promoter stopped before its 10 s bound, and how long stopping took.
+static int test_promote(void)
+{
+    struct test_thread thread = {.lock = PTHREAD_MUTEX_INITIALIZER,
+                                 .changed = PTHREAD_COND_INITIALIZER};
+    struct promoter promoter;
+    pthread_t handle;
+    long caller;
+    long started;
+    int64_t start;
+
+    if (!promoter_start(&promoter, clock_ns(CLOCK_MONOTONIC) - IDLE_BOUND_NS +
+                                       50 * NSEC_PER_MSEC))
+        return 1;
+    set_idle_priority(0, true);
+    if (pthread_create(&handle, NULL, test_thread_run, &thread) != 0)
+        return 1;
+    pthread_mutex_lock(&thread.lock);
+    while (thread.tid == 0)
+        pthread_cond_wait(&thread.changed, &thread.lock);
+    pthread_mutex_unlock(&thread.lock);
+    pthread_join(promoter.thread, NULL);
+    caller = syscall(SYS_sched_getscheduler, 0);
+    started = syscall(SYS_sched_getscheduler, thread.tid);
+    pthread_mutex_lock(&thread.lock);
+    thread.done = true;
+    pthread_cond_broadcast(&thread.changed);
+    pthread_mutex_unlock(&thread.lock);
+    pthread_join(handle, NULL);
+    printf("promoted caller=%ld thread=%ld\n", caller, started);
+
+    start = clock_ns(CLOCK_MONOTONIC);
+    if (!promoter_start(&promoter,
+                        start - IDLE_BOUND_NS + 10 * NSEC_PER_SEC))
+        return 1;
+    set_idle_priority(0, true);
+    promoter_stop(&promoter);
+    printf("stopped caller=%ld stop_ms=%" PRId64 "\n",
+           syscall(SYS_sched_getscheduler, 0),
+           (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_MSEC);
+    return 0;
+}
+
 static int cmd_test(int argc, char **argv)
 {
     const char *name = argc > 0 ? argv[0] : "";
@@ -4446,6 +4662,8 @@ static int cmd_test(int argc, char **argv)
         return test_restore_record(argc, argv);
     if (strcmp(name, "parallel") == 0)
         return test_parallel(argc, argv);
+    if (strcmp(name, "promote") == 0 && argc == 0)
+        return test_promote();
     if (strcmp(name, "idle-priority") == 0 && argc == 0) {
         long idle;
 
