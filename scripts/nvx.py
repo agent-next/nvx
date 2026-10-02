@@ -84,6 +84,7 @@ from nvx_tools.release import (
     collect_release_sources,
     create_release_archive,
     download_checkout_release,
+    ensure_openvmm_source,
     package_release,
     verify_source_tree,
 )
@@ -396,6 +397,11 @@ def _release_platform(hypervisor: str) -> str:
 
 def command_download(args: argparse.Namespace) -> None:
     download_checkout_release(args.repository, _release_platform(args.hypervisor))
+
+
+def command_setup_submodule(args: argparse.Namespace) -> None:
+    ensure_openvmm_source(BuildConstants.REPO_ROOT)
+    print("openvmm source initialized; release binary preserved")
 
 
 def _format_command(command: list[str]) -> str:
@@ -1034,6 +1040,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     download.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
     download.set_defaults(handler=command_download)
+
+    setup_submodule = subparsers.add_parser(
+        "setup-submodule",
+        help="init the openvmm submodule, preserving a release-installed binary",
+    )
+    setup_submodule.set_defaults(handler=command_setup_submodule)
 
     run = subparsers.add_parser("run", help="run an OpenVMM microVM")
     run.add_argument("--guest", choices=GUEST_NAMES, default="alpine")
