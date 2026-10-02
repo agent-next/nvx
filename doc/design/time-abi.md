@@ -327,7 +327,13 @@ the SPEC_CTRL family and MD_CLEAR from every backend on both generations
 Emerald Rapids profiles pin that value.
 A shared profile gives the same guest behavior on every backend; it does not
 make snapshots portable, because cross-backend restore is rejected
-(`E_BACKEND_MISMATCH`).
+(`E_BACKEND_MISMATCH`). The `IA32_ARCH_CAPABILITIES` bits outside the pinned
+mask are the backend's, because MSHV and WHP can neither set nor read them
+back. Measured, they differ only in `PSCHANGE_MC_NO` (bit 6) on Skylake-SP,
+where KVM sets it and MSHV shows the hardware's 0. Linux uses that bit only
+for `X86_BUG_ITLB_MULTIHIT`, which matters only to KVM inside the guest, so
+it changes no mitigation of an NVX guest, which has no VMX. Only the sysfs
+`itlb_multihit` line differs.
 
 **Format.** Schema `openvmm-cpu-profile/v1`. The canonical encoding is
 compact canonical JSON (object keys sorted by their UTF-8 bytes, no
