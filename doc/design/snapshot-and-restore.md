@@ -382,12 +382,15 @@ conversion and standalone NVX snapshot import are not supported.
 ## Template compatibility and placement
 
 A template represents a compatibility class, not an arbitrary fleet image.
-The class includes the backend, CPU profile and generation, guest kernel and
-agent build, effective command line, device roles and geometry, network
-identity/policy, and consumed layer identities. Deployment must rebuild or
-recertify templates on relevant rollouts; the VMM's actual compatibility and
-saved-state checks, not a promise about every build with the same version
-string, remain authoritative.
+The class includes the backend, CPU profile and generation, the
+[effective CPUID](time-abi.md#cpu-profiles) that the OpenVMM build computes
+for that profile and topology, guest kernel and agent build, effective command
+line, device roles and geometry, network identity/policy, and consumed layer
+identities. Deployment must rebuild or recertify templates on relevant
+rollouts: an OpenVMM build that computes a different effective CPUID, for
+example a different cache topology, rejects earlier templates with
+`E_CPU_SURFACE`. The VMM's actual compatibility and saved-state checks, not a
+promise about every build with the same version string, remain authoritative.
 
 Processor capacity and captured RAM geometry are immutable, but the opt-in
 activation contracts below allow one template to serve several online CPU
