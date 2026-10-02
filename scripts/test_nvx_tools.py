@@ -12,6 +12,7 @@ import json
 import lzma
 import os
 import queue
+import re
 import select
 import shutil
 import struct
@@ -1751,6 +1752,52 @@ class CiTests(unittest.TestCase):
 
 
 class CiConfigurationTests(unittest.TestCase):
+    def test_ci_needs_reference_declared_jobs(self):
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        jobs = set(
+            re.findall(
+                r"^  ([A-Za-z0-9_-]+):$",
+                workflow.split("jobs:\n", 1)[1],
+                re.MULTILINE,
+            )
+        )
+        for job_name in sorted(jobs):
+            job = _workflow_job(workflow, job_name)
+            match = re.search(r"^    needs:(.*)$", job, re.MULTILINE)
+            if match is None:
+                continue
+            inline = match.group(1).strip()
+            if inline:
+                dependencies = {name.strip() for name in inline.strip("[]").split(",")}
+            else:
+                dependencies = set(
+                    re.findall(
+                        r"^      - ([A-Za-z0-9_-]+)$",
+                        job.split("    if:", 1)[0],
+                        re.MULTILINE,
+                    )
+                )
+            with self.subTest(job=job_name):
+                self.assertLessEqual(
+                    dependencies,
+                    jobs,
+                    f"undefined job dependencies: {dependencies - jobs}",
+                )
+        required = _workflow_job(workflow, "required-status-check")
+        self.assertIn("      - aci-edge-sandboxes\n", required)
+
+    def test_development_release_requires_successful_crate_checks(self):
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        release_job = _workflow_job(workflow, "release")
+        self.assertIn("      - aci-edge-sandboxes\n", release_job)
+        predicate = release_job.split("    if:", 1)[1].split("    runs-on:", 1)[0]
+        self.assertIn("needs.aci-edge-sandboxes.result == 'success' &&", predicate)
+        self.assertNotIn("needs.aci-edge-sandboxes.result == 'skipped'", predicate)
+
     def test_required_ci_result_policy(self):
         always_successful = {"quality", "aci-edge-sandboxes", "openvmm-changes"}
         builds = set(ci.REQUIRED_CI_BUILD_JOBS)

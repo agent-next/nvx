@@ -932,6 +932,7 @@ jobs:
     name: Publish development release
     needs:
       - quality
+      - aci-edge-sandboxes
       - openvmm-vmm-tests
       - openvmm-unit-tests
       - nvx-microvm-tests-kvm
@@ -947,6 +948,7 @@ jobs:
         github.ref == 'refs/heads/dev' &&
         !cancelled() &&
         needs.quality.result == 'success' &&
+        needs.aci-edge-sandboxes.result == 'success' &&
         (
           needs.openvmm-vmm-tests.result == 'success' ||
           needs.openvmm-vmm-tests.result == 'skipped'
@@ -1018,7 +1020,7 @@ jobs:
     name: Required status check
     needs:
       - quality
-      - aci_edge_sandboxes
+      - aci-edge-sandboxes
       - openvmm-changes
       - artifacts
       - build-openvmm-linux-gnu
