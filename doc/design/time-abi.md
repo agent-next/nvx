@@ -378,11 +378,12 @@ APIC identity, and the runtime-owned bits have mask 0. OpenVMM computes it,
 records it, and recomputes it on restore, so the record never depends on how
 a backend enumerates or caches CPUID, and one profile and topology give the
 same record on every backend. At preflight, before any VP runs, each backend
-reports VP 0's CPUID for exactly the governed leaves (KVM from the
+reports VP 0's CPUID for the governed leaves (KVM from the
 `KVM_SET_CPUID2` table it programmed, MSHV with `get_cpuid_values` on VP 0,
 WHP from VP 0's register view), reading an entry without a subleaf at
 subleaf 0, and OpenVMM compares the report with the effective CPUID under its
-masks.
+masks. MSHV and WHP also report VP 0's view at the reserved entries the
+host's CPUID enumerates (verification step 6).
 
 The effective CPUID is the single source of the guest's CPUID. Core passes it
 to the backend as `TimeAbiConfig::cpuid`, with the per-VP fields unmasked,
@@ -411,7 +412,8 @@ such entry instead would add tens of registrations to every partition setup,
 about 1 ms per restore on WHP. On every fleet host both hypervisors present
 zeros there: the fleet fingerprints, and the MSHV and WHP hardware sweeps of
 subleaves 0 to 63 of every indexed leaf and four leaves past each maximum.
-The boot check and the snapshot record cover only the governed entries.
+The `E_CPU_SURFACE` comparison and the snapshot record cover only the
+governed entries.
 
 Informational fields:
 
@@ -479,10 +481,16 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
    presents no non-zero CPUID entry outside the profile's tables, apart from
    the identity range and the topology leaves (`E_CPU_UNLISTED`).
    - `--cpu-fingerprint` checks the probe partition's guest view.
-   - The support check at every cold boot and restore checks the backend's
-     supported surface. That surface derives from the root's CPUID, which
-     can show values a guest does not see, so it must report the guest's
-     view for these entries, or the check would fail sound hosts.
+   - At every cold boot and restore, step 5's check covers it on VP 0's
+     view. The candidates are the entries that the host's CPUID enumerates
+     outside the profile's tables (`cpu_profile::unlisted_cpuid_candidates`),
+     each read at subleaf 0 if subleaf-independent. The backend reads them
+     with the governed leaves, a few reads more. The supported surface of
+     step 3 cannot serve: it derives from the root's CPUID, which shows
+     values that a guest does not see there, such as Intel PT's `0x14.1` and
+     RDT's `0xF.1` and `0x10.1` to `0x10.3`, so it would fail sound hosts.
+   - KVM answers reserved entries from the effective CPUID itself, so it
+     needs no check.
 
 The catalog has three profiles, derived from the fingerprints of three
 bare-metal hosts (one per backend) and fifteen Azure hosts:
@@ -698,11 +706,11 @@ In the worker, with every VP stopped:
 8. Create the partition with the profile CPUID, the identity leaves, and the
    time platform declaring `F = F_s` and `L = L_s`. Preflight the backend
    before any VP runs and before any VP state is restored: profile support
-   and effective CPUID (`E_PROFILE_UNSUPPORTED`, `E_CPU_SURFACE`), identity
-   routing (`E_IDENTITY_ROUTING`), the synchronized-set primitive
-   (`E_TSC_SYNC_UNSUPPORTED`), and no scaling (`E_TSC_SCALING_ACTIVE`).
-   MSHV's preflight writes `TimeFreeze` to probe the primitive and reads
-   VP 0's CPUID at its reset state.
+   and effective CPUID (`E_PROFILE_UNSUPPORTED`, `E_CPU_SURFACE`,
+   `E_CPU_UNLISTED`), identity routing (`E_IDENTITY_ROUTING`), the
+   synchronized-set primitive (`E_TSC_SYNC_UNSUPPORTED`), and no scaling
+   (`E_TSC_SCALING_ACTIVE`). MSHV's preflight writes `TimeFreeze` to probe
+   the primitive and reads VP 0's CPUID at its reset state.
 9. Read `F_d` and `L_d` and apply the
    [rate policy](#tsc-rate-policy-and-lapic-rate-rule)
    (`E_TSC_RATE_UNAVAILABLE`, `E_TSC_RATE_IMPLAUSIBLE`,
