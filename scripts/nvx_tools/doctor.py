@@ -522,7 +522,6 @@ def check_openvmm_preflight(context: DoctorContext) -> CheckResult:
         os.fspath(context.kernel),
         "--initrd",
         os.fspath(context.initrd),
-        # Before the flip, pass --openvmm-arg=--x-time-abi-v1.
         *context.openvmm_args,
         "--x-time-abi-verify",
     ]
@@ -550,7 +549,7 @@ def check_openvmm_preflight(context: DoctorContext) -> CheckResult:
             (line.strip() for line in reversed(output.splitlines()) if line.strip()),
             "no output",
         )
-        if "x-time-abi" in output and "unexpected argument" in output:
+        if "unexpected argument '--x-time-abi-verify'" in output:
             last = "this OpenVMM predates the time ABI's --x-time-abi-verify mode"
         return CheckResult(
             "H3",

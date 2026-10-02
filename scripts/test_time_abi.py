@@ -1261,16 +1261,18 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(context.facts["profile"], "intel.icelake-sp.v1")
         command = run.call_args.args[0]
         self.assertEqual(command[-1], "--x-time-abi-verify")
-        self.assertNotIn("--x-time-abi-v1", command)
+        self.assertEqual(command[command.index("--machine") + 1], "microvm")
         self.assertEqual(command[command.index("--kernel") + 1], str(context.kernel))
-        switched = context_with_files()
-        switched.openvmm_args = ("--x-time-abi-v1",)
+        # --openvmm-arg passes development options, such as a test hook.
+        hooked = context_with_files()
+        hooked.openvmm_args = ("--x-time-abi-test-hook", "force-utc-downtime")
         with patch.object(
             doctor.subprocess, "run", return_value=completed(line)
         ) as run:
-            self.assertTrue(doctor.check_openvmm_preflight(switched).passed)
+            self.assertTrue(doctor.check_openvmm_preflight(hooked).passed)
         self.assertEqual(
-            run.call_args.args[0][-2:], ["--x-time-abi-v1", "--x-time-abi-verify"]
+            run.call_args.args[0][-3:],
+            ["--x-time-abi-test-hook", "force-utc-downtime", "--x-time-abi-verify"],
         )
         failure = (
             "NVX-TIME-ABI-VERIFY: v=1 status=fail backend=kvm "
@@ -1282,8 +1284,15 @@ class DoctorTests(unittest.TestCase):
                 '[E_TSC_SYNC_UNSUPPORTED] OpenVMM verification failed (exit 1): failed: "sync" unsupported',
             ),
             (
-                completed("", 2, "error: unexpected argument '--x-time-abi-v1' found"),
+                completed(
+                    "", 2, "error: unexpected argument '--x-time-abi-verify' found"
+                ),
                 "predates the time ABI",
+            ),
+            # The flip removed --x-time-abi-v1; passing it is reported as is.
+            (
+                completed("", 2, "error: unexpected argument '--x-time-abi-v1' found"),
+                "unexpected argument '--x-time-abi-v1' found",
             ),
             (completed(line.replace("1000000000", "200000000")), "[E_LAPIC_RATE_"),
             (
