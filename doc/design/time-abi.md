@@ -503,9 +503,9 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
      with the governed leaves: 7 more reads on the Skylake-SP hosts
      (`0xF.1`, `0x10.1` to `0x10.3`, `0x12.1`, `0x12.2`, and `0x14.1`) and 6
      on the Azure 8370C and 8573C runners, whose roots report no Intel PT.
-     The supported surface of
-     step 3 cannot serve: it derives from the root's CPUID, which shows
-     values that a guest does not see there, so it would fail sound hosts.
+     The supported surface of step 3 cannot serve: it derives from the
+     root's CPUID, which shows values that a guest does not see there, so
+     it would fail sound hosts.
      On the Skylake-SP hosts, the MSHV and WHP roots read Intel PT's
      `0x14.1` as non-zero. A guest's own enumeration stops at `0x14.0`,
      which reads zero, so only the host-derived candidates reach `0x14.1`.
