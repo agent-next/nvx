@@ -850,19 +850,26 @@ class GuestTimeTests(unittest.TestCase):
         self.assertTrue(report[3].startswith("NVX-TIME-REPORT: v=1 phase=runtime "))
         self.assertEqual(report[4], "ok=0")
 
-    def test_readiness_times_travel_in_one_signal_value(self):
-        # The helper hands the readiness path's wall and CPU times to the
-        # daemon in one 64-bit sigqueue() value, each clamped to 32 bits.
-        for elapsed, cpu, value in (
-            (2400, 1200, "0x000004b000000960"),
-            (-5, 2**40, "0xffffffff00000000"),
-            (2**32 - 1, 0, "0x00000000ffffffff"),
-        ):
-            self.assertEqual(
-                self.run_test("readiness", str(elapsed), str(cpu)),
-                f"value={value} elapsed_us={min(max(elapsed, 0), 2**32 - 1)} "
-                f"cpu_us={min(max(cpu, 0), 2**32 - 1)}\n",
-            )
+    def test_deferred_work_starts_150_ms_late_and_is_promoted_100_ms_later(self):
+        # Step 13 and the asynchronous boot checks start 150 ms after the
+        # acknowledgement or the boot step and leave SCHED_IDLE 100 ms after
+        # they start.
+        self.assertEqual(
+            self.run_test("deferral"), "deferred_start_ms=150 idle_bound_ms=100\n"
+        )
+
+    def test_restore_cpu_time_is_step_13_with_the_daemons_fork(self):
+        # The worker's step 13 CPU time adds the daemon's preparation before
+        # the fork, the fork's cost to the daemon, which arrives on a pipe
+        # after the worker's copy of the timing was taken, and its own.
+        fields = dict(
+            field.split("=")
+            for field in self.run_test("step13-cpu", "20", "30", "10").split()
+        )
+        self.assertGreaterEqual(int(fields["prior_ms"]), 20)
+        self.assertLess(int(fields["prior_ms"]), 30)
+        self.assertGreaterEqual(int(fields["total_ms"]), 60)
+        self.assertLess(int(fields["total_ms"]), 90)
 
     def restore_record(self, text: str) -> str:
         return self.run_test(

@@ -124,13 +124,14 @@
 #define SLOW_TIME_CONSTANT 6
 #define TIMER_LIST_WAIT_NS (200 * NSEC_PER_MSEC)
 #define DEFAULT_STALL_TIMEOUT_S 21
-// The asynchronous boot checks start 100 ms after the time ABI boot step,
-// which init runs shortly before shell-ready, and restore step 13 100 ms
+// The asynchronous boot checks start 150 ms after the time ABI boot step,
+// which init runs shortly before shell-ready, and restore step 13 150 ms
 // after the acknowledgement: earlier, they contend with the readiness path
-// while the VMM still demand-faults guest memory. Both start at SCHED_IDLE
-// and continue at normal priority 100 ms after they start, which bounds the
-// fail-fast window under a CPU-bound workload.
-#define DEFERRED_START_NS (100 * NSEC_PER_MSEC)
+// while the VMM still demand-faults guest memory, and with the workload's own
+// first activity after readiness. Both start at SCHED_IDLE and continue at
+// normal priority 100 ms after they start, which bounds the fail-fast window
+// under a CPU-bound workload.
+#define DEFERRED_START_NS (150 * NSEC_PER_MSEC)
 #define IDLE_BOUND_NS (100 * NSEC_PER_MSEC)
 // nvx-time status and pre-capture wait at most 30 s for pending checks.
 #define STATUS_WAIT_NS (30 * NSEC_PER_SEC)
@@ -2665,50 +2666,27 @@ static void promoter_stop(struct promoter *promoter)
     pthread_join(promoter->thread, NULL);
 }
 
-// The readiness path's wall and CPU times travel to the daemon in one
-// sigqueue() value, 64 bits on x86-64: each in microseconds, clamped to 32
-// bits, the wall time in the low half.
-_Static_assert(sizeof(void *) == sizeof(uint64_t), "sigval holds 64 bits");
-
-static uint64_t clamp_u32(int64_t value)
-{
-    return value < 0 ? 0 : value > UINT32_MAX ? UINT32_MAX : (uint64_t)value;
-}
-
-static uint64_t pack_readiness(int64_t elapsed_us, int64_t cpu_us)
-{
-    return clamp_u32(cpu_us) << 32 | clamp_u32(elapsed_us);
-}
-
-static void unpack_readiness(uint64_t value, int64_t *elapsed_us,
-                             int64_t *cpu_us)
-{
-    *elapsed_us = (int64_t)(value & UINT32_MAX);
-    *cpu_us = (int64_t)(value >> 32);
-}
-
 // Restore steps 12 and 13 on the readiness path: the acknowledgement when the
-// host gated its input, then hand step 13 to DAEMON. The signal carries the
-// readiness path's wall time since START_NS (CLOCK_MONOTONIC) and its CPU
-// time since CPU_START_NS (this process's CPU clock, less any earlier
-// process's share), in microseconds, both read after the acknowledgement so
-// that neither read delays it. Returns -1, without acknowledging, when no
-// daemon runs; 1 when the daemon vanished after the acknowledgement. The
-// caller has enabled the ports when ACK is set.
-static int signal_restore(pid_t daemon, bool ack, int64_t start_ns,
-                          int64_t cpu_start_ns)
+// host gated its input, then hand step 13 to DAEMON. The sigqueue() value is
+// the readiness path's wall time since START_NS (CLOCK_MONOTONIC), in
+// microseconds clamped to 32 bits, read after the acknowledgement so that the
+// read does not delay it. The readiness path's CPU time is not reported: the
+// restore latency gate measures that path. Returns -1, without acknowledging,
+// when no daemon runs; 1 when the daemon vanished after the acknowledgement.
+// The caller has enabled the ports when ACK is set.
+static int signal_restore(pid_t daemon, bool ack, int64_t start_ns)
 {
     union sigval value;
     int64_t elapsed_us;
-    int64_t cpu_us;
 
     if (daemon <= 0 || kill(daemon, 0) != 0)
         return -1;
     if (ack)
         outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
     elapsed_us = (clock_ns(CLOCK_MONOTONIC) - start_ns) / NSEC_PER_USEC;
-    cpu_us = (cpu_time_ns() - cpu_start_ns) / NSEC_PER_USEC;
-    value.sival_ptr = (void *)(uintptr_t)pack_readiness(elapsed_us, cpu_us);
+    if (elapsed_us > UINT32_MAX)
+        elapsed_us = UINT32_MAX;
+    value.sival_ptr = (void *)(uintptr_t)(elapsed_us < 0 ? 0 : elapsed_us);
     return sigqueue(daemon, SIGUSR1, value) == 0 ? 0 : 1;
 }
 
@@ -3083,7 +3061,6 @@ struct daemon {
     bool restore_pending;
     int64_t restore_due_ns;
     int64_t readiness_us;
-    int64_t readiness_cpu_us;
 };
 
 static void watcher_consume(void *context, const char *message)
@@ -3297,23 +3274,79 @@ static int parse_restore_record(const char *text, unsigned long long *generation
 
 // The times that restore_work records. The wall time is READINESS_US, the
 // readiness path's, plus the checks' since START_NS, when they were due. The
-// CPU time is PRIOR_CPU_NS, the readiness path's and the daemon's share, plus
-// this process's since CPU_BASE_NS.
+// CPU time is step 13's alone: this process's since CPU_BASE_NS, plus the
+// daemon's preparation, PRIOR_CPU_NS up to the fork and the fork's own share,
+// which the daemon writes to FORK_FD (-1 when there is none) once the fork
+// returns.
 struct restore_timing {
     int64_t start_ns;
     int64_t readiness_us;
     int64_t prior_cpu_ns;
     int64_t cpu_base_ns;
+    int fork_fd;
 };
+
+// Step 13's CPU time so far, in a process that TIMING describes. The read
+// waits for the daemon's fork share if the daemon has not yet written it.
+static int64_t step13_cpu_ns(const struct restore_timing *timing)
+{
+    int64_t cpu = timing->prior_cpu_ns + cpu_time_ns() - timing->cpu_base_ns;
+    int64_t fork_share = 0;
+
+    if (timing->fork_fd >= 0 &&
+        read(timing->fork_fd, &fork_share, sizeof(fork_share)) ==
+            sizeof(fork_share) &&
+        fork_share > 0)
+        cpu += fork_share;
+    return cpu;
+}
+
+// Forks the step 13 worker at SCHED_IDLE for a daemon whose preparation
+// started at CPU_START_NS, its CPU clock, and completes TIMING's CPU fields
+// for the child. The parent returns to normal priority as soon as the fork
+// does. Its fork costs CPU time after the child's copy of TIMING was taken, so
+// it writes that share to a pipe that the child reads. Returns fork()'s
+// result.
+static pid_t fork_step13(int64_t cpu_start_ns, struct restore_timing *timing)
+{
+    int fds[2] = {-1, -1};
+    int64_t fork_share;
+    pid_t pid;
+
+    if (pipe2(fds, O_CLOEXEC) != 0)
+        fds[0] = fds[1] = -1;
+    timing->fork_fd = fds[0];
+    timing->cpu_base_ns = 0;
+    set_idle_priority(0, true);
+    timing->prior_cpu_ns = cpu_time_ns() - cpu_start_ns;
+    pid = fork();
+    if (pid == 0) {
+        if (fds[1] >= 0)
+            close(fds[1]);
+        return 0;
+    }
+    set_idle_priority(0, false);
+    if (fds[0] >= 0)
+        close(fds[0]);
+    timing->fork_fd = -1;
+    if (fds[1] >= 0) {
+        fork_share = cpu_time_ns() - cpu_start_ns - timing->prior_cpu_ns;
+        if (pid > 0)
+            (void)write_all(fds[1], &fork_share, sizeof(fork_share));
+        close(fds[1]);
+    }
+    return pid;
+}
 
 // Restore step 13, fail-fast: the step 11 restore checks, the grace-period
 // release, the saved watchdog settings, the deferred C7, and the restore
-// check's record. A child of the daemon runs it at SCHED_IDLE from 100 ms
-// after the acknowledgement; the daemon raises it to normal priority 100 ms
-// later and releases the suppression itself at the stall timeout.
-// restore-finish runs it inline, with its own deadline (WITH_DEADLINE), in
-// report-only mode when no daemon runs. Neither recorded time counts the
-// grace period wait or C7. Returns 0, or 1 when a report-only release failed.
+// check's record. A child of the daemon runs it at SCHED_IDLE from
+// DEFERRED_START_NS after the acknowledgement; the daemon raises it to normal
+// priority IDLE_BOUND_NS later and releases the suppression itself at the
+// stall timeout. restore-finish runs it inline, with its own deadline
+// (WITH_DEADLINE), in report-only mode when no daemon runs. Neither recorded
+// time counts the grace period wait or C7. Returns 0, or 1 when a report-only
+// release failed.
 static int restore_work(const bool *new_cpus, int new_count, bool with_deadline,
                         const struct restore_timing *timing)
 {
@@ -3329,7 +3362,7 @@ static int restore_work(const bool *new_cpus, int new_count, bool with_deadline,
     else
         run_restore_checks(&checks, new_cpus, new_count);
     elapsed = clock_ns(CLOCK_MONOTONIC) - timing->start_ns;
-    cpu = timing->prior_cpu_ns + cpu_time_ns() - timing->cpu_base_ns;
+    cpu = step13_cpu_ns(timing);
     if (with_deadline) {
         (void)read_int64(RCU_STALL_TIMEOUT, &timeout_s);
         released = release_with_deadline(timeout_s);
@@ -3351,10 +3384,10 @@ static int restore_work(const bool *new_cpus, int new_count, bool with_deadline,
     return released ? 0 : 1;
 }
 
-// Starts restore step 13 when it is due, 100 ms after the acknowledgement, in
-// a child at SCHED_IDLE, so the watcher and the discipline keep normal
-// priority; the fork itself also runs at SCHED_IDLE. The readiness path's
-// times came with the signal.
+// Starts restore step 13 when it is due, DEFERRED_START_NS after the
+// acknowledgement, in a child at SCHED_IDLE, so the watcher and the
+// discipline keep normal priority; the fork itself also runs at SCHED_IDLE.
+// The readiness path's wall time came with the signal.
 static void start_restore(struct daemon *daemon)
 {
     int64_t cpu_start = cpu_time_ns();
@@ -3388,18 +3421,13 @@ static void start_restore(struct daemon *daemon)
         }
     }
     (void)read_int64(RCU_STALL_TIMEOUT, &timeout_s);
-    // The worker's wall time runs from when step 13 was due. Its CPU time
-    // runs from the fork, and the daemon's share is this preparation.
+    // The worker's wall time runs from when step 13 was due. Its CPU time is
+    // step 13's: this preparation, the fork, and the worker's own.
     timing.start_ns = daemon->restore_due_ns;
     timing.readiness_us = daemon->readiness_us;
-    timing.cpu_base_ns = 0;
-    set_idle_priority(0, true);
-    timing.prior_cpu_ns = daemon->readiness_cpu_us * NSEC_PER_USEC +
-                          cpu_time_ns() - cpu_start;
-    pid = fork();
+    pid = fork_step13(cpu_start, &timing);
     if (pid == 0)
         _exit(restore_work(new_cpus, new_count, false, &timing));
-    set_idle_priority(0, false);
     if (pid < 0) {
         fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
                    PHASE_RESTORE, "cannot start the restore work: %s",
@@ -3457,19 +3485,17 @@ static void handle_signals(struct daemon *daemon)
     while (read(daemon->signals, &info, sizeof(info)) == sizeof(info)) {
         if (info.ssi_signo == SIGTERM)
             _exit(0);
-        // sigqueue() carries the readiness path's wall and CPU times. Step 13
-        // is due 100 ms later; the repair paired the clock with the packet's
-        // UTC now.
+        // sigqueue() carries the readiness path's wall time. Step 13 is due
+        // DEFERRED_START_NS later; the repair paired the clock with the
+        // packet's UTC now.
         if (info.ssi_signo == SIGUSR1) {
             daemon->restore_pending = true;
             daemon->last_accepted_ns = clock_ns(CLOCK_MONOTONIC);
             daemon->restore_due_ns =
                 daemon->last_accepted_ns + DEFERRED_START_NS;
-            daemon->readiness_us = 0;
-            daemon->readiness_cpu_us = 0;
-            if (info.ssi_code == SI_QUEUE)
-                unpack_readiness(info.ssi_ptr, &daemon->readiness_us,
-                                 &daemon->readiness_cpu_us);
+            daemon->readiness_us = info.ssi_code == SI_QUEUE
+                                       ? (int64_t)(info.ssi_ptr & UINT32_MAX)
+                                       : 0;
         }
     }
     // A worker that ended, if any: the daemon loop starts a due restore only
@@ -3561,8 +3587,8 @@ static void daemon_loop(struct daemon *daemon)
             arm_timer(daemon);
         }
         now = clock_ns(CLOCK_MONOTONIC);
-        // Step 13 starts 100 ms after the ack, and continues at normal
-        // priority 100 ms after it starts.
+        // Step 13 starts DEFERRED_START_NS after the ack, and continues at
+        // normal priority IDLE_BOUND_NS after it starts.
         if (daemon->restore_pending && daemon->worker_pid == 0 &&
             now >= daemon->restore_due_ns) {
             daemon->restore_pending = false;
@@ -3692,17 +3718,18 @@ static void sleep_until(int64_t deadline_ns)
 }
 
 // The asynchronous boot checks: every boot check but C12, fail-fast, from
-// 100 ms after the boot step at SCHED_IDLE, and at normal priority from
-// IDLE_BOUND_NS after they start. When they pass, the checker becomes the
+// DEFERRED_START_NS after the boot step at SCHED_IDLE, and at normal priority
+// from IDLE_BOUND_NS after they start. When they pass, the checker becomes the
 // daemon and records the boot check, whose wall and CPU times add C12's
 // (C12_NS and C12_CPU_NS) and the daemon's start, but not the delay. It never
 // returns.
 static void boot_checker(const struct boot_sample *sample, int64_t c12_ns,
                          int64_t c12_cpu_ns, int c12_failures)
 {
-    // The 100 ms count from this fork in the time ABI boot step, the one
+    // The delay counts from this fork in the time ABI boot step, the one
     // point that every guest mode shares: init runs it before the rest of its
-    // setup, so the checks start slightly less than 100 ms after shell-ready.
+    // setup, so the checks start somewhat less than DEFERRED_START_NS after
+    // shell-ready.
     int64_t start = clock_ns(CLOCK_MONOTONIC) + DEFERRED_START_NS;
     int64_t cpu_start = cpu_time_ns();
     int null = open("/dev/null", O_RDWR | O_CLOEXEC);
@@ -4004,7 +4031,6 @@ struct repair_record {
     int64_t step_realtime_ns;
     int64_t frequency;
     int64_t elapsed_us;
-    int64_t cpu_us;
 };
 
 static void apply_repair(struct time_state *state, const void *context)
@@ -4031,14 +4057,13 @@ static void apply_repair(struct time_state *state, const void *context)
              "none");
     // Step 8 marks this restore's check pending, so nvx-time status waits for
     // the daemon's step 13. Until then, restore_elapsed_us is the readiness
-    // path up to the clock step, at last_step_realtime_ns, and
-    // restore_cpu_us the helper's CPU time, which restore-finish adds to its
-    // own (0 when the helper finishes the restore itself).
+    // path up to the clock step, at last_step_realtime_ns; restore_cpu_us
+    // counts only step 13, which records it.
     snprintf(state->checks[PHASE_RESTORE].status,
              sizeof(state->checks[PHASE_RESTORE].status), "pending");
     state->checks[PHASE_RESTORE].cpus = 0;
     state->checks[PHASE_RESTORE].elapsed_us = repair->elapsed_us;
-    state->checks[PHASE_RESTORE].cpu_us = repair->cpu_us;
+    state->checks[PHASE_RESTORE].cpu_us = 0;
     state->checks[PHASE_RESTORE].generation = state->generation;
     state->checks[PHASE_RESTORE].failures = -1;
 }
@@ -4052,14 +4077,14 @@ static int repair_failed(const char *code, const char *detail)
 // Restore steps 6 to 8: read the packet with four-byte reads, validate it,
 // and set the wall clock from its bracketed UTC, then write the entropy to
 // ENTROPY_FD, the caller's file at ENTROPY_PATH. START_NS is when the capture
-// request returned, and CPU_START_NS this process's CPU clock right after the
-// restore. The caller holds the portb lock. With FINISH (untiered) and a
-// DAEMON, a restore with no processors or memory to activate needs no shell
-// work before the acknowledgement, so steps 12 and 13 start here too and no
-// second helper process starts; the metadata then begins with 2 instead of 1.
+// request returned. The caller holds the portb lock. With FINISH (untiered)
+// and a DAEMON, a restore with no processors or memory to activate needs no
+// shell work before the acknowledgement, so steps 12 and 13 start here too
+// and no second helper process starts; the metadata then begins with 2
+// instead of 1.
 static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
-                          int entropy_fd, int64_t start_ns,
-                          int64_t cpu_start_ns, bool finish, pid_t daemon)
+                          int entropy_fd, int64_t start_ns, bool finish,
+                          pid_t daemon)
 {
     static uint8_t body[PACKET_MAX_SIZE];
     static struct restore_packet packet;
@@ -4129,14 +4154,10 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
     repair.elapsed_us = (clock_ns(CLOCK_MONOTONIC) - start_ns) / NSEC_PER_USEC;
     repair.packet = &packet;
     // A plain untiered restore needs no shell work: this helper also
-    // acknowledges and hands step 13 to the daemon, and reads its CPU clock
-    // again only after the acknowledgement. Otherwise restore-finish adds
-    // this helper's CPU time to its own.
+    // acknowledges and hands step 13 to the daemon.
     finishing = finish && daemon > 0 && packet.online_vp_count == 0 &&
                 packet.range_count == 0 &&
                 (packet.flags & PACKET_MEMORY_TARGET) == 0;
-    repair.cpu_us =
-        finishing ? 0 : (cpu_time_ns() - cpu_start_ns) / NSEC_PER_USEC;
     // The entropy goes to the caller in every case, an untiered restore's
     // too; the file already exists, empty, so only its bytes are written.
     if (pwrite(entropy_fd, packet.entropy, PACKET_ENTROPY_SIZE, 0) !=
@@ -4155,7 +4176,7 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
     if (finishing) {
         finished = signal_restore(daemon,
                                   (packet.flags & PACKET_ACK_REQUIRED) != 0,
-                                  start_ns, cpu_start_ns);
+                                  start_ns);
         if (finished > 0)
             fail_fatal(STATUS_CONFORMANCE, "G_CONFORMANCE_C10", "conformance",
                        PHASE_RESTORE, "the time daemon is not running");
@@ -4182,7 +4203,6 @@ static int cmd_capture(int argc, char **argv)
     char *end;
     long request;
     int64_t start;
-    int64_t cpu_start;
     unsigned status;
     pid_t daemon = -1;
     int entropy_fd;
@@ -4237,13 +4257,8 @@ static int cmd_capture(int argc, char **argv)
         puts("0");
         return 0;
     }
-    // The restored TSC advanced by the downtime, and the first scheduler
-    // update after the restore charges that to this process, which ran the
-    // capture. Reading the CPU clock makes that update, so the baseline
-    // includes it.
-    cpu_start = cpu_time_ns();
-    result = repair_restore(previous_id, argv[2], entropy_fd, start, cpu_start,
-                            argc == 4, daemon);
+    result = repair_restore(previous_id, argv[2], entropy_fd, start, argc == 4,
+                            daemon);
     close(lock);
     return result;
 }
@@ -4252,7 +4267,7 @@ static int cmd_capture(int argc, char **argv)
 // acknowledgement when the packet asked for one, then the daemon runs step 13
 // asynchronously. The record tells it which CPUs activation onlined. The
 // readiness path started restore_elapsed_us before the helper's clock step,
-// at last_step_realtime_ns, and the helper spent restore_cpu_us of CPU time.
+// at last_step_realtime_ns.
 static int cmd_restore_finish(int argc, char **argv)
 {
     bool new_cpus[MAX_CPUS] = {false};
@@ -4261,7 +4276,6 @@ static int cmd_restore_finish(int argc, char **argv)
     struct time_state state;
     struct checks checks;
     char text[256];
-    int64_t cpu_start;
     int64_t start;
     bool ack = false;
     int new_count = 0;
@@ -4299,10 +4313,7 @@ static int cmd_restore_finish(int argc, char **argv)
     start = clock_ns(CLOCK_MONOTONIC) -
             (clock_ns(CLOCK_REALTIME) - state.last_step_realtime_ns) -
             state.checks[PHASE_RESTORE].elapsed_us * NSEC_PER_USEC;
-    // This process runs only for the restore, so all of its CPU time counts,
-    // plus the helper's.
-    cpu_start = -state.checks[PHASE_RESTORE].cpu_us * NSEC_PER_USEC;
-    signaled = signal_restore(daemon_pid(), ack, start, cpu_start);
+    signaled = signal_restore(daemon_pid(), ack, start);
     if (signaled == 0)
         return 0;
     if (signaled > 0 || !g_report_only) {
@@ -4311,13 +4322,15 @@ static int cmd_restore_finish(int argc, char **argv)
         check_failed(&checks, "C10", "the time daemon is not running");
         return 1;
     }
-    // Report-only runs may lack the daemon; finish the restore here.
+    // Report-only runs may lack the daemon; finish the restore here, where
+    // step 13's CPU time is restore_work's own.
     if (ack)
         outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
     timing.start_ns = clock_ns(CLOCK_MONOTONIC);
     timing.readiness_us = (timing.start_ns - start) / NSEC_PER_USEC;
+    timing.prior_cpu_ns = 0;
     timing.cpu_base_ns = cpu_time_ns();
-    timing.prior_cpu_ns = timing.cpu_base_ns - cpu_start;
+    timing.fork_fd = -1;
     (void)restore_work(new_cpus, new_count, true, &timing);
     return 0;
 }
@@ -4792,6 +4805,52 @@ static int test_promote(void)
     return 0;
 }
 
+static int64_t g_test_fork_burn_ms;
+
+// Spends MS milliseconds of this process's CPU time.
+static void burn_cpu(int64_t ms)
+{
+    int64_t until = cpu_time_ns() + ms * NSEC_PER_MSEC;
+
+    while (cpu_time_ns() < until)
+        ;
+}
+
+static void test_fork_burn(void)
+{
+    burn_cpu(g_test_fork_burn_ms);
+}
+
+// Forks a step 13 worker as start_restore does, after PRE_MS of preparation,
+// with a fork that costs the parent FORK_MS; the worker spends CHILD_MS and
+// prints its preparation share and step 13's CPU time.
+static int test_step13_cpu(int argc, char **argv)
+{
+    struct restore_timing timing = {0};
+    int64_t start = cpu_time_ns();
+    int status;
+    pid_t pid;
+
+    if (argc != 3)
+        return 2;
+    g_test_fork_burn_ms = strtoll(argv[1], NULL, 10);
+    if (pthread_atfork(NULL, test_fork_burn, NULL) != 0)
+        return 1;
+    burn_cpu(strtoll(argv[0], NULL, 10));
+    pid = fork_step13(start, &timing);
+    if (pid == 0) {
+        burn_cpu(strtoll(argv[2], NULL, 10));
+        printf("prior_ms=%" PRId64 " total_ms=%" PRId64 "\n",
+               timing.prior_cpu_ns / NSEC_PER_MSEC,
+               step13_cpu_ns(&timing) / NSEC_PER_MSEC);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (pid < 0 || waitpid(pid, &status, 0) != pid)
+        return 1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 static int cmd_test(int argc, char **argv)
 {
     const char *name = argc > 0 ? argv[0] : "";
@@ -4904,16 +4963,12 @@ static int cmd_test(int argc, char **argv)
     }
     if (strcmp(name, "restore-record") == 0)
         return test_restore_record(argc, argv);
-    if (strcmp(name, "readiness") == 0 && argc == 2) {
-        uint64_t value = pack_readiness(strtoll(argv[0], NULL, 10),
-                                        strtoll(argv[1], NULL, 10));
-        int64_t elapsed_us;
-        int64_t cpu_us;
-
-        unpack_readiness(value, &elapsed_us, &cpu_us);
-        printf("value=0x%016" PRIx64 " elapsed_us=%" PRId64 " cpu_us=%" PRId64
-               "\n",
-               value, elapsed_us, cpu_us);
+    if (strcmp(name, "step13-cpu") == 0)
+        return test_step13_cpu(argc, argv);
+    if (strcmp(name, "deferral") == 0 && argc == 0) {
+        printf("deferred_start_ms=%" PRId64 " idle_bound_ms=%" PRId64 "\n",
+               (int64_t)(DEFERRED_START_NS / NSEC_PER_MSEC),
+               (int64_t)(IDLE_BOUND_NS / NSEC_PER_MSEC));
         return 0;
     }
     if (strcmp(name, "parallel") == 0)
