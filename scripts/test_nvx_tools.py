@@ -10015,6 +10015,60 @@ class SharedFileTests(unittest.TestCase):
             self.assertTrue(all(member.uid == member.gid == 0 for member in members))
 
 
+class EnsureOpenvmmSourceTests(unittest.TestCase):
+    def test_preserves_release_binary_across_submodule_init(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".gitmodules").write_text(
+                "[submodule \"openvmm\"]\n"
+                "\tpath = openvmm\n"
+                "\turl = https://github.com/nanvix/openvmm.git\n",
+                encoding="ascii",
+            )
+            binary = root / "openvmm" / "target" / "release" / "openvmm"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"release-binary")
+
+            original_run = release.subprocess.run
+
+            def fake_run(command, **kwargs):
+                if "submodule" in command:
+                    (root / "openvmm" / "Cargo.toml").write_text(
+                        "[package]\n", encoding="ascii"
+                    )
+                    return None
+                return original_run(command, **kwargs)
+
+            with patch.object(
+                release.subprocess, "run", side_effect=fake_run
+            ):
+                release.ensure_openvmm_source(root)
+
+            self.assertTrue((root / "openvmm" / "Cargo.toml").exists())
+            self.assertEqual(binary.read_bytes(), b"release-binary")
+            staged = root / "build" / "openvmm-release-binary"
+            self.assertFalse(staged.exists())
+
+    def test_rejects_unexpected_openvmm_content_without_binary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stray = root / "openvmm" / "stray.txt"
+            stray.parent.mkdir(parents=True)
+            stray.write_text("not a release install\n", encoding="ascii")
+            with self.assertRaises(release.ScriptError):
+                release.ensure_openvmm_source(root)
+
+    def test_noop_when_submodule_initialized(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "openvmm").mkdir()
+            (root / "openvmm" / "Cargo.toml").write_text(
+                "[package]\n", encoding="ascii"
+            )
+            release.ensure_openvmm_source(root)
+            self.assertTrue((root / "openvmm" / "Cargo.toml").exists())
+
+
 class DownloadTests(unittest.TestCase):
     def test_rejects_nonpositive_attempts(self):
         with tempfile.TemporaryDirectory() as temporary:

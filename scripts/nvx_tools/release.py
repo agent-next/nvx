@@ -579,6 +579,58 @@ def _install_release_archive(archive_path: Path) -> None:
             _replace_runtime_file(source, artifact_path(name))
 
 
+def ensure_openvmm_source(repo_root: Path) -> None:
+    """Initialize the openvmm submodule without losing a release-installed binary.
+
+    ``download`` installs the packaged OpenVMM binary under
+    ``openvmm/target/release/``, which leaves ``openvmm/`` non-empty and makes
+    ``git submodule update --init openvmm`` fail with "destination path already
+    exists and is not an empty directory" — every later ``benchmark
+    --skip-build`` then errors on the missing ``openvmm/Cargo.toml``. Preserve
+    the installed binary across the submodule init by moving it aside and
+    restoring it afterwards. With the submodule already initialized this is a
+    no-op.
+    """
+    openvmm_dir = repo_root / "openvmm"
+    binary = openvmm_dir / "target" / "release" / "openvmm"
+    if (openvmm_dir / "Cargo.toml").exists():
+        return
+    staged: Path | None = None
+    if binary.exists():
+        staged = repo_root / "build" / "openvmm-release-binary"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if staged.exists():
+            staged.unlink()
+        binary.rename(staged)
+        target_dir = openvmm_dir / "target"
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+    try:
+        if openvmm_dir.exists() and any(openvmm_dir.iterdir()):
+            raise ScriptError(
+                "openvmm/ is not empty and holds no installed binary; "
+                "clean it or init the submodule manually"
+            )
+        subprocess.run(
+            [
+                "git",
+                "submodule",
+                "update",
+                "--init",
+                "--depth",
+                "1",
+                "openvmm",
+            ],
+            cwd=repo_root,
+            check=True,
+        )
+    finally:
+        if staged is not None:
+            destination = openvmm_dir / "target" / "release" / "openvmm"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            staged.rename(destination)
+
+
 def download_latest_release(repository: str, platform: str) -> None:
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     asset, download_token = _latest_release_asset_with_fallback(
