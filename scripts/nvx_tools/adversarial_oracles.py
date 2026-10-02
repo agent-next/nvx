@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Protocol, cast
+from typing import Any, BinaryIO, Protocol, cast
 
 from nvx_tools.adversarial_broker import append_json_line
 from nvx_tools.common import ScriptError
@@ -361,7 +361,86 @@ def _write_stdin(stream: BinaryIO, data: bytes, state: _StdinState) -> None:
         stream.close()
 
 
-def _freeze_linux_process_tree(pid: int) -> list[int]:
+def _linux_direct_children(pid: int) -> tuple[int, ...]:
+    task_path = Path(f"/proc/{pid}/task")
+    try:
+        task_ids = tuple(path.name for path in task_path.iterdir())
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise ScriptError(f"cannot enumerate process {pid} threads: {error}") from error
+
+    children: set[int] = set()
+    for task_id in task_ids:
+        children_path = task_path / task_id / "children"
+        try:
+            children.update(int(value) for value in children_path.read_text().split())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            raise ScriptError(
+                f"cannot enumerate process {pid} thread {task_id} children: {error}"
+            ) from error
+    return tuple(sorted(children))
+
+
+def _linux_task_states(pid: int) -> tuple[tuple[int, str], ...]:
+    task_path = Path(f"/proc/{pid}/task")
+    try:
+        task_paths = tuple(task_path.iterdir())
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise ScriptError(f"cannot observe process {pid} threads: {error}") from error
+
+    states: list[tuple[int, str]] = []
+    for task_path in task_paths:
+        stat_path = task_path / "stat"
+        try:
+            stat = stat_path.read_text()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ScriptError(
+                f"cannot observe process {pid} thread {task_path.name}: {error}"
+            ) from error
+        comm_end = stat.rfind(")")
+        fields = stat[comm_end + 1 :].split() if comm_end >= 0 else []
+        if not fields or len(fields[0]) != 1:
+            raise ScriptError(f"cannot parse process stat file {stat_path}")
+        try:
+            task_id = int(task_path.name)
+        except ValueError as error:
+            raise ScriptError(f"cannot parse task ID {task_path.name}") from error
+        states.append((task_id, fields[0]))
+    return tuple(sorted(states))
+
+
+def _wait_linux_process_quiescent(pid: int, deadline: float) -> bool:
+    quiescent_task_ids: tuple[int, ...] | None = None
+    while True:
+        states = _linux_task_states(pid)
+        if not states:
+            return False
+        task_ids = tuple(task_id for task_id, _ in states)
+        if all(state in {"T", "t", "Z", "X", "x"} for _, state in states):
+            if task_ids == quiescent_task_ids:
+                return True
+            quiescent_task_ids = task_ids
+        else:
+            quiescent_task_ids = None
+        if time.monotonic() >= deadline:
+            raise ScriptError(f"timed out stopping process {pid} for cleanup")
+        time.sleep(0.01)
+
+
+def _freeze_linux_process_tree(
+    pid: int,
+    *,
+    deadline: float | None = None,
+) -> list[int]:
+    if deadline is None:
+        deadline = time.monotonic() + PROCESS_TERMINATION_WAIT_SECONDS
     sigstop = cast(int, getattr(signal, "SIGSTOP"))  # noqa: B009
     try:
         os.kill(pid, sigstop)
@@ -369,41 +448,39 @@ def _freeze_linux_process_tree(pid: int) -> list[int]:
         return []
     except PermissionError as error:
         raise ScriptError(f"cannot stop process {pid} for cleanup: {error}") from error
-    children_path = Path(f"/proc/{pid}/task/{pid}/children")
-    try:
-        children = [int(value) for value in children_path.read_text().split()]
-    except FileNotFoundError:
-        children = []
-    except (OSError, ValueError) as error:
-        raise ScriptError(
-            f"cannot enumerate process {pid} children: {error}"
-        ) from error
+
+    if not _wait_linux_process_quiescent(pid, deadline):
+        return []
+
     frozen: list[int] = []
-    for child in children:
-        frozen.extend(_freeze_linux_process_tree(child))
+    seen_children: set[int] = set()
+    while True:
+        children = _linux_direct_children(pid)
+        new_children = tuple(child for child in children if child not in seen_children)
+        if not new_children:
+            break
+        seen_children.update(new_children)
+        for child in new_children:
+            frozen.extend(_freeze_linux_process_tree(child, deadline=deadline))
     frozen.append(pid)
     return frozen
 
 
-def _linux_direct_children(pid: int) -> tuple[int, ...]:
-    children_path = Path(f"/proc/{pid}/task/{pid}/children")
-    try:
-        return tuple(int(value) for value in children_path.read_text().split())
-    except FileNotFoundError:
-        return ()
-    except (OSError, ValueError) as error:
-        raise ScriptError(
-            f"cannot enumerate process {pid} children: {error}"
-        ) from error
-
-
-def _reap_linux_descendants(pids: Sequence[int]) -> None:
+def _reap_linux_descendants(
+    pids: Sequence[int],
+    *,
+    deadline: float | None = None,
+) -> None:
+    if deadline is None:
+        deadline = time.monotonic() + PROCESS_TERMINATION_WAIT_SECONDS
     sigkill = cast(int, getattr(signal, "SIGKILL"))  # noqa: B009
     wnohang = cast(int, getattr(os, "WNOHANG"))  # noqa: B009
     process_tree: list[int] = []
     seen: set[int] = set()
     for pid in pids:
-        for descendant in _freeze_linux_process_tree(pid):
+        if time.monotonic() >= deadline:
+            raise ScriptError("timed out freezing descendant processes for cleanup")
+        for descendant in _freeze_linux_process_tree(pid, deadline=deadline):
             if descendant not in seen:
                 seen.add(descendant)
                 process_tree.append(descendant)
@@ -412,7 +489,6 @@ def _reap_linux_descendants(pids: Sequence[int]) -> None:
             os.kill(pid, sigkill)
         except ProcessLookupError:
             continue
-    deadline = time.monotonic() + PROCESS_TERMINATION_WAIT_SECONDS
     remaining = set(process_tree)
     while remaining:
         for pid in tuple(remaining):
@@ -432,6 +508,57 @@ def _reap_linux_descendants(pids: Sequence[int]) -> None:
                 + ", ".join(str(pid) for pid in sorted(remaining))
             )
         time.sleep(0.01)
+
+
+def _reap_linux_children(parent_pid: int) -> None:
+    deadline = time.monotonic() + PROCESS_TERMINATION_WAIT_SECONDS
+    while children := _linux_direct_children(parent_pid):
+        if time.monotonic() >= deadline:
+            raise ScriptError(f"timed out reaping descendants of process {parent_pid}")
+        _reap_linux_descendants(children, deadline=deadline)
+
+
+def _redeliver_linux_signal(signum: int) -> None:
+    sigkill = cast(int, getattr(signal, "SIGKILL"))  # noqa: B009
+    if signum != sigkill:
+        signal.signal(signum, signal.SIG_DFL)
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    sig_unblock = getattr(signal, "SIG_UNBLOCK", None)
+    if pthread_sigmask is not None and sig_unblock is not None:
+        pthread_sigmask(sig_unblock, {signum})
+    os.kill(os.getpid(), signum)
+    raise ScriptError(f"failed to redeliver signal {signum} to process supervisor")
+
+
+def supervise_linux_process(command: Sequence[str]) -> int:
+    """Run and fully reap one process tree inside a private subreaper."""
+    if not command:
+        raise ValueError("supervised command is required")
+    _enable_linux_child_subreaper()
+    process = subprocess.Popen(command)
+    previous_handlers: dict[int, object] = {}
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        try:
+            process.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+    forwarded_signals = [int(signal.SIGINT), int(signal.SIGTERM)]
+    sighup = cast(int | None, getattr(signal, "SIGHUP", None))
+    if sighup is not None:
+        forwarded_signals.insert(0, sighup)
+    for signum in forwarded_signals:
+        previous_handlers[signum] = signal.signal(signum, forward_signal)
+    returncode = process.wait()
+    try:
+        _reap_linux_children(os.getpid())
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, cast(Any, handler))
+    if returncode < 0:
+        _redeliver_linux_signal(-returncode)
+    return returncode
 
 
 class _WindowsDynamicFunction(Protocol):
@@ -644,17 +771,47 @@ def _cleanup_windows_job(job: _WindowsJob) -> None:
         job.close()
 
 
-def _reap_contained_descendants(
-    *,
-    linux_children_before: frozenset[int],
-) -> None:
-    if sys.platform.startswith("linux"):
-        children = tuple(
-            pid
-            for pid in _linux_direct_children(os.getpid())
-            if pid not in linux_children_before
+class ProcessTreeContainment:
+    """Own one spawned process tree through platform-specific isolation."""
+
+    def __init__(self) -> None:
+        self._windows_job: _WindowsJob | None = (
+            _WindowsJob() if os.name == "nt" else None
         )
-        _reap_linux_descendants(children)
+        self._closed = False
+
+    def command(self, command: Sequence[str]) -> list[str]:
+        if not sys.platform.startswith("linux"):
+            return list(command)
+        supervisor = Path(__file__).with_name("process_supervisor.py")
+        return [sys.executable, "-I", str(supervisor), "--", *command]
+
+    @property
+    def creationflags(self) -> int:
+        return _WINDOWS_CREATE_SUSPENDED if os.name == "nt" else 0
+
+    def attach(self, process: subprocess.Popen[bytes]) -> None:
+        if self._windows_job is not None:
+            self._windows_job.assign_and_resume(process)
+
+    def abort_spawn(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._windows_job is not None:
+            self._windows_job.close()
+
+    def close(self, process: subprocess.Popen[bytes]) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._windows_job is not None:
+            _cleanup_windows_job(self._windows_job)
+            if process.poll() is None:
+                process.wait(timeout=PROCESS_TERMINATION_WAIT_SECONDS)
+            return
+        if process.poll() is None:
+            _terminate_process(process, process_group=False)
 
 
 def terminate_process_tree(
@@ -742,29 +899,24 @@ def run_bounded_process(
 ) -> BoundedProcessResult:
     if timeout <= 0:
         raise ScriptError("process timeout must be greater than zero")
-    if contained_by_parent:
-        _enable_linux_child_subreaper()
-    linux_children_before: frozenset[int] = (
-        frozenset(_linux_direct_children(os.getpid()))
-        if contained_by_parent and sys.platform.startswith("linux")
-        else frozenset[int]()
-    )
     output_dir.mkdir(parents=True, exist_ok=False)
     stdout_path = output_dir / "stdout.log"
     stderr_path = output_dir / "stderr.log"
-    windows_job = _WindowsJob() if contained_by_parent and os.name == "nt" else None
-    if os.name == "nt":
-        creationflags = (
-            _WINDOWS_CREATE_SUSPENDED
-            if contained_by_parent
-            else subprocess.CREATE_NEW_PROCESS_GROUP
-        )
-    else:
-        creationflags = 0
+    containment = ProcessTreeContainment() if contained_by_parent else None
+    process_command = (
+        containment.command(command) if containment is not None else list(command)
+    )
+    creationflags = (
+        containment.creationflags
+        if containment is not None
+        else subprocess.CREATE_NEW_PROCESS_GROUP
+        if os.name == "nt"
+        else 0
+    )
     started = time.monotonic()
     try:
         process = subprocess.Popen(
-            list(command),
+            process_command,
             cwd=cwd,
             env=dict(environment),
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
@@ -774,15 +926,15 @@ def run_bounded_process(
             creationflags=creationflags,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
-        if windows_job is not None:
-            windows_job.close()
+        if containment is not None:
+            containment.abort_spawn()
         raise
-    if windows_job is not None:
+    if containment is not None:
         try:
-            windows_job.assign_and_resume(process)
+            containment.attach(process)
         except (OSError, subprocess.SubprocessError, ScriptError, ValueError):
             try:
-                windows_job.close()
+                containment.abort_spawn()
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -790,10 +942,13 @@ def run_bounded_process(
             raise
     if process.stdout is None or process.stderr is None:
         try:
-            _terminate_process(process, process_group=not contained_by_parent)
+            if containment is not None:
+                containment.close(process)
+            else:
+                _terminate_process(process, process_group=True)
         finally:
-            if windows_job is not None:
-                _cleanup_windows_job(windows_job)
+            if containment is not None:
+                containment.abort_spawn()
         raise ScriptError("failed to capture adversarial executor output")
     stdout_state = _DrainState()
     stderr_state = _DrainState()
@@ -828,14 +983,13 @@ def run_bounded_process(
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _terminate_process(process, process_group=not contained_by_parent)
+            if containment is not None:
+                containment.close(process)
+            else:
+                _terminate_process(process, process_group=True)
     finally:
-        if windows_job is not None:
-            _cleanup_windows_job(windows_job)
-        elif contained_by_parent:
-            _reap_contained_descendants(
-                linux_children_before=linux_children_before,
-            )
+        if containment is not None:
+            containment.close(process)
     stdout_thread.join(timeout=PROCESS_READER_JOIN_SECONDS)
     stderr_thread.join(timeout=PROCESS_READER_JOIN_SECONDS)
     if stdin_thread is not None:

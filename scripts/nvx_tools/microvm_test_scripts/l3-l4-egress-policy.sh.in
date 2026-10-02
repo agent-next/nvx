@@ -6,18 +6,28 @@ fail() {
     exit "$code"
 }
 
-allowed=$(wget -T 5 -qO- http://@GATEWAY_IPV4@:@ALLOWED_TCP_PORT@/allowed) ||
+allowed=$(wget -T 5 -qO- http://@GATEWAY_IPV4@:@TCP_START@/allowed) ||
     fail 80
-[ "$allowed" = NVX-L3-L4-TCP-ALLOW ] || fail 81
+[ "$allowed" = NVX-L3-L4-TCP-ALLOW-START ] || fail 81
 
-if wget -T 2 -qO /dev/null http://@GATEWAY_IPV4@:@DENIED_TCP_PORT@/denied; then
+allowed=$(wget -T 5 -qO- http://@GATEWAY_IPV4@:@TCP_END@/allowed) ||
     fail 82
-fi
+[ "$allowed" = NVX-L3-L4-TCP-ALLOW-END ] || fail 83
 
-printf 'NVX-L3-L4-UDP-ALLOW' |
-    nc -u -w 1 @GATEWAY_IPV4@ @ALLOWED_UDP_PORT@ || fail 83
-printf 'NVX-L3-L4-UDP-DENY' |
-    nc -u -w 1 @GATEWAY_IPV4@ @DENIED_UDP_PORT@ || true
+for port in @TCP_ADJACENT_LOW@ @TCP_DENIED@ @TCP_ADJACENT_HIGH@; do
+    if wget -T 2 -qO /dev/null "http://@GATEWAY_IPV4@:$port/denied"; then
+        fail 84
+    fi
+done
+
+printf 'NVX-L3-L4-UDP-ALLOW-START' |
+    nc -u -w 1 @GATEWAY_IPV4@ @UDP_START@ || fail 85
+printf 'NVX-L3-L4-UDP-ALLOW-END' |
+    nc -u -w 1 @GATEWAY_IPV4@ @UDP_END@ || fail 86
+for port in @UDP_ADJACENT_LOW@ @UDP_DENIED@ @UDP_ADJACENT_HIGH@; do
+    printf 'NVX-L3-L4-UDP-DENY' |
+        nc -u -w 1 @GATEWAY_IPV4@ "$port" || true
+done
 sleep 1
 
 echo NVX-L3-L4-EGRESS-OK

@@ -70,7 +70,10 @@ class SourceMetadata(TypedDict):
 def _source_requirements(manifests: list[Path]) -> tuple[SourceRequirement, ...]:
     requirements: dict[tuple[str, str], SourceRequirement] = {}
     for path in manifests:
-        raw_document = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            raw_document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ScriptError(f"cannot read Ubuntu package manifest {path}") from error
         if not isinstance(raw_document, dict):
             raise ScriptError(f"{path} must contain a JSON object")
         document = cast(dict[str, object], raw_document)

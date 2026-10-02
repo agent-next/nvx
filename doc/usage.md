@@ -77,6 +77,23 @@ python3 scripts/nvx.py setup-cross-os-cache
 
 Installs the GNU tar and zstd tools used by GitHub Actions cross-OS caches.
 
+### `check-required-ci`
+
+```text
+python3 scripts/nvx.py check-required-ci
+    --event-name {pull_request,push}
+    --same-repository {false,true}
+    --run-tests VALUE
+    --run-workloads VALUE
+```
+
+Validates the GitHub Actions result values supplied through the
+`QUALITY_RESULT`, `CHANGES_RESULT`, and job-specific `*_RESULT` environment
+variables. CI supplies `true` or `false` for the two workload flags. The
+command expects successful results for jobs enabled by the event, repository,
+and workload flags, and `skipped` for jobs that are not enabled; mismatches
+are reported as errors and cause a nonzero exit.
+
 See [Setup](setup.md) for host prerequisites.
 
 ## Build commands
@@ -310,6 +327,7 @@ python3 scripts/nvx.py run
     [--network-ingress {allow,deny}]
     [--network-egress-allow CIDR[:PROTOCOL:PORT]]...
     [--network-egress-deny CIDR[:PROTOCOL:PORT]]...
+    [--network-egress-policy-file PATH]
     [--host-loopback {allow,deny}]
     [--network-proxy IPV4:TCP-PORT]
     [--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT]...
@@ -330,7 +348,7 @@ python3 scripts/nvx.py run
 | `--memory-mib MIB` | guest-specific | Set guest memory in MiB. Defaults to 128 for Alpine and 256 for Ubuntu. |
 | `--memory-capacity-mib MIB` | none | Reserve an immutable, 128 MiB-aligned RAM capacity for a fresh microVM snapshot. |
 | `--processors {1,2,4,8}` | `1` | Select the microVM processor count. |
-| `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Expose one host directory to the absolute guest target. Active snapshot restore requires the same canonical path, target, and mode; a dormant-slot restore may attach a new mapping that the resumed guest mounts explicitly. |
+| `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Expose one host directory to the absolute guest target. An `rw` mapping accepts guest-created symbolic links, which the host never follows. Active snapshot restore requires the same canonical path, target, and mode; a dormant-slot restore may attach a new mapping that the resumed guest mounts explicitly. |
 | `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside the mounted host root; repeat to deny multiple paths. |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with the static guest IPv4 address and prefix. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
@@ -338,6 +356,7 @@ python3 scripts/nvx.py run
 | `--network-ingress {allow,deny}` | `deny` | Set the default host ingress policy. The portable profile currently supports only `deny`; `allow` is rejected before launch. |
 | `--network-egress-allow CIDR[:PROTOCOL:PORT]` | none | Allow matching guest egress; repeat to add rules. |
 | `--network-egress-deny CIDR[:PROTOCOL:PORT]` | none | Deny matching guest egress; repeat to add rules. Deny rules take precedence. |
+| `--network-egress-policy-file PATH` | none | Load bounded IPv4 ranges and rule-local CIDR exclusions from JSON. Requires explicit `--network-egress`; cannot be mixed with explicit allow/deny rule flags. |
 | `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services. |
 | `--network-proxy IPV4:TCP-PORT` | none | Allow one explicit host TCP proxy endpoint. |
 | `--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT` | none | Publish one TCP or UDP localhost port to the guest; repeat to add forwards. |
@@ -372,12 +391,15 @@ python3 scripts/nvx.py sandbox
     [--timeout SECONDS]
     [--exec-timeout-ms MILLISECONDS]
     [--hypervisor {auto,whp,kvm,mshv}]
+    [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
+    [--mount-deny HOST_PATH]...
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
     [--network-egress {allow,deny}]
     [--network-ingress {allow,deny}]
     [--network-egress-allow CIDR[:PROTOCOL:PORT]]...
     [--network-egress-deny CIDR[:PROTOCOL:PORT]]...
+    [--network-egress-policy-file PATH]
     [--host-loopback {allow,deny}]
     [--network-proxy IPV4:TCP-PORT]
     [--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT]...
@@ -386,7 +408,8 @@ python3 scripts/nvx.py sandbox
     [--dry-run]
 ```
 
-Network policy options configure only the `run` and `provision` launches.
+Network policy and live-share options configure only the `run` and `provision`
+launches.
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -404,17 +427,20 @@ Network policy options configure only the `run` and `provision` launches.
 | `--timeout SECONDS` | `60` | Set the control response timeout for managed `start`, `exec`, and `stop`. |
 | `--exec-timeout-ms MILLISECONDS` | `0` | Set the managed `exec` guest workload timeout; zero disables it. |
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the host hypervisor. |
+| `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Live-share one host directory at the absolute target inside the container rootfs for `run` or `provision`; defaults to `ro`. An `rw` share accepts guest-created symbolic links, which the host never follows. `/`, `/etc`, and the `/proc`, `/sys`, `/dev`, and `/.nvx-agent` trees are reserved. |
+| `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside the `--mount` host directory; relative paths are resolved inside it. Repeat to deny multiple paths. |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with a static guest address. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy for `run` or `provision`. |
 | `--network-ingress {allow,deny}` | `deny` | Set the host ingress policy for `run` or `provision`. The portable profile supports only `deny`. |
 | `--network-egress-allow CIDR[:PROTOCOL:PORT]` | none | Allow matching guest egress; repeat to add rules. Requires explicit `--network-egress`. |
 | `--network-egress-deny CIDR[:PROTOCOL:PORT]` | none | Deny matching guest egress; repeat to add rules. Requires explicit `--network-egress`; deny rules take precedence. |
+| `--network-egress-policy-file PATH` | none | Load bounded IPv4 ranges and rule-local CIDR exclusions for `run` or `provision`. Managed provision persists lowered rules, not this path. Requires explicit `--network-egress`; cannot be mixed with explicit allow/deny rule flags. |
 | `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services for `run` or `provision`. |
 | `--network-proxy IPV4:TCP-PORT` | none | Allow one explicit host TCP proxy endpoint; the IPv4 address must match the guest gateway. |
 | `--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT` | none | Publish one TCP or UDP localhost port to the guest; repeat to add forwards and set `--host-loopback allow`. |
 | `--outcome-report PATH` | none | Write a bounded local JSON outcome report for one-shot `run` or managed `exec`. |
-| `--cmdline TEXT` | empty | Append non-sandbox kernel parameters; `nvx_*` and `tsc=` tokens are reserved. |
+| `--cmdline TEXT` | empty | Append non-sandbox kernel parameters; `nvx_*`, `virtfs_*`, and `tsc=` tokens are reserved. |
 | `--dry-run` | off | Print the generated OpenVMM microVM command without running it. |
 
 See [Run](run.md) for artifact preparation, the security boundary, and current
@@ -538,6 +564,7 @@ python3 scripts/nvx.py performance gate
     [--minimum-history N]
     [--threshold PERCENT]
     [--absolute-tolerance-ms MILLISECONDS]
+    [--history-reset-dir PATH]
     [--summary PATH]
 ```
 
@@ -546,6 +573,8 @@ Checks target p50 values for regressions against rolling baseline histories.
 `40`, and `--absolute-tolerance-ms` to `5`. The gate uses the median of the
 available window and treats metrics with insufficient history as warmups.
 `--summary` writes a Markdown summary.
+`--history-reset-dir` names tracked candidate histories; metrics removed from
+an existing history file restart baseline warmup.
 
 #### `performance persist`
 

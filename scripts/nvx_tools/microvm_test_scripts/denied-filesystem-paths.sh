@@ -25,6 +25,18 @@ if cat /mnt/second/secrets/token >/dev/null 2>&1; then
     fail 107
 fi
 printf 'NVX-GUEST-WRITE\n' >/mnt/share/allowed/from-guest || fail 108
+ln -s ../secrets/token /mnt/share/allowed/token-link || fail 109
+[ "$(readlink /mnt/share/allowed/token-link)" = ../secrets/token ] || fail 110
+if cat /mnt/share/allowed/token-link >/dev/null 2>&1; then
+    fail 111
+fi
+ln -s secrets /mnt/share/guest-alias || fail 112
+if cat /mnt/share/guest-alias/token >/dev/null 2>&1; then
+    fail 113
+fi
+if ln -s allowed /mnt/share/secrets/guest-link 2>/dev/null; then
+    fail 114
+fi
 
 echo NVX-DENIED-PATHS-OK
 nvx-exit 0

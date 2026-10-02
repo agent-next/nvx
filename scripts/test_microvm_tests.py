@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -156,6 +157,111 @@ class GuestIdentityScriptTests(unittest.TestCase):
                         run_guest_script.call_args.args[1].startswith("set -e\n")
                     )
                     run_guest_script.reset_mock()
+
+
+def _create_wsl_symlink(path: Path, target: str) -> None:
+    """Create the WSL-style link that OpenVMM stores for a guest on Windows."""
+    if sys.platform != "win32":
+        raise unittest.SkipTest("WSL-style links exist only on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.DeviceIoControl.restype = wintypes.BOOL
+    kernel32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    generic_write = 0x40000000
+    create_new = 1
+    open_reparse_point = 0x00200000
+    fsctl_set_reparse_point = 0x000900A4
+    handle = kernel32.CreateFileW(
+        str(path), generic_write, 0, None, create_new, open_reparse_point, None
+    )
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # Version 2 of the LX link layout stores the UTF-8 target after a
+        # 32-bit version field.
+        data = (2).to_bytes(4, "little") + target.encode()
+        reparse = (
+            microvm_tests.IO_REPARSE_TAG_LX_SYMLINK.to_bytes(4, "little")
+            + len(data).to_bytes(2, "little")
+            + bytes(2)
+            + data
+        )
+        buffer = ctypes.create_string_buffer(reparse, len(reparse))
+        returned = wintypes.DWORD()
+        if not kernel32.DeviceIoControl(
+            handle,
+            fsctl_set_reparse_point,
+            buffer,
+            len(reparse),
+            None,
+            0,
+            ctypes.byref(returned),
+            None,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+class GuestSymlinkTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.target = self.root / "target"
+        self.target.write_text("host data\n", encoding="utf-8")
+
+    @unittest.skipIf(sys.platform == "win32", "Windows hosts store WSL-style links")
+    def test_posix_link_must_keep_the_exact_target(self):
+        link = self.root / "link"
+        link.symlink_to("../target")
+        microvm_tests.assert_guest_symlink(link, "../target")
+
+        with self.assertRaisesRegex(RuntimeError, "does not point to"):
+            microvm_tests.assert_guest_symlink(link, "target")
+        with self.assertRaisesRegex(RuntimeError, "does not point to"):
+            microvm_tests.assert_guest_symlink(self.target, "target")
+
+    @unittest.skipUnless(sys.platform == "win32", "WSL-style links exist on Windows")
+    def test_windows_link_must_be_an_inert_wsl_link(self):
+        link = self.root / "link"
+        _create_wsl_symlink(link, "../target")
+        self.assertEqual(microvm_tests.read_wsl_symlink(link), b"../target")
+        microvm_tests.assert_guest_symlink(link, "../target")
+
+        with self.assertRaisesRegex(RuntimeError, "does not point to"):
+            microvm_tests.assert_guest_symlink(link, "target")
+        with self.assertRaisesRegex(RuntimeError, "not a WSL-style link"):
+            microvm_tests.assert_guest_symlink(self.target, "target")
+        followable = self.root / "followable"
+        try:
+            followable.symlink_to(self.target)
+        except OSError as error:
+            self.skipTest(f"NT symbolic links are unavailable: {error}")
+        with self.assertRaisesRegex(RuntimeError, "not a WSL-style link"):
+            microvm_tests.assert_guest_symlink(followable, str(self.target))
 
 
 class ControlSessionTests(unittest.TestCase):
@@ -1686,6 +1792,309 @@ class MicrovmTests(unittest.TestCase):
                 egress="block",
                 ingress="deny",
             )
+
+    def test_egress_port_reservation_closes_tcp_when_udp_fails(self):
+        endpoints = [MagicMock(spec=socket.socket) for _ in range(5)]
+        with (
+            patch.object(
+                microvm_tests,
+                "_bind_consecutive_ports",
+                side_effect=[endpoints, RuntimeError("UDP unavailable")],
+            ),
+            self.assertRaisesRegex(RuntimeError, "UDP unavailable"),
+        ):
+            microvm_tests.run_l3_l4_egress_policy(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initramfs"),
+                "whp",
+                memory_mib=128,
+                timeout=1,
+                output_dir=Path("."),
+            )
+        for endpoint in endpoints:
+            endpoint.close.assert_called_once_with()
+
+    def test_bounded_egress_acceptance_policy_lowers_ranges_and_exclusions(self):
+        policy = microvm_tests._bounded_egress_policy(
+            "192.0.2.1",
+            (21001, 21002, 21003),
+            (22001, 22002, 22003),
+        )
+
+        self.assertIn("192.0.2.0/24:tcp:21001", policy.allow)
+        self.assertIn("192.0.2.0/24:tcp:21003", policy.allow)
+        self.assertIn("192.0.2.0/24:udp:22001", policy.allow)
+        self.assertIn("192.0.2.0/24:udp:22003", policy.allow)
+        self.assertIn("192.0.2.0/24:tcp:21002", policy.deny)
+        self.assertIn("192.0.2.0/24:udp:22002", policy.deny)
+        self.assertNotIn("192.0.2.0/24:tcp:21000", policy.allow)
+        self.assertNotIn("192.0.2.0/24:tcp:21004", policy.allow)
+
+    def test_l3_l4_egress_acceptance_invokes_public_nvx_policy_file(self):
+        class ImmediateThread:
+            def __init__(
+                self, *, target: Callable[[], None], **_kwargs: object
+            ) -> None:
+                self.target = target
+
+            def start(self) -> None:
+                self.target()
+
+            def join(self, _timeout: float | None = None, **_kwargs: object) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return False
+
+        for guest, memory_mib in (("alpine", 128), ("ubuntu", 256)):
+            with self.subTest(guest=guest):
+                tcp = [MagicMock(spec=socket.socket) for _ in range(5)]
+                udp = [MagicMock(spec=socket.socket) for _ in range(5)]
+                for index, endpoint in enumerate(tcp):
+                    endpoint.getsockname.return_value = ("0.0.0.0", 21000 + index)
+                for index, endpoint in enumerate(udp):
+                    endpoint.getsockname.return_value = ("0.0.0.0", 22000 + index)
+                for endpoint in (tcp[0], tcp[2], tcp[4]):
+                    endpoint.accept.side_effect = TimeoutError
+                for endpoint in (udp[0], udp[2], udp[4]):
+                    endpoint.recvfrom.side_effect = TimeoutError
+                for endpoint in (tcp[1], tcp[3]):
+                    connection = MagicMock(spec=socket.socket)
+                    connection.recv.return_value = b"GET /allowed HTTP/1.1\r\n\r\n"
+                    endpoint.accept.return_value = (connection, ("127.0.0.1", 1))
+                udp[1].recvfrom.return_value = (
+                    b"NVX-L3-L4-UDP-ALLOW-START",
+                    ("127.0.0.1", 1),
+                )
+                udp[3].recvfrom.return_value = (
+                    b"NVX-L3-L4-UDP-ALLOW-END",
+                    ("127.0.0.1", 1),
+                )
+
+                with (
+                    tempfile.TemporaryDirectory() as temporary,
+                    patch.object(
+                        microvm_tests,
+                        "_bind_egress_ports",
+                        return_value=(tcp, udp),
+                    ),
+                    patch.object(microvm_tests, "run_guest_script") as run_guest_script,
+                    patch.object(microvm_tests, "OpenvmmProcess") as openvmm_process,
+                    patch.object(
+                        microvm_tests.threading,
+                        "Thread",
+                        side_effect=ImmediateThread,
+                    ),
+                ):
+                    wait = openvmm_process.return_value.__enter__.return_value.wait
+                    wait.side_effect = (
+                        MagicMock(
+                            returncode=1,
+                            output=b"--network-egress is required",
+                        ),
+                        MagicMock(
+                            returncode=1,
+                            output=b"invalid egress transport",
+                        ),
+                    )
+                    output_dir = Path(temporary)
+                    microvm_tests.run_l3_l4_egress_policy(
+                        Path("openvmm"),
+                        Path("vmlinux"),
+                        Path("initramfs"),
+                        "whp",
+                        memory_mib=memory_mib,
+                        timeout=1,
+                        output_dir=output_dir,
+                        guest=guest,
+                    )
+
+                    policy_path = output_dir / "l3-l4-requested-policy.json"
+                    nvx_path = str(Path(microvm_tests.__file__).parents[1] / "nvx.py")
+                    self.assertEqual(
+                        run_guest_script.call_args.args[0],
+                        [
+                            sys.executable,
+                            nvx_path,
+                            "run",
+                            "--guest",
+                            guest,
+                            "--hypervisor",
+                            "whp",
+                            "--memory-mib",
+                            str(memory_mib),
+                            "--net",
+                            microvm_tests.DIRECTIONAL_NETWORK_CIDR,
+                            "--network-profile",
+                            "portable",
+                            "--network-egress",
+                            "deny",
+                            "--network-ingress",
+                            "deny",
+                            "--network-egress-policy-file",
+                            str(policy_path),
+                            "--cmdline",
+                            "quiet loglevel=0",
+                        ],
+                    )
+                    self.assertIs(
+                        run_guest_script.call_args.kwargs["contain_process_tree"],
+                        True,
+                    )
+                    requested = json.loads(policy_path.read_text(encoding="utf-8"))
+                    self.assertEqual(requested["allow"][0]["port"], 21001)
+                    self.assertEqual(requested["allow"][0]["endPort"], 21003)
+                    self.assertEqual(requested["deny"][1]["port"], 21002)
+                    results = json.loads(
+                        (output_dir / "l3-l4-egress-policy-results.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    self.assertEqual(results["interface"], "nvx.py run")
+                    self.assertEqual(
+                        results["observed"]["allowed"],
+                        ["tcp:start", "tcp:end", "udp:start", "udp:end"],
+                    )
+                    self.assertEqual(
+                        results["observed"]["blocked"],
+                        [
+                            "tcp:adjacent-low",
+                            "tcp:interior",
+                            "tcp:adjacent-high",
+                            "udp:adjacent-low",
+                            "udp:interior",
+                            "udp:adjacent-high",
+                        ],
+                    )
+
+    def test_l3_l4_egress_does_not_report_unobserved_success(self):
+        class ControlledThread:
+            run_target = False
+
+            def __init__(
+                self, *, target: Callable[[], None], **_kwargs: object
+            ) -> None:
+                self.target = target
+
+            def start(self) -> None:
+                if self.run_target:
+                    self.target()
+
+            def join(self, _timeout: float | None = None, **_kwargs: object) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return False
+
+        for failure in ("absent-positive", "unexpected-connection"):
+            with self.subTest(failure=failure):
+                tcp = [MagicMock(spec=socket.socket) for _ in range(5)]
+                udp = [MagicMock(spec=socket.socket) for _ in range(5)]
+                for index, endpoint in enumerate(tcp):
+                    endpoint.getsockname.return_value = ("0.0.0.0", 21000 + index)
+                for index, endpoint in enumerate(udp):
+                    endpoint.getsockname.return_value = ("0.0.0.0", 22000 + index)
+                for endpoint in (tcp[0], tcp[2], tcp[4]):
+                    endpoint.accept.side_effect = TimeoutError
+                for endpoint in (udp[0], udp[2], udp[4]):
+                    endpoint.recvfrom.side_effect = TimeoutError
+
+                ControlledThread.run_target = failure == "unexpected-connection"
+                if ControlledThread.run_target:
+                    for endpoint in (tcp[1], tcp[3]):
+                        connection = MagicMock(spec=socket.socket)
+                        connection.recv.return_value = b"GET /allowed HTTP/1.1\r\n\r\n"
+                        endpoint.accept.return_value = (
+                            connection,
+                            ("127.0.0.1", 1),
+                        )
+                    udp[1].recvfrom.return_value = (
+                        b"NVX-L3-L4-UDP-ALLOW-START",
+                        ("127.0.0.1", 1),
+                    )
+                    udp[3].recvfrom.return_value = (
+                        b"NVX-L3-L4-UDP-ALLOW-END",
+                        ("127.0.0.1", 1),
+                    )
+                    tcp[0].accept.side_effect = None
+                    tcp[0].accept.return_value = (
+                        MagicMock(spec=socket.socket),
+                        ("127.0.0.1", 1),
+                    )
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    output_dir = Path(temporary)
+                    with (
+                        patch.object(
+                            microvm_tests,
+                            "_bind_egress_ports",
+                            return_value=(tcp, udp),
+                        ),
+                        patch.object(microvm_tests, "run_guest_script"),
+                        patch.object(
+                            microvm_tests.threading,
+                            "Thread",
+                            side_effect=ControlledThread,
+                        ),
+                        self.assertRaises(RuntimeError),
+                    ):
+                        microvm_tests.run_l3_l4_egress_policy(
+                            Path("openvmm"),
+                            Path("vmlinux"),
+                            Path("initramfs"),
+                            "whp",
+                            memory_mib=128,
+                            timeout=1,
+                            output_dir=output_dir,
+                        )
+                    self.assertFalse(
+                        (output_dir / "l3-l4-egress-policy-results.json").exists()
+                    )
+
+    def test_runner_dispatches_public_l3_l4_egress_acceptance(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        for guest, memory_mib in (("alpine", 128), ("ubuntu", 512)):
+            with (
+                self.subTest(guest=guest),
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(
+                    microvm_tests, "run_l3_l4_egress_policy"
+                ) as run_l3_l4_egress_policy,
+            ):
+                args = nvx.parse_args(
+                    [
+                        "test-microvm",
+                        "--backend",
+                        "whp",
+                        "--guest",
+                        guest,
+                        "--scenario",
+                        "l3-l4-egress-policy",
+                        "--output-dir",
+                        temporary,
+                    ]
+                )
+                self.assertEqual(microvm_tests.run(args), 0)
+
+                run_l3_l4_egress_policy.assert_called_once_with(
+                    microvm_tests.openvmm_binary_path(),
+                    microvm_tests.artifact_path(
+                        microvm_tests.KernelBuildConstants.BINARY_NAME
+                    ),
+                    microvm_tests.artifact_path(
+                        microvm_tests.guest_descriptor(guest).initramfs_name
+                    ),
+                    "whp",
+                    memory_mib=memory_mib,
+                    timeout=60.0,
+                    output_dir=Path(temporary),
+                    guest=guest,
+                )
 
     def test_sandbox_blocks_use_fixed_roles_and_access(self):
         with (

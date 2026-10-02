@@ -29,6 +29,15 @@ class ScriptError(RuntimeError):
     """Raised for an actionable command-line workflow failure."""
 
 
+def strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ScriptError(f"duplicate JSON property: {key}")
+        result[key] = value
+    return result
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -117,6 +126,19 @@ def run_capture(
         capture_output=True,
     )
     return CommandResult(command, result.returncode, result.stdout, result.stderr)
+
+
+def git_output(*arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(BuildConstants.REPO_ROOT), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=30.0,
+    )
+    return completed.stdout.strip()
 
 
 def openvmm_git_state(directory: Path) -> tuple[str, bool]:

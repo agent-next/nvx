@@ -7,15 +7,18 @@ import ctypes
 import hashlib
 import json
 import os
+import signal
 import socket
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from nvx_tools.adversarial import (
     LOCAL_EXECUTOR_STATE_ROOT,
@@ -56,10 +59,13 @@ from nvx_tools.adversarial_executor import (
 from nvx_tools.adversarial_oracles import (
     BoundedProcessResult,
     OracleSession,
+    _freeze_linux_process_tree,
+    _reap_linux_children,
+    _reap_linux_descendants,
     _WindowsJob,
     run_bounded_process,
 )
-from nvx_tools.benchmark import InteractiveProcess
+from nvx_tools.benchmark import InteractiveProcess, run_guest_script
 from nvx_tools.build_constants import (
     AlpineBuildConstants,
     InitramfsBuildConstants,
@@ -552,6 +558,274 @@ class AdversarialBrokerTests(unittest.TestCase):
 
 
 class AdversarialOracleTests(unittest.TestCase):
+    def test_linux_child_reaping_rescans_reparented_descendants(self) -> None:
+        with (
+            patch(
+                "nvx_tools.adversarial_oracles._linux_direct_children",
+                side_effect=((101,), (202,), ()),
+            ),
+            patch("nvx_tools.adversarial_oracles._reap_linux_descendants") as reap,
+            patch(
+                "nvx_tools.adversarial_oracles.time.monotonic",
+                return_value=100.0,
+            ),
+        ):
+            _reap_linux_children(99)
+
+        self.assertEqual(
+            [entry.args[0] for entry in reap.call_args_list],
+            [(101,), (202,)],
+        )
+        self.assertEqual(
+            {entry.kwargs["deadline"] for entry in reap.call_args_list},
+            {105.0},
+        )
+
+    def test_linux_child_reaping_bounds_repeated_adoptions(self) -> None:
+        with (
+            patch(
+                "nvx_tools.adversarial_oracles._linux_direct_children",
+                return_value=(101,),
+            ),
+            patch("nvx_tools.adversarial_oracles._reap_linux_descendants") as reap,
+            patch(
+                "nvx_tools.adversarial_oracles.time.monotonic",
+                side_effect=(100.0, 100.0, 106.0),
+            ),
+            self.assertRaisesRegex(
+                ScriptError,
+                "timed out reaping descendants of process 99",
+            ),
+        ):
+            _reap_linux_children(99)
+
+        reap.assert_called_once_with((101,), deadline=105.0)
+
+    def test_linux_descendant_reaping_propagates_deadline_to_each_freeze(self) -> None:
+        with (
+            patch.object(signal, "SIGKILL", 9, create=True),
+            patch.object(os, "WNOHANG", 1, create=True),
+            patch(
+                "nvx_tools.adversarial_oracles._freeze_linux_process_tree",
+                side_effect=([], []),
+            ) as freeze,
+            patch(
+                "nvx_tools.adversarial_oracles.time.monotonic",
+                return_value=100.0,
+            ),
+        ):
+            _reap_linux_descendants((101, 202), deadline=105.0)
+
+        self.assertEqual(
+            freeze.call_args_list,
+            [
+                call(101, deadline=105.0),
+                call(202, deadline=105.0),
+            ],
+        )
+
+    def test_linux_descendant_reaping_checks_deadline_between_roots(self) -> None:
+        with (
+            patch.object(signal, "SIGKILL", 9, create=True),
+            patch.object(os, "WNOHANG", 1, create=True),
+            patch(
+                "nvx_tools.adversarial_oracles._freeze_linux_process_tree",
+                return_value=[],
+            ) as freeze,
+            patch(
+                "nvx_tools.adversarial_oracles.time.monotonic",
+                side_effect=(100.0, 106.0),
+            ),
+            self.assertRaisesRegex(
+                ScriptError,
+                "timed out freezing descendant processes for cleanup",
+            ),
+        ):
+            _reap_linux_descendants((101, 202), deadline=105.0)
+
+        freeze.assert_called_once_with(101, deadline=105.0)
+
+    def test_process_tree_enumeration_waits_for_every_thread_to_stop(self) -> None:
+        events: list[str] = []
+
+        def task_states(_pid: int) -> tuple[tuple[int, str], ...]:
+            events.append("observe")
+            if events.count("observe") == 1:
+                return ((123, "R"), (124, "T"))
+            return ((123, "T"), (124, "t"))
+
+        def direct_children(_pid: int) -> tuple[int, ...]:
+            events.append("enumerate")
+            return ()
+
+        with (
+            patch.object(signal, "SIGSTOP", 19, create=True),
+            patch("nvx_tools.adversarial_oracles.os.kill"),
+            patch(
+                "nvx_tools.adversarial_oracles._linux_task_states",
+                side_effect=task_states,
+            ),
+            patch(
+                "nvx_tools.adversarial_oracles._linux_direct_children",
+                side_effect=direct_children,
+            ),
+            patch("nvx_tools.adversarial_oracles.time.sleep"),
+        ):
+            self.assertEqual(_freeze_linux_process_tree(123), [123])
+
+        self.assertEqual(events, ["observe", "observe", "observe", "enumerate"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_contained_guest_runner_cleans_threaded_detached_child_only(self) -> None:
+        for completion_marker in (b"SYNTHETIC-COMPLETE", b"NEVER-COMPLETE"):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                ready_path = root / "ready"
+                continue_path = root / "continue"
+                owned_pid_path = root / "owned.pid"
+                unrelated: list[subprocess.Popen[bytes]] = []
+
+                def spawn_unrelated(
+                    ready: Path = ready_path,
+                    resume: Path = continue_path,
+                    processes: list[subprocess.Popen[bytes]] = unrelated,
+                ) -> None:
+                    while not ready.exists():
+                        time.sleep(0.01)
+                    processes.append(
+                        subprocess.Popen(
+                            [sys.executable, "-c", "import time; time.sleep(60)"]
+                        )
+                    )
+                    resume.touch()
+
+                spawner = threading.Thread(target=spawn_unrelated)
+                spawner.start()
+                command = [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    (
+                        "import pathlib,subprocess,sys,threading,time\n"
+                        "print('ALPINE-MICROVM-BOOT-OK',flush=True)\n"
+                        "sys.stdin.readline()\n"
+                        "pathlib.Path(sys.argv[1]).touch()\n"
+                        "continue_path=pathlib.Path(sys.argv[2])\n"
+                        "while not continue_path.exists():\n"
+                        "    time.sleep(0.01)\n"
+                        "def spawn_from_thread():\n"
+                        "    child=subprocess.Popen([sys.executable,'-c',"
+                        "'import os,time; os.setsid(); time.sleep(60)'])\n"
+                        "    pathlib.Path(sys.argv[3]).write_text(str(child.pid))\n"
+                        "    if sys.argv[4] == 'keep-thread':\n"
+                        "        time.sleep(60)\n"
+                        "threading.Thread(target=spawn_from_thread).start()\n"
+                        "while not pathlib.Path(sys.argv[3]).exists():\n"
+                        "    time.sleep(0.01)\n"
+                        f"print({completion_marker!r}.decode(),flush=True)\n"
+                        + (
+                            "time.sleep(60)"
+                            if completion_marker == b"NEVER-COMPLETE"
+                            else ""
+                        )
+                    ),
+                    str(ready_path),
+                    str(continue_path),
+                    str(owned_pid_path),
+                    (
+                        "keep-thread"
+                        if completion_marker == b"NEVER-COMPLETE"
+                        else "return-thread"
+                    ),
+                ]
+                try:
+                    if completion_marker == b"NEVER-COMPLETE":
+                        with self.assertRaisesRegex(RuntimeError, "did not finish"):
+                            run_guest_script(
+                                command,
+                                "continue\n",
+                                completion_marker,
+                                timeout=5.0,
+                                contain_process_tree=True,
+                            )
+                    else:
+                        run_guest_script(
+                            command,
+                            "continue\n",
+                            completion_marker,
+                            timeout=5.0,
+                            contain_process_tree=True,
+                        )
+                    spawner.join(timeout=5.0)
+                    self.assertFalse(spawner.is_alive())
+                    self.assertEqual(len(unrelated), 1)
+                    self.assertIsNone(unrelated[0].poll())
+                    owned_pid = int(owned_pid_path.read_text(encoding="utf-8"))
+                    self.assertFalse(_process_running(owned_pid))
+                finally:
+                    if owned_pid_path.exists():
+                        owned_pid = int(owned_pid_path.read_text(encoding="utf-8"))
+                        if _process_running(owned_pid):
+                            os.kill(owned_pid, 9)
+                    if unrelated:
+                        unrelated[0].kill()
+                        unrelated[0].wait()
+
+    def test_contained_guest_runner_timeout_kills_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            child_pid_path = Path(temporary) / "child.pid"
+            command = [
+                sys.executable,
+                "-u",
+                "-c",
+                (
+                    "import pathlib,subprocess,sys,time; "
+                    "child=subprocess.Popen([sys.executable,'-c',"
+                    "'import time; time.sleep(60)']); "
+                    "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                    "print('ALPINE-MICROVM-BOOT-OK',flush=True); time.sleep(60)"
+                ),
+                str(child_pid_path),
+            ]
+            with self.assertRaisesRegex(RuntimeError, "did not finish"):
+                run_guest_script(
+                    command,
+                    "exit\n",
+                    b"NEVER-COMPLETE",
+                    timeout=0.5,
+                    contain_process_tree=True,
+                )
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        self.assertFalse(_process_running(child_pid))
+
+    def test_contained_guest_runner_normal_exit_kills_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            child_pid_path = Path(temporary) / "child.pid"
+            command = [
+                sys.executable,
+                "-u",
+                "-c",
+                (
+                    "import pathlib,subprocess,sys; "
+                    "print('ALPINE-MICROVM-BOOT-OK',flush=True); sys.stdin.readline(); "
+                    "child=subprocess.Popen([sys.executable,'-c',"
+                    "'import time; time.sleep(60)']); "
+                    "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                    "print('SYNTHETIC-COMPLETE',flush=True)"
+                ),
+                str(child_pid_path),
+            ]
+            result = run_guest_script(
+                command,
+                "continue\n",
+                b"SYNTHETIC-COMPLETE",
+                timeout=5.0,
+                contain_process_tree=True,
+            )
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        self.assertIn("SYNTHETIC-COMPLETE", result["text"])
+        self.assertFalse(_process_running(child_pid))
+
     def test_process_timeout_bounds_blocked_stdin_writer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result = run_bounded_process(
@@ -633,6 +907,99 @@ class AdversarialOracleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertTrue(result.teardown_complete)
         self.assertFalse(_process_running(child_pid))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_contained_native_process_isolates_supervisor_environment(self) -> None:
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "NVX_SUPERVISED_CHILD_MARKER": "requested-value",
+                "PYTHONHOME": "/nonexistent",
+                "PYTHONINSPECT": "1",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            success = run_bounded_process(
+                ["/bin/true"],
+                cwd=Path.cwd(),
+                output_dir=root / "success",
+                timeout=5.0,
+                environment=environment,
+                contained_by_parent=True,
+            )
+            propagated = run_bounded_process(
+                [
+                    "/bin/sh",
+                    "-c",
+                    (
+                        '[ "$NVX_SUPERVISED_CHILD_MARKER" = requested-value ]'
+                        ' && [ "$PYTHONHOME" = /nonexistent ]'
+                        ' && [ "$PYTHONINSPECT" = 1 ]'
+                        " || exit 9; exit 7"
+                    ),
+                ],
+                cwd=Path.cwd(),
+                output_dir=root / "propagated",
+                timeout=5.0,
+                environment=environment,
+                contained_by_parent=True,
+            )
+
+        self.assertFalse(success.timed_out)
+        self.assertEqual(success.returncode, 0)
+        self.assertFalse(propagated.timed_out)
+        self.assertEqual(propagated.returncode, 7)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_contained_native_process_preserves_child_signal_status(self) -> None:
+        sigkill = cast(int, getattr(signal, "SIGKILL"))  # noqa: B009
+        cases = (
+            ("sigterm", int(signal.SIGTERM), -int(signal.SIGTERM)),
+            ("sigkill", sigkill, -sigkill),
+            ("exit", 0, 7),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, child_signal, expected_returncode in cases:
+                with self.subTest(name=name):
+                    owned_pid_path = root / f"{name}.owned.pid"
+                    unrelated = subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(60)"]
+                    )
+                    try:
+                        result = run_bounded_process(
+                            [
+                                sys.executable,
+                                "-c",
+                                (
+                                    "import os,pathlib,signal,subprocess,sys; "
+                                    "child=subprocess.Popen([sys.executable,'-c',"
+                                    "'import os,time; os.setsid(); time.sleep(60)'],"
+                                    "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+                                    "stderr=subprocess.DEVNULL); "
+                                    "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                                    "signum=int(sys.argv[2]); "
+                                    "os.kill(os.getpid(),signum) if signum else sys.exit(7)"
+                                ),
+                                str(owned_pid_path),
+                                str(child_signal),
+                            ],
+                            cwd=Path.cwd(),
+                            output_dir=root / name,
+                            timeout=5.0,
+                            environment=os.environ,
+                            contained_by_parent=True,
+                        )
+                        owned_pid = int(owned_pid_path.read_text(encoding="utf-8"))
+                        self.assertFalse(result.timed_out)
+                        self.assertEqual(result.returncode, expected_returncode)
+                        self.assertTrue(result.teardown_complete)
+                        self.assertFalse(_process_running(owned_pid))
+                        self.assertIsNone(unrelated.poll())
+                    finally:
+                        unrelated.kill()
+                        unrelated.wait()
 
     def test_failed_windows_job_assignment_does_not_resume_process(self) -> None:
         job = _WindowsJob.__new__(_WindowsJob)
@@ -725,6 +1092,100 @@ class AdversarialOracleTests(unittest.TestCase):
                     {"NVX_ADVERSARIAL_OPENVMM_PID_JOURNAL": str(missing)},
                 )
         terminate.assert_called_once_with(process)
+
+    def test_pid_journal_failure_preserves_cleanup_error_as_cause(self) -> None:
+        process = MagicMock()
+        process.pid = 4321
+        with (
+            patch(
+                "nvx_tools.benchmark.subprocess.Popen",
+                return_value=process,
+            ),
+            patch("nvx_tools.benchmark.sys.platform", "win32"),
+            patch(
+                "nvx_tools.benchmark.record_adversarial_openvmm_pid",
+                side_effect=OSError("synthetic journal failure"),
+            ),
+            patch(
+                "nvx_tools.benchmark.terminate",
+                side_effect=RuntimeError("synthetic cleanup failure"),
+            ),
+            patch.object(InteractiveProcess, "close") as close,
+            self.assertRaisesRegex(OSError, "synthetic journal failure") as raised,
+        ):
+            InteractiveProcess(["openvmm"], {})
+
+        close.assert_called_once_with()
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertEqual(
+            str(raised.exception.__cause__),
+            "synthetic cleanup failure",
+        )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_pid_journal_failure_cleans_contained_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command_pid_path = root / "command.pid"
+            descendant_pid_path = root / "descendant.pid"
+            unrelated = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"]
+            )
+            owned_pids: list[int] = []
+
+            def fail_pid_journal(_pid: int, _environment: object) -> None:
+                deadline = time.monotonic() + 5.0
+                while not descendant_pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not descendant_pid_path.exists():
+                    raise AssertionError("contained descendant did not start")
+                raise OSError("synthetic PID journal failure")
+
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import os,pathlib,subprocess,sys,time; "
+                    "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+                    "child=subprocess.Popen([sys.executable,'-c',"
+                    "'import os,time; os.setsid(); time.sleep(60)'],"
+                    "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+                    "stderr=subprocess.DEVNULL); "
+                    "pathlib.Path(sys.argv[2]).write_text(str(child.pid)); "
+                    "time.sleep(60)"
+                ),
+                str(command_pid_path),
+                str(descendant_pid_path),
+            ]
+            try:
+                with (
+                    patch(
+                        "nvx_tools.benchmark.record_adversarial_openvmm_pid",
+                        side_effect=fail_pid_journal,
+                    ),
+                    self.assertRaisesRegex(
+                        OSError,
+                        "synthetic PID journal failure",
+                    ),
+                ):
+                    InteractiveProcess(
+                        command,
+                        dict(os.environ),
+                        contain_process_tree=True,
+                    )
+
+                owned_pids = [
+                    int(command_pid_path.read_text(encoding="utf-8")),
+                    int(descendant_pid_path.read_text(encoding="utf-8")),
+                ]
+                self.assertTrue(all(not _process_running(pid) for pid in owned_pids))
+                self.assertIsNone(unrelated.poll())
+            finally:
+                for pid in owned_pids:
+                    if _process_running(pid):
+                        os.kill(pid, 9)
+                unrelated.kill()
+                unrelated.wait()
 
     def test_filesystem_and_network_canaries_detect_policy_violations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

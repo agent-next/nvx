@@ -140,6 +140,62 @@ allow/deny options:
 Rules match IPv4 addresses or CIDRs and may add one TCP or UDP destination
 port. Deny matches take precedence over allow matches.
 
+NVX can lower inclusive TCP/UDP port ranges and rule-local IPv4 exclusions to
+those native rules:
+
+```json
+{
+  "allow": [
+    {
+      "cidr": "192.0.2.0/24",
+      "except": ["192.0.2.128/25"],
+      "protocol": "tcp",
+      "port": 8000,
+      "endPort": 8010
+    },
+    {
+      "cidr": "192.0.2.200/32"
+    }
+  ],
+  "deny": [
+    {
+      "cidr": "192.0.2.0/24",
+      "protocol": "tcp",
+      "port": 8005
+    }
+  ]
+}
+```
+
+Pass the file with `--network-egress-policy-file PATH` on `run`, one-shot
+`sandbox run`, or `sandbox provision`. An explicit `--network-egress allow` or
+`deny` is required. The file option cannot be mixed with
+`--network-egress-allow` or `--network-egress-deny`.
+
+The root accepts only `allow` and `deny` arrays. Each rule requires one IPv4
+`cidr`; optional `except` entries must be IPv4 CIDRs contained by that parent.
+Host bits are normalized like the native CIDR syntax: `10.0.0.5/24` means
+`10.0.0.0/24`, not one host. Use `/32` to select one IPv4 address.
+Duplicate JSON properties, unknown fields, and explicit `null` protocol values
+are rejected. Policy files are limited to 1 MiB of UTF-8 input.
+`protocol` is `tcp` or `udp` and requires `port` in `1..65535`. Optional
+`endPort` is inclusive, must be in `1..65535`, and cannot be below `port`.
+Omitting the protocol and ports matches every IPv4 transport supported by the
+native rule. Protocol-wide TCP/UDP rules without a port and IPv6 are not
+supported.
+
+Exclusions affect only their containing rule: they never become global deny
+rules. A later allow rule may therefore match an address excluded from an
+earlier allow rule, while an address excluded from a deny rule falls through to
+other rules and the explicit default. Explicit deny matches still take
+precedence over allow matches.
+
+NVX canonicalizes safely equivalent prefixes and rejects policies that lower to
+more than 256 allow rules or 256 deny rules. It rejects oversized expansions
+before launch rather than truncating or widening them. Managed provision stores
+the validated lowered rules in sandbox state, so later starts do not reread a
+mutable source policy file.
+
 Host-loopback denial and deliberate localhost port publishing are separately
 controlled from ordinary egress:
 
@@ -275,6 +331,14 @@ inside that root. Denied names are omitted from directory listings and remain
 inaccessible through `..`, a symlink/junction, or another mount of the same
 virtio-fs device. Unsafe, external, duplicate, overlapping, and nested-mount
 rules are rejected before boot.
+In an `rw` mapping, the guest can create symbolic links, and OpenVMM stores
+each target exactly as given. The guest resolves links in its own namespace;
+OpenVMM never follows a link while resolving a host path, so a link to an
+absolute host path, outside the root, or into a denied path cannot reach host
+data. An `ro` mapping rejects link creation with `EROFS`. On Windows, links
+are WSL-style reparse points, which Windows path resolution never follows.
+Treat links in a writable share as untrusted when host software later reads
+the directory.
 A snapshot captured without a mapping may restore with a new `--mount`; after
 resume, mount it explicitly inside the guest because the initramfs hook has
 already completed:
@@ -311,7 +375,9 @@ python3 scripts/nvx.py sandbox \
 
 CI uses `/sbin/nvx-sandbox-smoke` as the entrypoint to verify Ubuntu identity,
 the fixed non-root account, and a scratch-backed `/tmp` write before clean
-guest exit.
+guest exit. With `--arg TARGET --arg ro|rw`, it also checks a live share at
+`TARGET` as described below, including symbolic links in an `rw` share; the
+share needs a host-created, world-writable `nvx-links` directory for them.
 
 The layer UUID is the EROFS superblock UUID, not a content digest. The command
 validates the files before launch, orders roles independently of option order,
@@ -336,6 +402,52 @@ root; otherwise the workload is never started.
 The outer agent retains the initramfs root; the capability-stripped child
 enters only the assembled root with `chroot`, because Linux cannot
 `pivot_root` away from an initramfs `rootfs`.
+
+### Live host-directory share
+
+`sandbox run` and `sandbox provision` accept one
+`--mount GUEST_TARGET,HOST_PATH[,ro|rw]` (default `ro`) plus repeatable
+`--mount-deny HOST_PATH` rules. OpenVMM exports the host directory through its
+microVM virtio-fs device and enforces the access mode and denied paths on the
+host side, so edits are visible in both directions without staging or
+copy-back:
+
+```bash
+python3 scripts/nvx.py sandbox \
+  --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
+  --scratch /var/lib/nvx/scratch.ext4 \
+  --mount /workspace,/srv/checkout,rw \
+  --mount-deny .git/credentials \
+  --entrypoint /bin/sh
+```
+
+A relative `--mount-deny` path is resolved inside the exported host directory.
+After it assembles the container overlay and verifies the workload identity,
+the guest agent creates the target inside the container root and mounts the
+share there with `nosuid,nodev` before the workload enters its private mount
+namespace. A one-shot workload exit, a managed `stop`, and any failure after
+the share is mounted unmount it before the overlay is unmounted or the VM
+powers off. The target must be an absolute, canonical path; `/`, `/etc`, and
+the `/proc`, `/sys`, `/dev`, and `/.nvx-agent` trees are reserved for the
+container runtime.
+The guest refuses a target whose path crosses a symbolic link in a container
+layer, and any validation or mount failure aborts the sandbox with status 125
+instead of starting the workload without its share.
+
+Guest file permissions use the ownership and mode bits that OpenVMM reports
+for the exported files, so grant the selected workload identity access to the
+host directory. On a Linux host, a file or directory that the workload creates
+is owned by the OpenVMM user, so the workload cannot create entries inside a
+directory it created unless the host grants write access to others
+([#297](https://github.com/microsoft/nvx/issues/297) tracks caller-owned
+files). An `rw` share supports the symbolic links that package managers and
+language toolchains create; see
+[virtio-fs host mapping](#virtio-fs-host-mapping) for their semantics. One
+share per microVM and the existing OpenVMM file-identity policy apply. A
+managed sandbox stores the absolute host path in its configuration and
+reattaches the share on every `start`.
+
+### Managed lifecycle
 
 For a state-aware sandbox, provision configuration without starting a VM,
 start it once, run multiple workloads in the same warm guest, stop it while
@@ -365,7 +477,10 @@ Lifecycle transitions fail closed: `start` rejects an already-running or stale
 runtime record, `exec` and `stop` require a live OpenVMM process, and
 `deprovision` refuses to remove a running sandbox or unknown files. Managed
 workload arguments use the bounded control protocol rather than the kernel
-command line and may contain whitespace. The legacy operation-less `sandbox`
+command line and may contain whitespace. The workload sees one machine ID for
+the life of the VM. On `stop`, the guest agent unmounts the live share, overlay,
+layers, and scratch in dependency order before the VM powers off, as it does
+when a one-shot workload exits. The legacy operation-less `sandbox`
 form is `sandbox run`; it remains one-shot and rejects `--state-dir` or any
 request to retain VM state.
 

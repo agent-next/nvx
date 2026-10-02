@@ -53,6 +53,7 @@ from nvx_tools.build_constants import (
 )
 from nvx_tools.common import (
     ScriptError,
+    git_output,
     positive_int,
     remaining_timeout,
     require_tool,
@@ -76,26 +77,13 @@ class ExecutorUnavailableError(ScriptError):
     """The executor transport disappeared or stopped responding."""
 
 
-def _git(*arguments: str) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(BuildConstants.REPO_ROOT), *arguments],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
-        timeout=30.0,
-    )
-    return completed.stdout.strip()
-
-
 def _controller_metadata() -> dict[str, object]:
-    nvx_status = _git(
+    nvx_status = git_output(
         "status",
         "--porcelain",
         "--untracked-files=normal",
     ).splitlines()
-    openvmm_status = _git(
+    openvmm_status = git_output(
         "-C",
         str(OpenVMMBuildConstants.DIRECTORY),
         "status",
@@ -103,10 +91,10 @@ def _controller_metadata() -> dict[str, object]:
         "--untracked-files=normal",
     ).splitlines()
     return {
-        "nvx_commit": _git("rev-parse", "HEAD"),
+        "nvx_commit": git_output("rev-parse", "HEAD"),
         "nvx_dirty": bool(nvx_status),
         "nvx_status": nvx_status,
-        "openvmm_commit": _git(
+        "openvmm_commit": git_output(
             "-C",
             str(OpenVMMBuildConstants.DIRECTORY),
             "rev-parse",

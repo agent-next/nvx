@@ -1,10 +1,86 @@
 #!/bin/sh
 set -eu
 
+check_share() {
+    share=$1
+    share_mode=$2
+    [ "$(cat "$share/nvx-host-marker")" = host-to-guest ]
+    [ ! -e "$share/nvx-denied" ]
+    case "$share_mode" in
+        rw)
+            printf 'guest-to-host\n' >"$share/nvx-guest-marker"
+            mkdir "$share/nvx-guest-directory"
+            check_share_symlinks "$share"
+            ;;
+        ro)
+            if touch "$share/nvx-guest-marker" 2>/dev/null; then
+                exit 1
+            fi
+            if ln -s nvx-host-marker "$share/nvx-guest-link" 2>/dev/null; then
+                exit 1
+            fi
+            ;;
+        *) exit 2 ;;
+    esac
+    echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
+}
+
+# Exercise the symbolic-link primitives that package managers and language
+# toolchains use. The host pre-creates the world-writable nvx-links directory,
+# because a directory that the guest creates is owned by the VMM user.
+check_share_symlinks() {
+    share=$1
+    links=$share/nvx-links
+
+    # An npm-style .bin shim: a relative link to an executable in the share.
+    printf '#!/bin/sh\necho NVX-SYMLINK-TOOL-OK\n' >/tmp/nvx-tool
+    chmod 0755 /tmp/nvx-tool
+    cp /tmp/nvx-tool "$share/nvx-tool"
+    ln -s ../nvx-tool "$links/nvx-tool"
+    [ "$(readlink "$links/nvx-tool")" = ../nvx-tool ]
+    [ "$("$links/nvx-tool")" = NVX-SYMLINK-TOOL-OK ]
+
+    # Targets are stored exactly, even when they do not exist.
+    ln -s /nvx/absolute/target "$links/absolute"
+    [ "$(readlink "$links/absolute")" = /nvx/absolute/target ]
+
+    # Rename, replace, and remove a link without touching its target.
+    ln -s ../nvx-host-marker "$links/temporary"
+    mv "$links/temporary" "$links/marker"
+    [ "$(cat "$links/marker")" = host-to-guest ]
+    ln -sfn ../nvx-guest-marker "$links/marker"
+    [ "$(readlink "$links/marker")" = ../nvx-guest-marker ]
+    [ "$(cat "$links/marker")" = guest-to-host ]
+    rm "$links/marker"
+    [ "$(cat "$share/nvx-guest-marker")" = guest-to-host ]
+
+    # A link that leaves the share resolves in the guest, never on the host.
+    ln -s ../../nvx-outside-marker "$links/outside"
+    [ "$(readlink "$links/outside")" = ../../nvx-outside-marker ]
+    if [ "$(cat "$links/outside" 2>/dev/null)" = host-outside ]; then
+        exit 1
+    fi
+    printf 'guest-write\n' 2>/dev/null >"$links/outside" || true
+
+    # A link into a denied path cannot expose it.
+    ln -s ../nvx-denied/secret "$links/denied"
+    ln -s ../nvx-denied "$links/denied-directory"
+    if cat "$links/denied" >/dev/null 2>&1; then
+        exit 1
+    fi
+    if ls "$links/denied-directory/" >/dev/null 2>&1; then
+        exit 1
+    fi
+    echo "NVX-UBUNTU-SANDBOX-SYMLINK-OK target=$share"
+}
+
 [ "$(id -u)" = 65534 ]
 [ "$(id -g)" = 65534 ]
 [ "${HOME:-}" = /nonexistent ]
 grep -qx 'ID=ubuntu' /etc/os-release
 printf 'scratch-backed-write\n' >/tmp/nvx-ubuntu-sandbox-smoke
 [ "$(cat /tmp/nvx-ubuntu-sandbox-smoke)" = scratch-backed-write ]
+if [ "$#" -gt 0 ]; then
+    check_share "$1" "${2:-ro}"
+fi
 echo "NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534"
