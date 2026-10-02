@@ -1785,10 +1785,12 @@ touch, which doesn't depend on the guest's memory size.
 **Start-up budget.** The time ABI and CPU profile work of a cold boot or
 restore costs less than 0.5 ms over the pre-profile head (`e7ec0ca6c`),
 measured on prometheus32 (KVM) with the kvm agent's attribution harness; the
-flip requires it. At `31a5a04f9`, up to the backend preflight at one vCPU,
-a restore starts 0.46 ms and a cold boot 0.28 ms faster than `e7ec0ca6c`;
-the only added work is the worker's time ABI CPU checks, 40 to 60 µs over
-the pre-profile path, and every 90% upper bound is within +0.30 ms.
+flip requires it. At the integration head (`e06ed4d4a`), up to the backend
+preflight at one vCPU, a restore starts 0.32 ms and a cold boot 0.30 ms
+faster than `e7ec0ca6c`. The only added work is the worker's time ABI CPU
+checks, about 56 µs over the pre-profile path, and every 90% upper bound is
+within +0.31 ms. Process start moves each binary's milestones by about
+0.25 ms from run to run, so only differences within one run count.
 Neither path encodes, decodes, or hashes a profile document
 or an effective CPUID:
 
