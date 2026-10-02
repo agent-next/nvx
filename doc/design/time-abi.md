@@ -1688,9 +1688,9 @@ effective CPUID merge, `verify_support`, and the unlisted-entry check cost
 about 26 µs together (cold medians over 30 fresh processes). The codecs and
 digests (`CpuProfile::{encode, decode, digest, digest_string,
 to_pretty_json, from_pretty_json}` and `EffectiveCpuid::{encode, decode,
-decode_verified, digest}`), `cpu_profile::{verify_profile_record,
-restore_profile, pinned_profiles}`, and the fingerprint and derive paths are
-offline-only: tools and tests use them, and no start path may.
+decode_verified, digest}`), `cpu_profile::pinned_profiles`, and the
+fingerprint and derive paths are offline-only: tools, tests, and
+`--cpu-fingerprint` use them, and no start path may.
 
 The backends add their own CPUID work:
 
