@@ -1756,7 +1756,7 @@ wiring v7m on the production kernel (`vmlinux-lockstep`), with at least
 | Backend | Boot | Capture | Restore | Measured on |
 | --- | --- | --- | --- | --- |
 | KVM | 6 + 2 | 1 + 0.4 | 6.5 + 1.5 | prometheus32 and `azure-kvm-5`, 128 MiB |
-| MSHV | 3 + 0.75 | 1 + 0.4 | 2.5 + 0.5 | prometheus30 and `azure-azlinux-5`, 128 MiB |
+| MSHV | 3 + 0.75 | 1 + 0.4 | 2.5 + 0.5 | prometheus30 and `azure-azlinux-5`, 128 and 512 MiB |
 | WHP | 20 + 1.5 | 1 + 0.4 | 35 + 6 | prometheus28 and the 8370C and 8573C runners, 512 MiB |
 
 The fleet matrix driver enforces the budgets during validation. CI reports
@@ -1777,8 +1777,10 @@ counts the host stalls of their first touches of restored RAM:
   RAM 4 KiB at a time: medians of 3.4 to 7.6 ms at 1 to 8 vCPUs, and maxima
   of 5.15 ms at 1 vCPU and 13.14 ms at 8, over 72 restores.
 
-KVM's and MSHV's budgets come from 128 MiB guests, the size that CI and the
-fleet matrices run.
+KVM's budgets come from 128 MiB guests, the size that CI and the fleet
+matrices run. MSHV's hold at 128 and 512 MiB alike: MSHV registers all
+guest RAM before the restore, and the checks pay only for the chunks they
+touch, which doesn't depend on the guest's memory size.
 
 **Start-up budget.** The time ABI and CPU profile work of a cold boot or
 restore costs less than 0.5 ms over the pre-profile head (`e7ec0ca6c`),
