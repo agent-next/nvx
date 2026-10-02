@@ -377,6 +377,10 @@ the fixed non-root account, and a scratch-backed `/tmp` write before clean
 guest exit. With `--arg TARGET --arg ro|rw`, it also checks a live share at
 `TARGET` as described below, including symbolic links in an `rw` share; the
 share needs a host-created, world-writable `nvx-links` directory for them.
+`--arg caller` adds the `rw` checks for a caller-owned share and verifies that
+the workload owns what it creates, and `--arg eperm` verifies that a
+caller-owned share fails every access with `EPERM` when OpenVMM lacks the
+capabilities to switch identities.
 
 The layer UUID is the EROFS superblock UUID, not a content digest. The command
 validates the files before launch, orders roles independently of option order,
@@ -435,16 +439,60 @@ instead of starting the workload without its share.
 
 Guest file permissions use the ownership and mode bits that OpenVMM reports
 for the exported files, so grant the selected workload identity access to the
-host directory. On a Linux host, a file or directory that the workload creates
-is owned by the OpenVMM user, so the workload cannot create entries inside a
-directory it created unless the host grants write access to others
-([#297](https://github.com/microsoft/nvx/issues/297) tracks caller-owned
-files). An `rw` share supports the symbolic links that package managers and
+host directory. By default (`--mount-owner vmm`), OpenVMM performs every share
+operation as its own user. On a Linux host, a file or directory that the
+workload creates is then owned by the OpenVMM user, so the workload cannot
+create entries inside a directory it created unless the host grants write
+access to others, and a guest running as root acts with OpenVMM's privileges.
+An `rw` share supports the symbolic links that package managers and
 language toolchains create; see
 [virtio-fs host mapping](#virtio-fs-host-mapping) for their semantics. One
 share per microVM and the existing OpenVMM file-identity policy apply. A
-managed sandbox stores the absolute host path in its configuration and
-reattaches the share on every `start`.
+managed sandbox stores the absolute host path and owner policy in its
+configuration and reattaches the share on every `start`.
+
+#### Caller-owned files
+
+`--mount-owner caller` makes OpenVMM perform each guest request as the UID and
+GID of the guest process that issued it, so files that the workload creates
+belong to the workload identity on the host:
+
+```bash
+sudo python3 scripts/nvx.py sandbox \
+  --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
+  --scratch /var/lib/nvx/scratch.ext4 \
+  --workload-user 1001:1001 \
+  --mount /workspace,/home/runner/work/repo,rw \
+  --mount-owner caller \
+  --entrypoint /bin/sh
+```
+
+- For each request, OpenVMM switches its request thread's filesystem UID and
+  GID to the caller, clears the thread's supplementary groups and effective
+  capabilities, and restores them afterward. The host kernel therefore checks
+  every share operation as an unprivileged process with the caller's identity.
+  Choose a `--workload-user` that matches the host account that should own the
+  files, such as the runner user. The guest's supplementary groups are not
+  forwarded.
+- Requests from guest UID 0 or GID 0 are squashed to the owner of the host
+  directory, independently for the user and the group. The host directory must
+  belong to a non-root user and group, and NVX and OpenVMM reject the share
+  before boot otherwise. The guest cannot create root-owned files, change a
+  file's owner or group to root, create device nodes, or set file capabilities
+  on the host.
+- The OpenVMM process needs `CAP_SETUID` and `CAP_SETGID`. Run NVX as root, as
+  above, or grant the capabilities to the OpenVMM binary once:
+  `sudo setcap cap_setuid,cap_setgid=ep openvmm/target/release/openvmm`.
+  Without them, OpenVMM logs a warning and fails every guest request on the
+  share with `EPERM`; it never falls back to its own identity. The guest can
+  still mount the share, but every access to it fails.
+- Only Linux/KVM and Linux/MSHV hosts support caller ownership. On
+  Windows/WHP, a process cannot act as an arbitrary POSIX UID and GID, so NVX
+  and OpenVMM reject `--mount-owner caller` before boot.
+
+The guest kernel reports the caller identity. A guest process that can change
+its UID or GID can therefore act as any non-root host identity inside the
+shared directory; only root is squashed.
 
 ### Managed lifecycle
 

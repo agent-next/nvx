@@ -4,13 +4,21 @@ set -eu
 check_share() {
     share=$1
     share_mode=$2
+    if [ "$share_mode" = eperm ]; then
+        check_share_eperm "$share"
+        echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
+        return
+    fi
     [ "$(cat "$share/nvx-host-marker")" = host-to-guest ]
     [ ! -e "$share/nvx-denied" ]
     case "$share_mode" in
-        rw)
+        rw | caller)
             printf 'guest-to-host\n' >"$share/nvx-guest-marker"
             mkdir "$share/nvx-guest-directory"
             check_share_symlinks "$share"
+            if [ "$share_mode" = caller ]; then
+                check_share_owner "$share"
+            fi
             ;;
         ro)
             if touch "$share/nvx-guest-marker" 2>/dev/null; then
@@ -25,9 +33,43 @@ check_share() {
     echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
 }
 
+# With --mount-owner caller, OpenVMM performs each request as the workload, so
+# the workload owns what it creates and can write inside its own directories.
+check_share_owner() {
+    share=$1
+    identity="$(id -u):$(id -g)"
+    [ "$(stat -c %u:%g "$share/nvx-guest-marker")" = "$identity" ]
+    [ "$(stat -c %u:%g "$share/nvx-guest-directory")" = "$identity" ]
+    printf 'nested\n' >"$share/nvx-guest-directory/nvx-nested"
+    [ "$(stat -c %u:%g "$share/nvx-guest-directory/nvx-nested")" = "$identity" ]
+    echo "NVX-UBUNTU-SANDBOX-OWNER-OK target=$share identity=$identity"
+}
+
+# A caller-identity share fails every request with EPERM when OpenVMM lacks
+# CAP_SETUID and CAP_SETGID, instead of falling back to the OpenVMM identity.
+check_share_eperm() {
+    share=$1
+    if error=$(cat "$share/nvx-host-marker" 2>&1); then
+        exit 1
+    fi
+    case "$error" in
+        *"Operation not permitted"*) ;;
+        *) exit 1 ;;
+    esac
+    if error=$(touch "$share/nvx-guest-marker" 2>&1); then
+        exit 1
+    fi
+    case "$error" in
+        *"Operation not permitted"*) ;;
+        *) exit 1 ;;
+    esac
+    echo "NVX-UBUNTU-SANDBOX-EPERM-OK target=$share"
+}
+
 # Exercise the symbolic-link primitives that package managers and language
 # toolchains use. The host pre-creates the world-writable nvx-links directory,
-# because a directory that the guest creates is owned by the VMM user.
+# because with the default --mount-owner vmm, a directory that the guest creates
+# is owned by the OpenVMM user.
 check_share_symlinks() {
     share=$1
     links=$share/nvx-links

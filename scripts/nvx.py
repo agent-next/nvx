@@ -77,6 +77,7 @@ from nvx_tools.release import (
     verify_source_tree,
 )
 from nvx_tools.sandbox import (
+    MOUNT_OWNERS,
     SandboxLaunch,
     SandboxLayer,
     SandboxMount,
@@ -435,6 +436,8 @@ def command_sandbox(args: argparse.Namespace) -> None:
         )
     if args.mount_deny and args.mount is None:
         raise ScriptError("--mount-deny requires --mount")
+    if args.mount_owner is not None and args.mount is None:
+        raise ScriptError("--mount-owner requires --mount")
     if args.mount is not None and operation not in ("run", "provision"):
         raise ScriptError("--mount is only valid for sandbox run or provision")
     if operation in ("run", "provision"):
@@ -455,7 +458,11 @@ def command_sandbox(args: argparse.Namespace) -> None:
             mount=(
                 None
                 if args.mount is None
-                else SandboxMount.parse(args.mount, tuple(args.mount_deny))
+                else SandboxMount.parse(
+                    args.mount,
+                    tuple(args.mount_deny),
+                    owner=args.mount_owner or "vmm",
+                )
             ),
         ).validated()
         _validate_sandbox_systemd_policy(launch)
@@ -877,6 +884,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         metavar="HOST_PATH",
         help="hide one existing path inside the --mount host directory",
+    )
+    sandbox.add_argument(
+        "--mount-owner",
+        choices=MOUNT_OWNERS,
+        help=(
+            "host identity for --mount operations: vmm (default) or caller, which "
+            "acts as the guest caller with root squashed (Linux only)"
+        ),
     )
     sandbox.add_argument("--net", metavar="IPV4/PREFIX")
     sandbox.add_argument("--network-profile", choices=NETWORK_PROFILES)

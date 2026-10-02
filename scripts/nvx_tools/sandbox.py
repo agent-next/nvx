@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -25,6 +26,10 @@ SANDBOX_COMMAND_LINE_MAX_SIZE = (
 _HOSTNAME = re.compile(r"(?=^.{1,63}$)(?!-)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 DEFAULT_WORKLOAD_IDENTITY = (65534, 65534)
 MOUNT_ACCESS_MODES = ("ro", "rw")
+# `vmm` performs every share operation as the OpenVMM process; `caller` performs
+# each guest request as the guest caller's UID and GID, with root squashed to the
+# owner of the exported host directory.
+MOUNT_OWNERS = ("vmm", "caller")
 # The container runtime owns these guest paths: it mounts procfs, sysfs, and a
 # private /dev over them, stages its tools under /.nvx-agent, and bind-mounts the
 # workload machine ID into /etc. A live share must not shadow or be shadowed by
@@ -108,9 +113,15 @@ class SandboxMount:
     host_path: Path
     access: str = "ro"
     denied_paths: tuple[str, ...] = ()
+    owner: str = "vmm"
 
     @classmethod
-    def parse(cls, value: str, denied_paths: tuple[str, ...] = ()) -> SandboxMount:
+    def parse(
+        cls,
+        value: str,
+        denied_paths: tuple[str, ...] = (),
+        owner: str = "vmm",
+    ) -> SandboxMount:
         fields = value.split(",")
         if len(fields) not in (2, 3):
             raise ScriptError("--mount must be GUEST_TARGET,HOST_PATH[,ro|rw]")
@@ -123,6 +134,7 @@ class SandboxMount:
             host_path=Path(raw_path),
             access=access,
             denied_paths=denied_paths,
+            owner=owner,
         )
 
     def __post_init__(self) -> None:
@@ -130,6 +142,10 @@ class SandboxMount:
         if self.access not in MOUNT_ACCESS_MODES:
             raise ScriptError(
                 f"unsupported sandbox mount mode {self.access!r}; choose ro or rw"
+            )
+        if self.owner not in MOUNT_OWNERS:
+            raise ScriptError(
+                f"unsupported sandbox mount owner {self.owner!r}; choose vmm or caller"
             )
         raw_path = os.fspath(self.host_path)
         if any(character in raw_path for character in ",\0"):
@@ -155,7 +171,23 @@ class SandboxMount:
             raise ScriptError(
                 f"sandbox mount host path is not a plain directory: {self.host_path}"
             )
+        if self.owner == "caller":
+            self._validate_caller_owner()
         return self
+
+    def _validate_caller_owner(self) -> None:
+        if not _caller_owner_supported():
+            raise ScriptError(
+                "--mount-owner caller requires a Linux host (KVM or MSHV); on "
+                "Windows/WHP every share operation runs as the OpenVMM process"
+            )
+        uid, gid = _directory_owner(self.host_path)
+        if uid == 0 or gid == 0:
+            raise ScriptError(
+                "--mount-owner caller squashes guest root to the owner of the "
+                "shared directory, so it must belong to a non-root user and group: "
+                f"{self.host_path} is owned by {uid}:{gid}"
+            )
 
     def absolute(self) -> SandboxMount:
         # Join instead of normalizing so OpenVMM still sees, and rejects, every
@@ -169,6 +201,7 @@ class SandboxMount:
             ),
             access=self.access,
             denied_paths=self.denied_paths,
+            owner=self.owner,
         )
 
     def openvmm_arguments(self) -> list[str]:
@@ -178,6 +211,8 @@ class SandboxMount:
         ]
         for denied in self.denied_paths:
             arguments.extend(("--mount-deny", denied))
+        if self.owner != "vmm":
+            arguments.extend(("--mount-owner", self.owner))
         return arguments
 
     def command_line_fragment(self) -> str:
@@ -309,6 +344,16 @@ class SandboxLaunch:
                 "sandbox kernel command line exceeds its 1024-byte x86 budget"
             )
         return command_line
+
+
+def _caller_owner_supported() -> bool:
+    """Returns whether OpenVMM can perform share requests as the guest caller."""
+    return sys.platform == "linux"
+
+
+def _directory_owner(path: Path) -> tuple[int, int]:
+    status = path.stat()
+    return status.st_uid, status.st_gid
 
 
 def _reject_disk_path(path: Path) -> None:

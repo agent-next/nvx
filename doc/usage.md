@@ -389,6 +389,7 @@ python3 scripts/nvx.py sandbox
     [--hypervisor {auto,whp,kvm,mshv}]
     [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
     [--mount-deny HOST_PATH]...
+    [--mount-owner {vmm,caller}]
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
     [--network-egress {allow,deny}]
@@ -425,6 +426,7 @@ launches.
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the host hypervisor. |
 | `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Live-share one host directory at the absolute target inside the container rootfs for `run` or `provision`; defaults to `ro`. An `rw` share accepts guest-created symbolic links, which the host never follows. `/`, `/etc`, and the `/proc`, `/sys`, `/dev`, and `/.nvx-agent` trees are reserved. |
 | `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside the `--mount` host directory; relative paths are resolved inside it. Repeat to deny multiple paths. |
+| `--mount-owner {vmm,caller}` | `vmm` | Select the host identity for `--mount` operations. `vmm` performs them as the OpenVMM process. `caller` performs each request as the guest caller's UID and GID, squashes UID 0 and GID 0 to the owner of the host directory, and fails requests with `EPERM` when OpenVMM lacks `CAP_SETUID` and `CAP_SETGID`. `caller` requires Linux and a host directory owned by a non-root user and group. |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with a static guest address. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy for `run` or `provision`. |

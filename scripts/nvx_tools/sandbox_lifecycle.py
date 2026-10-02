@@ -220,6 +220,7 @@ def _serialize_mount(mount: SandboxMount | None) -> dict[str, Any] | None:
         "host_path": os.fspath(absolute.host_path),
         "access": absolute.access,
         "denied_paths": list(absolute.denied_paths),
+        "owner": absolute.owner,
     }
 
 
@@ -237,6 +238,7 @@ def _deserialize_mount(value: object) -> SandboxMount | None:
         host_path=Path(str(mount["host_path"])),
         access=str(mount["access"]),
         denied_paths=tuple(str(path) for path in cast(list[object], denied_paths)),
+        owner=str(mount["owner"]),
     )
 
 
