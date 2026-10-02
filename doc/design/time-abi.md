@@ -268,7 +268,7 @@ settled cell on the registered hosts.
 | Identity MSRs routed to OpenVMM | `KVM_CAP_X86_USER_SPACE_MSR` (`UNKNOWN`, `FILTER`) and `KVM_X86_SET_MSR_FILTER` denying reads and writes of `0x40000000..=0x400001ff`; the filter takes precedence over KVM's in-kernel Hyper-V MSRs. A Linux boot takes four MSR exits, all on the BSP, at any vCPU count | MSR-index intercepts (`HV_INTERCEPT_TYPE_X64_MSR_INDEX`, `READ_WRITE`) for `0x40000002`, `0x40000022`, `0x40000023`, and `0x40000118`. The hypervisor itself raises #GP for writes to the three read-only MSRs and for every other MSR in the range. Native synthetic MSRs are forbidden: they pre-empt the intercepts, and the native `HV_X64_MSR_TSC_FREQUENCY` returns the destination's rate instead of `F`. Verified on hypervisor builds 26100.30000 (bare metal) and 26100.9444 (Azure) | `X64MsrExitBitmap` with `UnhandledMsrs` (capability `0x3f` on every host) and the offloaded APIC, no synthetic features and no `hv1_emulator`: the identity MSRs exit to OpenVMM, which raises #GP for every other MSR in the range |
 | Native rate `F_d` | `KVM_GET_TSC_KHZ` × 1000 on VP 0 (1 kHz granularity) | `ProcessorClockFrequency` partition property | `WHvCapabilityCodeProcessorClockFrequency` |
 | No TSC scaling | Never `KVM_SET_TSC_KHZ`; every vCPU reports the host rate | No frequency override | No `ProcessorClockFrequency` partition property; the 1 GHz request is removed |
-| LAPIC rate `L` | In-kernel LAPIC at 1 GHz; `KVM_CAP_X86_APIC_BUS_CYCLES_NS` never set | 200 MHz | Offloaded APIC at its fixed 200 MHz, verified at preflight (setting `InterruptClockFrequency` is not supported); the emulated APIC is not used |
+| LAPIC rate `L` | In-kernel LAPIC at 1 GHz; `KVM_CAP_X86_APIC_BUS_CYCLES_NS` never set | The hypervisor's LAPIC at 200 MHz | Offloaded APIC at its fixed 200 MHz, verified at preflight (setting `InterruptClockFrequency` is not supported); the emulated APIC is not used |
 | TSC-deadline and `TSC_ADJUST` hidden; both MSRs raise #GP | CPUID bits cleared; the MSR filter also denies `IA32_TSC_ADJUST` (`0x3b`) and `IA32_TSC_DEADLINE` (`0x6e0`), which KVM would otherwise serve (reading 0 and ignoring writes to `0x6e0`), and OpenVMM raises #GP | Feature-bank bits `tsc_deadline_tmr_support`, `tsc_adjust_support`, and `a_count_m_count_support` cleared, and CPUID bits cleared; the hypervisor then raises #GP for reads and writes of both MSRs on every CPU | Feature-bank bits `TscDeadlineTmr`, `TscAdjust`, and `ACountMCount` cleared, and CPUID bits cleared; both MSRs exit to OpenVMM, which raises #GP on every CPU |
 | Invariant TSC exposed | CPUID bit. KVM hides it from a guest with `"Hv#1"` until KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is set, so OpenVMM writes 1 to it host-side at vCPU creation | Forced by the profile through a CPUID intercept result: Azure's nested MSHV cannot offer the bit to its guests, although the host OS sees an invariant TSC, and without it each AP pays about 150 ms of calibration. Qualification measures the property instead (`H4`, `H6`) | Set by the CPUID override on every host: on Azure, WHP cannot offer it through the feature banks (bank 1 lacks `TscInvariant`), although the host OS sees an invariant TSC. There the guest TSCs stayed within 60 ns of each other at 8 vCPUs over 60 s and matched the declared rate against host QPC to 0.000 ppm (residual at most 0.07 µs) over 118 s; `H4` and `H6` measure both on every host |
 | No paravirtual or synthetic features | No KVM leaves; `KVM_CAP_ENFORCE_PV_FEATURE_CPUID`, so KVM's paravirtual MSRs raise #GP; KVM's in-kernel Hyper-V MSRs are unreachable behind the filter | No synthetic processor features | `--hv` stays rejected for the microVM |
@@ -802,7 +802,10 @@ In the worker, with every VP stopped:
     timer (`E_LAPIC_PERIODIC`, `E_LAPIC_TSC_DEADLINE`) before any VP runs,
     so restore takes no separate pass over the VPs to check them.
 15. Advance VM time by `D` and the RTC's UTC by `D` (milliseconds). The PIT
-    catches up from its saved VM-time cursor; it is idle.
+    catches up from its saved VM-time cursor; it is idle. Steps 14 and 15
+    touch disjoint state, because no time ABI LAPIC reads VM time (see the
+    LAPIC rate row of [Backend obligations](#backend-obligations)), so
+    OpenVMM runs them concurrently and waits for both before step 16.
 16. Seal the time fields of the restore packet: `D`, its source, the rate
     deviation, `g`, and the test-hook flag.
 17. Start the state units, with host input gated when the restore requires an
@@ -1714,8 +1717,9 @@ The backends add their own CPUID work:
 **Attribution.** With `OPENVMM_STARTUP_PROFILE` set, OpenVMM's lifecycle
 profile records three exclusive time ABI restore phases:
 `restore.time_abi_clock` (restore steps 12 to 16, whose phases OpenVMM also
-logs as `time ABI restore clock` with `tsc_set_us`, `lapic_us`,
-`vm_time_us`, and `total_us`), `restore.guest_resume`
+logs as `time ABI restore clock`: `tsc_set_us`, then `lapic_us` and
+`vm_time_us`, which overlap and are each measured from the end of the TSC
+set, and `total_us`), `restore.guest_resume`
 (from the VP release to the guest's first selection of the restore packet),
 and, for a restore with `ACK_REQUIRED`, `restore.guest_repair` (from that
 selection to the arrival of the `0x605` acknowledgement). The
