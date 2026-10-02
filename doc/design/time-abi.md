@@ -365,7 +365,7 @@ sees it. Host qualification measures them instead. Profiles also pin policy zero
 profiles' derivation policy). The effective guest CPUID is a pure function of
 the profile, the VM topology, and the time ABI's identity leaves.
 
-**Effective CPUID.** The effective CPUID (`openvmm-effective-cpuid/v1`)
+**Effective CPUID.** The effective CPUID
 lists exactly the governed leaves: every leaf and subleaf of the profile's
 `cpuid` table; the topology leaves `0xB` and `0x1F`, when they are within
 the maximum basic leaf, at the subleaves the VM's topology defines and the
@@ -375,9 +375,11 @@ which Linux reads to end its enumeration; and the identity leaves
 `0x40000000..=0x40000005` with the explicit zero leaves. Each
 entry holds the four registers and their masks; the per-VP fields hold VP 0's
 APIC identity, and the runtime-owned bits have mask 0. OpenVMM computes it,
-records it, and recomputes it on restore, so the record never depends on how
-a backend enumerates or caches CPUID, and one profile and topology give the
-same record on every backend. At preflight, before any VP runs, each backend
+records it as the manifest's packed binary record, and recomputes it on
+restore, so the record never depends on how a backend enumerates or caches
+CPUID, and one profile and topology give the same record on every backend.
+Its canonical JSON form (`openvmm-effective-cpuid/v1`) serves tools, never
+the start paths. At preflight, before any VP runs, each backend
 reports VP 0's CPUID for the governed leaves (KVM from the
 `KVM_SET_CPUID2` table it programmed, MSHV with `get_cpuid_values` on VP 0,
 WHP from VP 0's register view), reading an entry without a subleaf at
@@ -476,10 +478,11 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
    without a probe partition, which would add 2.6 to 5.5 ms per cold boot
    and restore on WHP; the full fingerprint stays in `--cpu-fingerprint`.
 4. On restore only: this OpenVMM pins a profile with the same ID and digest,
-   and the recorded document hashes to it (`E_PROFILE_UNKNOWN`,
-   `E_PROFILE_DIGEST`), and the recomputed effective CPUID equals the
-   recorded one (`E_CPU_SURFACE`). The effective-CPUID record replaces the
-   exact-equality CPU contract.
+   and the recorded document is its canonical encoding
+   (`E_PROFILE_UNKNOWN`, `E_PROFILE_DIGEST`), and the recomputed effective
+   CPUID equals the recorded one (`E_CPU_SURFACE`). Both are comparisons
+   with precomputed or recomputed values; nothing is hashed or decoded. The
+   effective-CPUID record replaces the exact-equality CPU contract.
 5. The backend presents the effective CPUID: VP 0's CPUID for every governed
    leaf equals it under its masks (`E_CPU_SURFACE`).
 6. On MSHV and WHP, which pass reserved entries through, the hypervisor
@@ -692,14 +695,15 @@ Before worker construction:
    recapture).
 2. Validate the time contract and the CPU profile record: `time_abi_version`
    is 1, `tsc_tolerance_ppm` is 250, `F_s` is plausible, `L_s` is a backend
-   constant, identities are 16 bytes, `capture_generation < 2^32 - 1`, and
-   the embedded profile and effective-CPUID digests verify
-   (`E_MANIFEST_TIME`, `E_PROFILE_DIGEST`).
+   constant, identities are 16 bytes, `capture_generation < 2^32 - 1`, the
+   profile digest is 32 bytes, and the effective CPUID record is whole,
+   well-formed entries (`E_MANIFEST_TIME`). Validation computes no digest.
 3. Require the destination backend to equal `source_hypervisor`
    (`E_BACKEND_MISMATCH`).
-4. Require a pinned profile with the recorded ID and digest
-   (`E_PROFILE_UNKNOWN`, `E_PROFILE_DIGEST`), and the host's CPU generation
-   to be in it (`E_CPU_GENERATION`).
+4. Require a pinned profile with the recorded ID and digest, whose canonical
+   encoding is the embedded document byte for byte (`E_PROFILE_UNKNOWN`,
+   `E_PROFILE_DIGEST`), both compared with the build's precomputed record,
+   and the host's CPU generation to be in it (`E_CPU_GENERATION`).
 5. Preflight the downtime: sample the host clocks, select the source, and
    check the bounds (`E_DOWNTIME_*`, `E_HOST_IDENTITY`). The authoritative
    `D` is measured again in step 12.
@@ -809,7 +813,10 @@ state units are quiesced, capture:
    within 100 µs of it, keeping the tightest of at most 64 samples
    (`E_TSC_ANCHOR`), plus the host identities (`E_HOST_IDENTITY`); and
 3. records the declared rates, the CPU profile, the effective CPUID, and the
-   process's generation counter.
+   process's generation counter. The CPU profile record is the pinned
+   profile's precomputed digest and canonical encoding, copied, and the
+   effective CPUID is a packed binary record: capture encodes no document and
+   computes no digest.
 
 Each of these failures is a rollback-safe capture failure.
 
@@ -845,11 +852,15 @@ reused. It adds two required fields:
 | Number | Field | Type | Content |
 | --- | --- | --- | --- |
 | 1 | `id` | `string` | Profile ID |
-| 2 | `sha256` | `bytes` | Profile digest, 32 bytes |
-| 3 | `profile` | `bytes` | Canonical profile encoding, at most 1 MiB |
-| 4 | `effective_cpuid` | `bytes` | The [effective CPUID](#cpu-profiles) in its canonical encoding, `openvmm-effective-cpuid/v1` (compact canonical JSON): every governed leaf with its values and masks |
-| 5 | `effective_cpuid_sha256` | `bytes` | Digest of `effective_cpuid`, 32 bytes |
+| 2 | `sha256` | `bytes` | Profile digest, 32 bytes: the pinned profile's precomputed digest |
+| 3 | `profile` | `bytes` | The pinned profile's canonical encoding, at most 1 MiB |
+| 4 | `effective_cpuid` | `bytes` | The [effective CPUID](#cpu-profiles), 1 to 1,024 entries in its order (by leaf, then subleaf). Each entry is 44 bytes: eleven little-endian `u32` values, namely the leaf, then 1 and the subleaf (or 0 and 0 for an entry that applies to every subleaf), then the four registers `EAX` to `EDX`, then their four masks |
 | 6 | `capture_cpu_signature` | `u32` | CPUID.1:EAX of the capture host, for diagnostics |
+
+Field 5, a digest of field 4's earlier canonical JSON form, is retired and
+never reused. Restore checks the record by comparison: the digest and the
+document against the build's pinned record, and the effective CPUID against
+its recomputation, encoded the same way.
 
 Other rules:
 
@@ -1381,7 +1392,7 @@ rollback-safe: the guest continues, and OpenVMM logs the code.
 | `E_MANIFEST_TIME` | Time contract missing or malformed, `time_abi_version` not 1, or tolerance not 250 | Restore |
 | `E_BACKEND_MISMATCH` | Snapshot taken on another backend | Restore |
 | `E_PROFILE_UNKNOWN` | Profile ID not pinned in this OpenVMM, or a restore's explicit `--cpu-profile` names another profile than the snapshot's | Cold boot, restore |
-| `E_PROFILE_DIGEST` | Recorded, embedded, and pinned profile digests disagree, or the effective-CPUID digest is wrong | Restore |
+| `E_PROFILE_DIGEST` | The recorded profile digest or embedded document is not the pinned profile's of the same ID | Restore |
 | `E_PROFILE_HOST_UNKNOWN` | `--cpu-profile auto` maps the host to no profile, or to profiles of more than one generation | Cold boot |
 | `E_PROFILE_TIME_BITS` | The profile is invalid or violates the CPU time bits | Cold boot, restore |
 | `E_CPU_GENERATION` | Host CPU vendor, family, model, or stepping not in the profile | Cold boot, restore |
@@ -1600,6 +1611,22 @@ Expected effects:
 
 Expected wins are tracked separately and do not relax the gate.
 
+**Start-up budget.** The time ABI and CPU profile work of a cold boot or
+restore costs less than 0.5 ms over the pre-profile head (`e7ec0ca6c`),
+measured on prometheus32 (KVM) with the kvm agent's attribution harness; the
+flip requires it. Neither path encodes, decodes, or hashes a profile document
+or an effective CPUID:
+
+- the pinned profiles are compile-time constants with precomputed canonical
+  encodings and digests (`cpu_profile::pinned_record`), so selecting one
+  copies constants (about 30 µs);
+- capture copies the pinned record and writes the effective CPUID as a packed
+  binary record;
+- restore compares the recorded digest and document with the pinned record,
+  and the recomputed effective CPUID with the binary record, about 5 µs;
+- `verify_support` costs 2 to 10 µs of CPU time, plus the backend's surface:
+  about 11 µs on MSHV with its cached host CPUID, and 0.1 to 0.3 ms on WHP.
+
 **Attribution.** With `OPENVMM_STARTUP_PROFILE` set, OpenVMM's lifecycle
 profile records three exclusive time ABI restore phases:
 `restore.time_abi_clock` (restore steps 12 to 16, whose phases OpenVMM also
@@ -1611,7 +1638,9 @@ selection to the arrival of the `0x605` acknowledgement). The
 `restore.guest_repair_gate` milestone still spans from the VP release to the
 release of the acknowledgement boundary. The guest's restore checks run
 after the acknowledgement, outside these phases. `nvx-time status` reports
-`elapsed_us`, which covers the guest's readiness path and those checks.
+`elapsed_us`, which covers the guest's readiness path and those checks. On
+every cold boot and restore, the worker logs `time ABI CPU checks passed`
+with `recorded_cpuid_us`, `presented_cpuid_us`, and `profile_support_us`.
 
 ## Test matrix
 
