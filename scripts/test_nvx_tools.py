@@ -4045,7 +4045,7 @@ class BuildTests(unittest.TestCase):
                 encoding="ascii",
             )
             subprocess.run(
-                ["git", "init", "-q"],
+                ["git", "init", "-q", "-b", "fixture"],
                 cwd=root,
                 env=git_environment,
                 check=True,
