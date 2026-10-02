@@ -1137,8 +1137,8 @@ is still pending after 30 s, its line reports `status=pending`, without
 
 At boot, `elapsed_us` covers the checks and the daemon start; at capture,
 the step 1 checks of the [snapshot agent](#snapshot-agent). At restore, it
-covers steps 6 to 12 and the step 11 checks, but not the grace period wait
-or the deferred `C7`.
+covers steps 6 to 12 and the step 11 checks, but not step 13's 100 ms
+delay, the grace period wait, or the deferred `C7`.
 
 A failed check prints no marker: it emits the violation event with code
 `G_CONFORMANCE_<ID>` (`G_KERNEL_WX` for `K1`) and powers off with status 193,
@@ -1256,7 +1256,8 @@ acknowledgement.
     failure still emits its violation event and powers off with status 193.
 12. If `ACK_REQUIRED` is set, write the acknowledgement (2) to `0x605`.
 13. After the acknowledgement, or after step 10 when none is required, signal
-    the daemon, which finishes the restore asynchronously:
+    the daemon, which finishes the restore asynchronously, starting 100 ms
+    later at normal priority:
     - it runs the step 11 checks;
     - it waits for the [grace period release](#rcu-grace-period-release);
     - it restores the values saved in steps 2 and 3
@@ -1276,17 +1277,24 @@ signals the daemon, so no other process starts on the readiness path. Each
 extra process costs 2 to 4 ms after a restore (fork and exec under demand
 faulting, measured on KVM).
 
-Step 13 and the asynchronous boot checks start at `SCHED_IDLE`, so on few
-vCPUs they never take a CPU from the restored or starting workload. Work
-that has not finished 100 ms after the acknowledgement (or after step 10,
-when none is required) or after shell-ready continues at normal priority.
-This bounds how long a CPU-bound workload runs before a failing check powers
-the guest off: about 100 ms plus the checks' own run time, where
-`SCHED_IDLE` alone would allow about 0.5 s or more. On an idle KVM guest, a
-failing restore check powers off within 1 to 3 ms. The watcher and the
-discipline always run at normal priority, and stall suppression stays set
-until the release. Repair failures emit a violation event and power off with
-status 195.
+Step 13 starts 100 ms after the acknowledgement (or after step 10, when none
+is required) and runs at normal priority. Starting it earlier, even at
+`SCHED_IDLE`, slows the restored guest: its checks contend with the
+readiness path while the VMM is still demand-faulting guest memory. On WHP
+(prometheus28, 512 MiB, measurement-only builds) that added 4 to 12 ms to
+2-vCPU restores, whereas the 100 ms delay left them 0.8 and 1.2 ms over the
+release guest at 1 and 2 vCPUs. A failing restore check therefore powers the
+guest off about 100 ms plus the checks' own run time after the
+acknowledgement, whether or not the guest is idle.
+
+The asynchronous boot checks start at `SCHED_IDLE`, so on few vCPUs they
+never take a CPU from the starting workload. Work that has not finished
+100 ms after shell-ready continues at normal priority. This bounds how long
+a CPU-bound workload runs before a failing check powers the guest off: about
+100 ms plus the checks' own run time, where `SCHED_IDLE` alone would allow
+about 0.5 s or more. The watcher and the discipline always run at normal
+priority, and stall suppression stays set until the release. Repair failures
+emit a violation event and power off with status 195.
 
 ### RCU grace period release
 
@@ -1613,7 +1621,7 @@ Expected effects:
 | MSHV VP creation | Serialized at about 14 ms per application processor on bare metal (27 and 85 ms at 4 and 8 vCPUs); the frozen synchronized TSC set adds 40 to 170 µs for 1 to 4 VPs and no per-VP serialized work |
 | Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their `elapsed_us`, budgeted at 2.5 ms at one vCPU plus 0.3 ms per additional vCPU on KVM and MSHV, and 5 ms plus 0.6 ms per additional vCPU on WHP |
 | Counting LAPIC instead of TSC-deadline on KVM | Different timer-programming exits; covered by the gate |
-| Restore work before the acknowledgement | Only the packet read, the clock set, CPU and memory activation, and entropy and identity repair, in one helper process. The restore checks, the RCU release, and the deferred `C7` run asynchronously after the acknowledgement |
+| Restore work before the acknowledgement | Only the packet read, the clock set, CPU and memory activation, and entropy and identity repair, in one helper process. The restore checks, the RCU release, and the deferred `C7` start 100 ms after the acknowledgement, after the readiness path |
 | No time ABI console lines in production | Each console byte costs one or two port exits, about 10 to 12 µs on bare-metal KVM and an estimated 20 to 45 µs nested on Azure. Without the boot marker (about 110 bytes) and the restore marker (about 117 bytes), boots and restores save 1 to 5 ms, enough to fail the gate on `azure-kvm-5`; violation events still print |
 
 Expected wins are tracked separately and do not relax the gate.
