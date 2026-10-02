@@ -1451,6 +1451,14 @@ The daemon keeps `CLOCK_REALTIME` on host UTC through the kernel's PLL:
   `esterror = ceil(epsilon / 1000)` µs.
 - **Bounds.** The kernel limits the frequency to ±500 ppm; the declared rate
   tolerance uses at most 250 ppm of it.
+- **Convergence.** The boot check and restore repair step the clock, and
+  restore repair corrects the TSC's rate deviation. Neither corrects the rate
+  at which the host's own UTC clock runs against its TSC, which host time
+  synchronization slews by a few ppm. The PLL's frequency integrator absorbs
+  that rate over about an hour at the 64 s cadence. Until then the offset
+  settles near 256 s times the rate: 1.76 ms behind host UTC at the 6.88 ppm
+  of an Azure WHP runner, and an expected 4.2 ms at prometheus28's 16.5 ppm.
+  Both are far below the step threshold.
 
 The discipline never powers off the guest: a host wall-clock step is
 followed, not reported as a violation.
