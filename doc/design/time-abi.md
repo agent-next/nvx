@@ -2,12 +2,11 @@
 
 [Design index](../design.md)
 
-**Proposed.** This document specifies NVX time ABI v1, the single
-guest-visible time, timer, and clock contract of the microVM profile on KVM,
-MSHV, and WHP. It is authoritative for the `time-abi-v1` integration branches
-of `microsoft/nvx` and `nanvix/openvmm`. When implemented, it replaces the
-time rules in [Snapshot and restore](snapshot-and-restore.md#time-and-entropy)
-and the clock tokens in [Cold boot](cold-boot.md#effective-command-line).
+This document specifies NVX time ABI v1, the single guest-visible time,
+timer, and clock contract of the microVM profile on KVM, MSHV, and WHP, as NVX
+and its OpenVMM fork (`nanvix/openvmm`) implement it. It replaces the earlier
+time rules of [Snapshot and restore](snapshot-and-restore.md#time-and-entropy)
+and the clock tokens of [Cold boot](cold-boot.md#effective-command-line).
 
 Notation:
 
@@ -848,7 +847,10 @@ New snapshots use manifest version 6 with format magic
 `OPENVMM_SNAPSHOT_V6\0`. Restore accepts exactly version 6; versions 2
 through 5 and every other value are rejected with `E_SNAPSHOT_VERSION`, whose
 message tells the operator to recapture the snapshot. The legacy version
-branches and their format constants are deleted.
+branches and their format constants are deleted. Version 6 is the format's
+only version, so standard-machine disk snapshots use it too; they carry no
+machine contract and no time records. The manifest's fields 9 and 10, the
+version 2 artifact digests, are retired and never reused.
 
 **Capture.** After every VP has stopped at the snapshot boundary and the
 state units are quiesced, capture:
@@ -1759,6 +1761,10 @@ after the acknowledgement, outside these phases. `nvx-time status` reports
 checks. On
 every cold boot and restore, the worker logs `time ABI CPU checks passed`
 with `recorded_cpuid_us`, `presented_cpuid_us`, and `profile_support_us`.
+Their sum per restore at one vCPU is about 0.19 ms on bare-metal MSHV and
+0.14 ms nested, and 0.87 ms on bare-metal WHP and 1.6 to 1.9 ms nested, about
+95% of it WHP's per-leaf read-back. OpenVMM's comparison and unlisted-entry
+check take 40 to 66 µs of each.
 
 ## Test matrix
 
@@ -1867,7 +1873,9 @@ behavior:
 - MSHV: BSP-copy TSC alignment and exact rate equality.
 - WHP: the 1 GHz rate request and its silent fallback, and `RestoredTsc`
   with its RDTSC, RDTSCP, and `IA32_TSC` exits.
-- Restore packets v1 to v3 and manifest versions 2 to 5.
+- Restore packets v1 to v3, and manifest versions 2 to 5 for every snapshot:
+  standard-machine disk snapshots also move to version 6, so earlier ones
+  must be recaptured too.
 - The effect of `--restore-entropy`: every restore exposes packet v4, which
   carries fresh entropy. OpenVMM still accepts the option without effect,
   and the harness stops passing it.
@@ -1921,26 +1929,20 @@ Migration impact:
   ABI](machine-and-device-abi.md), [Cold boot](cold-boot.md), the
   benchmarks and CI guides, and the OpenVMM Guide (see the appendix).
 
-## Appendix: OpenVMM Guide update plan
+## Appendix: OpenVMM Guide
 
-`Guide/src/user_guide/openvmm/snapshots.md` changes as follows when the
-implementation lands:
+The OpenVMM Guide documents the user-facing contract in
+`Guide/src/user_guide/openvmm/snapshots.md`:
 
-1. **Overview.** Note that microVM snapshots carry a time contract and a CPU
-   profile, and that only manifest version 6 is accepted.
-2. **Restoring a snapshot.** Replace the paragraphs on MSHV
-   `IA32_TSC_ADJUST`, KVM TSC offset advancement, MSHV and WHP time freezing
-   and BSP alignment, and the WHP partition-reference-time TSC with one
-   paragraph on the synchronized TSC set and its read-back.
-3. **Generation ID.** Extend the portb paragraph with selector `0xa7`, window
-   port `0xeb`, status bit 6, four-byte reads, and packet v4.
-4. **Device configuration on restore.** Replace the CPU contract, TSC
-   frequency, and `lapic_timer_hz` paragraphs with a new **Time and CPU
-   compatibility** section: the identity, the CPU profile and
-   `--cpu-profile`, the 250 ppm rate rule, the exact LAPIC rule, the
-   downtime sources and bounds, the restore steps, and the error codes.
-5. **Limitations.** State that restore requires the same backend, CPU
-   generation, and profile, and that older snapshots must be recaptured.
-6. **CLI reference.** Document `--cpu-profile` and the doctor verification
-   mode. The test hooks stay undocumented in the Guide; this document
-   describes them.
+- **Overview:** the time contract and CPU profile in microVM manifests, and
+  manifest version 6 as the only accepted version.
+- **Restoring a snapshot:** restore packet v4, the time sample at `0xeb`, the
+  generation ID, and the synchronized TSC set with its read-back.
+- **Time and CPU compatibility:** the identity, the CPU profile and
+  `--cpu-profile`, the 250 ppm rate rule, the exact LAPIC rule, the downtime
+  sources and bounds, and the error codes.
+- **Limitations:** the same backend, CPU generation, and profile, and the
+  recapture of older snapshots.
+
+The CLI reference documents `--cpu-profile` and `--x-time-abi-verify`. The
+test hooks stay undocumented in the Guide; this document describes them.
