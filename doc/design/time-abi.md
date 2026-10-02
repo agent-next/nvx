@@ -420,15 +420,16 @@ on them. They are:
 KVM answers them from the effective CPUID: zero, Intel's out-of-range result
 (the highest basic leaf's) above the maximum basic leaf, or, past the last
 topology level, an invalid level with the x2APIC ID. MSHV and WHP pass them
-through from their own guest views. Verification keeps host features out of
-every entry passed through, at no run-time cost: profile verification fails a
-host whose hypervisor presents a non-zero entry outside the profile's tables
-(`E_CPU_UNLISTED`, verification step 6). A zero result for each such entry
-would instead add registrations to every partition setup: tens on WHP, about
-1 ms per restore, and 13 to 15 on MSHV, about 65 µs. Under the time ABI,
-the MSHV and WHP guest views of VP 0 read zero at every reserved entry their
-sweeps reach, including Intel PT's `0x14.1`, which the Skylake-SP roots show
-as non-zero:
+through from their own guest views. Both read zero at every reserved entry
+their sweeps reach (below), so neither programs zero results there, which
+would cost about 5 µs per entry at partition setup: about 35 µs on WHP for
+the 6 or 7 candidates of a fleet host, and about 65 µs on MSHV for its former
+13 to 15. Verification keeps host features out of every entry passed
+through: profile verification fails a host whose hypervisor presents a
+non-zero entry outside the profile's tables (`E_CPU_UNLISTED`, verification
+step 6), checked on VP 0's view at every start. Under the time ABI, the MSHV
+and WHP sweeps of VP 0 read zero there, including Intel PT's `0x14.1`, which
+the Skylake-SP roots show as non-zero:
 
 - WHP's hardware sweep covers subleaves 0 to 63 of every indexed leaf and four
   leaves past each maximum, on all three host types.
