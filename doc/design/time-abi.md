@@ -1090,8 +1090,12 @@ mounting `/proc`, `/sys`, and `/dev`, it takes a time sample within the
 (`C12`), so the workload starts on host time; this step is not counted as a
 discontinuity. Init then reports shell-ready (or starts the workload, in
 modes without a shell) and runs every other boot check asynchronously,
-starting 100 ms after shell-ready at `SCHED_IDLE`, and at normal priority
-from 100 ms after they start (see [Snapshot agent](#snapshot-agent)). The
+starting 100 ms after its time ABI boot step (`nvx-time boot`) at
+`SCHED_IDLE`, and at normal priority from 100 ms after they start (see
+[Snapshot agent](#snapshot-agent)). The boot step is the anchor because
+every mode reaches it, whereas a mode that execs an agent reports readiness
+later, on the agent's own protocol. In shell mode the boot step comes 15 to
+44 ms before shell-ready, so the checks start about 55 to 85 ms after it. The
 checks start the daemon when they pass. Every check stays
 fail-fast: a failure powers the guest off with status 193, even if the
 workload is running. A guest that powers off before its checks finish skips them, which
@@ -1183,15 +1187,21 @@ is still pending after 30 s, its line reports `status=pending`, without
 `elapsed_us` or `cpu_us`, and the exit status is 1.
 
 At boot, the checks' work is the checks and the daemon start, but not the
-100 ms delay after shell-ready; at capture,
+100 ms delay after the boot step; at capture,
 the step 1 checks of the [snapshot agent](#snapshot-agent). At restore, it
 is steps 6 to 12 and the step 11 checks, but not step 13's 100 ms delay, the
 grace period wait, or the deferred `C7`. `elapsed_us` is that work's wall
 time, including any wait for a CPU at `SCHED_IDLE`; it bounds the fail-fast
-latency and is not budgeted. `cpu_us` is the CPU time it consumes, summed
-over every thread and process that runs it (`CLOCK_PROCESS_CPUTIME_ID`);
-it is the background cost to the workload, which the fleet matrix driver
-checks against the budget in
+latency and is not budgeted. `cpu_us` is the CPU time that the `nvx-time`
+processes spend on it (`CLOCK_PROCESS_CPUTIME_ID`, summed over their
+threads); other processes, such as the shell's children in steps 9 and 10,
+are not counted. At restore, `cpu_us` counts only step 13's part: the
+daemon's preparation and the step 11 checks. Steps 6 to 12 are the readiness
+path, whose cost the restore latency gate already measures, so `cpu_us` is
+the background cost to the workload. The NVX kernel does not charge
+interrupt time to it (`CONFIG_IRQ_TIME_ACCOUNTING`), but it still scales with
+the host processor's clock: a host idling at a low frequency runs the checks
+more slowly. The fleet matrix driver checks `cpu_us` against the budget in
 [Performance expectations](#performance-expectations-and-acceptance-gate)
 during validation; CI reports it without gating on it.
 
@@ -1333,8 +1343,8 @@ extra process costs 2 to 4 ms after a restore (fork and exec under demand
 faulting, measured on KVM).
 
 Step 13 starts 100 ms after the acknowledgement (or after step 10, when none
-is required), and the asynchronous boot checks start 100 ms after
-shell-ready. Starting them earlier slows the guest: their checks contend
+is required), and the asynchronous boot checks start 100 ms after the boot
+step. Starting them earlier slows the guest: their checks contend
 with the readiness path on the other vCPUs, even at `SCHED_IDLE`. On WHP
 (prometheus28, 512 MiB, measurement-only builds), checks right after the
 acknowledgement added 6 to 12 ms to 2-vCPU restores, whereas the 100 ms
@@ -1346,7 +1356,7 @@ Step 13 and the asynchronous boot checks run at `SCHED_IDLE`, so on few
 vCPUs they never take a CPU from the restored or starting workload. Work
 that has not finished 100 ms after it starts continues at normal priority.
 Every check stays fail-fast: a failing check powers the guest off about
-100 ms after the acknowledgement or shell-ready on an idle guest, and at
+100 ms after the acknowledgement or the boot step on an idle guest, and at
 most about 200 ms plus the checks' own run time after it on a CPU-bound
 one, where `SCHED_IDLE` alone would allow about 0.5 s or more. The `elapsed_us`
 and `cpu_us` of both exclude the 100 ms delay. `nvx-time status` waits for
@@ -1679,7 +1689,7 @@ Expected effects:
 | Invariant TSC from the profile where the backend cannot offer it to guests (Azure MSHV and WHP) | Removes each AP's delay calibration of about 150 ms: an 8-vCPU cold boot takes 299 ms instead of 1,385 ms on Azure MSHV, and cold boots are 0.2 to 1.1 s faster at 2 to 8 vCPUs on Azure WHP |
 | Fixed restore work: the restore clock (0.7 to 1.1 ms), restore verification, and the backend preflight | A one-vCPU WHP restore is at parity on Azure 8370C runners (p50 −0.6 ms) and about 2 ms slower on bare metal, where no emulation cost is recovered; the counting LAPIC accounts for at most 0.75 ms of it |
 | MSHV VP creation | Serialized at about 14 ms per application processor on bare metal (27 and 85 ms at 4 and 8 vCPUs); the frozen synchronized TSC set adds 40 to 170 µs for 1 to 4 VPs and no per-VP serialized work |
-| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their wall time (`elapsed_us`, not budgeted) and CPU time (`cpu_us`). The same `cpu_us` budget holds for the boot, capture, and restore checks. The fleet matrix driver enforces it during validation; CI reports each phase against it (`<phase>_cpu_over_budget`) but does not gate on it, because the A/B gate above covers latency. The budget is 2.5 ms at one vCPU plus 0.75 ms per additional vCPU on KVM and MSHV. That is measured on KVM (prometheus32, wiring v5): 1.1, 2.3 to 3.2, 2.4 to 3.6, and 4.6 to 7.2 ms at 1, 2, 4, and 8 vCPUs. On WHP it is 5 ms plus 1.5 ms per additional vCPU, TBD(guest) until WHP and MSHV CPU times are measured |
+| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their wall time (`elapsed_us`, not budgeted) and CPU time (`cpu_us`). The same `cpu_us` budget holds for the boot, capture, and restore checks. The fleet matrix driver enforces it during validation; CI reports each phase against it (`<phase>_cpu_over_budget`) but does not gate on it, because the A/B gate above covers latency. The budget is TBD(guest) for every backend, provisionally 2.5 ms at one vCPU plus 0.75 ms per additional vCPU on KVM and MSHV and 5 ms plus 1.5 ms on WHP. Wiring v6 measured boot medians of 1.6 to 3.0 ms on MSHV, 3.6 to 5.0 ms on KVM (prometheus32 idles at 800 MHz, which slows the delayed checks), and 2.3 to 6.6 ms on WHP at 1 to 8 vCPUs, with captures under 2 ms everywhere. The values are set from the next guest build, which counts only step 13 at restore and runs with `CONFIG_IRQ_TIME_ACCOUNTING` |
 | Counting LAPIC instead of TSC-deadline on KVM | Different timer-programming exits; covered by the gate |
 | Restore work before the acknowledgement | Only the packet read, the clock set, CPU and memory activation, and entropy and identity repair, in one helper process. The restore checks, the RCU release, and the deferred `C7` start at `SCHED_IDLE` 100 ms after the acknowledgement, after the readiness path |
 | No time ABI console lines in production | Each console byte costs one or two port exits, about 10 to 12 µs on bare-metal KVM and an estimated 20 to 45 µs nested on Azure. Without the boot marker (about 110 bytes) and the restore marker (about 117 bytes), boots and restores save 1 to 5 ms, enough to fail the gate on `azure-kvm-5`; violation events still print |
@@ -1862,8 +1872,10 @@ Removed from NVX:
   and needs ACPI CPPC data the microVM lacks); and `CONFIG_KVM_GUEST` with
   `CONFIG_PARAVIRT_CLOCK` and `CONFIG_HALTPOLL_CPUIDLE`, which are dormant
   without a KVM signature. `CONFIG_HYPERVISOR_GUEST` and `CONFIG_PARAVIRT`
-  stay on and `CONFIG_HYPERV` stays off. The CI debug kernel adds
-  `CONFIG_DEBUG_KERNEL` with the soft-lockup and hung-task detectors only.
+  stay on and `CONFIG_HYPERV` stays off. `CONFIG_IRQ_TIME_ACCOUNTING` is
+  turned on, so `cpu_us` does not charge interrupts to the checks. The CI
+  debug kernel adds `CONFIG_DEBUG_KERNEL` with the soft-lockup and hung-task
+  detectors only.
 - Guest: RTC polling in `nvx-reseed`, and the restore packet v1 to v3 parser
   in `nvx-port-io`.
 - Harness: `tsc=reliable` and `no_timer_check` in `BASE_TUNING`; per-backend
