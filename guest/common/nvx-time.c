@@ -20,7 +20,8 @@
 //   restore-finish [--ack] [--new-cpus LIST]
 //                              acknowledgement, then the daemon's restore
 //                              checks and release
-//   status                     print the last check and the runtime state
+//   status                     print every recorded check and the runtime
+//                              state, after waiting for pending checks
 //   sample                     print one host time sample
 //   generation-id              print the VM generation ID
 //   exhaustive                 the CI-only exhaustive check
@@ -139,7 +140,6 @@
 #define STATE_PATH TIME_DIR "/state"
 #define STATE_TEMP_PATH TIME_DIR "/.state"
 #define STATE_LOCK_PATH TIME_DIR "/state.lock"
-#define REPORT_PATH TIME_DIR "/report"
 #define DAEMON_PID_PATH TIME_DIR "/daemon.pid"
 #define SUPPRESSION_PATH TIME_DIR "/suppression"
 #define SUPPRESSION_LOCK_PATH TIME_DIR "/suppression.lock"
@@ -652,12 +652,25 @@ static void fail_fatal(int status, const char *code, const char *source,
 // Published state (/run/nvx/time/state) and private records
 // ---------------------------------------------------------------------------
 
+// A conformance check's record: STATUS is empty until the phase first runs,
+// then "pending" while its check runs, then "ok" (a failed check powers the
+// guest off; report-only mode records "fail" instead). GENERATION is g when
+// the check ran; the boot check's is 0. FAILURES is the check's failure
+// count, kept in report-only mode only, and -1 otherwise.
+struct check_state {
+    char status[16];
+    uint64_t cpus;
+    int64_t elapsed_us;
+    uint64_t generation;
+    int64_t failures;
+};
+
+// The phases with a check record, indexed by enum phase.
+#define CHECK_PHASES 3
+
 struct time_state {
     uint64_t generation;
-    char check_phase[16];
-    char check_status[16];
-    uint64_t check_cpus;
-    int64_t check_elapsed_us;
+    struct check_state checks[CHECK_PHASES];
     uint64_t tsc_hz;
     uint64_t lapic_hz;
     uint64_t discontinuities;
@@ -677,12 +690,14 @@ struct time_state {
 };
 
 // A fresh state is published at the start of the boot checks, which are then
-// pending.
+// pending; a state without a boot record also counts as pending.
 static void state_init(struct time_state *state)
 {
     memset(state, 0, sizeof(*state));
-    snprintf(state->check_phase, sizeof(state->check_phase), "boot");
-    snprintf(state->check_status, sizeof(state->check_status), "pending");
+    for (int phase = 0; phase < CHECK_PHASES; phase++)
+        state->checks[phase].failures = -1;
+    snprintf(state->checks[PHASE_BOOT].status,
+             sizeof(state->checks[PHASE_BOOT].status), "pending");
     snprintf(state->last_discontinuity, sizeof(state->last_discontinuity),
              "none");
     snprintf(state->last_downtime_source, sizeof(state->last_downtime_source),
@@ -700,14 +715,26 @@ static void copy_word(char *destination, size_t size, const char *value)
 // known numeric key fails the parse.
 static int state_parse(char *text, struct time_state *state)
 {
+    struct check_state *boot = &state->checks[PHASE_BOOT];
+    struct check_state *capture = &state->checks[PHASE_CAPTURE];
+    struct check_state *restore = &state->checks[PHASE_RESTORE];
     struct {
         const char *key;
         uint64_t *unsigned_value;
         int64_t *signed_value;
     } const numbers[] = {
         {"generation", &state->generation, NULL},
-        {"check_cpus", &state->check_cpus, NULL},
-        {"check_elapsed_us", NULL, &state->check_elapsed_us},
+        {"boot_cpus", &boot->cpus, NULL},
+        {"capture_cpus", &capture->cpus, NULL},
+        {"restore_cpus", &restore->cpus, NULL},
+        {"boot_elapsed_us", NULL, &boot->elapsed_us},
+        {"capture_elapsed_us", NULL, &capture->elapsed_us},
+        {"restore_elapsed_us", NULL, &restore->elapsed_us},
+        {"capture_generation", &capture->generation, NULL},
+        {"restore_generation", &restore->generation, NULL},
+        {"boot_failures", NULL, &boot->failures},
+        {"capture_failures", NULL, &capture->failures},
+        {"restore_failures", NULL, &restore->failures},
         {"tsc_hz", &state->tsc_hz, NULL},
         {"lapic_hz", &state->lapic_hz, NULL},
         {"discontinuities", &state->discontinuities, NULL},
@@ -727,8 +754,9 @@ static int state_parse(char *text, struct time_state *state)
         char *value;
         size_t size;
     } const words[] = {
-        {"check_phase", state->check_phase, sizeof(state->check_phase)},
-        {"check_status", state->check_status, sizeof(state->check_status)},
+        {"boot_status", boot->status, sizeof(boot->status)},
+        {"capture_status", capture->status, sizeof(capture->status)},
+        {"restore_status", restore->status, sizeof(restore->status)},
         {"last_discontinuity", state->last_discontinuity,
          sizeof(state->last_discontinuity)},
         {"last_downtime_source", state->last_downtime_source,
@@ -768,41 +796,85 @@ static int state_parse(char *text, struct time_state *state)
     return 0;
 }
 
+// Appends a formatted line to TEXT at *LENGTH, if it fits.
+static void append_text(char *text, size_t size, size_t *length,
+                        const char *format, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static void append_text(char *text, size_t size, size_t *length,
+                        const char *format, ...)
+{
+    va_list arguments;
+    int written;
+
+    if (*length >= size)
+        return;
+    va_start(arguments, format);
+    written = vsnprintf(text + *length, size - *length, format, arguments);
+    va_end(arguments);
+    if (written > 0)
+        *length += (size_t)written;
+}
+
+// Formats the state in the order of the spec's state file table; the keys of
+// a phase whose check never ran are absent.
 static void state_format(const struct time_state *state, char *text,
                          size_t size)
 {
-    snprintf(text, size,
-             "version=1\n"
-             "generation=%" PRIu64 "\n"
-             "check_phase=%s\n"
-             "check_status=%s\n"
-             "check_cpus=%" PRIu64 "\n"
-             "check_elapsed_us=%" PRId64 "\n"
-             "tsc_hz=%" PRIu64 "\n"
-             "lapic_hz=%" PRIu64 "\n"
-             "discontinuities=%" PRIu64 "\n"
-             "last_discontinuity=%s\n"
-             "last_step_ns=%" PRId64 "\n"
-             "last_step_realtime_ns=%" PRId64 "\n"
-             "last_downtime_ns=%" PRIu64 "\n"
-             "last_downtime_source=%s\n"
-             "synchronized=%" PRIu64 "\n"
-             "offset_ns=%" PRId64 "\n"
-             "uncertainty_ns=%" PRId64 "\n"
-             "frequency_ppb=%" PRId64 "\n"
-             "samples=%" PRIu64 "\n"
-             "rejected_samples=%" PRIu64 "\n"
-             "last_sample_error=%s\n"
-             "violations=%" PRIu64 "\n",
-             state->generation, state->check_phase, state->check_status,
-             state->check_cpus, state->check_elapsed_us, state->tsc_hz,
-             state->lapic_hz, state->discontinuities,
-             state->last_discontinuity, state->last_step_ns,
-             state->last_step_realtime_ns, state->last_downtime_ns,
-             state->last_downtime_source, state->synchronized,
-             state->offset_ns, state->uncertainty_ns, state->frequency_ppb,
-             state->samples, state->rejected_samples,
-             state->last_sample_error, state->violations);
+    size_t length = 0;
+
+    append_text(text, size, &length, "version=1\ngeneration=%" PRIu64 "\n",
+                state->generation);
+    for (int phase = 0; phase < CHECK_PHASES; phase++) {
+        if (state->checks[phase].status[0] != '\0')
+            append_text(text, size, &length, "%s_status=%s\n",
+                        k_phase_names[phase], state->checks[phase].status);
+    }
+    for (int phase = 0; phase < CHECK_PHASES; phase++) {
+        if (state->checks[phase].status[0] != '\0')
+            append_text(text, size, &length, "%s_cpus=%" PRIu64 "\n",
+                        k_phase_names[phase], state->checks[phase].cpus);
+    }
+    for (int phase = 0; phase < CHECK_PHASES; phase++) {
+        if (state->checks[phase].status[0] != '\0')
+            append_text(text, size, &length, "%s_elapsed_us=%" PRId64 "\n",
+                        k_phase_names[phase], state->checks[phase].elapsed_us);
+    }
+    for (int phase = PHASE_CAPTURE; phase < CHECK_PHASES; phase++) {
+        if (state->checks[phase].status[0] != '\0')
+            append_text(text, size, &length, "%s_generation=%" PRIu64 "\n",
+                        k_phase_names[phase], state->checks[phase].generation);
+    }
+    for (int phase = 0; phase < CHECK_PHASES; phase++) {
+        if (state->checks[phase].status[0] != '\0' &&
+            state->checks[phase].failures >= 0)
+            append_text(text, size, &length, "%s_failures=%" PRId64 "\n",
+                        k_phase_names[phase], state->checks[phase].failures);
+    }
+    append_text(text, size, &length,
+                "tsc_hz=%" PRIu64 "\n"
+                "lapic_hz=%" PRIu64 "\n"
+                "discontinuities=%" PRIu64 "\n"
+                "last_discontinuity=%s\n"
+                "last_step_ns=%" PRId64 "\n"
+                "last_step_realtime_ns=%" PRId64 "\n"
+                "last_downtime_ns=%" PRIu64 "\n"
+                "last_downtime_source=%s\n"
+                "synchronized=%" PRIu64 "\n"
+                "offset_ns=%" PRId64 "\n"
+                "uncertainty_ns=%" PRId64 "\n"
+                "frequency_ppb=%" PRId64 "\n"
+                "samples=%" PRIu64 "\n"
+                "rejected_samples=%" PRIu64 "\n"
+                "last_sample_error=%s\n"
+                "violations=%" PRIu64 "\n",
+                state->tsc_hz, state->lapic_hz, state->discontinuities,
+                state->last_discontinuity, state->last_step_ns,
+                state->last_step_realtime_ns, state->last_downtime_ns,
+                state->last_downtime_source, state->synchronized,
+                state->offset_ns, state->uncertainty_ns, state->frequency_ppb,
+                state->samples, state->rejected_samples,
+                state->last_sample_error, state->violations);
 }
 
 static int state_load(struct time_state *state)
@@ -880,41 +952,43 @@ struct check_record {
     int64_t elapsed_us;
     uint64_t tsc_hz;
     uint64_t lapic_hz;
+    int failures;
 };
 
 static void apply_check(struct time_state *state, const void *context)
 {
     const struct check_record *record = context;
+    struct check_state *check = &state->checks[record->phase];
 
-    snprintf(state->check_phase, sizeof(state->check_phase), "%s",
-             k_phase_names[record->phase]);
-    snprintf(state->check_status, sizeof(state->check_status), "%s",
-             record->status);
-    state->check_cpus = (uint64_t)record->cpus;
-    state->check_elapsed_us = record->elapsed_us;
+    snprintf(check->status, sizeof(check->status), "%s", record->status);
+    check->cpus = (uint64_t)record->cpus;
+    check->elapsed_us = record->elapsed_us;
+    check->generation = record->phase == PHASE_BOOT ? 0 : state->generation;
+    check->failures = -1;
+    // Report-only mode keeps the failures in the state file, as the spec's
+    // keys reserved for it.
+    if (g_report_only) {
+        check->failures = record->failures;
+        if (record->failures > 0 && strcmp(record->status, "ok") == 0)
+            snprintf(check->status, sizeof(check->status), "fail");
+    }
     if (record->tsc_hz != 0)
         state->tsc_hz = record->tsc_hz;
     if (record->lapic_hz != 0)
         state->lapic_hz = record->lapic_hz;
 }
 
-// Records a conformance check in the state file: "pending" while it runs,
-// then "ok" (a failed check powers the guest off instead). Rates of 0 keep
-// the published ones. In report-only mode the failure count goes beside the
-// state, for nvx-time status.
+// Records a phase's conformance check in the state file: "pending" while it
+// runs, then "ok" (a failed check powers the guest off instead), with the
+// generation it ran in. Rates of 0 keep the published ones. Report-only mode
+// records "fail" and the failure count of a check that failed.
 static int record_check(enum phase phase, const char *status, int cpus,
                         int64_t elapsed_us, uint64_t tsc_hz, uint64_t lapic_hz,
                         int failures)
 {
-    struct check_record record = {phase,      status, cpus,
-                                  elapsed_us, tsc_hz, lapic_hz};
+    struct check_record record = {phase,  status,   cpus,    elapsed_us,
+                                  tsc_hz, lapic_hz, failures};
 
-    if (g_report_only) {
-        char text[32];
-
-        snprintf(text, sizeof(text), "failures=%d\n", failures);
-        (void)replace_file(REPORT_PATH, REPORT_PATH ".tmp", text);
-    }
     return state_apply(apply_check, &record);
 }
 
@@ -3717,17 +3791,30 @@ static int cmd_check(int argc, char **argv)
     return checks.failures == 0 ? 0 : 1;
 }
 
-// Waits until no conformance check is pending, for at most STATUS_WAIT_NS,
-// and loads the state into STATE. Returns 0, 1 when a check is still
-// pending, or -1 when the state is unreadable.
-static int wait_for_checks(struct time_state *state)
+// Whether a recorded check of STATE is still pending: the boot check only
+// with BOOT_ONLY, or any. A state without a boot record parses as a pending
+// boot check.
+static bool checks_pending(const struct time_state *state, bool boot_only)
+{
+    for (int phase = 0; phase < (boot_only ? 1 : CHECK_PHASES); phase++) {
+        if (strcmp(state->checks[phase].status, "pending") == 0)
+            return true;
+    }
+    return false;
+}
+
+// Waits until no recorded check (with BOOT_ONLY, no boot check) is pending,
+// for at most STATUS_WAIT_NS, and loads the state into STATE; a missing
+// state file counts as a pending boot check. Returns 0, or 1 when a check is
+// still pending.
+static int wait_for_checks(struct time_state *state, bool boot_only)
 {
     int64_t deadline = clock_ns(CLOCK_MONOTONIC) + STATUS_WAIT_NS;
 
     for (;;) {
         if (state_load(state) != 0)
-            return -1;
-        if (strcmp(state->check_status, "pending") != 0)
+            state_init(state);
+        else if (!checks_pending(state, boot_only))
             return 0;
         if (clock_ns(CLOCK_MONOTONIC) >= deadline)
             return 1;
@@ -3739,17 +3826,15 @@ static int cmd_pre_capture(void)
 {
     struct time_state state;
     struct checks checks;
+    int64_t elapsed;
     int64_t start;
-    int waited;
 
-    // The asynchronous boot checks start the daemon that C10 requires.
-    waited = wait_for_checks(&state);
-    if (waited != 0) {
+    // Step 1: the asynchronous boot checks start the daemon that C10
+    // requires.
+    if (wait_for_checks(&state, true) != 0) {
         memset(&checks, 0, sizeof(checks));
         checks.phase = PHASE_CAPTURE;
-        check_failed(&checks, "C10", "%s",
-                     waited > 0 ? "the boot checks are still pending"
-                                : "the time state is unreadable");
+        check_failed(&checks, "C10", "the boot checks are still pending");
         return 1;
     }
     start = clock_ns(CLOCK_MONOTONIC);
@@ -3759,6 +3844,7 @@ static int cmd_pre_capture(void)
         return 1;
     }
     run_capture_checks(&checks);
+    elapsed = clock_ns(CLOCK_MONOTONIC) - start;
     if (suppression_save() != 0) {
         char detail[DETAIL_MAX];
         int error = errno;
@@ -3770,9 +3856,9 @@ static int cmd_pre_capture(void)
                                 : strerror(error));
         return 1;
     }
+    // Step 1's record travels in the snapshot.
     if (record_check(PHASE_CAPTURE, "ok", checks.online_count,
-                     (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC, 0, 0,
-                     checks.failures) != 0)
+                     elapsed / NSEC_PER_USEC, 0, 0, checks.failures) != 0)
         check_failed(&checks, "C10", "cannot record the capture check: %s",
                      strerror(errno));
     return 0;
@@ -3820,13 +3906,15 @@ static void apply_repair(struct time_state *state, const void *context)
     state->samples++;
     snprintf(state->last_sample_error, sizeof(state->last_sample_error),
              "none");
-    // The daemon's step 13 runs the restore checks after the acknowledgement.
-    // Until then, check_elapsed_us is the readiness path up to the clock
-    // step, at last_step_realtime_ns.
-    snprintf(state->check_phase, sizeof(state->check_phase), "restore");
-    snprintf(state->check_status, sizeof(state->check_status), "pending");
-    state->check_cpus = 0;
-    state->check_elapsed_us = repair->elapsed_us;
+    // Step 8 marks this restore's check pending, so nvx-time status waits for
+    // the daemon's step 13. Until then, restore_elapsed_us is the readiness
+    // path up to the clock step, at last_step_realtime_ns.
+    snprintf(state->checks[PHASE_RESTORE].status,
+             sizeof(state->checks[PHASE_RESTORE].status), "pending");
+    state->checks[PHASE_RESTORE].cpus = 0;
+    state->checks[PHASE_RESTORE].elapsed_us = repair->elapsed_us;
+    state->checks[PHASE_RESTORE].generation = state->generation;
+    state->checks[PHASE_RESTORE].failures = -1;
 }
 
 static int repair_failed(const char *code, const char *detail)
@@ -4023,8 +4111,8 @@ static int cmd_capture(int argc, char **argv)
 // Restore steps 12 and 13 after the shell's activation and identity work: the
 // acknowledgement when the packet asked for one, then the daemon runs step 13
 // asynchronously. The record tells it which CPUs activation onlined. The
-// readiness path started check_elapsed_us before the helper's clock step, at
-// last_step_realtime_ns.
+// readiness path started restore_elapsed_us before the helper's clock step,
+// at last_step_realtime_ns.
 static int cmd_restore_finish(int argc, char **argv)
 {
     bool new_cpus[MAX_CPUS] = {false};
@@ -4068,7 +4156,7 @@ static int cmd_restore_finish(int argc, char **argv)
     }
     start = clock_ns(CLOCK_MONOTONIC) -
             (clock_ns(CLOCK_REALTIME) - state.last_step_realtime_ns) -
-            state.check_elapsed_us * NSEC_PER_USEC;
+            state.checks[PHASE_RESTORE].elapsed_us * NSEC_PER_USEC;
     signaled = signal_restore(daemon_pid(), ack, start);
     if (signaled == 0)
         return 0;
@@ -4086,62 +4174,67 @@ static int cmd_restore_finish(int argc, char **argv)
     return 0;
 }
 
-// Formats nvx-time status's lines from STATE: the marker of the last
-// conformance check, with status=pending and no elapsed_us while it runs,
-// and the runtime line. Report-only mode adds the check's FAILURES.
-static void format_status(const struct time_state *state, int failures,
-                          char *text, size_t size)
+// Formats nvx-time status's lines from STATE: one per recorded phase, in the
+// order boot, capture, and restore, with status=pending and no elapsed_us
+// while its check runs, then the runtime line. Report-only mode appends each
+// check's failure count, and a failed check's status is fail. Returns whether
+// every phase line reports ok.
+static bool format_status(const struct time_state *state, char *text,
+                          size_t size)
 {
-    bool pending = strcmp(state->check_status, "pending") == 0;
-    char elapsed[40] = "";
-    char suffix[32] = "";
-    int length;
+    size_t length = 0;
+    bool ok = true;
 
-    if (!pending)
-        snprintf(elapsed, sizeof(elapsed), " elapsed_us=%" PRId64,
-                 state->check_elapsed_us);
-    if (g_report_only)
-        snprintf(suffix, sizeof(suffix), " failures=%d", failures);
-    length = snprintf(text, size,
-                      "%s: v=1 phase=%s status=%s cpus=%" PRIu64
-                      " tsc_hz=%" PRIu64 " lapic_hz=%" PRIu64
-                      " generation=%" PRIu64 "%s%s\n",
-                      abi_prefix(), state->check_phase, state->check_status,
-                      state->check_cpus, state->tsc_hz, state->lapic_hz,
-                      state->generation, elapsed, suffix);
-    if (length < 0 || (size_t)length >= size)
-        return;
-    snprintf(text + length, size - (size_t)length,
-             "%s: v=1 phase=runtime status=%s generation=%" PRIu64
-             " discontinuities=%" PRIu64 " offset_ns=%" PRId64
-             " uncertainty_ns=%" PRId64 " rejected_samples=%" PRIu64
-             " last_sample_error=%s\n",
-             abi_prefix(),
-             state->synchronized != 0 ? "synchronized" : "unsynchronized",
-             state->generation, state->discontinuities, state->offset_ns,
-             state->uncertainty_ns, state->rejected_samples,
-             state->last_sample_error);
+    text[0] = '\0';
+    for (int phase = 0; phase < CHECK_PHASES; phase++) {
+        const struct check_state *check = &state->checks[phase];
+        const char *status = check->status;
+        char elapsed[40] = "";
+        char suffix[40] = "";
+
+        if (status[0] == '\0')
+            continue;
+        if (strcmp(status, "pending") != 0)
+            snprintf(elapsed, sizeof(elapsed), " elapsed_us=%" PRId64,
+                     check->elapsed_us);
+        if (g_report_only)
+            snprintf(suffix, sizeof(suffix), " failures=%" PRId64,
+                     check->failures > 0 ? check->failures : 0);
+        ok = ok && strcmp(status, "ok") == 0;
+        append_text(text, size, &length,
+                    "%s: v=1 phase=%s status=%s cpus=%" PRIu64
+                    " tsc_hz=%" PRIu64 " lapic_hz=%" PRIu64
+                    " generation=%" PRIu64 "%s%s\n",
+                    abi_prefix(), k_phase_names[phase], status, check->cpus,
+                    state->tsc_hz, state->lapic_hz, check->generation, elapsed,
+                    suffix);
+    }
+    append_text(text, size, &length,
+                "%s: v=1 phase=runtime status=%s generation=%" PRIu64
+                " discontinuities=%" PRIu64 " offset_ns=%" PRId64
+                " uncertainty_ns=%" PRId64 " rejected_samples=%" PRIu64
+                " last_sample_error=%s\n",
+                abi_prefix(),
+                state->synchronized != 0 ? "synchronized" : "unsynchronized",
+                state->generation, state->discontinuities, state->offset_ns,
+                state->uncertainty_ns, state->rejected_samples,
+                state->last_sample_error);
+    return ok;
 }
 
 // Prints the time state on demand, after waiting for pending checks: CI and
 // the matrix driver run it over the console; production paths never do.
+// Exits with 0 only when every phase line reports ok.
 static int cmd_status(void)
 {
     struct time_state state;
-    char text[768];
-    int failures = 0;
-    int waited = wait_for_checks(&state);
+    char text[1024];
+    int waited = wait_for_checks(&state, false);
+    bool ok = format_status(&state, text, sizeof(text));
 
-    if (waited < 0) {
-        fprintf(stderr, "nvx-time: the time state is unavailable\n");
-        return 1;
-    }
-    if (g_report_only && read_text(REPORT_PATH, text, sizeof(text)) >= 0)
-        (void)sscanf(text, "failures=%d", &failures);
-    format_status(&state, failures, text, sizeof(text));
     fputs(text, stdout);
     fflush(stdout);
-    return waited == 0 ? 0 : 1;
+    return waited == 0 && ok ? 0 : 1;
 }
 
 static int cmd_sample(void)
@@ -4645,17 +4738,19 @@ static int cmd_test(int argc, char **argv)
     }
     if (strcmp(name, "state") == 0)
         return test_state(argc, argv);
-    if (strcmp(name, "status") == 0 && argc == 3) {
+    if (strcmp(name, "status") == 0 && argc == 2) {
         static char text[4096];
         struct time_state state;
-        char out[768];
+        char out[1024];
+        bool ok;
 
         if (test_text(argv[0], text, sizeof(text)) != 0 ||
             state_parse(text, &state) != 0)
             return 2;
         g_report_only = strcmp(argv[1], "report-only") == 0;
-        format_status(&state, atoi(argv[2]), out, sizeof(out));
+        ok = format_status(&state, out, sizeof(out));
         fputs(out, stdout);
+        printf("ok=%d\n", ok ? 1 : 0);
         return 0;
     }
     if (strcmp(name, "restore-record") == 0)

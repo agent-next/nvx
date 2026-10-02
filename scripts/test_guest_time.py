@@ -553,9 +553,9 @@ class GuestTimeTests(unittest.TestCase):
         self.assertEqual(syslog([*lines, own_event]), ["ok"])
 
     def test_daemon_lines_start_on_a_fresh_console_line(self):
-        # The daemon prints the restore marker and runtime events while a
-        # shell may be in the middle of a line (its prompt, for example).
-        line = "NVX-TIME-ABI: v=1 phase=restore status=ok\n"
+        # The daemon prints violation events while a shell may be in the
+        # middle of a line (its prompt, for example).
+        line = "NVX-TIME-ABI-VIOLATION: v=1 code=G_RCU_STALL source=watcher\n"
         self.assertEqual(self.run_test("console", line, "sync"), line)
         self.assertEqual(self.run_test("console", line, "async"), "\n" + line)
 
@@ -734,8 +734,10 @@ class GuestTimeTests(unittest.TestCase):
     def test_state_file_round_trip(self):
         # The keys and their order follow the spec's state file table.
         text = (
-            "version=1\ngeneration=2\ncheck_phase=restore\ncheck_status=ok\n"
-            "check_cpus=4\ncheck_elapsed_us=1830\ntsc_hz=2194843000\n"
+            "version=1\ngeneration=2\nboot_status=ok\ncapture_status=ok\n"
+            "restore_status=pending\nboot_cpus=8\ncapture_cpus=8\nrestore_cpus=0\n"
+            "boot_elapsed_us=2400\ncapture_elapsed_us=310\nrestore_elapsed_us=1830\n"
+            "capture_generation=1\nrestore_generation=2\ntsc_hz=2194843000\n"
             "lapic_hz=200000000\ndiscontinuities=3\nlast_discontinuity=step\n"
             "last_step_ns=-200000000\nlast_step_realtime_ns=1790841600000000000\n"
             "last_downtime_ns=31000000000\nlast_downtime_source=utc\n"
@@ -744,11 +746,22 @@ class GuestTimeTests(unittest.TestCase):
             "last_sample_error=none\nviolations=0\n"
         )
         self.assertEqual(self.run_test("state", self.fixture("state.txt", text)), text)
-        # A fresh state is the pending boot check.
+        # Report-only mode adds the failure counts, reserved for it, after the
+        # generations, and a failed check's status is fail.
+        report = text.replace("restore_status=pending", "restore_status=fail").replace(
+            "restore_generation=2\n",
+            "restore_generation=2\nboot_failures=0\ncapture_failures=0\n"
+            "restore_failures=3\n",
+        )
+        self.assertEqual(
+            self.run_test("state", self.fixture("state.txt", report)), report
+        )
+        # A fresh state is the pending boot check; the capture and restore keys
+        # are absent until those checks first run.
         self.assertTrue(
             self.run_test("state", self.fixture("state.txt", "version=1\n")).startswith(
-                "version=1\ngeneration=0\ncheck_phase=boot\ncheck_status=pending\n"
-                "check_cpus=0\ncheck_elapsed_us=0\ntsc_hz=0\nlapic_hz=0\n"
+                "version=1\ngeneration=0\nboot_status=pending\nboot_cpus=0\n"
+                "boot_elapsed_us=0\ntsc_hz=0\nlapic_hz=0\n"
             )
         )
         self.assertEqual(
@@ -758,45 +771,81 @@ class GuestTimeTests(unittest.TestCase):
             "error",
         )
 
-    def status(self, text: str, mode: str = "enforcing", failures: int = 0) -> str:
+    def status(self, text: str, mode: str = "enforcing") -> list[str]:
         return self.run_test(
-            "status", self.fixture("state.txt", text), mode, str(failures)
-        )
+            "status", self.fixture("state.txt", text), mode
+        ).splitlines()
 
-    def test_status_prints_the_last_check_and_the_runtime_line(self):
+    def test_status_prints_every_recorded_check_and_the_runtime_line(self):
         state = (
-            "version=1\ngeneration=1\ncheck_phase=restore\ncheck_status=ok\n"
-            "check_cpus=4\ncheck_elapsed_us=1830\ntsc_hz=2194843000\n"
-            "lapic_hz=200000000\ndiscontinuities=1\nsynchronized=1\n"
+            "version=1\ngeneration=2\nboot_status=ok\ncapture_status=ok\n"
+            "restore_status=ok\nboot_cpus=8\ncapture_cpus=8\nrestore_cpus=4\n"
+            "boot_elapsed_us=2400\ncapture_elapsed_us=310\nrestore_elapsed_us=1830\n"
+            "capture_generation=1\nrestore_generation=2\ntsc_hz=2194843000\n"
+            "lapic_hz=200000000\ndiscontinuities=2\nsynchronized=1\n"
             "offset_ns=-42\nuncertainty_ns=1800\nrejected_samples=2\n"
             "last_sample_error=G_SAMPLE_UNCERTAIN\n"
         )
+        rates = "tsc_hz=2194843000 lapic_hz=200000000"
+        # One line per recorded phase, each with the generation its check ran
+        # in, then the runtime line; the hook adds whether status exits 0.
         self.assertEqual(
             self.status(state),
-            "NVX-TIME-ABI: v=1 phase=restore status=ok cpus=4 tsc_hz=2194843000 "
-            "lapic_hz=200000000 generation=1 elapsed_us=1830\n"
-            "NVX-TIME-ABI: v=1 phase=runtime status=synchronized generation=1 "
-            "discontinuities=1 offset_ns=-42 uncertainty_ns=1800 "
-            "rejected_samples=2 last_sample_error=G_SAMPLE_UNCERTAIN\n",
-        )
-        # A check still pending after the wait has no elapsed_us.
-        pending = state.replace("check_status=ok", "check_status=pending")
-        pending = pending.replace("synchronized=1", "synchronized=0")
-        self.assertEqual(
-            self.status(pending).splitlines(),
             [
-                "NVX-TIME-ABI: v=1 phase=restore status=pending cpus=4 "
-                "tsc_hz=2194843000 lapic_hz=200000000 generation=1",
-                "NVX-TIME-ABI: v=1 phase=runtime status=unsynchronized "
-                "generation=1 discontinuities=1 offset_ns=-42 uncertainty_ns=1800 "
+                f"NVX-TIME-ABI: v=1 phase=boot status=ok cpus=8 {rates} "
+                "generation=0 elapsed_us=2400",
+                f"NVX-TIME-ABI: v=1 phase=capture status=ok cpus=8 {rates} "
+                "generation=1 elapsed_us=310",
+                f"NVX-TIME-ABI: v=1 phase=restore status=ok cpus=4 {rates} "
+                "generation=2 elapsed_us=1830",
+                "NVX-TIME-ABI: v=1 phase=runtime status=synchronized generation=2 "
+                "discontinuities=2 offset_ns=-42 uncertainty_ns=1800 "
                 "rejected_samples=2 last_sample_error=G_SAMPLE_UNCERTAIN",
+                "ok=1",
             ],
         )
-        # Report-only mode marks both lines and counts the check's failures.
-        report = self.status(state, "report-only", 3).splitlines()
-        self.assertTrue(report[0].startswith("NVX-TIME-REPORT: v=1 phase=restore "))
-        self.assertTrue(report[0].endswith(" elapsed_us=1830 failures=3"))
-        self.assertTrue(report[1].startswith("NVX-TIME-REPORT: v=1 phase=runtime "))
+        # A check still pending after the wait has no elapsed_us and fails the
+        # exit status. A cold boot has a boot line only, and a state without a
+        # boot record counts as a pending boot check.
+        pending = state.replace("restore_status=ok", "restore_status=pending")
+        self.assertEqual(
+            self.status(pending)[2::2],
+            [
+                f"NVX-TIME-ABI: v=1 phase=restore status=pending cpus=4 {rates} "
+                "generation=2",
+                "ok=0",
+            ],
+        )
+        boot_pending = (
+            "NVX-TIME-ABI: v=1 phase=boot status=pending cpus=0 tsc_hz=0 "
+            "lapic_hz=0 generation=0"
+        )
+        for text in ("version=1\ngeneration=0\nboot_status=pending\n", "version=1\n"):
+            lines = self.status(text)
+            self.assertEqual(lines[0], boot_pending, text)
+            self.assertTrue(lines[1].startswith("NVX-TIME-ABI: v=1 phase=runtime "))
+            self.assertEqual(lines[2:], ["ok=0"], text)
+        # Report-only mode marks every line and appends each check's failure
+        # count from the state file, where a failed check's status is fail.
+        report = self.status(
+            state.replace("restore_status=ok", "restore_status=fail").replace(
+                "restore_generation=2\n",
+                "restore_generation=2\nboot_failures=0\nrestore_failures=3\n",
+            ),
+            "report-only",
+        )
+        self.assertEqual(
+            report[0],
+            f"NVX-TIME-REPORT: v=1 phase=boot status=ok cpus=8 {rates} "
+            "generation=0 elapsed_us=2400 failures=0",
+        )
+        self.assertEqual(
+            report[2],
+            f"NVX-TIME-REPORT: v=1 phase=restore status=fail cpus=4 {rates} "
+            "generation=2 elapsed_us=1830 failures=3",
+        )
+        self.assertTrue(report[3].startswith("NVX-TIME-REPORT: v=1 phase=runtime "))
+        self.assertEqual(report[4], "ok=0")
 
     def restore_record(self, text: str) -> str:
         return self.run_test(
