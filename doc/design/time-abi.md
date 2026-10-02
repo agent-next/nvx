@@ -1747,7 +1747,7 @@ wiring v7m on the production kernel (`vmlinux-lockstep`), with at least
 
 | Backend | Boot | Capture | Restore | Measured on |
 | --- | --- | --- | --- | --- |
-| KVM | 6 + 2 | 1 + 0.4 | 5 + 1.75 | prometheus32 and `azure-kvm-5`, 128 MiB |
+| KVM | 6 + 2 | 1 + 0.4 | 6.5 + 1.5 | prometheus32 and `azure-kvm-5`, 128 MiB |
 | MSHV | 3 + 0.75 | 1 + 0.4 | 2.5 + 0.5 | prometheus30 and `azure-azlinux-5`, 128 MiB |
 | WHP | 20 + 1.5 | 1 + 0.4 | 35 + 6 | prometheus28 and the 8370C and 8573C runners, 512 MiB |
 
@@ -1766,8 +1766,8 @@ counts the host stalls of their first touches of restored RAM:
   toucher about 1.1 ms on bare metal (see MSHV root-driver costs). The
   restore budget leaves room for one more stall above every maximum.
 - On `azure-kvm-5`, KVM's restore checks fault in the file-backed restored
-  RAM 4 KiB at a time: medians of 3.3 to 7.8 ms at 1 to 8 vCPUs, and a
-  maximum of 13.14 ms.
+  RAM 4 KiB at a time: medians of 3.4 to 7.6 ms at 1 to 8 vCPUs, and maxima
+  of 5.15 ms at 1 vCPU and 13.14 ms at 8, over 72 restores.
 
 KVM's and MSHV's budgets come from 128 MiB guests, the size that CI and the
 fleet matrices run.
