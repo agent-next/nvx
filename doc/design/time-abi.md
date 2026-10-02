@@ -1058,10 +1058,10 @@ mounting `/proc`, `/sys`, and `/dev`, it takes a time sample within the
 [uncertainty bound](#uncertainty-bounds) and steps the clock to host UTC
 (`C12`), so the workload starts on host time; this step is not counted as a
 discontinuity. Init then reports shell-ready (or starts the workload, in
-modes without a shell) and runs every other boot check asynchronously: at
-`SCHED_IDLE` for the first 100 ms after shell-ready, and at normal priority
-after that (see [Snapshot agent](#snapshot-agent)). The checks start the
-daemon when they pass. Every check stays
+modes without a shell) and runs every other boot check asynchronously,
+starting 100 ms after shell-ready at `SCHED_IDLE`, and at normal priority
+from 100 ms after they start (see [Snapshot agent](#snapshot-agent)). The
+checks start the daemon when they pass. Every check stays
 fail-fast: a failure powers the guest off with status 193, even if the
 workload is running. A guest that powers off before its checks finish skips them, which
 is why CI takes its evidence from `nvx-time status`, which waits for them.
@@ -1151,7 +1151,8 @@ line by its `phase`.
 is still pending after 30 s, its line reports `status=pending`, without
 `elapsed_us` or `cpu_us`, and the exit status is 1.
 
-At boot, the checks' work is the checks and the daemon start; at capture,
+At boot, the checks' work is the checks and the daemon start, but not the
+100 ms delay after shell-ready; at capture,
 the step 1 checks of the [snapshot agent](#snapshot-agent). At restore, it
 is steps 6 to 12 and the step 11 checks, but not step 13's 100 ms delay, the
 grace period wait, or the deferred `C7`. `elapsed_us` is that work's wall
@@ -1300,25 +1301,27 @@ extra process costs 2 to 4 ms after a restore (fork and exec under demand
 faulting, measured on KVM).
 
 Step 13 starts 100 ms after the acknowledgement (or after step 10, when none
-is required). Starting it earlier slows the restored guest: its checks
-contend with the readiness path while the VMM is still demand-faulting guest
-memory, even at `SCHED_IDLE`. On WHP (prometheus28, 512 MiB, measurement-only
-builds) that added 6 to 12 ms to 2-vCPU restores, whereas the 100 ms delay
-left them 0.8 and 1.2 ms over the release guest at 1 and 2 vCPUs.
+is required), and the asynchronous boot checks start 100 ms after
+shell-ready. Starting them earlier slows the guest: their checks contend
+with the readiness path on the other vCPUs, even at `SCHED_IDLE`. On WHP
+(prometheus28, 512 MiB, measurement-only builds), checks right after the
+acknowledgement added 6 to 12 ms to 2-vCPU restores, whereas the 100 ms
+delay left them 0.8 and 1.2 ms over the release guest at 1 and 2 vCPUs. On
+MSHV (prometheus30), boot checks right after shell-ready added about 3 ms
+to 2-vCPU cold boots. KVM showed no clear effect either way.
 
 Step 13 and the asynchronous boot checks run at `SCHED_IDLE`, so on few
 vCPUs they never take a CPU from the restored or starting workload. Work
-that has not finished 100 ms after it starts (step 13) or after shell-ready
-(the boot checks) continues at normal priority. Every check stays
-fail-fast: a failing restore check powers the guest off about 100 ms after
-the acknowledgement on an idle guest, and at most about 200 ms plus the
-checks' own run time on a CPU-bound one. A failing boot check powers it off
-within about 100 ms plus the checks' run time after shell-ready, where
-`SCHED_IDLE` alone would allow about 0.5 s or more. `nvx-time status` waits
-for this deferred work, within its 30 s bound. The watcher and the
-discipline always run at normal priority, and stall suppression stays set
-until the release. Repair failures emit a violation event and power off
-with status 195.
+that has not finished 100 ms after it starts continues at normal priority.
+Every check stays fail-fast: a failing check powers the guest off about
+100 ms after the acknowledgement or shell-ready on an idle guest, and at
+most about 200 ms plus the checks' own run time after it on a CPU-bound
+one, where `SCHED_IDLE` alone would allow about 0.5 s or more. The `elapsed_us`
+and `cpu_us` of both exclude the 100 ms delay. `nvx-time status` waits for
+this deferred work, within its 30 s bound. The watcher and the discipline
+always run at normal priority, and stall suppression stays set until the
+release. Repair failures emit a violation event and power off with status
+195.
 
 ### RCU grace period release
 
