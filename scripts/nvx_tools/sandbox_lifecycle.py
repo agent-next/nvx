@@ -36,10 +36,6 @@ CONTROL_SOCKET_NAME = "control.sock"
 OUTCOME_NAME = "outcome.json"
 STATE_FORMAT = 1
 CONFIG_FORMAT = 1
-# Format-1 readers ignore unknown fields, so a configuration with a live share
-# uses a format that older NVX releases reject instead of starting without it.
-MOUNT_CONFIG_FORMAT = 2
-CONFIG_FORMATS = (CONFIG_FORMAT, MOUNT_CONFIG_FORMAT)
 OUTCOME_SCHEMA_VERSION = 1
 
 
@@ -61,7 +57,7 @@ def _read_json(
     description: str,
     *,
     version_field: str = "format",
-    version: int | tuple[int, ...] = STATE_FORMAT,
+    version: int = STATE_FORMAT,
 ) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -70,8 +66,7 @@ def _read_json(
     if not isinstance(value, dict):
         raise ScriptError(f"{description} has an unsupported format: {path}")
     typed = cast(dict[str, Any], value)
-    accepted = (version,) if isinstance(version, int) else version
-    if typed.get(version_field) not in accepted:
+    if typed.get(version_field) != version:
         raise ScriptError(f"{description} has an unsupported format: {path}")
     return typed
 
@@ -180,7 +175,7 @@ def _serialize_launch(
     cmdline: str,
 ) -> dict[str, Any]:
     return {
-        "format": CONFIG_FORMAT if launch.mount is None else MOUNT_CONFIG_FORMAT,
+        "format": CONFIG_FORMAT,
         "layers": [
             {
                 "role": layer.role,
@@ -266,8 +261,6 @@ def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ScriptError("sandbox configuration is malformed") from error
-    if (config.get("format") == MOUNT_CONFIG_FORMAT) != (launch.mount is not None):
-        raise ScriptError("sandbox configuration format does not match its mount")
     return launch.validated()
 
 
@@ -375,7 +368,7 @@ def start(state_path: Path, timeout: float) -> None:
     config = _read_json(
         require_file(state_dir / CONFIG_NAME, "sandbox configuration"),
         "sandbox configuration",
-        version=CONFIG_FORMATS,
+        version=CONFIG_FORMAT,
     )
     if (state_dir / RUNTIME_NAME).exists():
         raise ScriptError("sandbox is already running or has stale runtime state")

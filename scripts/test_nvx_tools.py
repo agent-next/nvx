@@ -6079,13 +6079,7 @@ class SandboxTests(unittest.TestCase):
             config = json.loads(
                 (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
             )
-            self.assertEqual(config["format"], sandbox_lifecycle.MOUNT_CONFIG_FORMAT)
-            with self.assertRaisesRegex(common.ScriptError, "unsupported format"):
-                sandbox_lifecycle._read_json(
-                    state / sandbox_lifecycle.CONFIG_NAME,
-                    "sandbox configuration",
-                    version=1,
-                )
+            self.assertEqual(config["format"], sandbox_lifecycle.CONFIG_FORMAT)
             self.assertEqual(
                 config["mount"],
                 {
@@ -6122,6 +6116,14 @@ class SandboxTests(unittest.TestCase):
             )
             self.assertEqual(command[command.index("--mount-deny") + 1], "secrets")
 
+            # Every configuration uses one format, with or without a share.
+            config["format"] = 2
+            (state / sandbox_lifecycle.CONFIG_NAME).write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(common.ScriptError, "unsupported format"):
+                sandbox_lifecycle.start(state, 10)
+
     def test_managed_lifecycle_accepts_configuration_without_mount(self):
         config: dict[str, object] = {
             "format": sandbox_lifecycle.CONFIG_FORMAT,
@@ -6145,33 +6147,35 @@ class SandboxTests(unittest.TestCase):
 
         with (
             patch.object(sandbox, "require_file", side_effect=require),
+            tempfile.TemporaryDirectory() as share,
         ):
             self.assertIsNone(sandbox_lifecycle._deserialize_launch(config).mount)
-            config["format"] = sandbox_lifecycle.MOUNT_CONFIG_FORMAT
-            with self.assertRaisesRegex(common.ScriptError, "does not match"):
-                sandbox_lifecycle._deserialize_launch(config)
             config["mount"] = {"guest_target": "/workspace"}
             with self.assertRaisesRegex(common.ScriptError, "malformed"):
                 sandbox_lifecycle._deserialize_launch(config)
             config["mount"] = {
                 "guest_target": "/proc",
-                "host_path": "share",
+                "host_path": share,
                 "access": "rw",
                 "denied_paths": [],
                 "owner": "vmm",
             }
             with self.assertRaisesRegex(common.ScriptError, "reserved"):
                 sandbox_lifecycle._deserialize_launch(config)
+            # Configurations with and without a share use the same format.
             config["mount"] = {
                 "guest_target": "/workspace",
-                "host_path": "share",
+                "host_path": share,
                 "access": "rw",
                 "denied_paths": [],
                 "owner": "vmm",
             }
-            config["format"] = sandbox_lifecycle.CONFIG_FORMAT
-            with self.assertRaisesRegex(common.ScriptError, "does not match"):
-                sandbox_lifecycle._deserialize_launch(config)
+            mount = sandbox_lifecycle._deserialize_launch(config).mount
+            assert mount is not None
+            self.assertEqual(
+                (mount.guest_target, mount.host_path, mount.access, mount.owner),
+                ("/workspace", Path(share), "rw", "vmm"),
+            )
 
     def test_mount_owner_defaults_to_vmm_and_forwards_caller(self):
         default = sandbox.SandboxMount.parse("/workspace,host-dir,rw")
@@ -6369,7 +6373,7 @@ class SandboxTests(unittest.TestCase):
 
             config_path = state / sandbox_lifecycle.CONFIG_NAME
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual(config["format"], sandbox_lifecycle.MOUNT_CONFIG_FORMAT)
+            self.assertEqual(config["format"], sandbox_lifecycle.CONFIG_FORMAT)
             self.assertEqual(config["mount"]["owner"], "caller")
 
             process = MagicMock()
@@ -6413,7 +6417,7 @@ class SandboxTests(unittest.TestCase):
             "owner": "caller",
         }
         config: dict[str, object] = {
-            "format": sandbox_lifecycle.MOUNT_CONFIG_FORMAT,
+            "format": sandbox_lifecycle.CONFIG_FORMAT,
             "layers": [
                 {
                     "role": "distro",
