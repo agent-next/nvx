@@ -281,7 +281,10 @@ def configure_parser(
     parser: argparse.ArgumentParser,
     repository_dir: Path,
 ) -> None:
-    default_cpus = ",".join(str(cpu) for cpu in sorted(physical_cpu_representatives()))
+    default_cpus = ",".join(
+        str(cpu)
+        for cpu in sorted(apply_hybrid_cpu_filter(physical_cpu_representatives()))
+    )
     parser.description = (
         "Build and benchmark OpenVMM microVM boot or the host-side phase 2 "
         "snapshot foundations. No NVX VMM binary is built or run."
@@ -640,6 +643,63 @@ def physical_cpu_representatives() -> set[int]:
         if representatives:
             return representatives
     return set(range(os.cpu_count() or 1))
+
+
+def cpu_frequency_classes() -> dict[int, set[int]]:
+    """Group logical CPUs by their cpuinfo_max_freq cluster.
+
+    Hybrid parts (Intel P+E cores, AMD hybrid) expose distinct per-CPU
+    maximum frequencies; homogeneous parts collapse to a single class.
+    CPUs without cpufreq information are ignored. Used to keep snapshot
+    capture and restore on one CPU model: KVM exposes CPUID leaves that
+    differ between core types (notably leaf 4 cache parameters), so a
+    snapshot taken on one core type fails OpenVMM's destination CPU
+    contract check when restored on another.
+    """
+    classes: dict[int, set[int]] = {}
+    for entry in sorted(
+        Path("/sys/devices/system/cpu").glob("cpu[0-9]*"),
+        key=lambda entry: _cpu_number(entry.name),
+    ):
+        freq_path = entry / "cpufreq" / "cpuinfo_max_freq"
+        try:
+            frequency = int(freq_path.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            continue
+        classes.setdefault(frequency, set()).add(_cpu_number(entry.name))
+    return classes
+
+
+def _cpu_number(name: str) -> int:
+    digits = name.removeprefix("cpu")
+    return int(digits) if digits.isdigit() else -1
+
+
+def apply_hybrid_cpu_filter(representatives: set[int]) -> set[int]:
+    """Restrict representatives to one frequency class on hybrid parts.
+
+    Selects the highest-frequency (performance) class by default so that
+    snapshot capture and restore observe an identical CPU contract.
+    ``NVX_CPU_CLASS=all`` disables the filter; ``NVX_CPU_CLASS=efficiency``
+    selects the lowest-frequency class instead. Frequencies within 10% of
+    each other are treated as one class: turbo-favored cores of the same
+    physical type report slightly higher maxima and must not split it.
+    """
+    preference = os.environ.get("NVX_CPU_CLASS", "performance").strip().lower()
+    classes = cpu_frequency_classes()
+    if len(classes) < 2 or preference == "all":
+        return representatives
+    ordered = sorted(classes)
+    clusters: list[list[int]] = [[ordered[0]]]
+    for frequency in ordered[1:]:
+        if frequency <= clusters[-1][-1] * 1.10:
+            clusters[-1].append(frequency)
+        else:
+            clusters.append([frequency])
+    cluster = clusters[0] if preference == "efficiency" else clusters[-1]
+    allowed = {cpu for f in cluster for cpu in classes[f]}
+    selected = {cpu for cpu in representatives if cpu in allowed}
+    return selected or representatives
 
 
 def windows_physical_cpu_representatives() -> set[int]:

@@ -1395,8 +1395,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def apply_hybrid_process_affinity() -> None:
+    """Pin this process (and inherited children) to one CPU class on hybrid parts.
+
+    KVM exposes core-type-dependent CPUID leaves on hybrid CPUs, so an
+    OpenVMM snapshot captured on one core type fails the destination CPU
+    contract check when restored on another. On a hybrid Linux host without
+    an explicit affinity, bind this process tree to the performance cores so
+    ``run``, ``test-microvm``, and ``sandbox`` stay snapshot-portable.
+    ``NVX_CPU_CLASS=efficiency`` or ``all`` selects the other class or
+    disables the binding. Subcommands that manage affinity themselves
+    (``benchmark``) are skipped because they set affinity per process.
+    """
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+    if command == "benchmark" or os.environ.get("NVX_CPU_CLASS", "").lower() == "all":
+        return
+    try:
+        from nvx_tools.benchmark import (
+            apply_hybrid_cpu_filter,
+            physical_cpu_representatives,
+        )
+
+        selected = apply_hybrid_cpu_filter(physical_cpu_representatives())
+        current = os.sched_getaffinity(0)
+        restricted = current & selected
+        if restricted and restricted != current:
+            os.sched_setaffinity(0, restricted)
+    except (OSError, ImportError, AttributeError):
+        return
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    apply_hybrid_process_affinity()
     try:
         result = args.handler(args)
     except KeyboardInterrupt:
