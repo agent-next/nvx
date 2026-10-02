@@ -124,9 +124,13 @@
 #define SLOW_TIME_CONSTANT 6
 #define TIMER_LIST_WAIT_NS (200 * NSEC_PER_MSEC)
 #define DEFAULT_STALL_TIMEOUT_S 21
-// The asynchronous boot checks and restore step 13 run at SCHED_IDLE for
-// 100 ms, then at normal priority, which bounds the fail-fast window under a
-// CPU-bound workload.
+// The asynchronous boot checks start 100 ms after the time ABI boot step,
+// which init runs shortly before shell-ready, and restore step 13 100 ms
+// after the acknowledgement: earlier, they contend with the readiness path
+// while the VMM still demand-faults guest memory. Both start at SCHED_IDLE
+// and continue at normal priority 100 ms after they start, which bounds the
+// fail-fast window under a CPU-bound workload.
+#define DEFERRED_START_NS (100 * NSEC_PER_MSEC)
 #define IDLE_BOUND_NS (100 * NSEC_PER_MSEC)
 // nvx-time status and pre-capture wait at most 30 s for pending checks.
 #define STATUS_WAIT_NS (30 * NSEC_PER_SEC)
@@ -178,6 +182,13 @@ static int64_t clock_ns(clockid_t clock)
 
     clock_gettime(clock, &now);
     return (int64_t)now.tv_sec * NSEC_PER_SEC + now.tv_nsec;
+}
+
+// The CPU time of this process, every thread's, exited threads' included:
+// what the spec's cpu_us sums.
+static int64_t cpu_time_ns(void)
+{
+    return clock_ns(CLOCK_PROCESS_CPUTIME_ID);
 }
 
 static int write_all(int fd, const void *data, size_t size)
@@ -654,13 +665,15 @@ static void fail_fatal(int status, const char *code, const char *source,
 
 // A conformance check's record: STATUS is empty until the phase first runs,
 // then "pending" while its check runs, then "ok" (a failed check powers the
-// guest off; report-only mode records "fail" instead). GENERATION is g when
-// the check ran; the boot check's is 0. FAILURES is the check's failure
-// count, kept in report-only mode only, and -1 otherwise.
+// guest off; report-only mode records "fail" instead). ELAPSED_US is the
+// check's wall time and CPU_US its CPU time over every process that ran it.
+// GENERATION is g when the check ran; the boot check's is 0. FAILURES is the
+// check's failure count, kept in report-only mode only, and -1 otherwise.
 struct check_state {
     char status[16];
     uint64_t cpus;
     int64_t elapsed_us;
+    int64_t cpu_us;
     uint64_t generation;
     int64_t failures;
 };
@@ -730,6 +743,9 @@ static int state_parse(char *text, struct time_state *state)
         {"boot_elapsed_us", NULL, &boot->elapsed_us},
         {"capture_elapsed_us", NULL, &capture->elapsed_us},
         {"restore_elapsed_us", NULL, &restore->elapsed_us},
+        {"boot_cpu_us", NULL, &boot->cpu_us},
+        {"capture_cpu_us", NULL, &capture->cpu_us},
+        {"restore_cpu_us", NULL, &restore->cpu_us},
         {"capture_generation", &capture->generation, NULL},
         {"restore_generation", &restore->generation, NULL},
         {"boot_failures", NULL, &boot->failures},
@@ -839,6 +855,11 @@ static void state_format(const struct time_state *state, char *text,
         if (state->checks[phase].status[0] != '\0')
             append_text(text, size, &length, "%s_elapsed_us=%" PRId64 "\n",
                         k_phase_names[phase], state->checks[phase].elapsed_us);
+    }
+    for (int phase = 0; phase < CHECK_PHASES; phase++) {
+        if (state->checks[phase].status[0] != '\0')
+            append_text(text, size, &length, "%s_cpu_us=%" PRId64 "\n",
+                        k_phase_names[phase], state->checks[phase].cpu_us);
     }
     for (int phase = PHASE_CAPTURE; phase < CHECK_PHASES; phase++) {
         if (state->checks[phase].status[0] != '\0')
@@ -950,6 +971,7 @@ struct check_record {
     const char *status;
     int cpus;
     int64_t elapsed_us;
+    int64_t cpu_us;
     uint64_t tsc_hz;
     uint64_t lapic_hz;
     int failures;
@@ -963,6 +985,7 @@ static void apply_check(struct time_state *state, const void *context)
     snprintf(check->status, sizeof(check->status), "%s", record->status);
     check->cpus = (uint64_t)record->cpus;
     check->elapsed_us = record->elapsed_us;
+    check->cpu_us = record->cpu_us;
     check->generation = record->phase == PHASE_BOOT ? 0 : state->generation;
     check->failures = -1;
     // Report-only mode keeps the failures in the state file, as the spec's
@@ -980,14 +1003,15 @@ static void apply_check(struct time_state *state, const void *context)
 
 // Records a phase's conformance check in the state file: "pending" while it
 // runs, then "ok" (a failed check powers the guest off instead), with the
-// generation it ran in. Rates of 0 keep the published ones. Report-only mode
-// records "fail" and the failure count of a check that failed.
+// generation it ran in and its wall and CPU times. Rates of 0 keep the
+// published ones. Report-only mode records "fail" and the failure count of a
+// check that failed.
 static int record_check(enum phase phase, const char *status, int cpus,
-                        int64_t elapsed_us, uint64_t tsc_hz, uint64_t lapic_hz,
-                        int failures)
+                        int64_t elapsed_us, int64_t cpu_us, uint64_t tsc_hz,
+                        uint64_t lapic_hz, int failures)
 {
-    struct check_record record = {phase,  status,   cpus,    elapsed_us,
-                                  tsc_hz, lapic_hz, failures};
+    struct check_record record = {phase,  status, cpus,     elapsed_us,
+                                  cpu_us, tsc_hz, lapic_hz, failures};
 
     return state_apply(apply_check, &record);
 }
@@ -2641,25 +2665,50 @@ static void promoter_stop(struct promoter *promoter)
     pthread_join(promoter->thread, NULL);
 }
 
+// The readiness path's wall and CPU times travel to the daemon in one
+// sigqueue() value, 64 bits on x86-64: each in microseconds, clamped to 32
+// bits, the wall time in the low half.
+_Static_assert(sizeof(void *) == sizeof(uint64_t), "sigval holds 64 bits");
+
+static uint64_t clamp_u32(int64_t value)
+{
+    return value < 0 ? 0 : value > UINT32_MAX ? UINT32_MAX : (uint64_t)value;
+}
+
+static uint64_t pack_readiness(int64_t elapsed_us, int64_t cpu_us)
+{
+    return clamp_u32(cpu_us) << 32 | clamp_u32(elapsed_us);
+}
+
+static void unpack_readiness(uint64_t value, int64_t *elapsed_us,
+                             int64_t *cpu_us)
+{
+    *elapsed_us = (int64_t)(value & UINT32_MAX);
+    *cpu_us = (int64_t)(value >> 32);
+}
+
 // Restore steps 12 and 13 on the readiness path: the acknowledgement when the
-// host gated its input, then hand step 13 to DAEMON, with the readiness
-// path's duration since START_NS (CLOCK_MONOTONIC), in microseconds, in the
-// signal. Returns -1, without acknowledging, when no daemon runs; 1 when the
-// daemon vanished after the acknowledgement. The caller has enabled the ports
-// when ACK is set.
-static int signal_restore(pid_t daemon, bool ack, int64_t start_ns)
+// host gated its input, then hand step 13 to DAEMON. The signal carries the
+// readiness path's wall time since START_NS (CLOCK_MONOTONIC) and its CPU
+// time since CPU_START_NS (this process's CPU clock, less any earlier
+// process's share), in microseconds, both read after the acknowledgement so
+// that neither read delays it. Returns -1, without acknowledging, when no
+// daemon runs; 1 when the daemon vanished after the acknowledgement. The
+// caller has enabled the ports when ACK is set.
+static int signal_restore(pid_t daemon, bool ack, int64_t start_ns,
+                          int64_t cpu_start_ns)
 {
     union sigval value;
     int64_t elapsed_us;
+    int64_t cpu_us;
 
     if (daemon <= 0 || kill(daemon, 0) != 0)
         return -1;
     if (ack)
         outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
     elapsed_us = (clock_ns(CLOCK_MONOTONIC) - start_ns) / NSEC_PER_USEC;
-    value.sival_int = (int)(elapsed_us < 0         ? 0
-                            : elapsed_us > INT_MAX ? INT_MAX
-                                                   : elapsed_us);
+    cpu_us = (cpu_time_ns() - cpu_start_ns) / NSEC_PER_USEC;
+    value.sival_ptr = (void *)(uintptr_t)pack_readiness(elapsed_us, cpu_us);
     return sigqueue(daemon, SIGUSR1, value) == 0 ? 0 : 1;
 }
 
@@ -3032,7 +3081,9 @@ struct daemon {
     int64_t worker_deadline_ns;
     bool suppression_released;
     bool restore_pending;
+    int64_t restore_due_ns;
     int64_t readiness_us;
+    int64_t readiness_cpu_us;
 };
 
 static void watcher_consume(void *context, const char *message)
@@ -3244,30 +3295,41 @@ static int parse_restore_record(const char *text, unsigned long long *generation
     return parse_new_cpus(cpus, new_cpus);
 }
 
+// The times that restore_work records. The wall time is READINESS_US, the
+// readiness path's, plus the checks' since START_NS, when they were due. The
+// CPU time is PRIOR_CPU_NS, the readiness path's and the daemon's share, plus
+// this process's since CPU_BASE_NS.
+struct restore_timing {
+    int64_t start_ns;
+    int64_t readiness_us;
+    int64_t prior_cpu_ns;
+    int64_t cpu_base_ns;
+};
+
 // Restore step 13, fail-fast: the step 11 restore checks, the grace-period
 // release, the saved watchdog settings, the deferred C7, and the restore
-// check's record. A child of the daemon runs it at SCHED_IDLE, and the daemon
-// raises it to normal priority after 100 ms and releases the suppression
-// itself at the stall timeout; restore-finish runs it inline, with its own
-// deadline (WITH_DEADLINE), in report-only mode when no daemon runs. The
-// recorded duration is READINESS_US, the readiness path's, plus the checks',
-// without the grace period wait or C7. Returns 0, or 1 when a report-only
-// release failed.
+// check's record. A child of the daemon runs it at SCHED_IDLE from 100 ms
+// after the acknowledgement; the daemon raises it to normal priority 100 ms
+// later and releases the suppression itself at the stall timeout.
+// restore-finish runs it inline, with its own deadline (WITH_DEADLINE), in
+// report-only mode when no daemon runs. Neither recorded time counts the
+// grace period wait or C7. Returns 0, or 1 when a report-only release failed.
 static int restore_work(const bool *new_cpus, int new_count, bool with_deadline,
-                        int64_t readiness_us)
+                        const struct restore_timing *timing)
 {
-    int64_t start = clock_ns(CLOCK_MONOTONIC);
     int64_t timeout_s = DEFAULT_STALL_TIMEOUT_S;
     char detail[DETAIL_MAX];
     struct checks checks;
     int64_t elapsed;
+    int64_t cpu;
     bool released;
 
     if (checks_init(&checks, PHASE_RESTORE) != 0)
         check_failed(&checks, "C6", "cannot read the CPU sets");
     else
         run_restore_checks(&checks, new_cpus, new_count);
-    elapsed = clock_ns(CLOCK_MONOTONIC) - start;
+    elapsed = clock_ns(CLOCK_MONOTONIC) - timing->start_ns;
+    cpu = timing->prior_cpu_ns + cpu_time_ns() - timing->cpu_base_ns;
     if (with_deadline) {
         (void)read_int64(RCU_STALL_TIMEOUT, &timeout_s);
         released = release_with_deadline(timeout_s);
@@ -3282,19 +3344,22 @@ static int restore_work(const bool *new_cpus, int new_count, bool with_deadline,
                    PHASE_RESTORE, "%s", detail);
     check_timer_list(&checks, TIMER_LIST_WAIT_NS);
     if (record_check(PHASE_RESTORE, "ok", checks.online_count,
-                     readiness_us + elapsed / NSEC_PER_USEC, 0, 0,
-                     checks.failures) != 0)
+                     timing->readiness_us + elapsed / NSEC_PER_USEC,
+                     cpu / NSEC_PER_USEC, 0, 0, checks.failures) != 0)
         check_failed(&checks, "C10", "cannot record the restore check: %s",
                      strerror(errno));
     return released ? 0 : 1;
 }
 
-// Starts restore step 13 after the acknowledgement, in a child at
-// SCHED_IDLE, so the watcher and the discipline keep normal priority; the
-// fork itself also runs at SCHED_IDLE. READINESS_US comes with the signal.
-static void start_restore(struct daemon *daemon, int64_t readiness_us)
+// Starts restore step 13 when it is due, 100 ms after the acknowledgement, in
+// a child at SCHED_IDLE, so the watcher and the discipline keep normal
+// priority; the fork itself also runs at SCHED_IDLE. The readiness path's
+// times came with the signal.
+static void start_restore(struct daemon *daemon)
 {
+    int64_t cpu_start = cpu_time_ns();
     bool new_cpus[MAX_CPUS] = {false};
+    struct restore_timing timing;
     struct time_state state;
     unsigned long long generation;
     int64_t timeout_s = DEFAULT_STALL_TIMEOUT_S;
@@ -3323,12 +3388,17 @@ static void start_restore(struct daemon *daemon, int64_t readiness_us)
         }
     }
     (void)read_int64(RCU_STALL_TIMEOUT, &timeout_s);
-    // The repair paired the clock with the packet's UTC.
-    daemon->last_accepted_ns = clock_ns(CLOCK_MONOTONIC);
+    // The worker's wall time runs from when step 13 was due. Its CPU time
+    // runs from the fork, and the daemon's share is this preparation.
+    timing.start_ns = daemon->restore_due_ns;
+    timing.readiness_us = daemon->readiness_us;
+    timing.cpu_base_ns = 0;
     set_idle_priority(0, true);
+    timing.prior_cpu_ns = daemon->readiness_cpu_us * NSEC_PER_USEC +
+                          cpu_time_ns() - cpu_start;
     pid = fork();
     if (pid == 0)
-        _exit(restore_work(new_cpus, new_count, false, readiness_us));
+        _exit(restore_work(new_cpus, new_count, false, &timing));
     set_idle_priority(0, false);
     if (pid < 0) {
         fail_fatal(STATUS_REPAIR, "G_REPAIR_SUPPRESSION", "repair",
@@ -3337,7 +3407,7 @@ static void start_restore(struct daemon *daemon, int64_t readiness_us)
         return;
     }
     daemon->worker_pid = pid;
-    daemon->worker_promote_ns = clock_ns(CLOCK_MONOTONIC) + IDLE_BOUND_NS;
+    daemon->worker_promote_ns = daemon->restore_due_ns + IDLE_BOUND_NS;
     daemon->worker_deadline_ns =
         clock_ns(CLOCK_MONOTONIC) + timeout_s * NSEC_PER_SEC;
     daemon->suppression_released = false;
@@ -3387,20 +3457,24 @@ static void handle_signals(struct daemon *daemon)
     while (read(daemon->signals, &info, sizeof(info)) == sizeof(info)) {
         if (info.ssi_signo == SIGTERM)
             _exit(0);
-        // sigqueue() carries the readiness path's duration in microseconds.
+        // sigqueue() carries the readiness path's wall and CPU times. Step 13
+        // is due 100 ms later; the repair paired the clock with the packet's
+        // UTC now.
         if (info.ssi_signo == SIGUSR1) {
             daemon->restore_pending = true;
-            daemon->readiness_us =
-                info.ssi_code == SI_QUEUE ? info.ssi_int : 0;
+            daemon->last_accepted_ns = clock_ns(CLOCK_MONOTONIC);
+            daemon->restore_due_ns =
+                daemon->last_accepted_ns + DEFERRED_START_NS;
+            daemon->readiness_us = 0;
+            daemon->readiness_cpu_us = 0;
+            if (info.ssi_code == SI_QUEUE)
+                unpack_readiness(info.ssi_ptr, &daemon->readiness_us,
+                                 &daemon->readiness_cpu_us);
         }
     }
-    // The previous restore's worker can end just before a capture, and the
-    // signalfd returns SIGUSR1 before SIGCHLD: reap before starting.
+    // A worker that ended, if any: the daemon loop starts a due restore only
+    // once the previous worker is reaped.
     reap_children(daemon);
-    if (daemon->restore_pending && daemon->worker_pid == 0) {
-        daemon->restore_pending = false;
-        start_restore(daemon, daemon->readiness_us);
-    }
 }
 
 // Sets up the daemon's signal and timer descriptors and its OOM exemption.
@@ -3443,6 +3517,16 @@ static int poll_timeout_until(int64_t deadline_ns)
                : (int)((remaining + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC);
 }
 
+// Returns the earlier of two poll timeouts, where -1 is none.
+static int earlier_timeout(int first, int second)
+{
+    if (first < 0)
+        return second;
+    if (second < 0)
+        return first;
+    return first < second ? first : second;
+}
+
 static void daemon_loop(struct daemon *daemon)
 {
     for (;;) {
@@ -3451,13 +3535,14 @@ static void daemon_loop(struct daemon *daemon)
                                 {daemon->timer, POLLIN, 0}};
         bool waiting = daemon->worker_pid > 0 && !daemon->suppression_released;
         bool idle = daemon->worker_pid > 0 && daemon->worker_promote_ns != 0;
-        int timeout = poll_timeout_until(idle ? daemon->worker_promote_ns : 0);
-        int deadline =
-            poll_timeout_until(waiting ? daemon->worker_deadline_ns : 0);
+        bool due = daemon->restore_pending && daemon->worker_pid == 0;
+        int timeout = earlier_timeout(
+            earlier_timeout(
+                poll_timeout_until(idle ? daemon->worker_promote_ns : 0),
+                poll_timeout_until(waiting ? daemon->worker_deadline_ns : 0)),
+            poll_timeout_until(due ? daemon->restore_due_ns : 0));
         int64_t now;
 
-        if (timeout < 0 || (deadline >= 0 && deadline < timeout))
-            timeout = deadline;
         if (poll(fds, ARRAY_SIZE(fds), timeout) < 0 && errno != EINTR) {
             sleep(1);
             continue;
@@ -3476,7 +3561,14 @@ static void daemon_loop(struct daemon *daemon)
             arm_timer(daemon);
         }
         now = clock_ns(CLOCK_MONOTONIC);
-        // Step 13 continues at normal priority 100 ms after the ack.
+        // Step 13 starts 100 ms after the ack, and continues at normal
+        // priority 100 ms after it starts.
+        if (daemon->restore_pending && daemon->worker_pid == 0 &&
+            now >= daemon->restore_due_ns) {
+            daemon->restore_pending = false;
+            start_restore(daemon);
+            now = clock_ns(CLOCK_MONOTONIC);
+        }
         if (daemon->worker_pid > 0 && daemon->worker_promote_ns != 0 &&
             now >= daemon->worker_promote_ns) {
             daemon->worker_promote_ns = 0;
@@ -3588,14 +3680,31 @@ static void boot_foreground(struct checks *checks, void *context)
     check_debug_watchdogs(checks);
 }
 
-// The asynchronous boot checks: every boot check but C12, after shell-ready,
-// fail-fast, at SCHED_IDLE for at most IDLE_BOUND_NS. When they pass, the
-// checker becomes the daemon and records the boot check, whose duration adds
-// C12's (C12_NS) and the daemon's start. It never returns.
-static void boot_checker(const struct boot_sample *sample, int64_t c12_ns,
-                         int c12_failures)
+// Sleeps until DEADLINE_NS on CLOCK_MONOTONIC.
+static void sleep_until(int64_t deadline_ns)
 {
-    int64_t start = clock_ns(CLOCK_MONOTONIC);
+    struct timespec when = {(time_t)(deadline_ns / NSEC_PER_SEC),
+                            (long)(deadline_ns % NSEC_PER_SEC)};
+
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &when, NULL) ==
+           EINTR)
+        ;
+}
+
+// The asynchronous boot checks: every boot check but C12, fail-fast, from
+// 100 ms after the boot step at SCHED_IDLE, and at normal priority from
+// IDLE_BOUND_NS after they start. When they pass, the checker becomes the
+// daemon and records the boot check, whose wall and CPU times add C12's
+// (C12_NS and C12_CPU_NS) and the daemon's start, but not the delay. It never
+// returns.
+static void boot_checker(const struct boot_sample *sample, int64_t c12_ns,
+                         int64_t c12_cpu_ns, int c12_failures)
+{
+    // The 100 ms count from this fork in the time ABI boot step, the one
+    // point that every guest mode shares: init runs it before the rest of its
+    // setup, so the checks start slightly less than 100 ms after shell-ready.
+    int64_t start = clock_ns(CLOCK_MONOTONIC) + DEFERRED_START_NS;
+    int64_t cpu_start = cpu_time_ns();
     int null = open("/dev/null", O_RDWR | O_CLOEXEC);
     struct boot_log_job log_job;
     struct promoter promoter;
@@ -3619,6 +3728,7 @@ static void boot_checker(const struct boot_sample *sample, int64_t c12_ns,
         _exit(1);
     promoting = promoter_start(&promoter, start);
     set_idle_priority(0, true);
+    sleep_until(start);
     if (checks_init(&checks, PHASE_BOOT) != 0) {
         check_failed(&checks, "C1", "cannot read the CPU sets");
         _exit(1);
@@ -3668,6 +3778,7 @@ static void boot_checker(const struct boot_sample *sample, int64_t c12_ns,
     if (record_check(PHASE_BOOT, "ok", checks.online_count,
                      (c12_ns + clock_ns(CLOCK_MONOTONIC) - start) /
                          NSEC_PER_USEC,
+                     (c12_cpu_ns + cpu_time_ns() - cpu_start) / NSEC_PER_USEC,
                      checks.tsc_hz, checks.lapic_hz, checks.failures) != 0)
         check_failed(&checks, "C10", "cannot publish the time state: %s",
                      strerror(errno));
@@ -3683,9 +3794,11 @@ static void boot_checker(const struct boot_sample *sample, int64_t c12_ns,
 static int cmd_boot(void)
 {
     int64_t start = clock_ns(CLOCK_MONOTONIC);
+    int64_t cpu_start = cpu_time_ns();
     struct boot_sample sample = {0, 0, 0};
     struct time_state state;
     struct checks checks;
+    int64_t c12_cpu;
     pid_t pid;
 
     g_generation = 0;
@@ -3706,9 +3819,11 @@ static int cmd_boot(void)
         return 1;
     }
     fflush(NULL);
+    // The child cannot read this process's CPU clock.
+    c12_cpu = cpu_time_ns() - cpu_start;
     pid = fork();
     if (pid == 0)
-        boot_checker(&sample, clock_ns(CLOCK_MONOTONIC) - start,
+        boot_checker(&sample, clock_ns(CLOCK_MONOTONIC) - start, c12_cpu,
                      checks.failures);
     if (pid < 0) {
         check_failed(&checks, "C10", "cannot start the boot checks: %s",
@@ -3753,6 +3868,7 @@ static void run_restore_checks(struct checks *checks, const bool *new_cpus,
 static int cmd_check(int argc, char **argv)
 {
     int64_t start = clock_ns(CLOCK_MONOTONIC);
+    int64_t cpu_start = cpu_time_ns();
     bool new_cpus[MAX_CPUS] = {false};
     int new_count = 0;
     enum phase phase = PHASE_RUNTIME;
@@ -3786,8 +3902,9 @@ static int cmd_check(int argc, char **argv)
     else
         run_restore_checks(&checks, new_cpus, new_count);
     (void)record_check(phase, "ok", checks.online_count,
-                       (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC, 0,
-                       0, checks.failures);
+                       (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC,
+                       (cpu_time_ns() - cpu_start) / NSEC_PER_USEC, 0, 0,
+                       checks.failures);
     return checks.failures == 0 ? 0 : 1;
 }
 
@@ -3826,8 +3943,10 @@ static int cmd_pre_capture(void)
 {
     struct time_state state;
     struct checks checks;
+    int64_t cpu_start;
     int64_t elapsed;
     int64_t start;
+    int64_t cpu;
 
     // Step 1: the asynchronous boot checks start the daemon that C10
     // requires.
@@ -3838,6 +3957,7 @@ static int cmd_pre_capture(void)
         return 1;
     }
     start = clock_ns(CLOCK_MONOTONIC);
+    cpu_start = cpu_time_ns();
     g_generation = (uint32_t)state.generation;
     if (checks_init(&checks, PHASE_CAPTURE) != 0) {
         check_failed(&checks, "C6", "cannot read the CPU sets");
@@ -3845,6 +3965,7 @@ static int cmd_pre_capture(void)
     }
     run_capture_checks(&checks);
     elapsed = clock_ns(CLOCK_MONOTONIC) - start;
+    cpu = cpu_time_ns() - cpu_start;
     if (suppression_save() != 0) {
         char detail[DETAIL_MAX];
         int error = errno;
@@ -3858,7 +3979,8 @@ static int cmd_pre_capture(void)
     }
     // Step 1's record travels in the snapshot.
     if (record_check(PHASE_CAPTURE, "ok", checks.online_count,
-                     elapsed / NSEC_PER_USEC, 0, 0, checks.failures) != 0)
+                     elapsed / NSEC_PER_USEC, cpu / NSEC_PER_USEC, 0, 0,
+                     checks.failures) != 0)
         check_failed(&checks, "C10", "cannot record the capture check: %s",
                      strerror(errno));
     return 0;
@@ -3882,6 +4004,7 @@ struct repair_record {
     int64_t step_realtime_ns;
     int64_t frequency;
     int64_t elapsed_us;
+    int64_t cpu_us;
 };
 
 static void apply_repair(struct time_state *state, const void *context)
@@ -3908,11 +4031,14 @@ static void apply_repair(struct time_state *state, const void *context)
              "none");
     // Step 8 marks this restore's check pending, so nvx-time status waits for
     // the daemon's step 13. Until then, restore_elapsed_us is the readiness
-    // path up to the clock step, at last_step_realtime_ns.
+    // path up to the clock step, at last_step_realtime_ns, and
+    // restore_cpu_us the helper's CPU time, which restore-finish adds to its
+    // own (0 when the helper finishes the restore itself).
     snprintf(state->checks[PHASE_RESTORE].status,
              sizeof(state->checks[PHASE_RESTORE].status), "pending");
     state->checks[PHASE_RESTORE].cpus = 0;
     state->checks[PHASE_RESTORE].elapsed_us = repair->elapsed_us;
+    state->checks[PHASE_RESTORE].cpu_us = repair->cpu_us;
     state->checks[PHASE_RESTORE].generation = state->generation;
     state->checks[PHASE_RESTORE].failures = -1;
 }
@@ -3926,14 +4052,14 @@ static int repair_failed(const char *code, const char *detail)
 // Restore steps 6 to 8: read the packet with four-byte reads, validate it,
 // and set the wall clock from its bracketed UTC, then write the entropy to
 // ENTROPY_FD, the caller's file at ENTROPY_PATH. START_NS is when the capture
-// request returned. The caller holds the portb lock. With FINISH (untiered)
-// and a DAEMON, a restore with no processors or memory to activate needs no
-// shell work before the acknowledgement, so steps 12 and 13 start here too
-// and no second helper process starts; the metadata then begins with 2
-// instead of 1.
+// request returned, and CPU_START_NS this process's CPU clock right after the
+// restore. The caller holds the portb lock. With FINISH (untiered) and a
+// DAEMON, a restore with no processors or memory to activate needs no shell
+// work before the acknowledgement, so steps 12 and 13 start here too and no
+// second helper process starts; the metadata then begins with 2 instead of 1.
 static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
-                          int entropy_fd, int64_t start_ns, bool finish,
-                          pid_t daemon)
+                          int entropy_fd, int64_t start_ns,
+                          int64_t cpu_start_ns, bool finish, pid_t daemon)
 {
     static uint8_t body[PACKET_MAX_SIZE];
     static struct restore_packet packet;
@@ -3946,6 +4072,7 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
     int64_t t1;
     int64_t sample_theta;
     int64_t sample_epsilon;
+    bool finishing;
     int finished = -1;
 
     t0 = clock_ns(CLOCK_REALTIME);
@@ -4001,6 +4128,15 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
     repair.step_realtime_ns = clock_ns(CLOCK_REALTIME);
     repair.elapsed_us = (clock_ns(CLOCK_MONOTONIC) - start_ns) / NSEC_PER_USEC;
     repair.packet = &packet;
+    // A plain untiered restore needs no shell work: this helper also
+    // acknowledges and hands step 13 to the daemon, and reads its CPU clock
+    // again only after the acknowledgement. Otherwise restore-finish adds
+    // this helper's CPU time to its own.
+    finishing = finish && daemon > 0 && packet.online_vp_count == 0 &&
+                packet.range_count == 0 &&
+                (packet.flags & PACKET_MEMORY_TARGET) == 0;
+    repair.cpu_us =
+        finishing ? 0 : (cpu_time_ns() - cpu_start_ns) / NSEC_PER_USEC;
     // The entropy goes to the caller in every case, an untiered restore's
     // too; the file already exists, empty, so only its bytes are written.
     if (pwrite(entropy_fd, packet.entropy, PACKET_ENTROPY_SIZE, 0) !=
@@ -4016,12 +4152,10 @@ static int repair_restore(const uint8_t *previous_id, const char *entropy_path,
         return repair_failed("G_REPAIR_CLOCK", detail);
     }
     format_hex(packet.entropy, GENERATION_ID_SIZE, id);
-    // A plain untiered restore needs no shell work: this helper also
-    // acknowledges and hands step 13 to the daemon.
-    if (finish && daemon > 0 && packet.online_vp_count == 0 &&
-        packet.range_count == 0 && (packet.flags & PACKET_MEMORY_TARGET) == 0) {
-        finished = signal_restore(
-            daemon, (packet.flags & PACKET_ACK_REQUIRED) != 0, start_ns);
+    if (finishing) {
+        finished = signal_restore(daemon,
+                                  (packet.flags & PACKET_ACK_REQUIRED) != 0,
+                                  start_ns, cpu_start_ns);
         if (finished > 0)
             fail_fatal(STATUS_CONFORMANCE, "G_CONFORMANCE_C10", "conformance",
                        PHASE_RESTORE, "the time daemon is not running");
@@ -4048,6 +4182,7 @@ static int cmd_capture(int argc, char **argv)
     char *end;
     long request;
     int64_t start;
+    int64_t cpu_start;
     unsigned status;
     pid_t daemon = -1;
     int entropy_fd;
@@ -4102,8 +4237,13 @@ static int cmd_capture(int argc, char **argv)
         puts("0");
         return 0;
     }
-    result = repair_restore(previous_id, argv[2], entropy_fd, start, argc == 4,
-                            daemon);
+    // The restored TSC advanced by the downtime, and the first scheduler
+    // update after the restore charges that to this process, which ran the
+    // capture. Reading the CPU clock makes that update, so the baseline
+    // includes it.
+    cpu_start = cpu_time_ns();
+    result = repair_restore(previous_id, argv[2], entropy_fd, start, cpu_start,
+                            argc == 4, daemon);
     close(lock);
     return result;
 }
@@ -4112,14 +4252,16 @@ static int cmd_capture(int argc, char **argv)
 // acknowledgement when the packet asked for one, then the daemon runs step 13
 // asynchronously. The record tells it which CPUs activation onlined. The
 // readiness path started restore_elapsed_us before the helper's clock step,
-// at last_step_realtime_ns.
+// at last_step_realtime_ns, and the helper spent restore_cpu_us of CPU time.
 static int cmd_restore_finish(int argc, char **argv)
 {
     bool new_cpus[MAX_CPUS] = {false};
     const char *new_list = "none";
+    struct restore_timing timing;
     struct time_state state;
     struct checks checks;
     char text[256];
+    int64_t cpu_start;
     int64_t start;
     bool ack = false;
     int new_count = 0;
@@ -4157,7 +4299,10 @@ static int cmd_restore_finish(int argc, char **argv)
     start = clock_ns(CLOCK_MONOTONIC) -
             (clock_ns(CLOCK_REALTIME) - state.last_step_realtime_ns) -
             state.checks[PHASE_RESTORE].elapsed_us * NSEC_PER_USEC;
-    signaled = signal_restore(daemon_pid(), ack, start);
+    // This process runs only for the restore, so all of its CPU time counts,
+    // plus the helper's.
+    cpu_start = -state.checks[PHASE_RESTORE].cpu_us * NSEC_PER_USEC;
+    signaled = signal_restore(daemon_pid(), ack, start, cpu_start);
     if (signaled == 0)
         return 0;
     if (signaled > 0 || !g_report_only) {
@@ -4169,16 +4314,19 @@ static int cmd_restore_finish(int argc, char **argv)
     // Report-only runs may lack the daemon; finish the restore here.
     if (ack)
         outb(SNAPSHOT_ACKNOWLEDGE, PORT_SNAPSHOT);
-    (void)restore_work(new_cpus, new_count, true,
-                       (clock_ns(CLOCK_MONOTONIC) - start) / NSEC_PER_USEC);
+    timing.start_ns = clock_ns(CLOCK_MONOTONIC);
+    timing.readiness_us = (timing.start_ns - start) / NSEC_PER_USEC;
+    timing.cpu_base_ns = cpu_time_ns();
+    timing.prior_cpu_ns = timing.cpu_base_ns - cpu_start;
+    (void)restore_work(new_cpus, new_count, true, &timing);
     return 0;
 }
 
 // Formats nvx-time status's lines from STATE: one per recorded phase, in the
-// order boot, capture, and restore, with status=pending and no elapsed_us
-// while its check runs, then the runtime line. Report-only mode appends each
-// check's failure count, and a failed check's status is fail. Returns whether
-// every phase line reports ok.
+// order boot, capture, and restore, with status=pending and neither
+// elapsed_us nor cpu_us while its check runs, then the runtime line.
+// Report-only mode appends each check's failure count, and a failed check's
+// status is fail. Returns whether every phase line reports ok.
 static bool format_status(const struct time_state *state, char *text,
                           size_t size)
 {
@@ -4189,14 +4337,15 @@ static bool format_status(const struct time_state *state, char *text,
     for (int phase = 0; phase < CHECK_PHASES; phase++) {
         const struct check_state *check = &state->checks[phase];
         const char *status = check->status;
-        char elapsed[40] = "";
+        char times[64] = "";
         char suffix[40] = "";
 
         if (status[0] == '\0')
             continue;
         if (strcmp(status, "pending") != 0)
-            snprintf(elapsed, sizeof(elapsed), " elapsed_us=%" PRId64,
-                     check->elapsed_us);
+            snprintf(times, sizeof(times),
+                     " elapsed_us=%" PRId64 " cpu_us=%" PRId64,
+                     check->elapsed_us, check->cpu_us);
         if (g_report_only)
             snprintf(suffix, sizeof(suffix), " failures=%" PRId64,
                      check->failures > 0 ? check->failures : 0);
@@ -4206,7 +4355,7 @@ static bool format_status(const struct time_state *state, char *text,
                     " tsc_hz=%" PRIu64 " lapic_hz=%" PRIu64
                     " generation=%" PRIu64 "%s%s\n",
                     abi_prefix(), k_phase_names[phase], status, check->cpus,
-                    state->tsc_hz, state->lapic_hz, check->generation, elapsed,
+                    state->tsc_hz, state->lapic_hz, check->generation, times,
                     suffix);
     }
     append_text(text, size, &length,
@@ -4755,6 +4904,18 @@ static int cmd_test(int argc, char **argv)
     }
     if (strcmp(name, "restore-record") == 0)
         return test_restore_record(argc, argv);
+    if (strcmp(name, "readiness") == 0 && argc == 2) {
+        uint64_t value = pack_readiness(strtoll(argv[0], NULL, 10),
+                                        strtoll(argv[1], NULL, 10));
+        int64_t elapsed_us;
+        int64_t cpu_us;
+
+        unpack_readiness(value, &elapsed_us, &cpu_us);
+        printf("value=0x%016" PRIx64 " elapsed_us=%" PRId64 " cpu_us=%" PRId64
+               "\n",
+               value, elapsed_us, cpu_us);
+        return 0;
+    }
     if (strcmp(name, "parallel") == 0)
         return test_parallel(argc, argv);
     if (strcmp(name, "promote") == 0 && argc == 0)

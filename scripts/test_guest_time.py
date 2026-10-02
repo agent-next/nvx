@@ -737,6 +737,7 @@ class GuestTimeTests(unittest.TestCase):
             "version=1\ngeneration=2\nboot_status=ok\ncapture_status=ok\n"
             "restore_status=pending\nboot_cpus=8\ncapture_cpus=8\nrestore_cpus=0\n"
             "boot_elapsed_us=2400\ncapture_elapsed_us=310\nrestore_elapsed_us=1830\n"
+            "boot_cpu_us=1900\ncapture_cpu_us=290\nrestore_cpu_us=640\n"
             "capture_generation=1\nrestore_generation=2\ntsc_hz=2194843000\n"
             "lapic_hz=200000000\ndiscontinuities=3\nlast_discontinuity=step\n"
             "last_step_ns=-200000000\nlast_step_realtime_ns=1790841600000000000\n"
@@ -761,7 +762,7 @@ class GuestTimeTests(unittest.TestCase):
         self.assertTrue(
             self.run_test("state", self.fixture("state.txt", "version=1\n")).startswith(
                 "version=1\ngeneration=0\nboot_status=pending\nboot_cpus=0\n"
-                "boot_elapsed_us=0\ntsc_hz=0\nlapic_hz=0\n"
+                "boot_elapsed_us=0\nboot_cpu_us=0\ntsc_hz=0\nlapic_hz=0\n"
             )
         )
         self.assertEqual(
@@ -781,6 +782,7 @@ class GuestTimeTests(unittest.TestCase):
             "version=1\ngeneration=2\nboot_status=ok\ncapture_status=ok\n"
             "restore_status=ok\nboot_cpus=8\ncapture_cpus=8\nrestore_cpus=4\n"
             "boot_elapsed_us=2400\ncapture_elapsed_us=310\nrestore_elapsed_us=1830\n"
+            "boot_cpu_us=1900\ncapture_cpu_us=290\nrestore_cpu_us=640\n"
             "capture_generation=1\nrestore_generation=2\ntsc_hz=2194843000\n"
             "lapic_hz=200000000\ndiscontinuities=2\nsynchronized=1\n"
             "offset_ns=-42\nuncertainty_ns=1800\nrejected_samples=2\n"
@@ -788,25 +790,26 @@ class GuestTimeTests(unittest.TestCase):
         )
         rates = "tsc_hz=2194843000 lapic_hz=200000000"
         # One line per recorded phase, each with the generation its check ran
-        # in, then the runtime line; the hook adds whether status exits 0.
+        # in and its wall and CPU times, then the runtime line; the hook adds
+        # whether status exits 0.
         self.assertEqual(
             self.status(state),
             [
                 f"NVX-TIME-ABI: v=1 phase=boot status=ok cpus=8 {rates} "
-                "generation=0 elapsed_us=2400",
+                "generation=0 elapsed_us=2400 cpu_us=1900",
                 f"NVX-TIME-ABI: v=1 phase=capture status=ok cpus=8 {rates} "
-                "generation=1 elapsed_us=310",
+                "generation=1 elapsed_us=310 cpu_us=290",
                 f"NVX-TIME-ABI: v=1 phase=restore status=ok cpus=4 {rates} "
-                "generation=2 elapsed_us=1830",
+                "generation=2 elapsed_us=1830 cpu_us=640",
                 "NVX-TIME-ABI: v=1 phase=runtime status=synchronized generation=2 "
                 "discontinuities=2 offset_ns=-42 uncertainty_ns=1800 "
                 "rejected_samples=2 last_sample_error=G_SAMPLE_UNCERTAIN",
                 "ok=1",
             ],
         )
-        # A check still pending after the wait has no elapsed_us and fails the
-        # exit status. A cold boot has a boot line only, and a state without a
-        # boot record counts as a pending boot check.
+        # A check still pending after the wait has neither elapsed_us nor
+        # cpu_us and fails the exit status. A cold boot has a boot line only,
+        # and a state without a boot record counts as a pending boot check.
         pending = state.replace("restore_status=ok", "restore_status=pending")
         self.assertEqual(
             self.status(pending)[2::2],
@@ -837,15 +840,29 @@ class GuestTimeTests(unittest.TestCase):
         self.assertEqual(
             report[0],
             f"NVX-TIME-REPORT: v=1 phase=boot status=ok cpus=8 {rates} "
-            "generation=0 elapsed_us=2400 failures=0",
+            "generation=0 elapsed_us=2400 cpu_us=1900 failures=0",
         )
         self.assertEqual(
             report[2],
             f"NVX-TIME-REPORT: v=1 phase=restore status=fail cpus=4 {rates} "
-            "generation=2 elapsed_us=1830 failures=3",
+            "generation=2 elapsed_us=1830 cpu_us=640 failures=3",
         )
         self.assertTrue(report[3].startswith("NVX-TIME-REPORT: v=1 phase=runtime "))
         self.assertEqual(report[4], "ok=0")
+
+    def test_readiness_times_travel_in_one_signal_value(self):
+        # The helper hands the readiness path's wall and CPU times to the
+        # daemon in one 64-bit sigqueue() value, each clamped to 32 bits.
+        for elapsed, cpu, value in (
+            (2400, 1200, "0x000004b000000960"),
+            (-5, 2**40, "0xffffffff00000000"),
+            (2**32 - 1, 0, "0x00000000ffffffff"),
+        ):
+            self.assertEqual(
+                self.run_test("readiness", str(elapsed), str(cpu)),
+                f"value={value} elapsed_us={min(max(elapsed, 0), 2**32 - 1)} "
+                f"cpu_us={min(max(cpu, 0), 2**32 - 1)}\n",
+            )
 
     def restore_record(self, text: str) -> str:
         return self.run_test(
