@@ -523,7 +523,14 @@ offers the same features. On Skylake-SP, used only by the bare-metal
 development hosts, the shared profile drops what one backend alone offers:
 PKU, UMIP, and FDP_EXCPTN_ONLY (KVM only), FLUSH_L1D (not on WHP), and the
 AMD-alias speculation bits in `0x80000008` EBX (KVM only; Intel guests use
-the `7.0` EDX equivalents, which every backend presents).
+the `7.0` EDX equivalents, which every backend presents). Without FLUSH_L1D,
+and with `FB_CLEAR` clear, Linux cannot confirm the microcode that makes
+VERW clear the fill buffers. It therefore reports MMIO Stale Data as
+"Vulnerable: Clear CPU buffers attempted, no microcode" where a KVM-native
+guest on the same host reports "Mitigation: Clear CPU buffers". The guest
+still clears the CPU buffers with VERW (`MD_CLEAR`), as its MDS and TAA
+status, "Mitigation: Clear CPU buffers", shows, and the host has the
+microcode, so only the reported status differs.
 
 No profile pins the legacy P6 L2-cache MSRs; they raise #GP on every
 backend (see [MSRs](#msrs)).
