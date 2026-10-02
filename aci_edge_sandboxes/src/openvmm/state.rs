@@ -5,7 +5,7 @@
 //!   .locks/<token>.lock       serializes lifecycle transitions of one sandbox
 //!   <token>/
 //!     sandbox.json            provisioned configuration
-//!     launch.json             control endpoint of a start in progress
+//!     launch.json             endpoint and available process identity of a start in progress
 //!     runtime.json            OpenVMM process identity and endpoint (running only)
 //!     control.capability      launch capability (running only)
 //!     control.sock            Linux control endpoint (running only)
@@ -16,7 +16,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -76,13 +75,22 @@ pub(crate) struct RuntimeRecord {
 
 /// Marker written before OpenVMM is launched and replaced by the runtime record afterwards.
 ///
-/// If the launching process dies in between, the endpoint identifies the OpenVMM process that
-/// may still be running.
+/// Process identity is added as soon as the child is identified, before writing runtime state.
+/// A marker without identity is never expired: its child may be alive without an endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LaunchRecord {
     pub(crate) format: u32,
     pub(crate) endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) process: Option<ProcessIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: u32,
+    pub(crate) start_time: u64,
 }
 
 /// Held advisory lock. Dropping it releases the lock.
@@ -209,11 +217,7 @@ impl StateStore {
         write_json(&self.dir(sandbox_id).join(LAUNCH_NAME), launch)
     }
 
-    /// Returns the launch marker of a sandbox and its age.
-    pub(crate) fn launch(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> Result<Option<(LaunchRecord, Duration)>> {
+    pub(crate) fn launch(&self, sandbox_id: &SandboxId) -> Result<Option<LaunchRecord>> {
         let path = self.dir(sandbox_id).join(LAUNCH_NAME);
         let Some(launch) = read_json::<LaunchRecord>(&path)? else {
             return Ok(None);
@@ -224,15 +228,7 @@ impl StateStore {
                 path.display()
             )));
         }
-        let age = fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .map(|modified| {
-                SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default()
-            })
-            .map_err(io_error(format!("cannot read {}", path.display())))?;
-        Ok(Some((launch, age)))
+        Ok(Some(launch))
     }
 
     /// Removes the launch marker once the runtime record replaces it.
@@ -440,11 +436,19 @@ mod tests {
         let launch = LaunchRecord {
             format: STATE_FORMAT,
             endpoint: "endpoint".to_owned(),
+            process: None,
         };
         store.write_launch(&id, &launch).unwrap();
-        let (recorded, age) = store.launch(&id).unwrap().unwrap();
-        assert_eq!(recorded, launch);
-        assert!(age < Duration::from_secs(60));
+        assert_eq!(store.launch(&id).unwrap(), Some(launch.clone()));
+        let identified = LaunchRecord {
+            process: Some(ProcessIdentity {
+                pid: 1,
+                start_time: 2,
+            }),
+            ..launch.clone()
+        };
+        store.write_launch(&id, &identified).unwrap();
+        assert_eq!(store.launch(&id).unwrap(), Some(identified));
         store.remove_launch(&id);
         assert!(store.launch(&id).unwrap().is_none());
         store.write_launch(&id, &launch).unwrap();

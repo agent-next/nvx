@@ -15,7 +15,8 @@
 //!
 //! Kernel command-line tokens adjust the emulation: `fake_exit_on_start=CODE` fails the launch,
 //! `fake_boot_delay_ms=MS` delays the control endpoint, `fake_crash_after_ms=MS` makes the VM
-//! die, `fake_ignore_stop=1` ignores stop requests, and `fake_legacy_guest=1` refuses the
+//! die, `fake_ignore_stop=1` ignores stop requests, `fake_ignore_cancel=1` ignores cancellation,
+//! and `fake_legacy_guest=1` refuses the
 //! features request like a guest agent that predates it. The command line is recorded in
 //! `fake-openvmm-<token>.json` next to the kernel.
 
@@ -63,6 +64,7 @@ struct Options {
     boot_delay: Duration,
     crash_after: Option<Duration>,
     ignore_stop: bool,
+    ignore_cancel: bool,
     legacy_guest: bool,
 }
 
@@ -270,6 +272,7 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
         boot_delay: millis("fake_boot_delay_ms").unwrap_or_default(),
         crash_after: millis("fake_crash_after_ms"),
         ignore_stop: knob("fake_ignore_stop") == Some("1"),
+        ignore_cancel: knob("fake_ignore_cancel") == Some("1"),
         legacy_guest: knob("fake_legacy_guest") == Some("1"),
     })
 }
@@ -413,6 +416,7 @@ struct Session<'a, S> {
     epoch: u64,
     guest_sequence: u64,
     host_sequence: u64,
+    ignore_cancel: bool,
 }
 
 impl<S: Read + Write + Pending> Session<'_, S> {
@@ -492,7 +496,9 @@ impl<S: Read + Write + Pending> Session<'_, S> {
         while self.stream.pending()? {
             match self.request()? {
                 None => return Ok(Interrupt::Disconnected),
-                Some((APP_CANCEL, id, _)) if id == request_id => return Ok(Interrupt::Cancel),
+                Some((APP_CANCEL, id, _)) if id == request_id && !self.ignore_cancel => {
+                    return Ok(Interrupt::Cancel);
+                }
                 Some((APP_CANCEL, _, _)) => {}
                 Some((_, id, _)) => self.send(APP_ERROR, id, 16, b"busy")?,
             }
@@ -695,6 +701,7 @@ fn serve_client<S: Read + Write + Pending>(
         epoch,
         guest_sequence: 1,
         host_sequence: 0,
+        ignore_cancel: options.ignore_cancel,
     };
     match session.run(options, guest) {
         Ok(Flow::Exit) => {

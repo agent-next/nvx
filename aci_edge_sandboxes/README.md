@@ -221,9 +221,12 @@ PID and start time, with the host. If a VM died, its sandbox reverts to
 provisioned. If the host cannot determine whether the process still runs, the
 operation fails instead of forgetting a live VM. A failed start clears the
 runtime record only after OpenVMM has exited; otherwise the sandbox stays
-marked as running until `stop` succeeds. An interrupted start whose endpoint
-has no server yet fails operations with `backend_error` until `start_timeout`
-has passed since the launch, because OpenVMM may still be starting.
+marked as running until `stop` succeeds. A launch marker records the child's
+PID and start time before runtime state is written, so recovery can terminate
+a child that has not created its endpoint. If a caller dies before recording
+identity and no endpoint identifies the child, operations fail with
+`backend_error` and retain the marker regardless of its age. Elapsed time never
+proves that an unobserved VM exited.
 
 Operations run safely from different processes, which matches MXC's
 one-process-per-phase model. On Windows, set `breakaway_from_job` if the
@@ -330,6 +333,9 @@ behind the profile's NAT gateway `10.0.0.1`, which also serves DNS.
 - `Canceller::cancel` sends `CANCEL` to the guest within 20 ms. The agent kills
   every process in the workload's cgroup, and the execution ends with
   `Cancelled`. Cancelling an execution that already finished does nothing.
+  Once cancellation is sent, a missing response fails with `backend_error`
+  within `control_timeout`, or an earlier workload-response deadline, even
+  when the workload has no timeout.
 - If the process that runs an execution dies, OpenVMM resets the control
   session, and the agent kills the workload, so the next exec does not wait for
   it.

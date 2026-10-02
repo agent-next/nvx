@@ -90,7 +90,8 @@ use self::protocol::{
 };
 use self::session::{ControlSession, ExecEvent, SessionError};
 use self::state::{
-    BACKEND_KEY, LaunchRecord, RuntimeRecord, STATE_FORMAT, SandboxRecord, StateStore,
+    BACKEND_KEY, LaunchRecord, ProcessIdentity, RuntimeRecord, STATE_FORMAT, SandboxRecord,
+    StateStore,
 };
 use crate::backend::{Backend, ExecControl, ExecIo};
 use crate::capabilities::Capabilities;
@@ -172,8 +173,8 @@ impl OpenVmmBackend {
             self.store.clear_runtime(sandbox_id)?;
             return Ok(RunState::Provisioned);
         }
-        if let Some((launch, age)) = self.store.launch(sandbox_id)? {
-            self.recover_launch(sandbox_id, &launch, age)?;
+        if let Some(launch) = self.store.launch(sandbox_id)? {
+            self.recover_launch(sandbox_id, &launch)?;
             self.store.clear_runtime(sandbox_id)?;
         }
         Ok(RunState::Provisioned)
@@ -182,42 +183,42 @@ impl OpenVmmBackend {
     /// Terminates the OpenVMM process of a start whose caller died before recording it.
     ///
     /// Lifecycle locks serialize starts, so a launch marker seen under the lock always belongs
-    /// to an interrupted start. OpenVMM listens on its endpoint early in its startup, so the
-    /// endpoint's server process identifies it.
-    fn recover_launch(
-        &self,
-        sandbox_id: &SandboxId,
-        launch: &LaunchRecord,
-        age: Duration,
-    ) -> Result<()> {
+    /// to an interrupted start. Recorded identity is authoritative even before an endpoint
+    /// exists; legacy markers can be recovered only when their endpoint identifies the child.
+    fn recover_launch(&self, sandbox_id: &SandboxId, launch: &LaunchRecord) -> Result<()> {
         let interrupted = |detail: &str| {
             Error::backend_error(format!(
                 "an interrupted start of sandbox {sandbox_id} {detail}"
             ))
         };
-        let pid = platform::endpoint_server_pid(&launch.endpoint)
-            .map_err(|error| interrupted("cannot be recovered yet").with_source(error))?;
-        let Some(pid) = pid else {
-            if age < self.config.start_timeout {
-                return Err(interrupted(&format!(
-                    "happened less than {} s ago and may still be launching OpenVMM; retry later",
-                    self.config.start_timeout.as_secs()
-                )));
+        let identity = match &launch.process {
+            Some(identity) => identity.clone(),
+            None => {
+                let pid = platform::endpoint_server_pid(&launch.endpoint)
+                    .map_err(|error| interrupted("cannot be recovered yet").with_source(error))?;
+                let Some(pid) = pid else {
+                    return Err(interrupted(
+                        "has no recorded process identity or observable endpoint; cannot verify \
+                         that OpenVMM exited, so the launch marker is retained",
+                    ));
+                };
+                let Some(start_time) = platform::process_start_time(pid)
+                    .map_err(|error| interrupted("cannot be recovered yet").with_source(error))?
+                else {
+                    return Ok(());
+                };
+                ProcessIdentity { pid, start_time }
             }
-            return Ok(());
         };
-        let Some(start_time) = platform::process_start_time(pid)
-            .map_err(|error| interrupted("cannot be recovered yet").with_source(error))?
-        else {
-            return Ok(());
-        };
-        match process::kill(pid, start_time) {
+        match process::kill(identity.pid, identity.start_time) {
             Ok(true) => Ok(()),
             Ok(false) => Err(interrupted(&format!(
-                "left OpenVMM process {pid} running, and it did not exit"
+                "left OpenVMM process {} running, and it did not exit",
+                identity.pid
             ))),
             Err(error) => Err(interrupted(&format!(
-                "left OpenVMM process {pid} running, and it could not be terminated"
+                "left OpenVMM process {} running, and it could not be terminated",
+                identity.pid
             ))
             .with_source(error)),
         }
@@ -553,16 +554,17 @@ impl Backend for OpenVmmBackend {
         let arguments = launch::openvmm_arguments(&self.config, &record, &endpoint, &report)?;
 
         self.store.write_capability(sandbox_id, &capability)?;
-        // The marker names the endpoint before OpenVMM exists, so a VM whose caller dies before
-        // recording the process identity can still be found and terminated.
+        let log = self.store.create_log(sandbox_id)?;
+        // Until the child is identified, recovery must retain this marker unless the endpoint
+        // identifies the child. An absent endpoint never proves that a launch has exited.
         self.store.write_launch(
             sandbox_id,
             &LaunchRecord {
                 format: STATE_FORMAT,
                 endpoint: endpoint.clone(),
+                process: None,
             },
         )?;
-        let log = self.store.create_log(sandbox_id)?;
         let started = Instant::now();
         let child = match process::spawn(
             &self.config,
@@ -602,7 +604,16 @@ impl Backend for OpenVmmBackend {
             start_time,
             endpoint: endpoint.clone(),
         };
-        if let Err(error) = self.store.write_runtime(sandbox_id, &runtime) {
+        let identified = LaunchRecord {
+            format: STATE_FORMAT,
+            endpoint: endpoint.clone(),
+            process: Some(ProcessIdentity { pid, start_time }),
+        };
+        if let Err(error) = self
+            .store
+            .write_launch(sandbox_id, &identified)
+            .and_then(|()| self.store.write_runtime(sandbox_id, &runtime))
+        {
             if process::kill_child(child) {
                 let _ = self.store.clear_runtime(sandbox_id);
             }
@@ -764,7 +775,7 @@ impl Backend for OpenVmmBackend {
 fn pump(
     mut session: ControlSession,
     request_id: u64,
-    deadline: Option<Instant>,
+    mut deadline: Option<Instant>,
     mut io: ExecIo,
     cancel_requested: &AtomicBool,
     control_timeout: Duration,
@@ -775,14 +786,18 @@ fn pump(
     let mut cancel_sent = false;
     loop {
         if !cancel_sent && cancel_requested.load(Ordering::Acquire) {
+            let cancellation_deadline = Instant::now() + control_timeout;
             session
-                .cancel_exec(request_id, Instant::now() + control_timeout)
+                .cancel_exec(request_id, cancellation_deadline)
                 .map_err(|error| {
                     Error::backend_error(format!(
                         "cannot deliver the cancellation request: {error}"
                     ))
                     .with_source(error)
                 })?;
+            deadline = Some(deadline.map_or(cancellation_deadline, |deadline| {
+                deadline.min(cancellation_deadline)
+            }));
             cancel_sent = true;
         }
         let slice = Instant::now() + CANCEL_POLL_INTERVAL;

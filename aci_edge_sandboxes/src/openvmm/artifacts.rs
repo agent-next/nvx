@@ -200,8 +200,8 @@ fn discover_with(
     }
     Err(Error::backend_unavailable(format!(
         "cannot locate the OpenVMM executable and NVX guest artifacts: set {} or {}, {}, and {}, \
-         place an NVX release in a {:?} directory next to the executable, or build the nvx crate \
-         with the bundled feature",
+         place an NVX release in a {:?} directory next to the executable, or build the \
+         aci_edge_sandboxes crate with the bundled feature",
         Artifacts::ENV_DIR,
         Artifacts::ENV_OPENVMM,
         Artifacts::ENV_KERNEL,
@@ -430,6 +430,11 @@ mod tests {
         let error = discover_with(variables(&[]), Some(exe_dir.path()), no_bundle).unwrap_err();
         assert_eq!(error.code(), ErrorCode::BackendUnavailable);
         assert!(error.message().contains(Artifacts::ENV_DIR));
+        assert!(
+            error
+                .message()
+                .contains("build the aci_edge_sandboxes crate with the bundled feature")
+        );
     }
 
     #[test]

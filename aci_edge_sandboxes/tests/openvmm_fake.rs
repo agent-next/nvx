@@ -7,7 +7,10 @@
 ))]
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -23,6 +26,78 @@ mod support;
 struct Fixture {
     directory: TempDir,
     state_root: PathBuf,
+}
+
+struct PendingVm {
+    child: Child,
+}
+
+impl PendingVm {
+    fn spawn(arguments: &[String], capability: &[u8], directory: &Path) -> Self {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(capability).unwrap();
+        drop(writer);
+        Self {
+            child: Command::new(env!("CARGO_BIN_EXE_aci-edge-sandboxes-fake-openvmm"))
+                .args(arguments)
+                .current_dir(directory)
+                .stdin(Stdio::from(reader))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_time(&self) -> u64 {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", self.child.id())).unwrap();
+        stat.rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn start_time(&self) -> u64 {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+        let mut created = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exited = created;
+        let mut kernel = created;
+        let mut user = created;
+        // SAFETY: Child owns the live process handle and all outputs point to valid storage.
+        let succeeded = unsafe {
+            GetProcessTimes(
+                self.child.as_raw_handle().cast(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        assert_ne!(succeeded, 0, "{}", std::io::Error::last_os_error());
+        (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)
+    }
+}
+
+impl Drop for PendingVm {
+    fn drop(&mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            self.child.kill().unwrap();
+        }
+        self.child.wait().unwrap();
+    }
 }
 
 impl Fixture {
@@ -504,7 +579,81 @@ fn interrupted_starts_do_not_leak_vms() {
 }
 
 #[test]
-fn launch_markers_without_a_vm_expire() {
+fn interrupted_starts_before_an_endpoint_recover_or_retain_the_child() {
+    for identified in [true, false] {
+        let fixture = Fixture::new();
+        let nvx = fixture.nvx();
+        let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
+        nvx.start(&sandbox_id).unwrap();
+        let runtime = state_json(&fixture, &sandbox_id, "runtime.json");
+        let dir = fixture.state_root.join(sandbox_id.token());
+        let capability = fs::read(dir.join("control.capability")).unwrap();
+        let mut arguments = fixture.launch_arguments(&sandbox_id);
+        let command_line = arguments
+            .iter()
+            .position(|argument| argument == "--cmdline")
+            .unwrap()
+            + 1;
+        arguments[command_line].push_str(" fake_boot_delay_ms=30000");
+        nvx.stop(&sandbox_id).unwrap();
+        fs::remove_file(dir.join("outcome.json")).unwrap();
+
+        let child = PendingVm::spawn(&arguments, &capability, &dir);
+        let pid = child.child.id();
+        let mut launch = serde_json::json!({
+            "format": runtime["format"],
+            "endpoint": runtime["endpoint"],
+        });
+        if identified {
+            launch["process"] = serde_json::json!({ "pid": pid, "startTime": child.start_time() });
+        }
+        let marker = dir.join("launch.json");
+        fs::write(&marker, launch.to_string()).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        assert!(support::process_running(pid));
+        assert!(!dir.join("runtime.json").exists());
+
+        let result = nvx.start(&sandbox_id);
+        if identified {
+            result.unwrap();
+            assert!(
+                !support::process_running(pid),
+                "the pre-endpoint child survived recovery"
+            );
+            assert!(!marker.exists());
+            assert_ne!(
+                state_json(&fixture, &sandbox_id, "runtime.json")["pid"],
+                pid
+            );
+            assert_eq!(
+                run(&nvx, &sandbox_id, "echo recovered").stdout,
+                b"recovered\n"
+            );
+            nvx.stop(&sandbox_id).unwrap();
+            nvx.deprovision(&sandbox_id).unwrap();
+        } else {
+            if result.is_ok() {
+                nvx.stop(&sandbox_id).unwrap();
+            }
+            assert_eq!(result.unwrap_err().code(), ErrorCode::BackendError);
+            assert!(support::process_running(pid));
+            assert!(marker.exists());
+            assert!(!dir.join("runtime.json").exists());
+            assert_eq!(
+                nvx.deprovision(&sandbox_id).unwrap_err().code(),
+                ErrorCode::BackendError
+            );
+        }
+    }
+}
+
+#[test]
+fn launch_markers_without_process_identity_do_not_expire() {
     let fixture = Fixture::new();
     let nvx = fixture.nvx();
     let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
@@ -519,27 +668,68 @@ fn launch_markers_without_a_vm_expire() {
     let launch = serde_json::json!({ "format": format, "endpoint": endpoint });
     fs::write(&marker, launch.to_string()).unwrap();
 
-    // The interrupted caller may still be launching OpenVMM, so the sandbox is left alone.
+    // An absent endpoint does not prove that the interrupted launch has no surviving child.
     for error in [
         nvx.start(&sandbox_id).unwrap_err(),
         nvx.deprovision(&sandbox_id).unwrap_err(),
     ] {
         assert_eq!(error.code(), ErrorCode::BackendError);
-        assert!(error.message().contains("retry later"), "{error}");
     }
     assert!(marker.exists());
 
-    // No launch outlives the start timeout without its VM serving the endpoint.
     fs::File::options()
         .write(true)
         .open(&marker)
         .unwrap()
         .set_modified(SystemTime::now() - Duration::from_secs(120))
         .unwrap();
-    nvx.start(&sandbox_id).unwrap();
-    assert!(!marker.exists());
-    nvx.stop(&sandbox_id).unwrap();
-    nvx.deprovision(&sandbox_id).unwrap();
+    let result = nvx.start(&sandbox_id);
+    if result.is_ok() {
+        nvx.stop(&sandbox_id).unwrap();
+    }
+    assert_eq!(result.unwrap_err().code(), ErrorCode::BackendError);
+    assert!(marker.exists());
+    assert_eq!(
+        nvx.deprovision(&sandbox_id).unwrap_err().code(),
+        ErrorCode::BackendError
+    );
+}
+
+#[test]
+fn cancellation_has_a_response_deadline_for_untimed_and_long_timed_workloads() {
+    for timeout in [None, Some(Duration::from_secs(30))] {
+        let fixture = Fixture::new();
+        let nvx = fixture.nvx_with(|config| {
+            config.kernel_command_line = "fake_ignore_cancel=1".to_owned();
+            config.control_timeout = Duration::from_millis(200);
+            config.stop_timeout = Duration::from_millis(200);
+        });
+        let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
+        nvx.start(&sandbox_id).unwrap();
+        let mut request = ExecRequest::command_line("echo started; sleep 10000");
+        request.process.timeout = timeout;
+        let mut execution = nvx.exec(&sandbox_id, &request).unwrap();
+        let mut stdout = execution.take_stdout().unwrap();
+        let mut started = [0u8; 8];
+        stdout.read_exact(&mut started).unwrap();
+        assert_eq!(&started, b"started\n");
+        drop(stdout);
+        execution.canceller().cancel().unwrap();
+        let (finished, received) = mpsc::channel();
+        let worker = thread::spawn(move || finished.send(execution.wait()).unwrap());
+        let started = Instant::now();
+        let outcome = received.recv_timeout(Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        nvx.stop(&sandbox_id).unwrap();
+        worker.join().unwrap();
+        nvx.deprovision(&sandbox_id).unwrap();
+        let error = outcome
+            .expect("cancellation must not wait for an unresponsive guest indefinitely")
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::BackendError);
+        assert!(error.message().contains("timed out"), "{error}");
+        assert!(elapsed < Duration::from_secs(2));
+    }
 }
 
 #[test]

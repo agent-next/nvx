@@ -136,7 +136,8 @@ pub struct OpenVmmConfig {
     pub kernel_command_line: String,
     /// Time allowed for the guest agent to become ready after `start`.
     pub start_timeout: Duration,
-    /// Time allowed to connect to a sandbox's control endpoint.
+    /// Time allowed to connect to a sandbox's control endpoint and receive a cancellation
+    /// outcome.
     pub control_timeout: Duration,
     /// Time allowed for a graceful stop before the VM is terminated.
     pub stop_timeout: Duration,
