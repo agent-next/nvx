@@ -1097,7 +1097,9 @@ starting 150 ms after its time ABI boot step (`nvx-time boot`) at
 [Snapshot agent](#snapshot-agent)). The boot step is the anchor because
 every mode reaches it, whereas a mode that execs an agent reports readiness
 later, on the agent's own protocol. In shell mode the boot step comes 15 to
-44 ms before shell-ready, so the checks start about 105 to 135 ms after it.
+44 ms before shell-ready on Alpine and 26 to 84 ms before it on Ubuntu at 1 to
+8 vCPUs, so the checks start about 65 to 135 ms after it. Because they start
+at `SCHED_IDLE`, a start closer to shell-ready costs the boot path nothing.
 The checks start the daemon when they pass. Every check stays
 fail-fast: a failure powers the guest off with status 193, even if the
 workload is running. A guest that powers off before its checks finish skips them, which
