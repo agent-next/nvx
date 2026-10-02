@@ -557,6 +557,22 @@ class AdversarialBrokerTests(unittest.TestCase):
                 read_replay(replay, cases=cases)
 
 
+
+def _wait_for_process_exit(pid: int, timeout: float = 5.0) -> bool:
+    """Bounded wait for an asynchronously killed process to disappear.
+
+    A SIGKILLed process stays visible to os.kill(pid, 0) until it is reaped,
+    so an immediate _process_running check races the kill; wait instead, and
+    still report failure when the process survives the whole timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_running(pid):
+            return True
+        time.sleep(0.05)
+    return not _process_running(pid)
+
+
 class AdversarialOracleTests(unittest.TestCase):
     def test_linux_child_reaping_rescans_reparented_descendants(self) -> None:
         with (
@@ -761,7 +777,7 @@ class AdversarialOracleTests(unittest.TestCase):
                     self.assertEqual(len(unrelated), 1)
                     self.assertIsNone(unrelated[0].poll())
                     owned_pid = int(owned_pid_path.read_text(encoding="utf-8"))
-                    self.assertFalse(_process_running(owned_pid))
+                    self.assertTrue(_wait_for_process_exit(owned_pid))
                 finally:
                     if owned_pid_path.exists():
                         owned_pid = int(owned_pid_path.read_text(encoding="utf-8"))
@@ -796,7 +812,7 @@ class AdversarialOracleTests(unittest.TestCase):
                     contain_process_tree=True,
                 )
             child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        self.assertFalse(_process_running(child_pid))
+        self.assertTrue(_wait_for_process_exit(child_pid))
 
     def test_contained_guest_runner_normal_exit_kills_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1178,7 +1194,7 @@ class AdversarialOracleTests(unittest.TestCase):
                     int(command_pid_path.read_text(encoding="utf-8")),
                     int(descendant_pid_path.read_text(encoding="utf-8")),
                 ]
-                self.assertTrue(all(not _process_running(pid) for pid in owned_pids))
+                self.assertTrue(all(_wait_for_process_exit(pid) for pid in owned_pids))
                 self.assertIsNone(unrelated.poll())
             finally:
                 for pid in owned_pids:
