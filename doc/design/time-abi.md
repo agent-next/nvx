@@ -1090,13 +1090,13 @@ mounting `/proc`, `/sys`, and `/dev`, it takes a time sample within the
 (`C12`), so the workload starts on host time; this step is not counted as a
 discontinuity. Init then reports shell-ready (or starts the workload, in
 modes without a shell) and runs every other boot check asynchronously,
-starting 100 ms after its time ABI boot step (`nvx-time boot`) at
+starting 150 ms after its time ABI boot step (`nvx-time boot`) at
 `SCHED_IDLE`, and at normal priority from 100 ms after they start (see
 [Snapshot agent](#snapshot-agent)). The boot step is the anchor because
 every mode reaches it, whereas a mode that execs an agent reports readiness
 later, on the agent's own protocol. In shell mode the boot step comes 15 to
-44 ms before shell-ready, so the checks start about 55 to 85 ms after it. The
-checks start the daemon when they pass. Every check stays
+44 ms before shell-ready, so the checks start about 105 to 135 ms after it.
+The checks start the daemon when they pass. Every check stays
 fail-fast: a failure powers the guest off with status 193, even if the
 workload is running. A guest that powers off before its checks finish skips them, which
 is why CI takes its evidence from `nvx-time status`, which waits for them.
@@ -1187,9 +1187,9 @@ is still pending after 30 s, its line reports `status=pending`, without
 `elapsed_us` or `cpu_us`, and the exit status is 1.
 
 At boot, the checks' work is the checks and the daemon start, but not the
-100 ms delay after the boot step; at capture,
+150 ms delay after the boot step; at capture,
 the step 1 checks of the [snapshot agent](#snapshot-agent). At restore, it
-is steps 6 to 12 and the step 11 checks, but not step 13's 100 ms delay, the
+is steps 6 to 12 and the step 11 checks, but not step 13's 150 ms delay, the
 grace period wait, or the deferred `C7`. `elapsed_us` is that work's wall
 time, including any wait for a CPU at `SCHED_IDLE`; it bounds the fail-fast
 latency and is not budgeted. `cpu_us` is the CPU time that the `nvx-time`
@@ -1321,7 +1321,7 @@ acknowledgement.
     failure still emits its violation event and powers off with status 193.
 12. If `ACK_REQUIRED` is set, write the acknowledgement (2) to `0x605`.
 13. After the acknowledgement, or after step 10 when none is required, signal
-    the daemon, which finishes the restore asynchronously, starting 100 ms
+    the daemon, which finishes the restore asynchronously, starting 150 ms
     later at `SCHED_IDLE`:
     - it runs the step 11 checks;
     - it waits for the [grace period release](#rcu-grace-period-release);
@@ -1342,24 +1342,28 @@ signals the daemon, so no other process starts on the readiness path. Each
 extra process costs 2 to 4 ms after a restore (fork and exec under demand
 faulting, measured on KVM).
 
-Step 13 starts 100 ms after the acknowledgement (or after step 10, when none
-is required), and the asynchronous boot checks start 100 ms after the boot
+Step 13 starts 150 ms after the acknowledgement (or after step 10, when none
+is required), and the asynchronous boot checks start 150 ms after the boot
 step. Starting them earlier slows the guest: their checks contend
 with the readiness path on the other vCPUs, even at `SCHED_IDLE`. On WHP
 (prometheus28, 512 MiB, measurement-only builds), checks right after the
-acknowledgement added 6 to 12 ms to 2-vCPU restores, whereas the 100 ms
+acknowledgement added 6 to 12 ms to 2-vCPU restores, whereas a 100 ms
 delay left them 0.8 and 1.2 ms over the release guest at 1 and 2 vCPUs. On
 MSHV (prometheus30), boot checks right after shell-ready added about 3 ms
-to 2-vCPU cold boots. KVM showed no clear effect either way.
+to 2-vCPU cold boots. KVM showed no clear effect either way. The delay is
+150 ms rather than 100 ms because a workload's own activity right after
+readiness must not meet the checks either: the guest-exit window of
+`network_snapshot_restore_wall` falls 110 to 130 ms after readiness on WHP
+and 87 to 97 ms on KVM, which checks starting at 100 ms could overlap.
 
 Step 13 and the asynchronous boot checks run at `SCHED_IDLE`, so on few
 vCPUs they never take a CPU from the restored or starting workload. Work
 that has not finished 100 ms after it starts continues at normal priority.
 Every check stays fail-fast: a failing check powers the guest off about
-100 ms after the acknowledgement or the boot step on an idle guest, and at
-most about 200 ms plus the checks' own run time after it on a CPU-bound
+150 ms after the acknowledgement or the boot step on an idle guest, and at
+most about 250 ms plus the checks' own run time after it on a CPU-bound
 one, where `SCHED_IDLE` alone would allow about 0.5 s or more. The `elapsed_us`
-and `cpu_us` of both exclude the 100 ms delay. `nvx-time status` waits for
+and `cpu_us` of both exclude the 150 ms delay. `nvx-time status` waits for
 this deferred work, within its 30 s bound. The watcher and the discipline
 always run at normal priority, and stall suppression stays set until the
 release. Repair failures emit a violation event and power off with status
@@ -1691,7 +1695,7 @@ Expected effects:
 | MSHV VP creation | Serialized at about 14 ms per application processor on bare metal (27 and 85 ms at 4 and 8 vCPUs); the frozen synchronized TSC set adds 40 to 170 µs for 1 to 4 VPs and no per-VP serialized work |
 | Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their wall time (`elapsed_us`, not budgeted) and CPU time (`cpu_us`). The same `cpu_us` budget holds for the boot, capture, and restore checks. The fleet matrix driver enforces it during validation; CI reports each phase against it (`<phase>_cpu_over_budget`) but does not gate on it, because the A/B gate above covers latency. The budget is TBD(guest) for every backend, provisionally 2.5 ms at one vCPU plus 0.75 ms per additional vCPU on KVM and MSHV and 5 ms plus 1.5 ms on WHP. Wiring v6 measured boot medians of 1.6 to 3.0 ms on MSHV, 3.6 to 5.0 ms on KVM (prometheus32 idles at 800 MHz, which slows the delayed checks), and 2.3 to 6.6 ms on WHP at 1 to 8 vCPUs, with captures under 2 ms everywhere. The values are set from the next guest build, which counts only step 13 at restore and runs with `CONFIG_IRQ_TIME_ACCOUNTING` |
 | Counting LAPIC instead of TSC-deadline on KVM | Different timer-programming exits; covered by the gate |
-| Restore work before the acknowledgement | Only the packet read, the clock set, CPU and memory activation, and entropy and identity repair, in one helper process. The restore checks, the RCU release, and the deferred `C7` start at `SCHED_IDLE` 100 ms after the acknowledgement, after the readiness path |
+| Restore work before the acknowledgement | Only the packet read, the clock set, CPU and memory activation, and entropy and identity repair, in one helper process. The restore checks, the RCU release, and the deferred `C7` start at `SCHED_IDLE` 150 ms after the acknowledgement, after the readiness path |
 | No time ABI console lines in production | Each console byte costs one or two port exits, about 10 to 12 µs on bare-metal KVM and an estimated 20 to 45 µs nested on Azure. Without the boot marker (about 110 bytes) and the restore marker (about 117 bytes), boots and restores save 1 to 5 ms, enough to fail the gate on `azure-kvm-5`; violation events still print |
 
 Expected wins are tracked separately and do not relax the gate.
