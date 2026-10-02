@@ -66,6 +66,23 @@ def encode_sample(
     return struct.pack("<BBHIQ", version, flags, reserved, generation, utc_ns)
 
 
+def can_leave_idle_priority() -> bool:
+    """Whether this process may switch from SCHED_IDLE back to SCHED_OTHER.
+
+    That needs CAP_SYS_NICE, which the guest has, or an RLIMIT_NICE of at
+    least 20; containers and CI runners usually have neither.
+    """
+    status = Path("/proc/self/status").read_text(encoding="utf-8")
+    capabilities = re.search(r"^CapEff:\s*([0-9a-f]+)$", status, re.MULTILINE)
+    if capabilities is not None and int(capabilities.group(1), 16) & (1 << 23):
+        return True
+    limits = Path("/proc/self/limits").read_text(encoding="utf-8")
+    nice = re.search(r"^Max nice priority\s+(\S+)", limits, re.MULTILINE)
+    return nice is not None and (
+        nice.group(1) == "unlimited" or int(nice.group(1)) >= 20
+    )
+
+
 TIMER_LIST_CPU = """\
 Tick Device: mode:     1
 Per CPU device: {cpu}
@@ -213,18 +230,22 @@ class GuestTimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, self.run_test(*arguments[1:]))
         # musl has no sched_setscheduler(); the daemon must still reach
-        # SCHED_IDLE after a restore. Returning to SCHED_OTHER needs
-        # CAP_SYS_NICE, which the guest has and a container may not.
-        result = subprocess.run(
-            [str(binary), "test", "idle-priority"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.startswith("idle=5 normal="), result.stdout)
-        self.assertTrue(self.run_test("idle-priority").startswith("idle=5 normal="))
+        # SCHED_IDLE after a restore and leave it after the bound.
+        policy = 0 if can_leave_idle_priority() else 5
+        for name, expected in (
+            ("idle-priority", f"idle=5 normal={policy}\n"),
+            ("promote", f"promoted caller={policy} thread={policy}\n"),
+        ):
+            result = subprocess.run(
+                [str(binary), "test", name],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(result.stdout.startswith(expected), result.stdout)
+            self.assertTrue(self.run_test(name).startswith(expected))
 
     def test_packet_memory_ranges_follow_the_header(self):
         packet = encode_packet(
@@ -395,6 +416,8 @@ class GuestTimeTests(unittest.TestCase):
             ),
             "unchecked MSR access error: RDMSR from 0x1ad at rIP: "
             "0xffffffff816f11ee (__rdmsr_on_cpu+0x1e/0x30)": "G_UNCHECKED_MSR",
+            "[Firmware Bug]: CPU   1: APIC ID mismatch. CPUID: 0x0000 "
+            "APIC: 0x0001": "G_APIC_ID_MISMATCH",
             "clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x1fa3": "none",
             "Hyper-V: LAPIC Timer Frequency: 0x1e8480": "none",
             "rcu: Hierarchical RCU implementation.": "none",
@@ -819,6 +842,17 @@ class GuestTimeTests(unittest.TestCase):
         output = self.run_test("parallel", f"{allowed[0]},{unusable[0]}")
         self.assertTrue(output.endswith("failures=8\n"), output)
         self.assertIn(f"cannot run on cpu {unusable[0]}", output)
+
+    def test_idle_work_continues_at_normal_priority_after_the_bound(self):
+        # The asynchronous checks leave SCHED_IDLE (5) for SCHED_OTHER (0)
+        # 100 ms after they start, every thread included; checks that end
+        # first stop the promoter without waiting for the bound.
+        policy = 0 if can_leave_idle_priority() else 5
+        promoted, stopped = self.run_test("promote").splitlines()
+        self.assertEqual(promoted, f"promoted caller={policy} thread={policy}")
+        fields = dict(field.split("=") for field in stopped.split()[1:])
+        self.assertEqual(fields["caller"], "5")
+        self.assertLess(int(fields["stop_ms"]), 1000)
 
 
 if __name__ == "__main__":
