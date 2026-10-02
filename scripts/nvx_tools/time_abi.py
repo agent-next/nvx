@@ -42,7 +42,7 @@ MAX_TSC_HZ = 10_000_000_000
 # checks' wall time (elapsed_us) has no budget. CI reports both and gates on
 # neither: the performance gate is the A/B comparison outside CI.
 CHECK_CPU_BUDGET_US: Mapping[str, Mapping[str, tuple[int, int]]] = {
-    "kvm": {"boot": (6_000, 2_000), "capture": (1_000, 400), "restore": (5_000, 1_750)},
+    "kvm": {"boot": (6_000, 2_000), "capture": (1_000, 400), "restore": (6_500, 1_500)},
     "mshv": {"boot": (3_000, 750), "capture": (1_000, 400), "restore": (2_500, 500)},
     "whp": {
         "boot": (20_000, 1_500),

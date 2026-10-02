@@ -144,7 +144,8 @@ class FieldParsingTests(unittest.TestCase):
                 {"boot", "capture", "restore"},
             )
         self.assertEqual(time_abi.check_cpu_budget_us("kvm", "boot", 1), 6_000)
-        self.assertEqual(time_abi.check_cpu_budget_us("kvm", "restore", 8), 17_250)
+        self.assertEqual(time_abi.check_cpu_budget_us("kvm", "restore", 1), 6_500)
+        self.assertEqual(time_abi.check_cpu_budget_us("kvm", "restore", 8), 17_000)
         self.assertEqual(time_abi.check_cpu_budget_us("mshv", "boot", 4), 5_250)
         self.assertEqual(time_abi.check_cpu_budget_us("mshv", "restore", 8), 6_000)
         self.assertEqual(time_abi.check_cpu_budget_us("whp", "capture", 2), 1_400)
