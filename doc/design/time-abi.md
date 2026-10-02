@@ -1729,7 +1729,7 @@ Expected effects:
 | Invariant TSC from the profile where the backend cannot offer it to guests (Azure MSHV and WHP) | Removes each AP's delay calibration of about 150 ms: an 8-vCPU cold boot takes 299 ms instead of 1,385 ms on Azure MSHV, and cold boots are 0.2 to 1.1 s faster at 2 to 8 vCPUs on Azure WHP |
 | Fixed restore work: the restore clock (0.7 to 1.1 ms), restore verification, and the backend preflight | A one-vCPU WHP restore is at parity on Azure 8370C runners (p50 −0.6 ms) and about 2 ms slower on bare metal, where no emulation cost is recovered; the counting LAPIC accounts for at most 0.75 ms of it |
 | MSHV root-driver costs | Host characteristics, which the time ABI and the legacy path pay alike, not ABI obligations. On prometheus30 (hypervisor 26100.30000) three root-driver costs make up 50 of the 70 ms of a one-vCPU, 512 MiB restore and 130 of 150 ms at eight vCPUs: registering guest RAM, which the driver maps no-access 4 KiB at a time (28 ms; 9.5 ms on Azure); creating each application processor after the first, about 14 ms, because `MSHV_CREATE_VP` pre-deposits 90 pages, a VP needs about 172 there, and each failed creation deposits one more page (21 and 78 ms at 4 and 8 vCPUs, and the same at cold boot; 1.9 ms at 8 vCPUs on Azure); and the first touch of each 2 MiB chunk after resume (about 22 ms, see below). The first two serialize on the driver's partition mutex. Prefaulting the snapshot's resident chunks before registration (`MADV_POPULATE_WRITE`) cuts the third to 4 to 10 ms but costs about 45 ms itself, so the remedies are driver changes (larger deposits, and read-only mappings for read faults or a smaller fault granule for private file mappings) or guest RAM filled from the snapshot in parallel. The frozen synchronized TSC set adds 40 to 170 µs for 1 to 4 VPs and no per-VP serialized work |
-| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their wall time (`elapsed_us`, not budgeted) and CPU time (`cpu_us`). Each backend has a `cpu_us` budget per phase (boot, capture, and restore), because WHP's restore checks also pay the first-touch faults of its lazily registered copy-on-write RAM, which the workload would otherwise pay. The fleet matrix driver enforces the budgets during validation; CI reports each phase against its budget (`<phase>_cpu_over_budget`) but does not gate on it, because the A/B gate above covers latency. The budgets are a + b·(n − 1) ms at n vCPUs, set to the larger of the bare-metal and Azure maxima of wiring v7 on the production kernel, plus headroom. The bare-metal floors, which cover every sample on prometheus28, 30, and 32 with 10 to 30% headroom, are boot 6 + 2, capture 1 + 0.4, and restore 4 + 0.75 on KVM, where nested azure-kvm-5 raises restore to 5 + 1.5 (medians 3.3 to 7.8 ms at 1 to 8 vCPUs and a maximum of 13.1 ms, from first-touch faults on the file-backed restored RAM); 3 + 0.5, 1 + 0.4, and 1.5 + 0.5 on MSHV; and 5 + 1, 1 + 0.4, and 20 + 2 on WHP. The Azure maxima are TBD(kvm, mshv, whp). The budgets are set at 512 MiB, the gate's memory size, which bounds the smaller validation guests: WHP's restore `cpu_us` grows with guest memory (medians 1.3 to 2.4 times higher at 512 MiB than at 128 MiB at 4 and 8 vCPUs on Azure), because the checks' first touches fault in lazily registered RAM. Wiring v7 measured medians of 1.6 to 3.7 ms at boot and 0.4 to 1.0 ms at restore on MSHV, 3.5 to 5.1 ms and 2.8 to 5.3 ms on KVM (prometheus32 idles at 800 MHz, which slows the delayed checks), and 2.6 to 4.8 ms and 7.7 to 11.5 ms on WHP at 1 to 8 vCPUs, with captures under 3 ms everywhere |
+| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their wall time (`elapsed_us`, not budgeted) and CPU time (`cpu_us`), which each backend budgets per phase (see `cpu_us` budgets below). Wiring v7 measured medians of 1.6 to 3.7 ms at boot and 0.4 to 1.0 ms at restore on MSHV, 3.5 to 5.1 ms and 2.8 to 5.3 ms on KVM (prometheus32 idles at 800 MHz, which slows the delayed checks), and 2.6 to 4.8 ms and 7.7 to 11.5 ms on WHP at 1 to 8 vCPUs, with captures under 3 ms everywhere |
 | Counting LAPIC instead of TSC-deadline on KVM | Different timer-programming exits; covered by the gate |
 | v1 profiles without `ITS_NO` | Linux's ITS mitigation at boot, about 6 ms of a one-vCPU cold boot where the host's KVM advertises `ITS_NO` (bare-metal prometheus32: +6.3 [5.5, 7.3] ms against the same build booted with `indirect_target_selection=off`). The gated Azure KVM, MSHV, and WHP guests were already mitigated and are unchanged; restore is unaffected |
 | The profile's CPU view at 2 or more vCPUs on KVM | Slower multi-vCPU cold boots, not gated: +8.0 [4.5, 15.5] ms at 2 vCPUs on prometheus32 and about +25 ms on azure-kvm-5. A component bisect blames no profile field: OpenVMM's `CPUID.4` reported a private L3 cache per vCPU, which made Linux's cache-info initialization wait a 10 ms tick for CPU 1 on many boots. With the L3 shared by the socket the wait is gone (0 of 40 boots). At the integration head on prometheus32 with wiring v7m, 2-vCPU cold boots more than 8 ms over the earlier median fall from 9 of 20 to 2 of 20 (mean −6.4 [−11.9, −1.0] ms; the medians tie, because fewer than half of the earlier boots waited), and 8-vCPU cold boots show no measurable change (+3.0 [−1.6, +7.5] ms). The bisect's −7.2 ms at 8 vCPUs came from boots with `initcall_debug` and an older guest. The msr driver's per-CPU hotplug callback (`msr_init`) still waits one or two ticks on multi-vCPU boots, as it did before the profiles |
@@ -1738,6 +1738,39 @@ Expected effects:
 | No time ABI console lines in production | Each console byte costs one or two port exits, about 10 to 12 µs on bare-metal KVM and an estimated 20 to 45 µs nested on Azure. Without the boot marker (about 110 bytes) and the restore marker (about 117 bytes), boots and restores save 1 to 5 ms, enough to fail the gate on `azure-kvm-5`; violation events still print |
 
 Expected wins are tracked separately and do not relax the gate.
+
+**`cpu_us` budgets.** Each backend budgets the CPU time of each phase's
+checks (boot, capture, and restore) at a + b·(n − 1) ms for n online vCPUs,
+per sample. A budget is the larger of the bare-metal and Azure maxima of
+wiring v7m on the production kernel (`vmlinux-lockstep`), with at least
+20% headroom:
+
+| Backend | Boot | Capture | Restore | Measured on |
+| --- | --- | --- | --- | --- |
+| KVM | 6 + 2 | 1 + 0.4 | 5 + 1.75 | prometheus32 and `azure-kvm-5`, 128 MiB |
+| MSHV | 3 + 0.75 | 1 + 0.4 | 2.5 + 0.5 | prometheus30 and `azure-azlinux-5`, 128 MiB |
+| WHP | 20 + 1.5 | 1 + 0.4 | 35 + 6 | prometheus28 and the 8370C and 8573C runners, 512 MiB |
+
+The fleet matrix driver enforces the budgets during validation. CI reports
+each phase against its budget (`<phase>_cpu_over_budget`) but does not gate
+on it, because the A/B gate above covers latency. The checks' CPU time also
+counts the host stalls of their first touches of restored RAM:
+
+- WHP's restore checks fault in its lazily registered copy-on-write RAM,
+  which the workload would otherwise do. Their cost grows with guest memory:
+  medians are 1.3 to 2.4 times higher at 512 MiB than at 128 MiB at 4 and
+  8 vCPUs on Azure. So WHP's budgets come from 512 MiB guests, which bound
+  smaller ones. Its Azure maxima are 17.03 ms at boot with 2 vCPUs and
+  42.20 ms at restore with 4.
+- On MSHV, each first touch of a 2 MiB chunk of restored RAM stalls the
+  toucher about 1.1 ms on bare metal (see MSHV root-driver costs). The
+  restore budget leaves room for one more stall above every maximum.
+- On `azure-kvm-5`, KVM's restore checks fault in the file-backed restored
+  RAM 4 KiB at a time: medians of 3.3 to 7.8 ms at 1 to 8 vCPUs, and a
+  maximum of 13.14 ms.
+
+KVM's and MSHV's budgets come from 128 MiB guests, the size that CI and the
+fleet matrices run.
 
 **Start-up budget.** The time ABI and CPU profile work of a cold boot or
 restore costs less than 0.5 ms over the pre-profile head (`e7ec0ca6c`),
