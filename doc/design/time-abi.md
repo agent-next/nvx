@@ -1118,7 +1118,7 @@ It then prints one line per recorded phase, in the order boot, capture, and
 restore, then the runtime line:
 
 ```text
-NVX-TIME-ABI: v=1 phase=<boot|capture|restore> status=<ok|pending> cpus=<n> tsc_hz=<F> lapic_hz=<L> generation=<g> elapsed_us=<duration>
+NVX-TIME-ABI: v=1 phase=<boot|capture|restore> status=<ok|pending> cpus=<n> tsc_hz=<F> lapic_hz=<L> generation=<g> elapsed_us=<duration> cpu_us=<duration>
 NVX-TIME-ABI: v=1 phase=runtime status=<synchronized|unsynchronized> generation=<g> discontinuities=<n> offset_ns=<theta> uncertainty_ns=<epsilon> rejected_samples=<n> last_sample_error=<none|G_SAMPLE_UNCERTAIN>
 ```
 
@@ -1139,12 +1139,18 @@ line by its `phase`.
 
 `status` exits with status 0 when every phase line reports `ok`. If a check
 is still pending after 30 s, its line reports `status=pending`, without
-`elapsed_us`, and the exit status is 1.
+`elapsed_us` or `cpu_us`, and the exit status is 1.
 
-At boot, `elapsed_us` covers the checks and the daemon start; at capture,
+At boot, the checks' work is the checks and the daemon start; at capture,
 the step 1 checks of the [snapshot agent](#snapshot-agent). At restore, it
-covers steps 6 to 12 and the step 11 checks, but not step 13's 100 ms
-delay, the grace period wait, or the deferred `C7`.
+is steps 6 to 12 and the step 11 checks, but not step 13's 100 ms delay, the
+grace period wait, or the deferred `C7`. `elapsed_us` is that work's wall
+time, including any wait for a CPU at `SCHED_IDLE`; it bounds the fail-fast
+latency and is not budgeted. `cpu_us` is the CPU time it consumes, summed
+over every thread and process that runs it (`CLOCK_PROCESS_CPUTIME_ID`);
+it is the background cost to the workload, and the
+[performance budget](#performance-expectations-and-acceptance-gate) applies
+to it.
 
 A failed check prints no marker: it emits the violation event with code
 `G_CONFORMANCE_<ID>` (`G_KERNEL_WX` for `K1`) and powers off with status 193,
@@ -1367,7 +1373,8 @@ every change, and `nvx-time status` reads it. The sandbox agent bind-mounts
 | `generation` | `g` |
 | `boot_status`, `capture_status`, `restore_status` | `pending` while the phase's check runs, then `ok`; absent until the phase first runs (a failed check powers the guest off). The capture keys hold the latest capture, and the restore keys this process's restore |
 | `boot_cpus`, `capture_cpus`, `restore_cpus` | Online CPUs the check covered |
-| `boot_elapsed_us`, `capture_elapsed_us`, `restore_elapsed_us` | Its duration, as `elapsed_us` in the [status command](#conformance-checks-and-the-nvx-time-abi-marker) |
+| `boot_elapsed_us`, `capture_elapsed_us`, `restore_elapsed_us` | Its wall time, as `elapsed_us` in the [status command](#conformance-checks-and-the-nvx-time-abi-marker) |
+| `boot_cpu_us`, `capture_cpu_us`, `restore_cpu_us` | Its CPU time, as `cpu_us` in the [status command](#conformance-checks-and-the-nvx-time-abi-marker) |
 | `capture_generation`, `restore_generation` | `g` when the check ran (the boot check's is 0) |
 | `boot_failures`, `capture_failures`, `restore_failures` | [Report-only mode](#conformance-checks-and-the-nvx-time-abi-marker) only: the check's failure count |
 | `tsc_hz`, `lapic_hz` | `F` and `L` |
@@ -1625,7 +1632,7 @@ Expected effects:
 | Invariant TSC from the profile where the backend cannot offer it to guests (Azure MSHV and WHP) | Removes each AP's delay calibration of about 150 ms: an 8-vCPU cold boot takes 299 ms instead of 1,385 ms on Azure MSHV, and cold boots are 0.2 to 1.1 s faster at 2 to 8 vCPUs on Azure WHP |
 | Fixed restore work: the restore clock (0.7 to 1.1 ms), restore verification, and the backend preflight | A one-vCPU WHP restore is at parity on Azure 8370C runners (p50 −0.6 ms) and about 2 ms slower on bare metal, where no emulation cost is recovered; the counting LAPIC accounts for at most 0.75 ms of it |
 | MSHV VP creation | Serialized at about 14 ms per application processor on bare metal (27 and 85 ms at 4 and 8 vCPUs); the frozen synchronized TSC set adds 40 to 170 µs for 1 to 4 VPs and no per-VP serialized work |
-| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their `elapsed_us`, budgeted at 2.5 ms at one vCPU plus 0.3 ms per additional vCPU on KVM and MSHV, and 5 ms plus 0.6 ms per additional vCPU on WHP |
+| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their wall time (`elapsed_us`, not budgeted) and CPU time (`cpu_us`). The same `cpu_us` budget holds for the boot, capture, and restore checks: 2.5 ms at one vCPU plus 0.75 ms per additional vCPU on KVM and MSHV. That is measured on KVM (prometheus32, wiring v5): 1.1, 2.3 to 3.2, 2.4 to 3.6, and 4.6 to 7.2 ms at 1, 2, 4, and 8 vCPUs. On WHP it is 5 ms plus 1.5 ms per additional vCPU, TBD(guest) until WHP and MSHV CPU times are measured |
 | Counting LAPIC instead of TSC-deadline on KVM | Different timer-programming exits; covered by the gate |
 | Restore work before the acknowledgement | Only the packet read, the clock set, CPU and memory activation, and entropy and identity repair, in one helper process. The restore checks, the RCU release, and the deferred `C7` start 100 ms after the acknowledgement, after the readiness path |
 | No time ABI console lines in production | Each console byte costs one or two port exits, about 10 to 12 µs on bare-metal KVM and an estimated 20 to 45 µs nested on Azure. Without the boot marker (about 110 bytes) and the restore marker (about 117 bytes), boots and restores save 1 to 5 ms, enough to fail the gate on `azure-kvm-5`; violation events still print |
@@ -1659,7 +1666,8 @@ selection to the arrival of the `0x605` acknowledgement). The
 `restore.guest_repair_gate` milestone still spans from the VP release to the
 release of the acknowledgement boundary. The guest's restore checks run
 after the acknowledgement, outside these phases. `nvx-time status` reports
-`elapsed_us`, which covers the guest's readiness path and those checks. On
+`elapsed_us` and `cpu_us`, which cover the guest's readiness path and those
+checks. On
 every cold boot and restore, the worker logs `time ABI CPU checks passed`
 with `recorded_cpuid_us`, `presented_cpuid_us`, and `profile_support_us`.
 
