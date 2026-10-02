@@ -1106,9 +1106,11 @@ can be evaluated under an OpenVMM that does not implement the time ABI.
 Violations print `NVX-TIME-REPORT-VIOLATION` lines with the event's fields.
 `nvx-time status` prints its phase lines with the `NVX-TIME-REPORT` prefix,
 `status=fail` for a failed check, and ` failures=<n>` appended, and it exits
-with status 1 if any check failed. These prefixes are reserved for this mode;
-production images never set the token, and harnesses never accept a
-report-only boot as conformant.
+with status 1 if any check failed. The state file carries them: in this mode
+only, a phase's `_status` key may be `fail`, and `boot_failures`,
+`capture_failures`, and `restore_failures` count each check's failures.
+These prefixes and keys are reserved for this mode; production images never
+set the token, and harnesses never accept a report-only boot as conformant.
 
 ### Violation watcher
 
@@ -1164,9 +1166,13 @@ builds the soft-lockup and hung-task detectors.
 
 Before the capture request:
 
-1. Run the capture checks (`C6`, `C7`, `C10`). They do not wait and print
-   nothing; they record `capture_status=ok` in the state file, which the
-   snapshot carries.
+1. Wait until no boot check is pending, for at most 30 s, as
+   `nvx-time status` does: a capture right after shell-ready may find the
+   asynchronous boot checks still running, and the daemon, which `C10`
+   requires, starts only when they pass. A timeout fails the capture with
+   `G_CONFORMANCE_C10` (193). Then run the capture checks (`C6`, `C7`,
+   `C10`), which do not wait and print nothing; they record
+   `capture_status=ok` in the state file, which the snapshot carries.
 2. Save `/sys/module/rcupdate/parameters/rcu_cpu_stall_suppress` and write 1.
 3. Debug: save and zero `/proc/sys/kernel/soft_watchdog` and
    `/proc/sys/kernel/hung_task_timeout_secs`.
@@ -1181,9 +1187,10 @@ acknowledgement.
 
 6. Read the status from `0xea`. Bit 1 is always set after a restore.
 7. Read `CLOCK_REALTIME` as `t0`, write `0xa5` to `0xea`, read it as `t1`,
-   and read the packet with four-byte reads: `inl`, or `rep insl`, which
-   KVM serves in one exit and MSHV and WHP through OpenVMM's instruction
-   emulator. Validate the magic, version,
+   and read the packet with four-byte `inl` reads. (`rep insl` would take a
+   single exit on KVM, but OpenVMM's instruction emulator, which serves
+   string port I/O on MSHV and WHP, raises #GP for it at CPL 3 although the
+   TSS I/O permission bitmap grants the port.) Validate the magic, version,
    reserved bits, counts, `g`, and the generation ID (`G_REPAIR_PACKET`,
    `G_REPAIR_GENERATION`).
 8. Set the wall clock. Compute `theta` and `epsilon` from the bracket. If
@@ -1304,6 +1311,7 @@ every change, and `nvx-time status` reads it. The sandbox agent bind-mounts
 | `boot_cpus`, `capture_cpus`, `restore_cpus` | Online CPUs the check covered |
 | `boot_elapsed_us`, `capture_elapsed_us`, `restore_elapsed_us` | Its duration, as `elapsed_us` in the [status command](#conformance-checks-and-the-nvx-time-abi-marker) |
 | `capture_generation`, `restore_generation` | `g` when the check ran (the boot check's is 0) |
+| `boot_failures`, `capture_failures`, `restore_failures` | [Report-only mode](#conformance-checks-and-the-nvx-time-abi-marker) only: the check's failure count |
 | `tsc_hz`, `lapic_hz` | `F` and `L` |
 | `discontinuities` | Wall-clock discontinuities since cold boot: restores plus discipline steps |
 | `last_discontinuity` | `none`, `restore`, or `step` |
