@@ -48,10 +48,11 @@
     {
       "id": "filesystem-alias-boundary",
       "scenario": "denied-filesystem-paths",
-      "description": "Probe direct, parent-relative, symlink, junction, and secondary-mount path-policy bypasses.",
+      "description": "Probe direct, parent-relative, symlink, guest-created symlink, junction, and secondary-mount path-policy bypasses.",
       "coverage": [
         "path-traversal",
         "symlink-aliasing",
+        "guest-created-symlinks",
         "junction-aliasing",
         "mount-policy",
         "read-only-layers"

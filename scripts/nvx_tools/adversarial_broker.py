@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast
 
 from nvx_tools.common import ScriptError
+from nvx_tools.common import strict_json_object as _strict_object
 
 SCHEMA_VERSION = 1
 CAMPAIGNS = (
@@ -63,15 +64,6 @@ _RESULT_CATEGORIES = frozenset(
         "availability-failure",
     }
 )
-
-
-def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ScriptError(f"duplicate JSON property: {key}")
-        result[key] = value
-    return result
 
 
 def _reject_json_constant(value: str) -> object:

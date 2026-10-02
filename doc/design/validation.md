@@ -26,7 +26,8 @@ backend and covers IRQ0/RTC behavior, raw portb I/O, shutdown status, exact
 snapshot sequencing, repeated immutable restore, coherent downtime, fresh
 generation IDs, `getrandom()` output, kernel UUIDs, temporary-file identifiers,
 entropy reseed, active console RX/TX, network policy and HTTP traffic, and live
-virtio-fs attachment revalidation. Directional network coverage verifies an
+virtio-fs attachment revalidation, including a guest-created symbolic link held
+across capture. Directional network coverage verifies an
 egress request and response with ingress denied, denial of a host connection
 to an active guest listener, complete egress denial, and pre-boot rejection of
 unsupported ingress on KVM, MSHV, and WHP. L3/L4 coverage verifies TCP and UDP
@@ -41,7 +42,8 @@ cleanly. Sandbox coverage adds deterministic active block-I/O drain, paired
 scratch publication, two private restores, fresh scratch replacement, and
 pre-entry rejection of missing, corrupt, mismatched, or wrong-geometry media.
 Denied-filesystem coverage verifies listing suppression, allowed writes,
-direct and parent-relative denial, symlink/junction alias denial, a second
+direct and parent-relative denial, symlink/junction alias denial, guest-created
+links into the denied subtree, a second
 virtio-fs mount, and pre-boot rejection of unsafe path policies.
 The native suite targets KVM, MSHV, and WHP; a passing run on one backend is
 not a fresh result for the others.

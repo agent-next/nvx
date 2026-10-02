@@ -40,6 +40,7 @@ from nvx_tools.build_constants import (
 from nvx_tools.common import (
     ScriptError,
     artifact_path,
+    git_output,
     openvmm_binary_path,
     require_file,
 )
@@ -138,26 +139,13 @@ def _string(
     return value
 
 
-def _git(*arguments: str) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(BuildConstants.REPO_ROOT), *arguments],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
-        timeout=30.0,
-    )
-    return completed.stdout.strip()
-
-
 def _target_metadata() -> dict[str, object]:
-    nvx_status = _git(
+    nvx_status = git_output(
         "status",
         "--porcelain",
         "--untracked-files=normal",
     ).splitlines()
-    openvmm_status = _git(
+    openvmm_status = git_output(
         "-C",
         str(OpenVMMBuildConstants.DIRECTORY),
         "status",
@@ -165,10 +153,10 @@ def _target_metadata() -> dict[str, object]:
         "--untracked-files=normal",
     ).splitlines()
     return {
-        "nvx_commit": _git("rev-parse", "HEAD"),
+        "nvx_commit": git_output("rev-parse", "HEAD"),
         "nvx_dirty": bool(nvx_status),
         "nvx_status": nvx_status,
-        "openvmm_commit": _git(
+        "openvmm_commit": git_output(
             "-C",
             str(OpenVMMBuildConstants.DIRECTORY),
             "rev-parse",

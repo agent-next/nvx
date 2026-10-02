@@ -82,7 +82,9 @@ def _read_workload_identity(output: bytes) -> tuple[str, str]:
     try:
         text = output.decode("utf-8")
     except UnicodeDecodeError as error:
-        raise RuntimeError("public workload identity probe returned invalid UTF-8") from error
+        raise RuntimeError(
+            "public workload identity probe returned invalid UTF-8"
+        ) from error
     records = [line.split(":") for line in text.splitlines() if line]
     if (
         len(records) != 1
@@ -442,11 +444,8 @@ def run_managed_exec_configuration(
             raise RuntimeError("managed cleanup removed a supplied workload artifact")
     except Exception as error:
         if root.exists() and not preservation_reported:
-            preserved_path = _bounded_text(
-                str(root).encode("utf-8", errors="replace")
-            )
+            preserved_path = _bounded_text(str(root).encode("utf-8", errors="replace"))
             raise RuntimeError(
-                f"{error}; managed fixture preserved for recovery: "
-                f"{preserved_path}"
+                f"{error}; managed fixture preserved for recovery: {preserved_path}"
             ) from error
         raise

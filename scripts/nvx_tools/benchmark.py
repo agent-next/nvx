@@ -33,6 +33,7 @@ from string import Template
 from typing import TextIO, TypedDict, cast
 
 from . import common
+from .adversarial_oracles import ProcessTreeContainment
 from .build_constants import (
     AlpineBuildConstants,
     BuildConstants,
@@ -1295,8 +1296,23 @@ def parse_virtio_restore_event(line: str) -> dict[str, object] | None:
 
 
 class InteractiveProcess:
-    def __init__(self, command: Sequence[str], environment: dict[str, str]) -> None:
+    def __init__(
+        self,
+        command: Sequence[str],
+        environment: dict[str, str],
+        *,
+        contain_process_tree: bool = False,
+    ) -> None:
         self.terminal_fd: int | None = None
+        self.containment = ProcessTreeContainment() if contain_process_tree else None
+        creationflags = (
+            self.containment.creationflags if self.containment is not None else 0
+        )
+        process_command = (
+            self.containment.command(command)
+            if self.containment is not None
+            else list(command)
+        )
         if sys.platform.startswith("linux"):
             openpty = cast(
                 Callable[[], tuple[int, int]] | None,
@@ -1307,31 +1323,69 @@ class InteractiveProcess:
             terminal_fd, child_fd = openpty()
             try:
                 self.process = subprocess.Popen(
-                    command,
+                    process_command,
                     stdin=child_fd,
                     stdout=child_fd,
                     stderr=child_fd,
                     env=environment,
+                    creationflags=creationflags,
                 )
             except Exception:
                 os.close(terminal_fd)
+                if self.containment is not None:
+                    self.containment.abort_spawn()
                 raise
             finally:
                 os.close(child_fd)
             self.terminal_fd = terminal_fd
         else:
-            self.process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=environment,
-            )
+            try:
+                self.process = subprocess.Popen(
+                    process_command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=environment,
+                    creationflags=creationflags,
+                )
+            except Exception:
+                if self.containment is not None:
+                    self.containment.abort_spawn()
+                raise
+        try:
+            if self.containment is not None:
+                self.containment.attach(self.process)
+        except BaseException:
+            self.process.kill()
+            self.process.wait()
+            self.close()
+            raise
         try:
             record_adversarial_openvmm_pid(self.process.pid, environment)
-        except BaseException:
-            terminate(self.process)
-            self.close()
+        except BaseException as primary_error:
+            cleanup_error: BaseException | None = None
+            if self.containment is not None:
+                try:
+                    self.close()
+                except BaseException as error:
+                    cleanup_error = error
+                try:
+                    terminate(self.process)
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            else:
+                try:
+                    terminate(self.process)
+                except BaseException as error:
+                    cleanup_error = error
+                try:
+                    self.close()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            if cleanup_error is not None:
+                raise primary_error from cleanup_error
             raise
 
     def read_output(self, chunks: queue.Queue[bytes | None]) -> None:
@@ -1366,9 +1420,16 @@ class InteractiveProcess:
             self.process.stdin.flush()
 
     def close(self) -> None:
+        if self.containment is not None:
+            self.containment.close(self.process)
         if self.terminal_fd is not None:
             os.close(self.terminal_fd)
             self.terminal_fd = None
+        else:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+            if self.process.stdout is not None:
+                self.process.stdout.close()
 
 
 def record_adversarial_openvmm_pid(
@@ -2031,6 +2092,34 @@ def _try_peak_rss(process: subprocess.Popen[bytes], current: int) -> int:
         return current
 
 
+def _raise_guest_script_failure(
+    primary_error: BaseException | None,
+    cleanup_errors: list[BaseException],
+) -> None:
+    if primary_error is not None:
+        if cleanup_errors:
+            cleanup_summary = "\n".join(
+                f"- {type(error).__name__}: {error}" for error in cleanup_errors
+            )
+            primary_error.args = (
+                f"{primary_error}\n--- cleanup failures ---\n{cleanup_summary}",
+                *primary_error.args[1:],
+            )
+            primary_error.cleanup_errors = tuple(cleanup_errors)  # type: ignore[attr-defined]
+        raise primary_error.with_traceback(primary_error.__traceback__)
+
+    if len(cleanup_errors) == 1:
+        error = cleanup_errors[0]
+        raise error.with_traceback(error.__traceback__)
+    if cleanup_errors:
+        cleanup_summary = "\n".join(
+            f"- {type(error).__name__}: {error}" for error in cleanup_errors
+        )
+        error = RuntimeError(f"guest cleanup failed:\n{cleanup_summary}")
+        error.cleanup_errors = tuple(cleanup_errors)  # type: ignore[attr-defined]
+        raise error
+
+
 def run_guest_script(
     command: Sequence[str],
     script: str,
@@ -2041,11 +2130,16 @@ def run_guest_script(
     teardown_mode: str = "guest-exit",
     log_path: Path | None = None,
     boot_marker: bytes = BOOT_MARKER,
+    contain_process_tree: bool = False,
 ) -> GuestCommandResult:
     environment = os.environ.copy()
     environment["OPENVMM_LOG"] = "off"
     started_ns = time.perf_counter_ns()
-    interaction = InteractiveProcess(command, environment)
+    interaction = InteractiveProcess(
+        command,
+        environment,
+        contain_process_tree=contain_process_tree,
+    )
     process = interaction.process
     if windows_cpus is not None:
         set_windows_affinity(process.pid, windows_cpus)
@@ -2059,6 +2153,9 @@ def run_guest_script(
     input_sent = False
     completed = False
     peak_bytes = 0
+    result: GuestCommandResult | None = None
+    primary_error: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -2069,6 +2166,8 @@ def run_guest_script(
             except queue.Empty:
                 peak_bytes = _try_peak_rss(process, peak_bytes)
                 if process.poll() is not None:
+                    if interaction.containment is not None:
+                        interaction.containment.close(process)
                     continue
                 continue
             if chunk is None:
@@ -2096,24 +2195,44 @@ def run_guest_script(
             raise RuntimeError(
                 f"guest exited without completion marker {completion_marker.decode()!r}"
             )
-        return {
+        result = {
             "text": output.decode("utf-8", "replace"),
             "wall_ms": (time.perf_counter_ns() - started_ns) / 1_000_000,
             "peak_rss_bytes": peak_bytes,
         }
     except BaseException as error:
-        terminate(process)
-        if not isinstance(error, Exception):
-            raise
-        tail = output[-4096:].decode("utf-8", "replace")
-        if tail:
-            raise RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") from error
-        raise
-    finally:
-        if log_path is not None:
+        try:
+            if interaction.containment is not None:
+                interaction.containment.close(process)
+            else:
+                terminate(process)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if isinstance(error, Exception):
+            tail = output[-4096:].decode("utf-8", "replace")
+            if tail:
+                wrapped = RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}")
+                wrapped.__cause__ = error
+                primary_error = wrapped
+            else:
+                primary_error = error
+        else:
+            primary_error = error
+
+    if log_path is not None:
+        try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_bytes(output)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+    try:
         interaction.close()
+    except BaseException as cleanup_error:
+        cleanup_errors.append(cleanup_error)
+
+    _raise_guest_script_failure(primary_error, cleanup_errors)
+    assert result is not None
+    return result
 
 
 def capture_automatic_snapshot(

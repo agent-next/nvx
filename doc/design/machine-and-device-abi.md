@@ -341,10 +341,15 @@ lifetimes. It requires FUSE 7.31 or newer and caps writes at 1 MiB. Without
 guest-discoverable. Its explicit profile rejects SectionFs, Aggregate,
 alternate tags, extra queues, shared-memory windows, and PCI transport.
 The host root is pinned by its platform object identity and revalidated when
-the export is opened, and every operation stays confined to the export:
-paths containing symbolic-link components are rejected, symbolic-link creation
-is refused, and bounded inode, alias, and handle tables fail an operation
-rather than create untracked host state.
+the export is opened, and every operation stays confined to the export: on
+Linux, each host operation opens its parent directory without following a
+symbolic link or leaving the root and never follows the final component; on
+Windows, guest-created links are WSL-style reparse points that path resolution
+never follows, and ancestor components that are links or reparse points are
+rejected. A read-write mapping lets the guest create symbolic links with
+exact targets, which only the guest resolves; a read-only mapping rejects
+them. Bounded inode, alias, and handle tables fail an operation rather than
+create untracked host state.
 Read-only mode rejects mutation in the host device before invoking host
 filesystem operations; read-write mode exposes only the supported common host
 contract.
@@ -355,8 +360,9 @@ and bind-mount aliases. The policy is unchanged by a second guest mount.
 
 The exported directory is external live state, not part of the VM snapshot.
 An active capture saves its exact canonical host path, denied-path set, FUSE negotiation, node
-and handle allocation, aliases, lookup counts, directory snapshots and cookies,
-and the identities needed to reopen objects. Restore requires the same path,
+and handle allocation, aliases (including those of symbolic links), lookup
+counts, directory snapshots and cookies, and the identities needed to reopen
+objects. Restore requires the same path,
 target, mode, denied-path set, root identity, and reopenable objects. A dormant capture instead
 saves explicit unattached state and may restore with no attachment or bind a
 new HostFs backend. The resumed guest then mounts tag `microvm` explicitly;
