@@ -1733,8 +1733,11 @@ The backends add their own CPUID work:
   does not enumerate.
 - MSHV reads VP 0's report in one rep `HvCallGetVpCpuidValues`: 73 µs p50 on
   prometheus30 and 51 µs on azure-azlinux-5, against 0.51 and 0.82 ms with
-  one call per entry. WHP's report takes 50 native reads, about 0.78 ms
-  (median) on prometheus28.
+  one call per entry. WHP has no batched read: its report takes 57 to 60
+  native reads, one call each, which with its one host enumeration cost
+  0.81 ms on prometheus28 and 1.48 to 1.86 ms on Azure (medians). Reading
+  them on a few threads before any VP runs is the allowed lever if a gate
+  needs it.
 
 **Attribution.** With `OPENVMM_STARTUP_PROFILE` set, OpenVMM's lifecycle
 profile records three exclusive time ABI restore phases:
