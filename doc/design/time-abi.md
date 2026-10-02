@@ -1424,17 +1424,19 @@ A host probe compares the TSC with two host clocks:
 - **Interval agreement and conclusiveness** use a clock that time
   synchronization never steers: `CLOCK_MONOTONIC_RAW` on Linux and
   `QueryPerformanceCounter` on Windows.
-- **The whole-window rate**, checked against `F_d`, uses the disciplined
-  `CLOCK_MONOTONIC` on Linux, which is never stepped and runs at the true
-  rate, and `QueryPerformanceCounter` on Windows.
+- **The whole-window rate `r`** and its deviation from `F_d` use the
+  disciplined `CLOCK_MONOTONIC` on Linux, which is never stepped and whose
+  long-run rate is the true one, and `QueryPerformanceCounter` on Windows.
 
 A sample reads the TSC between two reads of a clock and keeps the tightest of
 up to 64 such brackets. Its uncertainty is half the bracket plus half the
-clock's resolution. The resolution is measured, not taken from
-`clock_getres`: it is the smallest step the clock is observed to take, for
-example 100 ns for the Hyper-V reference TSC page clock
-(`hyperv_clocksource_tsc_page`), which `clock_getres` reports as 1 ns, and
-one 10 MHz tick for `QueryPerformanceCounter`.
+clock's resolution. A clock's resolution is the larger of its reported
+resolution and, when two consecutive reads return the same value, the
+smallest step observed between consecutive reads. Hyper-V's reference TSC
+page clock (`hyperv_clocksource_tsc_page`), the clocksource of MSHV roots and
+the Azure MSHV runners, advances the Linux clocks in 100 ns steps, although
+`clock_getres` reports 1 ns. `QueryPerformanceCounter`'s resolution is one
+10 MHz tick.
 
 The probe sleeps between samples, so the host's CPUs can idle: 3 samples 1 s
 apart in `validate-runner`, and 13 samples 10 s apart (120 s) in `doctor`.
@@ -1450,17 +1452,20 @@ check passes if:
 - where `F_d` is known (in `doctor`, and in the `validate-runner` jobs that
   run `H3`), `|r - F_d|` is at most 100 ppm of `F_d`.
 
-The detail reports `r`, its deviation from `F_d` in ppm, the agreement, the
-largest `u_i`, both clocks and their measured resolutions, and, on Linux, the
-host clocksource, which never gates.
+The probe's output names both clocks, each with its role (rate or
+stability), resolution, and observed step. The detail reports `r`, its
+deviation from `F_d` in ppm, the agreement, the largest `u_i`, the stability
+clock, and, on Linux, the host clocksource, which never gates.
 
-Interval agreement uses the undisciplined clock because chrony steers
-`CLOCK_MONOTONIC`'s rate every few seconds, on Azure through the Hyper-V PTP
-clock:
+Interval agreement uses the undisciplined clock because chrony's frequency
+updates move `CLOCK_MONOTONIC`'s rate between seconds, on Azure through the
+Hyper-V PTP clock:
 
 - Against `CLOCK_MONOTONIC`, the short schedule failed 3 of 9 runs on the
-  Azure MSHV runners. The agreement reached 12.2 ppm, and 30 1-s intervals
-  spread by up to 2.7 ppm while chrony's frequency moved by up to 2.7 ppm.
+  Azure MSHV runners: their interval rates differed by up to 12.2 ppm. Over
+  30 1-s intervals they spread by up to 2.7 ppm, against at most 0.07 ppm
+  versus `CLOCK_MONOTONIC_RAW`, while chrony's frequency moved by up to
+  2.7 ppm.
 - Against `CLOCK_MONOTONIC_RAW` and `QueryPerformanceCounter`, 35
   short-schedule runs on the Azure KVM, MSHV, and WHP runners agree within
   0.000 to 0.050 ppm, with the largest `u_i` between 0.04 and 0.106 ppm. The
