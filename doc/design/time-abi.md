@@ -1190,10 +1190,10 @@ grace period wait, or the deferred `C7`. `elapsed_us` is that work's wall
 time, including any wait for a CPU at `SCHED_IDLE`; it bounds the fail-fast
 latency and is not budgeted. `cpu_us` is the CPU time it consumes, summed
 over every thread and process that runs it (`CLOCK_PROCESS_CPUTIME_ID`);
-it is the background cost to the workload, which CI reports against the
-budget in
+it is the background cost to the workload, which the fleet matrix driver
+checks against the budget in
 [Performance expectations](#performance-expectations-and-acceptance-gate)
-without gating on it.
+during validation; CI reports it without gating on it.
 
 A failed check prints no marker: it emits the violation event with code
 `G_CONFORMANCE_<ID>` (`G_KERNEL_WX` for `K1`) and powers off with status 193,
@@ -1679,7 +1679,7 @@ Expected effects:
 | Invariant TSC from the profile where the backend cannot offer it to guests (Azure MSHV and WHP) | Removes each AP's delay calibration of about 150 ms: an 8-vCPU cold boot takes 299 ms instead of 1,385 ms on Azure MSHV, and cold boots are 0.2 to 1.1 s faster at 2 to 8 vCPUs on Azure WHP |
 | Fixed restore work: the restore clock (0.7 to 1.1 ms), restore verification, and the backend preflight | A one-vCPU WHP restore is at parity on Azure 8370C runners (p50 −0.6 ms) and about 2 ms slower on bare metal, where no emulation cost is recovered; the counting LAPIC accounts for at most 0.75 ms of it |
 | MSHV VP creation | Serialized at about 14 ms per application processor on bare metal (27 and 85 ms at 4 and 8 vCPUs); the frozen synchronized TSC set adds 40 to 170 µs for 1 to 4 VPs and no per-VP serialized work |
-| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their wall time (`elapsed_us`, not budgeted) and CPU time (`cpu_us`). The same `cpu_us` budget holds for the boot, capture, and restore checks; CI reports each phase against it (`<phase>_cpu_over_budget`) but does not gate on it, because the A/B gate above covers latency. The budget is 2.5 ms at one vCPU plus 0.75 ms per additional vCPU on KVM and MSHV. That is measured on KVM (prometheus32, wiring v5): 1.1, 2.3 to 3.2, 2.4 to 3.6, and 4.6 to 7.2 ms at 1, 2, 4, and 8 vCPUs. On WHP it is 5 ms plus 1.5 ms per additional vCPU, TBD(guest) until WHP and MSHV CPU times are measured |
+| Boot check and daemon start | Off the cold-boot path. Before shell-ready only the initial time sample and clock step remain (`C12`: one port write and four reads). The other checks and the daemon start run after shell-ready, and `nvx-time status` reports their wall time (`elapsed_us`, not budgeted) and CPU time (`cpu_us`). The same `cpu_us` budget holds for the boot, capture, and restore checks. The fleet matrix driver enforces it during validation; CI reports each phase against it (`<phase>_cpu_over_budget`) but does not gate on it, because the A/B gate above covers latency. The budget is 2.5 ms at one vCPU plus 0.75 ms per additional vCPU on KVM and MSHV. That is measured on KVM (prometheus32, wiring v5): 1.1, 2.3 to 3.2, 2.4 to 3.6, and 4.6 to 7.2 ms at 1, 2, 4, and 8 vCPUs. On WHP it is 5 ms plus 1.5 ms per additional vCPU, TBD(guest) until WHP and MSHV CPU times are measured |
 | Counting LAPIC instead of TSC-deadline on KVM | Different timer-programming exits; covered by the gate |
 | Restore work before the acknowledgement | Only the packet read, the clock set, CPU and memory activation, and entropy and identity repair, in one helper process. The restore checks, the RCU release, and the deferred `C7` start at `SCHED_IDLE` 100 ms after the acknowledgement, after the readiness path |
 | No time ABI console lines in production | Each console byte costs one or two port exits, about 10 to 12 µs on bare-metal KVM and an estimated 20 to 45 µs nested on Azure. Without the boot marker (about 110 bytes) and the restore marker (about 117 bytes), boots and restores save 1 to 5 ms, enough to fail the gate on `azure-kvm-5`; violation events still print |
@@ -1762,7 +1762,10 @@ matrix driver run `/sbin/nvx-time status` over the console after shell-ready
 and after every restore. They require exit status 0 and, after a restore, a
 `phase=restore` line with `status=ok`, the restored `generation`, and `cpus`
 equal to the online CPUs; after a cold boot, a `phase=boot` line with
-`generation=0`. The fleet runs them on
+`generation=0`. During fleet validation (`p6`), the matrix driver also
+requires each phase's `cpu_us` to be within the budget in
+[Performance expectations](#performance-expectations-and-acceptance-gate);
+CI reports it without gating on it. The fleet runs them on
 the hosts our SSH account can use,
 which for KVM are prometheus32 and `azure-kvm-5` and for MSHV prometheus30
 and `azure-azlinux-5`: the account cannot open `/dev/kvm` or `/dev/mshv` on
