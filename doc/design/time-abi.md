@@ -269,6 +269,7 @@ settled cell on the registered hosts.
 | Native rate `F_d` | `KVM_GET_TSC_KHZ` × 1000 on VP 0 (1 kHz granularity) | `ProcessorClockFrequency` partition property | `WHvCapabilityCodeProcessorClockFrequency` |
 | No TSC scaling | Never `KVM_SET_TSC_KHZ`; every vCPU reports the host rate | No frequency override | No `ProcessorClockFrequency` partition property; the 1 GHz request is removed |
 | LAPIC rate `L` | In-kernel LAPIC at 1 GHz; `KVM_CAP_X86_APIC_BUS_CYCLES_NS` never set | The hypervisor's LAPIC at 200 MHz | Offloaded APIC at its fixed 200 MHz, verified at preflight (setting `InterruptClockFrequency` is not supported); the emulated APIC is not used |
+| Pending LAPIC vector after a LAPIC state write | Nothing more: `KVM_SET_LAPIC` raises `KVM_REQ_EVENT`, which wakes a halted vCPU for a deliverable vector | Writing the LAPIC state does not wake a halted VP, so the backend asserts the highest pending edge-triggered vector (16 and up) to the VP's own APIC through the hypervisor's interrupt path after the write, and again when the VP next runs; level-triggered vectors stay with the IOAPIC | Writing the offloaded LAPIC state does not reliably wake a halted VP, so the backend asserts the highest pending edge-triggered vector with `WHvRequestInterrupt` to the VP's own APIC ID after the write, and again before the VP next runs |
 | TSC-deadline and `TSC_ADJUST` hidden; both MSRs raise #GP | CPUID bits cleared; the MSR filter also denies `IA32_TSC_ADJUST` (`0x3b`) and `IA32_TSC_DEADLINE` (`0x6e0`), which KVM would otherwise serve (reading 0 and ignoring writes to `0x6e0`), and OpenVMM raises #GP | Feature-bank bits `tsc_deadline_tmr_support`, `tsc_adjust_support`, and `a_count_m_count_support` cleared, and CPUID bits cleared; the hypervisor then raises #GP for reads and writes of both MSRs on every CPU | Feature-bank bits `TscDeadlineTmr`, `TscAdjust`, and `ACountMCount` cleared, and CPUID bits cleared; both MSRs exit to OpenVMM, which raises #GP on every CPU |
 | Invariant TSC exposed | CPUID bit. KVM hides it from a guest with `"Hv#1"` until KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is set, so OpenVMM writes 1 to it host-side at vCPU creation | Forced by the profile through a CPUID intercept result: Azure's nested MSHV cannot offer the bit to its guests, although the host OS sees an invariant TSC, and without it each AP pays about 150 ms of calibration. Qualification measures the property instead (`H4`, `H6`) | Set by the CPUID override on every host: on Azure, WHP cannot offer it through the feature banks (bank 1 lacks `TscInvariant`), although the host OS sees an invariant TSC. There the guest TSCs stayed within 60 ns of each other at 8 vCPUs over 60 s and matched the declared rate against host QPC to 0.000 ppm (residual at most 0.07 µs) over 118 s; `H4` and `H6` measure both on every host |
 | No paravirtual or synthetic features | No KVM leaves; `KVM_CAP_ENFORCE_PV_FEATURE_CPUID`, so KVM's paravirtual MSRs raise #GP; KVM's in-kernel Hyper-V MSRs are unreachable behind the filter | No synthetic processor features | `--hv` stays rejected for the microVM |
@@ -605,9 +606,16 @@ ticks = floor(D * L / 1_000_000_000 / divide)
 where `divide` is the divide-configuration value (1 to 128). If `ticks` is at
 least the current count, the count becomes 0 and the timer interrupt is queued
 in the restored LAPIC state unless the LVT is masked; otherwise the current
-count decreases by `ticks`. A periodic or TSC-deadline LAPIC timer is never
-valid: capture and restore reject one that is armed (`E_LAPIC_PERIODIC`,
-`E_LAPIC_TSC_DEADLINE`).
+count decreases by `ticks`. A vector queued this way, or one pending in the
+restored state, must reach its VP when the VP is released, even if the VP is
+halted. MSHV and WHP do not wake a halted VP for an IRR bit written with its
+LAPIC state, so their backends assert the vector again (see
+[Backend obligations](#backend-obligations)). Without that, on busy 8-vCPU
+guests, 29 of 60 time ABI restores on MSHV (prometheus30) and 5 of 12 on WHP
+(prometheus28) left a CPU halted with its timer vector pending until another
+interrupt woke it, about 2 s later or never; with it, 0 of 300 and 0 of 12.
+A periodic or TSC-deadline LAPIC timer is never valid: capture and restore
+reject one that is armed (`E_LAPIC_PERIODIC`, `E_LAPIC_TSC_DEADLINE`).
 
 ## Cross-vCPU skew bound
 
