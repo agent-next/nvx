@@ -424,7 +424,7 @@ topology level, an invalid level with the x2APIC ID. MSHV and WHP pass them
 through from their own guest views. Both read zero at every reserved entry
 their sweeps reach (below), so neither programs zero results there, which
 would cost about 5 µs per entry at partition setup: about 35 µs on WHP for
-the 6 or 7 candidates of a fleet host, and about 65 µs on MSHV for its former
+the 6 or 7 candidates of a fleet host, and 49 to 63 µs on MSHV for its former
 13 to 15. Verification keeps host features out of every entry passed
 through: profile verification fails a host whose hypervisor presents a
 non-zero entry outside the profile's tables (`E_CPU_UNLISTED`, verification
@@ -1717,8 +1717,10 @@ The backends add their own CPUID work:
   which neither uses (`cpu_profile::cpuid::enumerate_basic_and_extended`).
   Every CPUID instruction exits in a Hyper-V root, so a full enumeration
   costs 70 to 100 µs on the bare-metal roots and 0.23 to 0.31 ms on Azure's
-  nested roots; skipping the range saves about a fifth. KVM takes its
-  surface from `KVM_GET_SUPPORTED_CPUID` and does not enumerate.
+  nested roots. Skipping the range took MSHV's from 96 to 49 µs on
+  prometheus30 and from 305 to 220 µs nested, more than its share of the
+  queries suggests. KVM takes its surface from `KVM_GET_SUPPORTED_CPUID` and
+  does not enumerate.
 - MSHV reads VP 0's report in one rep `HvCallGetVpCpuidValues`: 73 µs p50 on
   prometheus30 and 51 µs on azure-azlinux-5, against 0.51 and 0.82 ms with
   one call per entry. WHP's report takes 50 native reads, about 0.78 ms
