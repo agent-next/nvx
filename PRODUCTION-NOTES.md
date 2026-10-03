@@ -65,6 +65,11 @@ outside the submodule path or the submodule init should tolerate the installed t
 
 Idle density on the cloud host: 256 concurrent idle microVMs at 2.1% of 16 vCPU.
 
+Restore latency under host load (P-core class, spinners + benchmark pinned to the same
+cores, measured busy from /proc/stat, n=30 per level): ambient ~24% → p50 7.5 / p95 8.2;
+53% → 9.1 / 10.8; 78% → 12.1 / 16.0; 88% → 14.3 / 20.3 ms. The warm path stays
+p95 ≤ 21 ms at ~90% measured CPU busy.
+
 ## 4. One-shot sandbox path works end-to-end
 
 `sandbox run` with the shipped `ubuntu-distro.erofs` layer + a preformatted ext4 scratch
@@ -94,3 +99,19 @@ chromium, blender) running four real workload classes end-to-end:
 - **Layer build path that works**: docker container with the real toolchain → `docker
   export` → extract → `mkfs.erofs -z lz4hc -U <uuid>` → use as any layer role. A 975 MiB
   debian+blender+chromium layer boots and runs all four classes.
+
+## 6. Latent benchmark bugs found at concurrency (fixed here)
+
+Both surfaced only when restoring in a tight multi-worker loop (warm-pool bench), never
+in the sequential suites:
+
+- **`guest_exit_prequeued` omission aborts OpenVMM.** Calling the restore path without
+  `guest_exit_prequeued=True` makes the harness write `guest-exit.sh` into the guest
+  console after the marker while the restored workload is already exiting on its own;
+  the input race ends in `OpenVMM exited with status -6 (SIGABRT) during teardown` in
+  ~1% of runs even though the marker fired and the restore succeeded. The
+  shell-snapshot-restore suite passes the flag; any new caller must too (warmpool does).
+- **Doubled carriage return hides a marker line.** The guest console occasionally emits
+  `\r\r\n` after the marker; `contains_output_line` stripped only one `\r`, so a printed
+  marker line was missed (~1/2000) and a successful restore reported as a failure.
+  Fixed with `rstrip(b"\r")` + regression test.
