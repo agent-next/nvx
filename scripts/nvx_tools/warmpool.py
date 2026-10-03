@@ -32,6 +32,7 @@ from nvx_tools.benchmark import (
     SNAPSHOT_FILENAMES,
     benchmark,
     capture_snapshot,
+    cpu_frequency_classes,
     snapshot_restore_command,
     workload_boot_command,
 )
@@ -65,6 +66,42 @@ def read_manifest(pool_dir: Path) -> dict[str, object]:
     if not manifest.is_file():
         raise ScriptError(f"{pool_dir} is not a pool: missing {POOL_MANIFEST}")
     return json.loads(manifest.read_text())
+
+
+def pool_class_frequencies() -> list[int]:
+    """Max-frequency (kHz) signature of the CPU class this process runs on."""
+    classes = cpu_frequency_classes()
+    affinity = os.sched_getaffinity(0)
+    return sorted({frequency for frequency, cpus in classes.items() if cpus & affinity})
+
+
+def validate_pool_class(pool_dir: Path) -> None:
+    """Refuse to serve a pool captured on a CPU class this host does not have.
+
+    Snapshot restores are portable only within one CPU frequency class (the
+    destination CPU contract check); a pool tagged with frequencies this host
+    does not expose, or whose CPUs are outside this process affinity, must not
+    be served. Pools filled before the tag existed are served unchanged.
+    """
+    tag = [int(frequency) for frequency in read_manifest(pool_dir).get("cpu_class_frequencies_khz") or []]
+    if not tag:
+        return
+    classes = cpu_frequency_classes()
+    tagged_cpus: set[int] = set()
+    for frequency in tag:
+        if frequency not in classes:
+            raise ScriptError(
+                f"pool CPU class {tag} kHz does not exist on this host "
+                f"(classes: {sorted(classes)})"
+            )
+        tagged_cpus |= classes[frequency]
+    ordered = sorted(tag)
+    if ordered[-1] > ordered[0] * 1.10:
+        # same 10% merge as apply_hybrid_cpu_filter: turbo-favored cores of
+        # one physical type stay one class, two classes must not mix
+        raise ScriptError(f"pool CPU class tag spans multiple classes: {tag}")
+    if not tagged_cpus & os.sched_getaffinity(0):
+        raise ScriptError("pool CPU class cpus are outside this process affinity")
 
 
 def acquire_entries(pool_dir: Path, count: int) -> list[Path]:
@@ -147,6 +184,7 @@ def command_fill(args: argparse.Namespace) -> int:
         {
             "version": 1,
             "cpu_affinity": sorted(os.sched_getaffinity(0)),
+            "cpu_class_frequencies_khz": pool_class_frequencies(),
             "memory_mib": args.memory_mib,
             "processors": args.processors,
             "backend": args.backend,
@@ -166,7 +204,7 @@ def command_status(args: argparse.Namespace) -> int:
 
 
 def command_acquire(args: argparse.Namespace) -> int:
-    read_manifest(args.pool_dir)
+    validate_pool_class(args.pool_dir)
     for claimed in acquire_entries(args.pool_dir, args.count):
         print(claimed)
     return 0
@@ -187,6 +225,7 @@ def command_prune(args: argparse.Namespace) -> int:
 
 
 def command_bench(args: argparse.Namespace) -> int:
+    validate_pool_class(args.pool_dir)
     manifest = read_manifest(args.pool_dir)
     _, _, executable = _require_artifacts(args.nvx_dir, args.openvmm_dir)
     pool_before = len(pool_entry_paths(args.pool_dir))

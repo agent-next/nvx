@@ -18847,6 +18847,31 @@ class WarmpoolTests(unittest.TestCase):
         with self.assertRaises(nvx.ScriptError):
             warmpool.read_manifest(empty)
 
+    def test_pool_class_tag_guard(self) -> None:
+        pool = self.make_pool(entries=1)
+        real_affinity = os.sched_getaffinity(0)
+        classes = {6_000_000: {0}, 5_700_000: {2}, 4_200_000: {16, 17}}
+        with (
+            patch.object(warmpool, "cpu_frequency_classes", return_value=classes),
+            patch.object(
+                os, "sched_getaffinity", return_value=real_affinity & {0, 2}
+            ),
+        ):
+            warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": [5_700_000]})
+            warmpool.validate_pool_class(pool)  # tagged class present, in affinity
+            warmpool.write_manifest(
+                pool, {"cpu_class_frequencies_khz": [5_700_000, 6_000_000]}
+            )
+            warmpool.validate_pool_class(pool)  # one merged (turbo) cluster
+            warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": [9_999_999]})
+            with self.assertRaises(nvx.ScriptError):
+                warmpool.validate_pool_class(pool)  # class absent on host
+            warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": [5_700_000, 4_200_000]})
+            with self.assertRaises(nvx.ScriptError):
+                warmpool.validate_pool_class(pool)  # spans two classes
+            warmpool.write_manifest(pool, {})
+            warmpool.validate_pool_class(pool)  # untagged legacy pool serves
+
     def test_cli_registration(self) -> None:
         parser = nvx.parse_args(
             ["warmpool", "acquire", "--pool-dir", "/tmp/pool", "--count", "2"]
