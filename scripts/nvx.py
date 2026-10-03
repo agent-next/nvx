@@ -20,6 +20,7 @@ from nvx_tools.aci_edge_sandboxes_tests import (
 from nvx_tools.adversarial import configure_parser as configure_adversarial_parser
 from nvx_tools.benchmark import configure_parser as configure_benchmark_parser
 from nvx_tools.benchmark import run as run_benchmark
+from nvx_tools.warmpool import configure_parser as configure_warmpool_parser
 from nvx_tools.build import (
     build_all,
     build_distro_layer,
@@ -1338,6 +1339,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     configure_benchmark_parser(benchmark, BuildConstants.REPO_ROOT)
     benchmark.set_defaults(handler=command_benchmark)
+
+    warmpool = subparsers.add_parser(
+        "warmpool",
+        help="manage pre-captured snapshot pools for fast sandbox starts",
+    )
+    configure_warmpool_parser(warmpool, BuildConstants.REPO_ROOT)
 
     performance = subparsers.add_parser(
         "performance",
