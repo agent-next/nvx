@@ -113,6 +113,7 @@ from nvx_tools.time_abi import (
     host_cpu_profile_guidance,
     openvmm_cpu_generations,
 )
+from nvx_tools.warmpool import configure_parser as configure_warmpool_parser
 
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
@@ -1447,6 +1448,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     configure_benchmark_parser(benchmark, BuildConstants.REPO_ROOT)
     benchmark.set_defaults(handler=command_benchmark)
+
+    warmpool = subparsers.add_parser(
+        "warmpool",
+        help="manage pre-captured snapshot pools for fast sandbox starts",
+    )
+    configure_warmpool_parser(warmpool, BuildConstants.REPO_ROOT)
 
     performance = subparsers.add_parser(
         "performance",
