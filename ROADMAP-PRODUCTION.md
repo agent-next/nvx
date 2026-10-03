@@ -17,16 +17,19 @@ where our fork deliberately builds on their plan instead of diverging.
 - **P1.4 warm-pool manager (`nvx.py warmpool` fill/acquire/release/prune/status/bench)**:
   oracle PASSED on i9-14900K — 6087 restores / 60 s = **101.4/s sustained** (bar ≥50/s),
   p50 7.0 / p95 8.6 ms (bar <50 ms), 0 failures, 0 leaked claims after churn.
+- **P0.1 core-type-aware snapshot pools (landed)**: `test-microvm --scenario
+  snapshot-class-matrix` proves same-class restore passes while cross-class restore is
+  refused with the destination CPU contract error (verified on i9-14900K; hosts with a
+  single frequency class skip honestly). `warmpool` pools now carry
+  `cpu_class_frequencies_khz` (10% merge = one class) and acquire/bench refuse to serve
+  a pool whose class this host does not expose or whose CPUs fall outside the process
+  affinity.
 - Two latent benchmark bugs fixed (guest-exit input race → SIGABRT under concurrency;
   doubled-CR marker miss) — see PRODUCTION-NOTES §6.
 
 ## P0 — substrate correctness under fleet conditions
 
-1. **Core-type-aware snapshot pools** — today snapshots are portable only within one CPU
-   core type (hybrid) and one host ABI. Oracle: restore-matrix test capturing on class A
-   and restoring on class A/B fails ONLY on B with the documented contract error, plus a
-   pool tag carrying the capture core type. (Partially covered: warmpool records the
-   capture CPU affinity in pool.json.)
+1. ~~Core-type-aware snapshot pools~~ — landed, see above.
 2. ~~Restore-under-load SLO~~ — landed, see above.
 3. **Memory ceiling behavior** — overcommit bounds: what happens at RSS pressure (OOM
    guest vs host), and a per-VM memory.high watermark. Oracle: fault-injection test
