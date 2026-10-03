@@ -54,6 +54,7 @@ from nvx_tools import (  # noqa: E402
     sandbox,
     sandbox_lifecycle,
     ubuntu,
+    warmpool,
 )
 from nvx_tools.build_constants import (  # noqa: E402
     AlpineBuildConstants,
@@ -15126,6 +15127,13 @@ class BenchmarkTests(unittest.TestCase):
                 marker,
             )
         )
+        self.assertTrue(
+            benchmark.contains_output_line(
+                b"OPENVMM-SNAPSHOT-RESTORE-OK\r\r\n",
+                marker,
+            ),
+            "a doubled carriage return before the newline must not hide the marker",
+        )
 
     def test_device_restore_marker_and_trace_parsers(self):
         marker = benchmark.parse_device_restore_marker(
@@ -18743,6 +18751,55 @@ class DownloadTests(unittest.TestCase):
                 )
 
             self.assertEqual(destination.read_bytes(), payload)
+
+
+class WarmpoolTests(unittest.TestCase):
+    def make_pool(self, entries: int = 2) -> Path:
+        root = Path(tempfile.mkdtemp(prefix="warmpool-test-"))
+        self.addCleanup(shutil.rmtree, root)
+        for _ in range(entries):
+            entry = root / f"entry-{uuid.uuid4().hex[:8]}"
+            entry.mkdir()
+            for name in warmpool.SNAPSHOT_FILENAMES:
+                (entry / name).write_bytes(b"0" * 16)
+        warmpool.write_manifest(root, {"version": 1, "memory_mib": 128})
+        return root
+
+    def test_acquire_release_roundtrip(self) -> None:
+        pool = self.make_pool(entries=2)
+        claimed = warmpool.acquire_entries(pool, 2)
+        self.assertEqual(len(claimed), 2)
+        self.assertEqual(len(warmpool.pool_entry_paths(pool)), 0)
+        with self.assertRaises(nvx.ScriptError):
+            warmpool.acquire_entries(pool, 1)
+        for path in claimed:
+            warmpool.release_entry(pool, path)
+        self.assertEqual(len(warmpool.pool_entry_paths(pool)), 2)
+        self.assertEqual(len(warmpool.pool_claimed_paths(pool)), 0)
+
+    def test_prune_removes_only_stale_claims(self) -> None:
+        pool = self.make_pool(entries=2)
+        stale, fresh = warmpool.acquire_entries(pool, 2)
+        old = time.time() - 3600
+        os.utime(stale, (old, old))
+        removed = warmpool.prune_claims(pool, ttl_s=60)
+        self.assertEqual(removed, 1)
+        self.assertTrue(fresh.is_dir())
+        self.assertFalse(stale.exists())
+
+    def test_manifest_required(self) -> None:
+        empty = Path(tempfile.mkdtemp(prefix="warmpool-empty-"))
+        self.addCleanup(shutil.rmtree, empty)
+        with self.assertRaises(nvx.ScriptError):
+            warmpool.read_manifest(empty)
+
+    def test_cli_registration(self) -> None:
+        parser = nvx.parse_args(
+            ["warmpool", "acquire", "--pool-dir", "/tmp/pool", "--count", "2"]
+        )
+        self.assertEqual(parser.warmpool_operation, "acquire")
+        self.assertEqual(parser.count, 2)
+        self.assertTrue(callable(parser.handler))
 
 
 if __name__ == "__main__":

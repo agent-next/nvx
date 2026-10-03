@@ -1291,7 +1291,10 @@ def exit_status_after_eof(
 
 
 def contains_output_line(output: bytes | bytearray, marker: bytes) -> bool:
-    return any(line.removesuffix(b"\r") == marker for line in output.split(b"\n"))
+    # rstrip, not removesuffix: the guest console occasionally emits a
+    # doubled carriage return before the newline, which would otherwise
+    # hide a marker line the workload did print
+    return any(line.rstrip(b"\r") == marker for line in output.split(b"\n"))
 
 
 def completed_output_line_with_prefix(
