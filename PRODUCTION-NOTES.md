@@ -124,9 +124,10 @@ drops the control endpoint before the auth handshake/ping completes (capability
 stdin write, attach, or first ping all surface as `BrokenPipeError` /
 `ConnectionResetError` or an endpoint-closed `ConnectionError`).
 
-**Fix in this branch.** `sandbox provision` and `sandbox start` now retry through
+**Fix in this branch.** `sandbox start` retries through
 `_with_control_retry` — 3 attempts with 0.5s/1.0s backoff — on `ConnectionError`
-(which covers `BrokenPipeError` and `ConnectionResetError`). Each start attempt tears
+(which covers `BrokenPipeError` and `ConnectionResetError`; `provision` never
+touches the control pipe, so it has no retry wrapper). Each start attempt tears
 down the failed OpenVMM process and respawns it, so a retry is a clean boot. Retries
 log `sandbox start attempt N failed: ...` to stderr. `sandbox exec` is deliberately
 not retried: a managed exec failure stays honest.
@@ -148,5 +149,7 @@ no auth — same trust boundary as `control.capability`):
 The daemon refuses to start when the sandbox is not running, execs through the same
 `session.exec` path as `sandbox exec` (one request per connection, connections served
 serially since the session is a sequenced protocol), exits non-zero when the VM dies
-so clients re-provision, and removes the socket file on exit. If the daemon is killed
-with SIGKILL the socket file is left behind — remove it before restarting.
+so clients re-provision, and removes the socket file on exit (SIGTERM unwinds through cleanup; only
+SIGKILL leaves the socket file behind — remove it before restarting). While the
+daemon lives it holds the control channel: external lifecycle ops such as
+`sandbox stop` time out — kill the daemon first.

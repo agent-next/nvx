@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -376,9 +377,7 @@ def provision(
     host_loopback_forward: tuple[str, ...],
     cmdline: str,
 ) -> None:
-    _with_control_retry(
-        "provision",
-        lambda: _provision_once(
+    _provision_once(
             state_path,
             launch,
             hypervisor=hypervisor,
@@ -393,7 +392,6 @@ def provision(
             network_proxy=network_proxy,
             host_loopback_forward=host_loopback_forward,
             cmdline=cmdline,
-        ),
     )
 
 
@@ -686,6 +684,15 @@ def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
     """
     if os.name == "nt":
         raise ScriptError("sandbox execd is unsupported on Windows")
+    # Default SIGTERM kills the process without running the finally below,
+    # leaving the socket file behind; exit through an exception instead so
+    # cleanup happens (ccz fork review F1). signal.signal only works from the
+    # main thread (ValueError otherwise) -- a thread-hosted daemon keeps the
+    # default behavior.
+    try:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    except ValueError:
+        pass
     state_dir = _prepare_state_directory(state_path, create=False)
     runtime, capability = _load_running(state_dir)
     pid = int(runtime["pid"])
