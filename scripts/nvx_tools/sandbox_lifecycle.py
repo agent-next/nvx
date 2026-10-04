@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import stat
 import subprocess
 import time
 import uuid
@@ -397,6 +398,12 @@ def provision(
         )
     if restore_snapshot is not None:
         require_directory(restore_snapshot, "sandbox restore snapshot")
+    for snapshot, description in (
+        (snapshot_destination, "sandbox snapshot destination"),
+        (restore_snapshot, "sandbox restore snapshot"),
+    ):
+        if snapshot is not None:
+            _snapshot_namespace(snapshot, description)
     _write_json(
         config_path,
         _serialize_launch(
@@ -418,6 +425,37 @@ def provision(
             restore_snapshot=restore_snapshot,
         ),
     )
+
+
+def _snapshot_namespace(snapshot: Path, description: str) -> Path:
+    """Return the private directory that must hold a snapshot and its console.
+
+    OpenVMM binds a microVM console socket only inside the snapshot's own
+    device namespace, and only into a directory this user owns with mode
+    0700. That makes the snapshot's parent directory part of the sandbox
+    contract, so an unusable one is rejected before any VM state is written
+    rather than at boot.
+    """
+    parent = snapshot.parent if os.fspath(snapshot.parent) else Path(".")
+    try:
+        metadata = parent.lstat()
+    except OSError as error:
+        raise ScriptError(
+            f"{description} parent directory is unreadable: {parent}"
+        ) from error
+    mode = stat.S_IMODE(metadata.st_mode)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ScriptError(f"{description} parent must be a plain directory: {parent}")
+    if metadata.st_uid != os.geteuid():
+        raise ScriptError(
+            f"{description} parent must be owned by the current user: {parent}"
+        )
+    if mode != 0o700:
+        raise ScriptError(
+            f"{description} parent must have mode 0700 so only this user can "
+            f"reach the sandbox console socket: {parent} (found {mode:04o})"
+        )
+    return parent
 
 
 def _restore_snapshot_path(config: dict[str, Any]) -> Path | None:
@@ -487,7 +525,11 @@ def start(state_path: Path, timeout: float) -> None:
         snapshot_dir = restore_snapshot if restore_snapshot is not None else (
             snapshot_destination
         )
-        socket_dir = state_dir if snapshot_dir is None else snapshot_dir.parent
+        socket_dir = (
+            state_dir
+            if snapshot_dir is None
+            else _snapshot_namespace(snapshot_dir, "sandbox snapshot")
+        )
         endpoint_value = os.fspath(socket_dir / CONTROL_SOCKET_NAME)
     # A restore takes the guest kernel, command line, memory size, workload
     # identity, lifecycle, and network from the snapshot itself, so those

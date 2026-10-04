@@ -6249,6 +6249,9 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
         launch_overrides: dict[str, object] | None = None,
         provision_options: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        # OpenVMM binds a microVM console socket only into the snapshot's own
+        # parent directory, and only when that directory is mode 0700.
+        root.chmod(0o700)
         state = root / "state"
         sandbox_lifecycle.provision(
             state,
@@ -6368,6 +6371,51 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
             self.assertEqual(config["snapshot_destination"], str(root / "snap"))
             self.assertEqual(config["snapshot_tier"], "platform")
             self.assertIsNone(config["restore_snapshot"])
+
+    def test_snapshot_parent_must_be_private(self):
+        """OpenVMM only binds a console socket into a mode 0700 directory."""
+        world = Path(tempfile.mkdtemp(dir=tempfile.gettempdir()))
+        self.addCleanup(shutil.rmtree, world, ignore_errors=True)
+        world.chmod(0o755)
+        options = {
+            "snapshot_destination": world / "snap",
+            "snapshot_tier": "platform",
+        }
+        with self.assertRaisesRegex(common.ScriptError, "mode 0700"):
+            self._provision_raw(world, **options)
+        world.chmod(0o700)
+        # The same layout is accepted once the directory is private.
+        self.assertEqual(
+            self._provision_raw(world, **options)["format"],
+            sandbox_lifecycle.SNAPSHOT_CONFIG_FORMAT,
+        )
+
+    def _provision_raw(
+        self, root: Path, **options: object
+    ) -> dict[str, object]:
+        """Provision without the private-root adjustment _provision applies."""
+        sandbox_lifecycle.provision(
+            root / "state",
+            self._launch(root),
+            hypervisor="kvm",
+            memory_mib=512,
+            net=None,
+            network_profile=None,
+            network_egress=None,
+            network_ingress=None,
+            network_egress_allow=(),
+            network_egress_deny=(),
+            host_loopback=None,
+            network_proxy=None,
+            host_loopback_forward=(),
+            cmdline="quiet",
+            **options,
+        )
+        return json.loads(
+            (root / "state" / sandbox_lifecycle.CONFIG_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
 
     def test_snapshot_configuration_may_carry_a_live_share(self):
         """Format 3 must accept a mount the way format 2 does."""
