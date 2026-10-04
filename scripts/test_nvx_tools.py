@@ -6369,6 +6369,29 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
             self.assertEqual(config["snapshot_tier"], "platform")
             self.assertIsNone(config["restore_snapshot"])
 
+    def test_snapshot_configuration_may_carry_a_live_share(self):
+        """Format 3 must accept a mount the way format 2 does."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            share = root / "share"
+            share.mkdir()
+            config = self._provision(
+                root,
+                launch_overrides={
+                    "mount": sandbox.SandboxMount.parse(f"/work,{share},rw")
+                },
+                provision_options={
+                    "snapshot_destination": root / "snap",
+                    "snapshot_tier": "platform",
+                },
+            )
+
+            self.assertEqual(config["format"], sandbox_lifecycle.SNAPSHOT_CONFIG_FORMAT)
+            self.assertIsNotNone(config["mount"])
+            launch = sandbox_lifecycle._deserialize_launch(config)
+            self.assertIsNotNone(launch.mount)
+            self.assertEqual(launch.mount.guest_target, "/work")
+
     def test_capture_start_arms_the_guest_trigger_and_the_snapshot_destination(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

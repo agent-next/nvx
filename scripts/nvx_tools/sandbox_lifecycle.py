@@ -293,7 +293,12 @@ def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ScriptError("sandbox configuration is malformed") from error
-    if (config.get("format") == MOUNT_CONFIG_FORMAT) != (launch.mount is not None):
+    # Format 1 is the no-share configuration, format 2 exists only to carry a
+    # live share, and format 3 (snapshot) admits either.
+    config_format = config.get("format")
+    if (config_format == CONFIG_FORMAT and launch.mount is not None) or (
+        config_format == MOUNT_CONFIG_FORMAT and launch.mount is None
+    ):
         raise ScriptError("sandbox configuration format does not match its mount")
     return launch.validated()
 
