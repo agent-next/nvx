@@ -7915,6 +7915,22 @@ class SandboxTests(unittest.TestCase):
                     sandbox_lifecycle.ManagedExecResult(0, "exit", b"", b""),
                 )
 
+    def test_managed_exec_outcome_rejects_existing_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            target = directory / "target"
+            target.write_text("existing", encoding="utf-8")
+            path = directory / "outcome.json"
+            try:
+                path.symlink_to(target)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+            with self.assertRaisesRegex(common.ScriptError, "already exists"):
+                sandbox_lifecycle.write_exec_outcome(
+                    path,
+                    sandbox_lifecycle.ManagedExecResult(0, "exit", b"", b""),
+                )
+
     def test_managed_stop_cleans_runtime_state_if_report_is_invalid(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)

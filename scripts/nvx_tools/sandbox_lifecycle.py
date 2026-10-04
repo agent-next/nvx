@@ -19,6 +19,7 @@ from .common import (
     ScriptError,
     artifact_path,
     openvmm_binary_path,
+    path_exists,
     require_file,
 )
 from .control_session import (
@@ -84,7 +85,7 @@ def _outcome_destination(path: Path) -> Path:
     if not candidate.name:
         raise ScriptError("outcome report path has no filename")
     resolved = parent.resolve() / candidate.name
-    if os.path.lexists(resolved):
+    if path_exists(resolved):
         raise ScriptError(f"outcome report already exists: {resolved}")
     return resolved
 
