@@ -115,3 +115,41 @@ in the sequential suites:
   `\r\r\n` after the marker; `contains_output_line` stripped only one `\r`, so a printed
   marker line was missed (~1/2000) and a successful restore reported as a failure.
   Fixed with `rstrip(b"\r")` + regression test.
+
+## 7. Boot-storm EPIPE on the managed control pipe (fixed here)
+
+A 128-simultaneous-boot thundering herd broke ~13% of `sandbox start` calls with
+`error: [Errno 32] Broken pipe` at ~3.8s: the freshly spawned OpenVMM process dies or
+drops the control endpoint before the auth handshake/ping completes (capability
+stdin write, attach, or first ping all surface as `BrokenPipeError` /
+`ConnectionResetError` or an endpoint-closed `ConnectionError`).
+
+**Fix in this branch.** `sandbox start` retries through
+`_with_control_retry` — 3 attempts with 0.5s/1.0s backoff — on `ConnectionError`
+(which covers `BrokenPipeError` and `ConnectionResetError`; `provision` never
+touches the control pipe, so it has no retry wrapper). Each start attempt tears
+down the failed OpenVMM process and respawns it, so a retry is a clean boot. Retries
+log `sandbox start attempt N failed: ...` to stderr. `sandbox exec` is deliberately
+not retried: a managed exec failure stays honest.
+
+## 8. Persistent exec daemon (`sandbox execd`)
+
+`sandbox exec` pays a full Python cold start (~200 ms floor at low load) because it
+re-imports the toolchain and re-opens a control session per call. `sandbox execd
+--state-dir D --socket PATH` is a long-lived single-operator daemon that holds one
+`ControlSession` and serves a one-line JSON protocol over a unix socket (mode 0600,
+no auth — same trust boundary as `control.capability`):
+
+- request: `{"cmd": ["/bin/sh","-c","..."], "timeout_ms": 30000}` (`timeout_ms`
+  optional, 0 disables the guest timeout)
+- response: `{"rc": int, "out": str, "err": str, "b64": bool}` — `out`/`err` are
+  base64 only when `b64` is true (non-UTF-8 output); malformed requests and guest
+  rejections get `{"error": str}`.
+
+The daemon refuses to start when the sandbox is not running, execs through the same
+`session.exec` path as `sandbox exec` (one request per connection, connections served
+serially since the session is a sequenced protocol), exits non-zero when the VM dies
+so clients re-provision, and removes the socket file on exit (SIGTERM unwinds through cleanup; only
+SIGKILL leaves the socket file behind — remove it before restarting). While the
+daemon lives it holds the control channel: external lifecycle ops such as
+`sandbox stop` time out — kill the daemon first.
