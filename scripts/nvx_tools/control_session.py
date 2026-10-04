@@ -49,6 +49,10 @@ class ManagedExecResult:
     stderr: bytes
 
 
+class GuestExecRejected(ScriptError):
+    """The guest rejected an exec but the control session stayed in sync."""
+
+
 class _SocketStream:
     def __init__(self, connection: socket.socket) -> None:
         self._connection = connection
@@ -395,7 +399,7 @@ class ControlSession:
                     )
                 return ManagedExecResult(status, category, bytes(stdout), bytes(stderr))
             elif kind == APP_ERROR:
-                raise ScriptError(
+                raise GuestExecRejected(
                     "managed guest rejected exec "
                     f"(status={status}, category={response.decode('ascii', 'replace')})"
                 )
