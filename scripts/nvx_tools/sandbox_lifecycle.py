@@ -45,7 +45,10 @@ MOUNT_CONFIG_FORMAT = 2
 # release must reject it rather than silently boot without the wake plane.
 SNAPSHOT_CONFIG_FORMAT = 3
 CONFIG_FORMATS = (CONFIG_FORMAT, MOUNT_CONFIG_FORMAT, SNAPSHOT_CONFIG_FORMAT)
-SNAPSHOT_TIERS = ("platform", "workload-start", "instance-checkpoint")
+# The sandbox capture point sits after the read-only layers are mounted and
+# before the scratch is consumed, which is exactly OpenVMM's `platform` tier:
+# a fleet-wide clone point whose restore receives a pristine writable layer.
+SNAPSHOT_CAPTURE_TIER = "platform"
 OUTCOME_SCHEMA_VERSION = 1
 
 
@@ -185,7 +188,6 @@ def _serialize_launch(
     host_loopback_forward: tuple[str, ...],
     cmdline: str,
     snapshot_destination: Path | None = None,
-    snapshot_tier: str | None = None,
     restore_snapshot: Path | None = None,
 ) -> dict[str, Any]:
     snapshot = snapshot_destination is not None or restore_snapshot is not None
@@ -222,7 +224,9 @@ def _serialize_launch(
         "snapshot_destination": (
             None if snapshot_destination is None else os.fspath(snapshot_destination)
         ),
-        "snapshot_tier": snapshot_tier,
+        "snapshot_tier": (
+            SNAPSHOT_CAPTURE_TIER if snapshot_destination is not None else None
+        ),
         "restore_snapshot": (
             None if restore_snapshot is None else os.fspath(restore_snapshot)
         ),
@@ -378,7 +382,6 @@ def provision(
     host_loopback_forward: tuple[str, ...],
     cmdline: str,
     snapshot_destination: Path | None = None,
-    snapshot_tier: str | None = None,
     restore_snapshot: Path | None = None,
 ) -> None:
     state_dir = _prepare_state_directory(state_path, create=True)
@@ -389,12 +392,6 @@ def provision(
     if snapshot_destination is not None and restore_snapshot is not None:
         raise ScriptError(
             "sandbox snapshot capture and restore are mutually exclusive"
-        )
-    if snapshot_tier is not None and snapshot_destination is None:
-        raise ScriptError("a sandbox snapshot tier requires a snapshot destination")
-    if snapshot_tier is not None and snapshot_tier not in SNAPSHOT_TIERS:
-        raise ScriptError(
-            "unsupported sandbox snapshot tier; choose " + ", ".join(SNAPSHOT_TIERS)
         )
     if restore_snapshot is not None:
         require_directory(restore_snapshot, "sandbox restore snapshot")
@@ -421,7 +418,6 @@ def provision(
             host_loopback_forward=host_loopback_forward,
             cmdline=cmdline,
             snapshot_destination=snapshot_destination,
-            snapshot_tier=snapshot_tier,
             restore_snapshot=restore_snapshot,
         ),
     )
@@ -468,27 +464,14 @@ def _restore_snapshot_path(config: dict[str, Any]) -> Path | None:
     return Path(value)
 
 
-def _snapshot_capture(
-    config: dict[str, Any],
-) -> tuple[Path | None, str | None]:
-    """Return the configured snapshot capture destination and tier."""
+def _snapshot_capture(config: dict[str, Any]) -> Path | None:
+    """Return the configured snapshot capture destination, if this sandbox captures."""
     destination = config.get("snapshot_destination")
-    tier = config.get("snapshot_tier")
     if destination is None:
-        if tier is not None:
-            raise ScriptError(
-                "--snapshot-tier requires --snapshot-destination in the sandbox "
-                "configuration"
-            )
-        return None, None
+        return None
     if not isinstance(destination, str) or not destination:
         raise ScriptError("sandbox configuration has an invalid snapshot destination")
-    if tier not in SNAPSHOT_TIERS:
-        raise ScriptError(
-            "sandbox configuration has an unsupported snapshot tier; choose "
-            + ", ".join(SNAPSHOT_TIERS)
-        )
-    return Path(destination), str(tier)
+    return Path(destination)
 
 
 def start(state_path: Path, timeout: float) -> None:
@@ -504,7 +487,7 @@ def start(state_path: Path, timeout: float) -> None:
     outcome_path.unlink(missing_ok=True)
     launch = _deserialize_launch(config)
     restore_snapshot = _restore_snapshot_path(config)
-    snapshot_destination, snapshot_tier = _snapshot_capture(config)
+    snapshot_destination = _snapshot_capture(config)
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
     kernel = require_file(
         artifact_path(KernelBuildConstants.BINARY_NAME), "Linux direct kernel"
@@ -575,7 +558,7 @@ def start(state_path: Path, timeout: float) -> None:
                     "--snapshot-destination",
                     os.fspath(snapshot_destination),
                     "--snapshot-tier",
-                    str(snapshot_tier),
+                    SNAPSHOT_CAPTURE_TIER,
                 ]
             )
     net = config.get("net")

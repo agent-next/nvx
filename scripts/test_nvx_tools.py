@@ -6361,15 +6361,14 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
             root = Path(temporary)
             config = self._provision(
                 root,
-                provision_options={
-                    "snapshot_destination": root / "snap",
-                    "snapshot_tier": "platform",
-                },
+                provision_options={"snapshot_destination": root / "snap"},
             )
 
             self.assertEqual(config["format"], sandbox_lifecycle.SNAPSHOT_CONFIG_FORMAT)
             self.assertEqual(config["snapshot_destination"], str(root / "snap"))
-            self.assertEqual(config["snapshot_tier"], "platform")
+            self.assertEqual(
+                config["snapshot_tier"], sandbox_lifecycle.SNAPSHOT_CAPTURE_TIER
+            )
             self.assertIsNone(config["restore_snapshot"])
 
     def test_snapshot_parent_must_be_private(self):
@@ -6377,10 +6376,7 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
         world = Path(tempfile.mkdtemp(dir=tempfile.gettempdir()))
         self.addCleanup(shutil.rmtree, world, ignore_errors=True)
         world.chmod(0o755)
-        options = {
-            "snapshot_destination": world / "snap",
-            "snapshot_tier": "platform",
-        }
+        options = {"snapshot_destination": world / "snap"}
         with self.assertRaisesRegex(common.ScriptError, "mode 0700"):
             self._provision_raw(world, **options)
         world.chmod(0o700)
@@ -6428,10 +6424,7 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
                 launch_overrides={
                     "mount": sandbox.SandboxMount.parse(f"/work,{share},rw")
                 },
-                provision_options={
-                    "snapshot_destination": root / "snap",
-                    "snapshot_tier": "platform",
-                },
+                provision_options={"snapshot_destination": root / "snap"},
             )
 
             self.assertEqual(config["format"], sandbox_lifecycle.SNAPSHOT_CONFIG_FORMAT)
@@ -6445,10 +6438,7 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
             root = Path(temporary)
             self._provision(
                 root,
-                provision_options={
-                    "snapshot_destination": root / "snap",
-                    "snapshot_tier": "platform",
-                },
+                provision_options={"snapshot_destination": root / "snap"},
             )
             command = self._start_command(root / "state")
 
@@ -6456,7 +6446,10 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
             self.assertEqual(
                 command[command.index("--snapshot-destination") + 1], str(root / "snap")
             )
-            self.assertEqual(command[command.index("--snapshot-tier") + 1], "platform")
+            self.assertEqual(
+                command[command.index("--snapshot-tier") + 1],
+                sandbox_lifecycle.SNAPSHOT_CAPTURE_TIER,
+            )
             # The guest init agent captures at the workload handoff only when
             # the kernel command line arms the trigger.
             cmdline = command[command.index("--cmdline") + 1]
@@ -6486,26 +6479,6 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
             self.assertNotIn("--snapshot-tier", command)
             cmdline = command[command.index("--cmdline") + 1]
             self.assertNotIn(sandbox.SNAPSHOT_TRIGGER_TOKEN, cmdline.split())
-
-    def test_capture_rejects_a_tier_it_cannot_represent(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            self._provision(root)
-            config = json.loads(
-                (root / "state" / sandbox_lifecycle.CONFIG_NAME).read_text(
-                    encoding="utf-8"
-                )
-            )
-            config["snapshot_destination"] = str(root / "snap")
-            config["snapshot_tier"] = "nonsense"
-            state = root / "state"
-            (state / sandbox_lifecycle.CONFIG_NAME).write_text(
-                json.dumps(config), encoding="utf-8"
-            )
-            with self.assertRaisesRegex(common.ScriptError, "snapshot tier"):
-                self._start_command(state)
-
-    # --- restore ---
 
     def test_restore_start_replaces_the_boot_arguments_with_the_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -6594,27 +6567,6 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
             with self.assertRaisesRegex(common.ScriptError, "mutually exclusive"):
                 nvx.command_sandbox(args)
 
-    def test_snapshot_tier_requires_a_destination(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            args = nvx.parse_args(
-                [
-                    "sandbox",
-                    "provision",
-                    "--state-dir",
-                    str(root / "state"),
-                    "--layer",
-                    f"distro,{root / 'distro.erofs'},"
-                    "11111111-1111-1111-1111-111111111111",
-                    "--scratch",
-                    str(root / "scratch.ext4"),
-                    "--snapshot-tier",
-                    "platform",
-                ]
-            )
-            with self.assertRaisesRegex(common.ScriptError, "requires --snapshot-destination"):
-                nvx.command_sandbox(args)
-
     def test_restore_is_rejected_where_it_cannot_be_honored(self):
         for operation in ("run", "start", "exec"):
             with tempfile.TemporaryDirectory() as temporary:
@@ -6663,18 +6615,24 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
             self.assertEqual(arguments[0], "--machine")
             self.assertEqual(arguments[1], "microvm")
 
-    def test_sandbox_init_agent_arms_the_capture_point_before_the_handoff(self):
+    def test_sandbox_init_agent_captures_before_the_scratch_is_consumed(self):
         source = (
             BuildConstants.REPO_ROOT / "guest" / "common" / "nvx-init-agent"
         ).read_text(encoding="utf-8")
         trigger = source.index('*" sandboxsnap "*)')
+        layers = source.index("mount_layer ")
+        scratch_mount = source.index('mount -t ext4 -o rw,nosuid,nodev "$scratch_device"')
+        overlay = source.index("mount -t overlay overlay")
         handoff = source.index("nvx-container-launch")
-        managed = source.index("/sbin/nvx-managed-agent")
-        # The capture must land after every mount and cgroup is in place and
-        # before the workload or the managed agent is handed the container.
-        self.assertLess(trigger, managed)
-        self.assertLess(trigger, handoff)
-        self.assertIn("/sbin/nvx-snapshot", source[trigger:handoff])
+        # Every read-only layer must be mounted and the scratch device resolved
+        # before the capture, but the scratch must not be mounted yet: the
+        # fresh-scratch tier refuses a capture taken with it mounted, and a
+        # restore has to mount a pristine one of its own.
+        self.assertLess(layers, trigger)
+        self.assertLess(trigger, scratch_mount)
+        self.assertLess(scratch_mount, overlay)
+        self.assertLess(overlay, handoff)
+        self.assertIn("/sbin/nvx-snapshot --fresh-scratch", source[trigger:scratch_mount])
 
 
 class BenchmarkTests(unittest.TestCase):

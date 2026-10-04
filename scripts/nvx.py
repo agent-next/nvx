@@ -84,8 +84,6 @@ from nvx_tools.sandbox import (
     parse_workload_identity,
 )
 
-SNAPSHOT_TIERS = sandbox_lifecycle.SNAPSHOT_TIERS
-
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
 NETWORK_PROFILES = ("portable",)
@@ -471,8 +469,6 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError(
             "--snapshot-destination is only valid for sandbox run or provision"
         )
-    if args.snapshot_tier is not None and args.snapshot_destination is None:
-        raise ScriptError("--snapshot-tier requires --snapshot-destination")
     if args.snapshot_destination is not None and args.restore_snapshot is not None:
         raise ScriptError(
             "--snapshot-destination and --restore-snapshot are mutually exclusive"
@@ -484,7 +480,6 @@ def command_sandbox(args: argparse.Namespace) -> None:
             raise ScriptError(f"sandbox {operation} requires --layer and --scratch")
         network_egress_allow, network_egress_deny = _resolve_network_egress_rules(args)
         snapshot_destination = args.snapshot_destination
-        snapshot_tier = args.snapshot_tier or "platform"
         restore_snapshot = args.restore_snapshot
         if snapshot_destination is not None:
             snapshot_destination = _sandbox_snapshot_path(snapshot_destination)
@@ -520,7 +515,6 @@ def command_sandbox(args: argparse.Namespace) -> None:
         network_egress_allow = ()
         network_egress_deny = ()
         snapshot_destination = None
-        snapshot_tier = None
         restore_snapshot = None
 
     if operation == "provision":
@@ -543,7 +537,6 @@ def command_sandbox(args: argparse.Namespace) -> None:
             host_loopback_forward=tuple(args.host_loopback_forward),
             cmdline=args.cmdline,
             snapshot_destination=snapshot_destination,
-            snapshot_tier=snapshot_tier if snapshot_destination is not None else None,
             restore_snapshot=restore_snapshot,
         )
         return
@@ -617,7 +610,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
                 "--snapshot-destination",
                 os.fspath(snapshot_destination),
                 "--snapshot-tier",
-                snapshot_tier,
+                sandbox_lifecycle.SNAPSHOT_CAPTURE_TIER,
             ]
         )
     _extend_network_arguments(
@@ -936,16 +929,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         metavar="DIR",
         help=(
-            "capture a snapshot at the sandbox workload handoff into DIR; "
-            "valid for run and provision"
-        ),
-    )
-    sandbox.add_argument(
-        "--snapshot-tier",
-        choices=SNAPSHOT_TIERS,
-        help=(
-            "sandbox snapshot capture tier (default: platform); requires "
-            "--snapshot-destination"
+            "capture a snapshot of the sandbox, layers mounted and scratch "
+            "untouched, into DIR; valid for run and provision"
         ),
     )
     sandbox.add_argument(
