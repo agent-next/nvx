@@ -6414,6 +6414,20 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
             cmdline = command[command.index("--cmdline") + 1]
             self.assertIn(f" {sandbox.SNAPSHOT_TRIGGER_TOKEN} ", f" {cmdline} ")
 
+    def test_capture_and_restore_bind_the_control_socket_next_to_the_snapshot(self):
+        """OpenVMM refuses a console socket outside the snapshot namespace."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "snap"
+            snapshot.mkdir()
+            self._provision(root, provision_options={"restore_snapshot": snapshot})
+            command = self._start_command(root / "state")
+
+            endpoint = command[command.index("--microvm-control-console") + 1]
+            self.assertEqual(
+                endpoint.removeprefix("listen="), str(root / "control.sock")
+            )
+
     def test_capture_without_a_destination_leaves_the_guest_trigger_disarmed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

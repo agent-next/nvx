@@ -477,11 +477,18 @@ def start(state_path: Path, timeout: float) -> None:
     capability = secrets.token_bytes(32)
     if capability == bytes(32):
         raise AssertionError("secrets.token_bytes returned an all-zero capability")
-    endpoint_value = (
-        f"//./pipe/openvmm-microvm-{uuid.uuid4().hex}"
-        if os.name == "nt"
-        else os.fspath(state_dir / CONTROL_SOCKET_NAME)
-    )
+    if os.name == "nt":
+        endpoint_value = f"//./pipe/openvmm-microvm-{uuid.uuid4().hex}"
+    else:
+        # OpenVMM binds the console into the snapshot's device namespace: the
+        # socket's parent directory must be exactly the snapshot directory's
+        # parent, or it refuses to start. A capture or restore therefore puts
+        # the control socket next to the snapshot directory.
+        snapshot_dir = restore_snapshot if restore_snapshot is not None else (
+            snapshot_destination
+        )
+        socket_dir = state_dir if snapshot_dir is None else snapshot_dir.parent
+        endpoint_value = os.fspath(socket_dir / CONTROL_SOCKET_NAME)
     # A restore takes the guest kernel, command line, memory size, workload
     # identity, lifecycle, and network from the snapshot itself, so those
     # options are rejected by OpenVMM on this path; the layer and scratch
@@ -601,7 +608,7 @@ def start(state_path: Path, timeout: float) -> None:
                 process.wait(timeout=5)
         (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
         capability_path.unlink(missing_ok=True)
-        (state_dir / CONTROL_SOCKET_NAME).unlink(missing_ok=True)
+        Path(endpoint_value).unlink(missing_ok=True)
         raise
     finally:
         log.close()
@@ -642,13 +649,31 @@ def stop(state_path: Path, timeout: float) -> dict[str, Any]:
     finally:
         (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
         (state_dir / CAPABILITY_NAME).unlink(missing_ok=True)
-        (state_dir / CONTROL_SOCKET_NAME).unlink(missing_ok=True)
+        _unlink_control_socket(state_dir, runtime)
     return outcome
+
+
+def _unlink_control_socket(state_dir: Path, runtime: dict[str, Any]) -> None:
+    """Remove the control socket wherever the runtime recorded it.
+
+    A capture or restore binds the socket outside the state directory, into
+    the snapshot's parent namespace, so the recorded endpoint is the truth.
+    A relative endpoint predates that layout and names the state directory's
+    own socket.
+    """
+    try:
+        endpoint = _endpoint(runtime)
+    except ScriptError:
+        return
+    if not endpoint.is_absolute():
+        endpoint = state_dir / endpoint
+    endpoint.unlink(missing_ok=True)
 
 
 def deprovision(state_path: Path) -> None:
     state_dir = _prepare_state_directory(state_path, create=False)
     runtime_path = state_dir / RUNTIME_NAME
+    runtime: dict[str, Any] | None = None
     if runtime_path.is_file():
         runtime = _read_json(runtime_path, "sandbox runtime state")
         try:
@@ -659,6 +684,7 @@ def deprovision(state_path: Path) -> None:
             ) from error
         if running:
             raise ScriptError("sandbox must be stopped before deprovision")
+        _unlink_control_socket(state_dir, runtime)
     for name in (
         RUNTIME_NAME,
         CAPABILITY_NAME,
