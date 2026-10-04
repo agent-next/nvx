@@ -6615,24 +6615,29 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
             self.assertEqual(arguments[0], "--machine")
             self.assertEqual(arguments[1], "microvm")
 
-    def test_sandbox_init_agent_captures_before_the_scratch_is_consumed(self):
+    def test_sandbox_init_agent_captures_a_fully_assembled_sandbox(self):
         source = (
             BuildConstants.REPO_ROOT / "guest" / "common" / "nvx-init-agent"
         ).read_text(encoding="utf-8")
         trigger = source.index('*" sandboxsnap "*)')
-        layers = source.index("mount_layer ")
+        layers = source.rindex("mount_layer ")
         scratch_mount = source.index('mount -t ext4 -o rw,nosuid,nodev "$scratch_device"')
         overlay = source.index("mount -t overlay overlay")
+        share = source.rindex("mount_live_share")
+        identity = source.rindex("workload-machine-id")
+        managed = source.index("/sbin/nvx-managed-agent")
         handoff = source.index("nvx-container-launch")
-        # Every read-only layer must be mounted and the scratch device resolved
-        # before the capture, but the scratch must not be mounted yet: the
-        # fresh-scratch tier refuses a capture taken with it mounted, and a
-        # restore has to mount a pristine one of its own.
-        self.assertLess(layers, trigger)
-        self.assertLess(trigger, scratch_mount)
+        # The instance-checkpoint tier captures a resumed sandbox, so every
+        # mount, cgroup, and identity must already be in place, and the guest
+        # must hand off to the workload or the managed agent right after.
+        self.assertLess(layers, scratch_mount)
         self.assertLess(scratch_mount, overlay)
-        self.assertLess(overlay, handoff)
-        self.assertIn("/sbin/nvx-snapshot --fresh-scratch", source[trigger:scratch_mount])
+        self.assertLess(overlay, share)
+        self.assertLess(identity, trigger)
+        self.assertLess(trigger, managed)
+        self.assertLess(trigger, handoff)
+        self.assertIn("/sbin/nvx-snapshot --tier instance-checkpoint",
+                      source[trigger:managed])
 
 
 class BenchmarkTests(unittest.TestCase):

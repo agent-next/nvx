@@ -302,22 +302,6 @@ fi
 [ "$scratch_fstype" = ext4 ] || fatal "unsupported scratch filesystem: $scratch_fstype"
 scratch_device=$(resolve_block_device "$scratch_address") ||
     fatal "scratch device at $scratch_address did not appear"
-
-# sandboxsnap: optional pre-scratch capture point for the sandbox wake plane
-# (see `sandbox provision --snapshot-destination`). When the kernel command
-# line contains "sandboxsnap", ask the VMM to capture the sandbox here, with
-# every read-only layer mounted and the scratch device present but untouched.
-# The VMM terminates the source on a successful capture; on a later restore
-# execution resumes at the next line, so each restore mounts its own pristine
-# writable layer and assembles the overlay from scratch. On a plain cold boot
-# (no --snapshot-destination) the VMM ignores the request and this is a no-op.
-case " $cmdline " in
-    *" sandboxsnap "*)
-        /sbin/nvx-snapshot --fresh-scratch
-        # ---- on restore, execution resumes here ----
-        ;;
-esac
-
 blockdev --flushbufs "$scratch_device" ||
     fatal "failed to drop cached blocks for scratch"
 mount -t ext4 -o rw,nosuid,nodev "$scratch_device" "$scratch" ||
@@ -377,6 +361,23 @@ esac
 mount_live_share
 workload_machine_id=$(tr -d - </proc/sys/kernel/random/uuid)
 printf '%s\n' "$workload_machine_id" >"$runtime/workload-machine-id"
+
+# sandboxsnap: optional pre-handoff capture point for the sandbox wake plane
+# (see `sandbox provision --snapshot-destination`). When the kernel command
+# line contains "sandboxsnap", ask the VMM to capture the sandbox at this
+# fully assembled point -- every read-only layer mounted, the scratch mounted,
+# the container overlay and live share up, and the workload identity resolved.
+# The VMM terminates the source on a successful capture; on a later restore
+# execution resumes at the next line and hands off to the workload or the
+# managed agent, so a restored sandbox is ready to serve work immediately.
+# On a plain cold boot (no --snapshot-destination) the VMM ignores the request
+# and this stays a no-op.
+case " $cmdline " in
+    *" sandboxsnap "*)
+        /sbin/nvx-snapshot --tier instance-checkpoint
+        # ---- on restore, execution resumes here ----
+        ;;
+esac
 
 if [ "$workload_lifecycle" = managed ]; then
     echo "NVX-SANDBOX-READY: managed layers=$layer_count"

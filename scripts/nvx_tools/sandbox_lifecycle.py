@@ -45,10 +45,13 @@ MOUNT_CONFIG_FORMAT = 2
 # release must reject it rather than silently boot without the wake plane.
 SNAPSHOT_CONFIG_FORMAT = 3
 CONFIG_FORMATS = (CONFIG_FORMAT, MOUNT_CONFIG_FORMAT, SNAPSHOT_CONFIG_FORMAT)
-# The sandbox capture point sits after the read-only layers are mounted and
-# before the scratch is consumed, which is exactly OpenVMM's `platform` tier:
-# a fleet-wide clone point whose restore receives a pristine writable layer.
-SNAPSHOT_CAPTURE_TIER = "platform"
+# A sandbox snapshot consumes tenant configuration (layer, scratch, entrypoint,
+# workload identity) and binds the layer identity, so OpenVMM's `platform` tier
+# is rejected for it: that tier carries only invariant command-line tokens and
+# leaves the layers unbound. `instance-checkpoint` is the tier that consumes the
+# full configuration, binds the layers, pairs the scratch, and resumes the
+# guest where the capture left it -- the wake plane a fleet wants.
+SNAPSHOT_CAPTURE_TIER = "instance-checkpoint"
 OUTCOME_SCHEMA_VERSION = 1
 
 
