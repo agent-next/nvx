@@ -77,11 +77,14 @@ from nvx_tools.release import (
     verify_source_tree,
 )
 from nvx_tools.sandbox import (
+    PROCESSOR_COUNTS,
     SandboxLaunch,
     SandboxLayer,
     SandboxMount,
     parse_workload_identity,
 )
+
+SNAPSHOT_TIERS = sandbox_lifecycle.SNAPSHOT_TIERS
 
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
@@ -403,6 +406,28 @@ def command_run(args: argparse.Namespace) -> None:
         raise SystemExit(subprocess.run(command).returncode)
 
 
+def _sandbox_snapshot_path(path: Path) -> Path:
+    """Resolve one snapshot directory to the absolute host path NVX records.
+
+    A capture creates the directory, so only its parent has to exist; the
+    lifecycle layer rejects a restore source that is missing.
+    """
+    resolved = path if path.is_absolute() else Path.cwd() / path
+    if os.fspath(resolved).rstrip(os.sep) != os.fspath(resolved):
+        raise ScriptError(
+            f"sandbox snapshot directory must not end in a separator: {path}"
+        )
+    if resolved.is_symlink():
+        raise ScriptError(f"sandbox snapshot directory is a symbolic link: {resolved}")
+    if resolved.exists() and not resolved.is_dir():
+        raise ScriptError(f"sandbox snapshot path is not a directory: {resolved}")
+    if not resolved.parent.is_dir():
+        raise ScriptError(
+            f"sandbox snapshot parent directory does not exist: {resolved.parent}"
+        )
+    return resolved
+
+
 def command_sandbox(args: argparse.Namespace) -> None:
     operation = args.sandbox_operation
     network_options = (
@@ -437,12 +462,39 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError("--mount-deny requires --mount")
     if args.mount is not None and operation not in ("run", "provision"):
         raise ScriptError("--mount is only valid for sandbox run or provision")
+    # The snapshot options belong to the operations that build a microVM. A
+    # managed start, exec, stop, or deprovision reads them from the state
+    # directory, so accepting them there would silently discard them.
+    if args.restore_snapshot is not None and operation != "provision":
+        raise ScriptError("--restore-snapshot is only valid for sandbox provision")
+    if args.snapshot_destination is not None and operation not in ("run", "provision"):
+        raise ScriptError(
+            "--snapshot-destination is only valid for sandbox run or provision"
+        )
+    if args.snapshot_tier is not None and args.snapshot_destination is None:
+        raise ScriptError("--snapshot-tier requires --snapshot-destination")
+    if args.snapshot_destination is not None and args.restore_snapshot is not None:
+        raise ScriptError(
+            "--snapshot-destination and --restore-snapshot are mutually exclusive"
+        )
     if operation in ("run", "provision"):
         if (args.net is None) != (args.network_profile is None):
             raise ScriptError("--net and --network-profile must be specified together")
         if not args.layer or args.scratch is None:
             raise ScriptError(f"sandbox {operation} requires --layer and --scratch")
         network_egress_allow, network_egress_deny = _resolve_network_egress_rules(args)
+        snapshot_destination = args.snapshot_destination
+        snapshot_tier = args.snapshot_tier or "platform"
+        restore_snapshot = args.restore_snapshot
+        if snapshot_destination is not None:
+            snapshot_destination = _sandbox_snapshot_path(snapshot_destination)
+        if restore_snapshot is not None:
+            restore_snapshot = _sandbox_snapshot_path(restore_snapshot)
+            if args.net is not None or network_egress_allow or network_egress_deny:
+                raise ScriptError(
+                    "a snapshot restore takes its network configuration from the "
+                    "snapshot; do not pass --net or network policy options"
+                )
         launch = SandboxLaunch(
             layers=tuple(args.layer),
             scratch=args.scratch,
@@ -457,12 +509,19 @@ def command_sandbox(args: argparse.Namespace) -> None:
                 if args.mount is None
                 else SandboxMount.parse(args.mount, tuple(args.mount_deny))
             ),
+            processors=args.processors,
+            # A restore resumes past the capture point from saved state, so only
+            # the capturing boot arms the guest trigger.
+            snapshot_capture=snapshot_destination is not None,
         ).validated()
         _validate_sandbox_systemd_policy(launch)
     else:
         launch = None
         network_egress_allow = ()
         network_egress_deny = ()
+        snapshot_destination = None
+        snapshot_tier = None
+        restore_snapshot = None
 
     if operation == "provision":
         if args.state_dir is None:
@@ -483,6 +542,9 @@ def command_sandbox(args: argparse.Namespace) -> None:
             network_proxy=args.network_proxy,
             host_loopback_forward=tuple(args.host_loopback_forward),
             cmdline=args.cmdline,
+            snapshot_destination=snapshot_destination,
+            snapshot_tier=snapshot_tier if snapshot_destination is not None else None,
+            restore_snapshot=restore_snapshot,
         )
         return
     if operation == "start":
@@ -549,6 +611,15 @@ def command_sandbox(args: argparse.Namespace) -> None:
         "--cmdline",
         launch.kernel_command_line(args.cmdline),
     ]
+    if snapshot_destination is not None:
+        command.extend(
+            [
+                "--snapshot-destination",
+                os.fspath(snapshot_destination),
+                "--snapshot-tier",
+                snapshot_tier,
+            ]
+        )
     _extend_network_arguments(
         command,
         args,
@@ -853,6 +924,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument("--memory-max", type=int)
     sandbox.add_argument("--pids-max", type=int)
     sandbox.add_argument("--memory-mib", type=int, default=256)
+    sandbox.add_argument(
+        "--processors",
+        type=int,
+        choices=PROCESSOR_COUNTS,
+        default=1,
+        help="guest vCPU count (default: 1)",
+    )
+    sandbox.add_argument(
+        "--snapshot-destination",
+        type=Path,
+        metavar="DIR",
+        help=(
+            "capture a snapshot at the sandbox workload handoff into DIR; "
+            "valid for run and provision"
+        ),
+    )
+    sandbox.add_argument(
+        "--snapshot-tier",
+        choices=SNAPSHOT_TIERS,
+        help=(
+            "sandbox snapshot capture tier (default: platform); requires "
+            "--snapshot-destination"
+        ),
+    )
+    sandbox.add_argument(
+        "--restore-snapshot",
+        type=Path,
+        metavar="DIR",
+        help=(
+            "restore the sandbox from a captured snapshot instead of booting; "
+            "valid for provision"
+        ),
+    )
     sandbox.add_argument(
         "--timeout",
         type=float,

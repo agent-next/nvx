@@ -4027,6 +4027,11 @@ class BuildTests(unittest.TestCase):
                 for key, value in os.environ.items()
                 if not key.startswith("GIT_CONFIG_")
             }
+            # Filtering drops any inherited GIT_CONFIG_* override without
+            # supplying one, so the host global config (notably a global
+            # core.hooksPath) would still apply to this throwaway repository.
+            git_environment["GIT_CONFIG_GLOBAL"] = os.devnull
+            git_environment["GIT_CONFIG_SYSTEM"] = os.devnull
             config = root / "kernel" / "config-microvm"
             patch_path = root / "kernel" / "patches" / "example.patch"
             stale_patch = root / "kernel" / "patches" / "stale.patch"
@@ -6214,6 +6219,377 @@ class SandboxTests(unittest.TestCase):
                     layers=(layer,),
                     scratch=scratch,
                 ).validated()
+
+
+class SandboxSnapshotWakeTests(unittest.TestCase):
+    """The sandbox wake plane: capture a layer snapshot and restore from it."""
+
+    def _launch(self, root: Path, **overrides: object) -> sandbox.SandboxLaunch:
+        layer = root / "distro.erofs"
+        scratch = root / "scratch.ext4"
+        layer.write_bytes(b"layer")
+        scratch.write_bytes(b"scratch")
+        fields: dict[str, object] = {
+            "layers": (
+                sandbox.SandboxLayer(
+                    role="distro",
+                    path=layer,
+                    uuid="11111111-1111-1111-1111-111111111111",
+                ),
+            ),
+            "scratch": scratch,
+        }
+        fields.update(overrides)
+        return sandbox.SandboxLaunch(**fields)  # type: ignore[arg-type]
+
+    def _provision(
+        self,
+        root: Path,
+        *,
+        launch_overrides: dict[str, object] | None = None,
+        provision_options: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        state = root / "state"
+        sandbox_lifecycle.provision(
+            state,
+            self._launch(root, **(launch_overrides or {})),
+            hypervisor="kvm",
+            memory_mib=512,
+            net=None,
+            network_profile=None,
+            network_egress=None,
+            network_ingress=None,
+            network_egress_allow=(),
+            network_egress_deny=(),
+            host_loopback=None,
+            network_proxy=None,
+            host_loopback_forward=(),
+            cmdline="quiet",
+            **(provision_options or {}),
+        )
+        return json.loads(
+            (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
+        )
+
+    def _start_command(self, state: Path) -> list[str]:
+        process = MagicMock()
+        process.pid = 321
+        process.stdin = io.BytesIO()
+        context = MagicMock()
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            patch.object(sandbox_lifecycle, "require_file", side_effect=require),
+            patch.object(
+                sandbox_lifecycle.subprocess, "Popen", return_value=process
+            ) as popen,
+            patch.object(
+                sandbox_lifecycle.ControlSession, "connect", return_value=context
+            ),
+        ):
+            sandbox_lifecycle.start(state, 10)
+        return popen.call_args.args[0]
+
+    # --- processors (gap 2) ---
+
+    def test_processors_default_to_one_and_are_omitted_from_the_host_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            launch = self._launch(root)
+            self.assertEqual(launch.processors, 1)
+            self.assertNotIn("--processors", launch.openvmm_arguments())
+            self.assertEqual(self._provision(root)["processors"], 1)
+
+    def test_processors_are_plumbed_to_the_host_command_and_kernel_command_line(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            launch = self._launch(root, processors=2)
+            arguments = launch.openvmm_arguments()
+            self.assertEqual(
+                arguments[arguments.index("--processors") + 1], "2"
+            )
+            # The sandbox layers, not the processor count, drive the guest
+            # command line; OpenVMM appends the processor limit itself.
+            self.assertIn("--microvm-sandbox-block", arguments)
+            self.assertEqual(
+                self._provision(root, launch_overrides={"processors": 2})["processors"],
+                2,
+            )
+
+    def test_unsupported_processor_count_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(common.ScriptError, "--processors"):
+                self._launch(root, processors=3)
+
+    def test_processor_count_round_trips_through_the_state_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            sandbox_lifecycle.provision(
+                state,
+                self._launch(root, processors=4),
+                hypervisor="kvm",
+                memory_mib=512,
+                net=None,
+                network_profile=None,
+                network_egress=None,
+                network_ingress=None,
+                network_egress_allow=(),
+                network_egress_deny=(),
+                host_loopback=None,
+                network_proxy=None,
+                host_loopback_forward=(),
+                cmdline="quiet",
+            )
+            config = json.loads(
+                (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                sandbox_lifecycle._deserialize_launch(config).processors, 4
+            )
+
+    # --- capture ---
+
+    def test_capture_provision_records_a_snapshot_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._provision(
+                root,
+                provision_options={
+                    "snapshot_destination": root / "snap",
+                    "snapshot_tier": "platform",
+                },
+            )
+
+            self.assertEqual(config["format"], sandbox_lifecycle.SNAPSHOT_CONFIG_FORMAT)
+            self.assertEqual(config["snapshot_destination"], str(root / "snap"))
+            self.assertEqual(config["snapshot_tier"], "platform")
+            self.assertIsNone(config["restore_snapshot"])
+
+    def test_capture_start_arms_the_guest_trigger_and_the_snapshot_destination(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._provision(
+                root,
+                provision_options={
+                    "snapshot_destination": root / "snap",
+                    "snapshot_tier": "platform",
+                },
+            )
+            command = self._start_command(root / "state")
+
+            self.assertIn("--snapshot-destination", command)
+            self.assertEqual(
+                command[command.index("--snapshot-destination") + 1], str(root / "snap")
+            )
+            self.assertEqual(command[command.index("--snapshot-tier") + 1], "platform")
+            # The guest init agent captures at the workload handoff only when
+            # the kernel command line arms the trigger.
+            cmdline = command[command.index("--cmdline") + 1]
+            self.assertIn(f" {sandbox.SNAPSHOT_TRIGGER_TOKEN} ", f" {cmdline} ")
+
+    def test_capture_without_a_destination_leaves_the_guest_trigger_disarmed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._provision(root)
+            command = self._start_command(root / "state")
+
+            self.assertNotIn("--snapshot-destination", command)
+            self.assertNotIn("--snapshot-tier", command)
+            cmdline = command[command.index("--cmdline") + 1]
+            self.assertNotIn(sandbox.SNAPSHOT_TRIGGER_TOKEN, cmdline.split())
+
+    def test_capture_rejects_a_tier_it_cannot_represent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._provision(root)
+            config = json.loads(
+                (root / "state" / sandbox_lifecycle.CONFIG_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            config["snapshot_destination"] = str(root / "snap")
+            config["snapshot_tier"] = "nonsense"
+            state = root / "state"
+            (state / sandbox_lifecycle.CONFIG_NAME).write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(common.ScriptError, "snapshot tier"):
+                self._start_command(state)
+
+    # --- restore ---
+
+    def test_restore_start_replaces_the_boot_arguments_with_the_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "snap"
+            snapshot.mkdir()
+            self._provision(root, provision_options={"restore_snapshot": snapshot})
+            command = self._start_command(root / "state")
+
+            self.assertEqual(
+                command[command.index("--restore-snapshot") + 1], str(snapshot)
+            )
+            # The snapshot carries the guest command line, memory size,
+            # lifecycle, and workload identity, so a restore must not restate
+            # them: OpenVMM rejects each one on this path.
+            for rejected in (
+                "--kernel",
+                "--initrd",
+                "--cmdline",
+                "--memory",
+                "--microvm-lifecycle",
+                "--microvm-workload-identity",
+                "--snapshot-destination",
+                "--snapshot-tier",
+            ):
+                self.assertNotIn(rejected, command)
+            # The layer and scratch devices are still required so OpenVMM can
+            # re-validate the snapshot's device contract against the same files.
+            self.assertIn("--microvm-sandbox-block", command)
+            self.assertNotIn(sandbox.SNAPSHOT_TRIGGER_TOKEN, command)
+
+    def test_restore_does_not_restate_network_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "snap"
+            snapshot.mkdir()
+            config = self._provision(root, provision_options={"restore_snapshot": snapshot})
+            config["net"] = "192.0.2.4/24"
+            config["network_profile"] = "portable"
+            config["network_egress"] = "deny"
+            config["network_egress_allow"] = ["192.0.2.0/24"]
+            config["network_proxy"] = "192.0.2.1:3128"
+            state = root / "state"
+            (state / sandbox_lifecycle.CONFIG_NAME).write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            command = self._start_command(state)
+
+            for rejected in (
+                "--net",
+                "--network-profile",
+                "--network-egress",
+                "--network-egress-allow",
+                "--network-proxy",
+            ):
+                self.assertNotIn(rejected, command)
+
+    def test_restore_rejects_a_snapshot_the_host_cannot_see(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(common.ScriptError, "not a plain directory"):
+                self._provision(
+                    root, provision_options={"restore_snapshot": root / "absent"}
+                )
+
+    def test_capture_and_restore_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "provision",
+                    "--state-dir",
+                    str(root / "state"),
+                    "--layer",
+                    f"distro,{root / 'distro.erofs'},"
+                    "11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(root / "scratch.ext4"),
+                    "--snapshot-destination",
+                    str(root / "snap"),
+                    "--restore-snapshot",
+                    str(root / "snap"),
+                ]
+            )
+            with self.assertRaisesRegex(common.ScriptError, "mutually exclusive"):
+                nvx.command_sandbox(args)
+
+    def test_snapshot_tier_requires_a_destination(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "provision",
+                    "--state-dir",
+                    str(root / "state"),
+                    "--layer",
+                    f"distro,{root / 'distro.erofs'},"
+                    "11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(root / "scratch.ext4"),
+                    "--snapshot-tier",
+                    "platform",
+                ]
+            )
+            with self.assertRaisesRegex(common.ScriptError, "requires --snapshot-destination"):
+                nvx.command_sandbox(args)
+
+    def test_restore_is_rejected_where_it_cannot_be_honored(self):
+        for operation in ("run", "start", "exec"):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                snapshot = root / "snap"
+                snapshot.mkdir()
+                arguments = [
+                    "sandbox",
+                    operation,
+                    "--state-dir",
+                    str(root / "state"),
+                    "--restore-snapshot",
+                    str(snapshot),
+                ]
+                if operation == "run":
+                    arguments.extend(
+                        (
+                            "--layer",
+                            f"distro,{root / 'distro.erofs'},"
+                            "11111111-1111-1111-1111-111111111111",
+                            "--scratch",
+                            str(root / "scratch.ext4"),
+                        )
+                    )
+                args = nvx.parse_args(arguments)
+                with self.assertRaisesRegex(
+                    common.ScriptError, "only valid for sandbox provision"
+                ):
+                    nvx.command_sandbox(args)
+
+    def test_plain_boot_command_line_is_unchanged(self):
+        """The existing user contract must not shift under this change."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            launch = self._launch(root)
+            self.assertEqual(
+                launch.kernel_command_line("quiet"),
+                (
+                    "quiet nvx_sandbox=1 "
+                    "nvx_layer=distro,0xd0003000,11111111-1111-1111-1111-111111111111 "
+                    "nvx_scratch=0xd0006000,ext4 "
+                    "nvx_entrypoint=/bin/sh nvx_hostname=nvx-sandbox"
+                ),
+            )
+            arguments = launch.openvmm_arguments()
+            self.assertEqual(arguments[0], "--machine")
+            self.assertEqual(arguments[1], "microvm")
+
+    def test_sandbox_init_agent_arms_the_capture_point_before_the_handoff(self):
+        source = (
+            BuildConstants.REPO_ROOT / "guest" / "common" / "nvx-init-agent"
+        ).read_text(encoding="utf-8")
+        trigger = source.index('*" sandboxsnap "*)')
+        handoff = source.index("nvx-container-launch")
+        managed = source.index("/sbin/nvx-managed-agent")
+        # The capture must land after every mount and cgroup is in place and
+        # before the workload or the managed agent is handed the container.
+        self.assertLess(trigger, managed)
+        self.assertLess(trigger, handoff)
+        self.assertIn("/sbin/nvx-snapshot", source[trigger:handoff])
 
 
 class BenchmarkTests(unittest.TestCase):

@@ -165,6 +165,12 @@ def require_file(path: Path, description: str) -> Path:
     return path
 
 
+def require_directory(path: Path, description: str) -> Path:
+    if not path.is_dir() or path.is_symlink():
+        raise ScriptError(f"{description} is not a plain directory: {path}")
+    return path
+
+
 def require_tool(name: str, message: str | None = None) -> str:
     executable = shutil.which(name)
     if executable is None:
