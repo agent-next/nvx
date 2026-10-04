@@ -258,10 +258,11 @@ class SandboxLaunch:
     def openvmm_arguments(self, *, restore: bool = False) -> list[str]:
         """Host-side OpenVMM arguments for this sandbox.
 
-        On a snapshot restore the guest command line is fixed by the captured
-        state, so the workload identity must not be re-declared; the layer and
-        scratch devices still are, so OpenVMM can re-validate the snapshot's
-        device contract against the same files.
+        A snapshot restore fixes the guest command line, so the workload
+        identity must not be re-declared, and OpenVMM supplies the scratch
+        itself from the snapshot's paired image -- only the read-only layers
+        are re-declared, so it can re-validate their identity against the
+        snapshot's device contract.
         """
         arguments = ["--machine", "microvm"]
         if self.processors != 1:
@@ -273,12 +274,11 @@ class SandboxLaunch:
                     f"{layer.role}:file:{os.fspath(layer.path)},ro",
                 )
             )
-        arguments.extend(
-            ("--microvm-sandbox-block", f"scratch:file:{os.fspath(self.scratch)}")
-        )
         if not restore:
             arguments.extend(
                 (
+                    "--microvm-sandbox-block",
+                    f"scratch:file:{os.fspath(self.scratch)}",
                     "--microvm-workload-identity",
                     f"{self.workload_identity[0]}:{self.workload_identity[1]}",
                 )

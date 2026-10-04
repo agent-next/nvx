@@ -6505,9 +6505,16 @@ class SandboxSnapshotWakeTests(unittest.TestCase):
                 "--snapshot-tier",
             ):
                 self.assertNotIn(rejected, command)
-            # The layer and scratch devices are still required so OpenVMM can
-            # re-validate the snapshot's device contract against the same files.
-            self.assertIn("--microvm-sandbox-block", command)
+            # The read-only layers are still required so OpenVMM can
+            # re-validate the snapshot's device contract against the same
+            # files; the scratch comes from the snapshot's paired image.
+            blocks = [
+                command[index + 1]
+                for index, value in enumerate(command)
+                if value == "--microvm-sandbox-block"
+            ]
+            self.assertEqual(len(blocks), 1)
+            self.assertTrue(blocks[0].startswith("distro:file:"))
             self.assertNotIn(sandbox.SNAPSHOT_TRIGGER_TOKEN, command)
 
     def test_restore_does_not_restate_network_configuration(self):
