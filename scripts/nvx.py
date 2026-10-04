@@ -659,6 +659,8 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError("--mount-owner requires --mount")
     if args.mount and operation not in ("run", "provision"):
         raise ScriptError("--mount is only valid for sandbox run or provision")
+    if args.socket is not None and operation != "execd":
+        raise ScriptError("--socket is only valid for sandbox execd")
     if operation in ("run", "provision"):
         if (args.net is None) != (args.network_profile is None):
             raise ScriptError("--net and --network-profile must be specified together")
@@ -729,6 +731,15 @@ def command_sandbox(args: argparse.Namespace) -> None:
         if args.outcome_report is not None:
             sandbox_lifecycle.write_exec_outcome(args.outcome_report, result)
         raise SystemExit(result.returncode)
+    if operation == "execd":
+        if args.state_dir is None:
+            raise ScriptError("sandbox execd requires --state-dir")
+        if args.socket is None:
+            raise ScriptError("sandbox execd requires --socket")
+        sandbox_lifecycle.exec_daemon(
+            args.state_dir, args.socket, timeout=args.timeout
+        )
+        return
     if operation == "stop":
         if args.state_dir is None:
             raise ScriptError("sandbox stop requires --state-dir")
@@ -1177,7 +1188,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument(
         "sandbox_operation",
         nargs="?",
-        choices=("run", "provision", "start", "exec", "stop", "deprovision"),
+        choices=(
+            "run", "provision", "start", "exec", "execd", "stop", "deprovision"
+        ),
         default="run",
     )
     sandbox.add_argument(
@@ -1189,6 +1202,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     sandbox.add_argument("--scratch", type=Path)
     sandbox.add_argument("--state-dir", type=Path)
+    sandbox.add_argument(
+        "--socket",
+        type=Path,
+        help="unix socket path for the persistent exec daemon (execd)",
+    )
     sandbox.add_argument("--entrypoint", default="/bin/sh")
     sandbox.add_argument("--arg", action="append", default=[], dest="sandbox_arg")
     sandbox.add_argument("--hostname", default="nvx-sandbox")

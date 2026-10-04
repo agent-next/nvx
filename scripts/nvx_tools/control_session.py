@@ -137,6 +137,10 @@ class ControlEndpointClosed(ConnectionError):
         super().__init__(message)
 
 
+class GuestExecRejected(ScriptError):
+    """The guest rejected an exec but the control session stayed in sync."""
+
+
 # A peer that closes with data that it has not read resets the connection, and a
 # write after the peer closed fails with a broken pipe.
 _PEER_CLOSED = (BrokenPipeError, ConnectionResetError)

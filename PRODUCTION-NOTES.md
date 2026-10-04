@@ -72,3 +72,79 @@ boots Ubuntu 26.04.1 userland, assembles the overlayfs, runs the entrypoint as u
 with dropped capabilities, and reports `NVX-SANDBOX-READY` / clean exit. Guest-side
 failures (e.g. malformed scratch) surface as explicit `NVX-SANDBOX-ERROR` + non-zero
 guest status, which is good honest failure.
+
+## 5. One-shot sandbox operational facts (found driving real workloads)
+
+Verified on the dedicated droplet with a debian:bookworm EROFS layer (python3, git, curl,
+chromium, blender) running four real workload classes end-to-end:
+
+- **`sandbox run` does not pass host environment variables into the workload** (documented
+  upstream). The working pattern is a per-sandbox `env.sh` written into the rw `--mount`
+  payload directory, sourced at the top of the workload script.
+- **The portable network profile has no guest DNS resolver.** Real internet egress works via
+  `--network-proxy 10.0.0.1:3128` plus a host-side forward proxy (tinyproxy): `curl -x` /
+  `chromium --proxy-server`. DNS then resolves host-side. Without this, every name lookup
+  in the guest fails.
+- **The guest agent validates the workload home directory exists.** Debian's `nobody` user
+  has home `/nonexistent`; a layer built from a debian rootfs must create that directory or
+  every sandbox exits with `NVX-SANDBOX-ERROR: configured workload home is unavailable`.
+- **Debian's blender is built without OpenImageDenoiser**; Cycles renders fail at denoise
+  time unless `cycles.use_denoising = False`. Headless blender also needs libgl1/libegl1
+  even for CPU renders (install them in the layer).
+- **Layer build path that works**: docker container with the real toolchain → `docker
+  export` → extract → `mkfs.erofs -z lz4hc -U <uuid>` → use as any layer role. A 975 MiB
+  debian+blender+chromium layer boots and runs all four classes.
+
+## 6. Latent benchmark bugs found at concurrency (fixed here)
+
+Both surfaced only when restoring in a tight multi-worker loop (warm-pool bench), never
+in the sequential suites:
+
+- **`guest_exit_prequeued` omission aborts OpenVMM.** Calling the restore path without
+  `guest_exit_prequeued=True` makes the harness write `guest-exit.sh` into the guest
+  console after the marker while the restored workload is already exiting on its own;
+  the input race ends in `OpenVMM exited with status -6 (SIGABRT) during teardown` in
+  ~1% of runs even though the marker fired and the restore succeeded. The
+  shell-snapshot-restore suite passes the flag; any new caller must too (warmpool does).
+- **Doubled carriage return hides a marker line.** The guest console occasionally emits
+  `\r\r\n` after the marker; `contains_output_line` stripped only one `\r`, so a printed
+  marker line was missed (~1/2000) and a successful restore reported as a failure.
+  Fixed with `rstrip(b"\r")` + regression test.
+
+## 7. Boot-storm EPIPE on the managed control pipe (fixed here)
+
+A 128-simultaneous-boot thundering herd broke ~13% of `sandbox start` calls with
+`error: [Errno 32] Broken pipe` at ~3.8s: the freshly spawned OpenVMM process dies or
+drops the control endpoint before the auth handshake/ping completes (capability
+stdin write, attach, or first ping all surface as `BrokenPipeError` /
+`ConnectionResetError` or an endpoint-closed `ConnectionError`).
+
+**Fix in this branch.** `sandbox start` retries through
+`_with_control_retry` — 3 attempts with 0.5s/1.0s backoff — on `ConnectionError`
+(which covers `BrokenPipeError` and `ConnectionResetError`; `provision` never
+touches the control pipe, so it has no retry wrapper). Each start attempt tears
+down the failed OpenVMM process and respawns it, so a retry is a clean boot. Retries
+log `sandbox start attempt N failed: ...` to stderr. `sandbox exec` is deliberately
+not retried: a managed exec failure stays honest.
+
+## 8. Persistent exec daemon (`sandbox execd`)
+
+`sandbox exec` pays a full Python cold start (~200 ms floor at low load) because it
+re-imports the toolchain and re-opens a control session per call. `sandbox execd
+--state-dir D --socket PATH` is a long-lived single-operator daemon that holds one
+`ControlSession` and serves a one-line JSON protocol over a unix socket (mode 0600,
+no auth — same trust boundary as `control.capability`):
+
+- request: `{"cmd": ["/bin/sh","-c","..."], "timeout_ms": 30000}` (`timeout_ms`
+  optional, 0 disables the guest timeout)
+- response: `{"rc": int, "out": str, "err": str, "b64": bool}` — `out`/`err` are
+  base64 only when `b64` is true (non-UTF-8 output); malformed requests and guest
+  rejections get `{"error": str}`.
+
+The daemon refuses to start when the sandbox is not running, execs through the same
+`session.exec` path as `sandbox exec` (one request per connection, connections served
+serially since the session is a sequenced protocol), exits non-zero when the VM dies
+so clients re-provision, and removes the socket file on exit (SIGTERM unwinds through cleanup; only
+SIGKILL leaves the socket file behind — remove it before restarting). While the
+daemon lives it holds the control channel: external lifecycle ops such as
+`sandbox stop` time out — kill the daemon first.

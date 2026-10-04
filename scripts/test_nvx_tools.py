@@ -5,6 +5,7 @@ import argparse
 import ast
 import contextlib
 import errno
+import base64
 import hashlib
 import http.client
 import http.server
@@ -18,6 +19,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -13326,6 +13328,278 @@ class SandboxTests(unittest.TestCase):
             os.fstat(prepared[0])
         self.assertEqual(connect.call_args.args[1], capability)
         session.ping.assert_called_once_with(10)
+    def test_managed_start_retries_a_broken_control_pipe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=(BrokenPipeError(32, "broken pipe"), None)
+            )
+            stderr = io.StringIO()
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                patch.object(sys, "stderr", stderr),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(attempts.call_count, 2)
+            sleep.assert_called_once_with(0.5)
+            self.assertIn("start attempt 1 failed", stderr.getvalue())
+            self.assertIn("Errno 32", stderr.getvalue())
+
+    def test_managed_start_gives_up_after_bounded_pipe_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=ConnectionResetError(104, "connection reset")
+            )
+            stderr = io.StringIO()
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                patch.object(sys, "stderr", stderr),
+                self.assertRaises(ConnectionResetError),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(attempts.call_count, 3)
+            self.assertEqual(
+                [call.args[0] for call in sleep.call_args_list], [0.5, 1.0]
+            )
+            self.assertIn("attempt 1 failed", stderr.getvalue())
+            self.assertIn("attempt 2 failed", stderr.getvalue())
+
+    def test_managed_start_does_not_retry_honest_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=common.ScriptError("sandbox is already running")
+            )
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                self.assertRaisesRegex(common.ScriptError, "already running"),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            attempts.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_managed_exec_stays_honest_without_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            sandbox_lifecycle._write_json(
+                state / sandbox_lifecycle.RUNTIME_NAME,
+                {
+                    "format": sandbox_lifecycle.STATE_FORMAT,
+                    "pid": os.getpid(),
+                    "control_endpoint": "control.sock",
+                },
+            )
+            (state / sandbox_lifecycle.CAPABILITY_NAME).write_bytes(b"x" * 32)
+            with (
+                patch.object(
+                    sandbox_lifecycle.ControlSession,
+                    "connect",
+                    side_effect=BrokenPipeError(32, "broken pipe"),
+                ) as connect,
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                self.assertRaises(BrokenPipeError),
+            ):
+                sandbox_lifecycle.exec_workload(
+                    state,
+                    ("/bin/true",),
+                    timeout_ms=0,
+                    response_timeout=5,
+                )
+
+            connect.assert_called_once()
+            sleep.assert_not_called()
+
+    def _execd_state(self, state: Path) -> None:
+        sandbox_lifecycle._write_json(
+            state / sandbox_lifecycle.RUNTIME_NAME,
+            {
+                "format": sandbox_lifecycle.STATE_FORMAT,
+                "pid": os.getpid(),
+                "control_endpoint": "control.sock",
+            },
+        )
+        (state / sandbox_lifecycle.CAPABILITY_NAME).write_bytes(b"x" * 32)
+
+    def _execd_request(
+        self, socket_path: Path, request: bytes
+    ) -> dict[str, Any]:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.connect(os.fspath(socket_path))
+            client.sendall(request + b"\n")
+            response = bytearray()
+            while b"\n" not in response:
+                chunk = client.recv(65_536)
+                if not chunk:
+                    break
+                response.extend(chunk)
+            return cast(dict[str, Any], json.loads(bytes(response).split(b"\n", 1)[0]))
+        finally:
+            client.close()
+
+    def test_execd_serves_requests_on_one_session_until_vm_dies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            socket_path = root / "execd.sock"
+            state.mkdir()
+            self._execd_state(state)
+            session = MagicMock()
+            session.exec.side_effect = (
+                sandbox_lifecycle.ManagedExecResult(0, "exit", b"hello", b"warn"),
+                sandbox_lifecycle.ManagedExecResult(1, "exit", b"\xff", b""),
+            )
+            context = MagicMock()
+            context.__enter__.return_value = session
+            running = [True]
+            failure: list[BaseException] = []
+
+            def serve() -> None:
+                try:
+                    sandbox_lifecycle.exec_daemon(state, socket_path, timeout=5)
+                except BaseException as error:
+                    failure.append(error)
+
+            with (
+                patch.object(
+                    sandbox_lifecycle, "_process_running", lambda _pid: running[0]
+                ),
+                patch.object(
+                    sandbox_lifecycle.ControlSession,
+                    "connect",
+                    return_value=context,
+                ),
+            ):
+                worker = threading.Thread(target=serve)
+                worker.start()
+                deadline = time.monotonic() + 5
+                while not socket_path.exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                self.assertEqual(os.stat(socket_path).st_mode & 0o777, 0o600)
+
+                response = self._execd_request(
+                    socket_path,
+                    json.dumps(
+                        {"cmd": ["/bin/sh", "-c", "echo hi"], "timeout_ms": 30000}
+                    ).encode("utf-8"),
+                )
+                self.assertEqual(
+                    response,
+                    {"rc": 0, "out": "hello", "err": "warn", "b64": False},
+                )
+                session.exec.assert_called_once_with(
+                    ("/bin/sh", "-c", "echo hi"),
+                    timeout_ms=30000,
+                    response_timeout=60.0,
+                )
+
+                response = self._execd_request(
+                    socket_path,
+                    json.dumps({"cmd": ["/bin/cat"]}).encode("utf-8"),
+                )
+                self.assertEqual(
+                    response["rc"], 1,
+                )
+                self.assertTrue(response["b64"])
+                self.assertEqual(
+                    base64.b64decode(response["out"]), b"\xff"
+                )
+
+                response = self._execd_request(socket_path, b"not json")
+                self.assertIn("error", response)
+
+                running[0] = False
+                worker.join(timeout=10)
+
+            self.assertEqual(len(failure), 1)
+            self.assertIsInstance(failure[0], common.ScriptError)
+            self.assertIn("VM exited", str(failure[0]))
+            self.assertFalse(socket_path.exists())
+            self.assertFalse(worker.is_alive())
+
+    def test_execd_refuses_to_start_when_sandbox_is_not_running(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            socket_path = root / "execd.sock"
+            state = root / "state"
+            state.mkdir()
+            with self.assertRaisesRegex(common.ScriptError, "not running"):
+                sandbox_lifecycle.exec_daemon(state, socket_path, timeout=5)
+            self.assertFalse(socket_path.exists())
+
+    def test_execd_exits_when_the_vm_is_already_gone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            socket_path = root / "execd.sock"
+            state.mkdir()
+            self._execd_state(state)
+            context = MagicMock()
+            with (
+                patch.object(
+                    sandbox_lifecycle,
+                    "_process_running",
+                    side_effect=(True, False, False),
+                ),
+                patch.object(
+                    sandbox_lifecycle.ControlSession,
+                    "connect",
+                    return_value=context,
+                ),
+                self.assertRaisesRegex(common.ScriptError, "VM exited"),
+            ):
+                sandbox_lifecycle.exec_daemon(state, socket_path, timeout=5)
+            self.assertFalse(socket_path.exists())
+
+    def test_sandbox_execd_cli_contract(self):
+        args = nvx.parse_args(
+            [
+                "sandbox",
+                "execd",
+                "--state-dir",
+                "state",
+                "--socket",
+                "execd.sock",
+            ]
+        )
+        self.assertEqual(args.sandbox_operation, "execd")
+        self.assertEqual(args.socket, Path("execd.sock"))
+        with patch.object(
+            sandbox_lifecycle, "exec_daemon"
+        ) as exec_daemon:
+            nvx.command_sandbox(args)
+        exec_daemon.assert_called_once_with(
+            Path("state"), Path("execd.sock"), timeout=60.0
+        )
+
+        missing_socket = nvx.parse_args(
+            ["sandbox", "execd", "--state-dir", "state"]
+        )
+        with self.assertRaisesRegex(common.ScriptError, "requires --socket"):
+            nvx.command_sandbox(missing_socket)
+        missing_state = nvx.parse_args(["sandbox", "execd", "--socket", "s"])
+        with self.assertRaisesRegex(common.ScriptError, "requires --state-dir"):
+            nvx.command_sandbox(missing_state)
+        wrong_operation = nvx.parse_args(
+            [
+                "sandbox",
+                "exec",
+                "--state-dir",
+                "state",
+                "--socket",
+                "s",
+            ]
+        )
+        with self.assertRaisesRegex(common.ScriptError, "only valid"):
+            nvx.command_sandbox(wrong_operation)
 
     def test_launch_contract_rejects_disk_option_delimiters(self):
         with tempfile.TemporaryDirectory() as temporary:

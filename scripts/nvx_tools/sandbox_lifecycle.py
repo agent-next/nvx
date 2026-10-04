@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
+import signal
+import socket
 import subprocess
+import sys
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,6 +31,7 @@ from .control_session import (
     MANAGED_EXIT_CATEGORIES,
     ControlEndpointClosed,
     ControlSession,
+    GuestExecRejected,
     ManagedExecResult,
     capability_pipe,
 )
@@ -60,6 +66,34 @@ CONFIG_FORMATS = (
     POLICY_CONFIG_FORMAT,
 )
 OUTCOME_SCHEMA_VERSION = 1
+# A control pipe that breaks while an OpenVMM process is starting is transient
+# under boot storms: the next attempt spawns a fresh process and endpoint.
+CONTROL_RETRY_BACKOFF_S = (0.5, 1.0)
+EXECD_MAX_REQUEST_BYTES = 1_048_576
+EXECD_POLL_S = 0.5
+EXECD_REQUEST_TIMEOUT_S = 30.0
+EXECD_RESPONSE_MARGIN_S = 30.0
+EXECD_UNBOUNDED_RESPONSE_S = 3_660.0
+
+
+def _with_control_retry(operation: str, action: Callable[[], None]) -> None:
+    for attempt in range(len(CONTROL_RETRY_BACKOFF_S) + 1):
+        try:
+            action()
+            return
+        # BrokenPipeError and ConnectionResetError are ConnectionError
+        # subclasses; the base also covers the endpoint-closed error raised
+        # when the peer drops the control socket mid-handshake.
+        except ConnectionError as error:
+            if attempt == len(CONTROL_RETRY_BACKOFF_S):
+                raise
+            delay = CONTROL_RETRY_BACKOFF_S[attempt]
+            print(
+                f"sandbox {operation} attempt {attempt + 1} failed: {error}; "
+                f"retrying in {delay}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
 
 
 def _write_json(path: Path, value: dict[str, Any], mode: int = 0o600) -> None:
@@ -533,6 +567,41 @@ def provision(
     host_loopback_forward: tuple[str, ...],
     cmdline: str,
 ) -> None:
+    _provision_once(
+            state_path,
+            launch,
+            hypervisor=hypervisor,
+            memory_mib=memory_mib,
+            net=net,
+            network_profile=network_profile,
+            network_egress=network_egress,
+            network_ingress=network_ingress,
+            network_egress_allow=network_egress_allow,
+            network_egress_deny=network_egress_deny,
+            host_loopback=host_loopback,
+            network_proxy=network_proxy,
+            host_loopback_forward=host_loopback_forward,
+            cmdline=cmdline,
+    )
+
+
+def _provision_once(
+    state_path: Path,
+    launch: SandboxLaunch,
+    *,
+    hypervisor: str,
+    memory_mib: int,
+    net: str | None,
+    network_profile: str | None,
+    network_egress: str | None,
+    network_ingress: str | None,
+    network_egress_allow: tuple[str, ...],
+    network_egress_deny: tuple[str, ...],
+    host_loopback: str | None,
+    network_proxy: str | None,
+    host_loopback_forward: tuple[str, ...],
+    cmdline: str,
+) -> None:
     state_dir = _prepare_state_directory(state_path, create=True)
     config_path = state_dir / CONFIG_NAME
     runtime_path = state_dir / RUNTIME_NAME
@@ -559,6 +628,10 @@ def provision(
 
 
 def start(state_path: Path, timeout: float) -> None:
+    _with_control_retry("start", lambda: _start_once(state_path, timeout))
+
+
+def _start_once(state_path: Path, timeout: float) -> None:
     state_dir = _prepare_state_directory(state_path, create=False)
     config = _read_json(
         require_file(state_dir / CONFIG_NAME, "sandbox configuration"),
@@ -726,6 +799,148 @@ def exec_workload(
             environment=environment,
             inherit_default_environment=inherit_default_environment,
         )
+
+
+def _execd_read_request(connection: socket.socket) -> bytes:
+    data = bytearray()
+    while True:
+        newline = data.find(b"\n")
+        if newline >= 0:
+            return bytes(data[:newline])
+        if len(data) > EXECD_MAX_REQUEST_BYTES:
+            raise ScriptError("sandbox execd request exceeds the 1 MiB limit")
+        chunk = connection.recv(65_536)
+        if not chunk:
+            if not data:
+                raise ScriptError(
+                    "sandbox execd connection closed without a request"
+                )
+            return bytes(data)
+        data.extend(chunk)
+
+
+def _execd_parse_request(raw: bytes) -> tuple[tuple[str, ...], int]:
+    try:
+        request = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ScriptError("sandbox execd request is not valid JSON") from error
+    if not isinstance(request, dict):
+        raise ScriptError("sandbox execd request must be a JSON object")
+    command = request.get("cmd")
+    timeout_ms = request.get("timeout_ms", 0)
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(argument, str) for argument in command)
+    ):
+        raise ScriptError("sandbox execd request requires a non-empty cmd list")
+    if (
+        not isinstance(timeout_ms, int)
+        or isinstance(timeout_ms, bool)
+        or timeout_ms < 0
+    ):
+        raise ScriptError("sandbox execd request has an invalid timeout_ms")
+    return tuple(command), timeout_ms
+
+
+def _execd_send(connection: socket.socket, payload: dict[str, Any]) -> None:
+    try:
+        connection.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+    except OSError as error:
+        print(f"sandbox execd failed to answer a client: {error}", file=sys.stderr)
+
+
+def _execd_result_payload(result: ManagedExecResult) -> dict[str, Any]:
+    try:
+        stdout = result.stdout.decode("utf-8")
+        stderr = result.stderr.decode("utf-8")
+        encoded = False
+    except UnicodeDecodeError:
+        stdout = base64.b64encode(result.stdout).decode("ascii")
+        stderr = base64.b64encode(result.stderr).decode("ascii")
+        encoded = True
+    return {"rc": result.returncode, "out": stdout, "err": stderr, "b64": encoded}
+
+
+def _execd_serve_connection(
+    connection: socket.socket, session: ControlSession
+) -> None:
+    try:
+        command, timeout_ms = _execd_parse_request(
+            _execd_read_request(connection)
+        )
+    except (ScriptError, OSError) as error:
+        _execd_send(connection, {"error": str(error)})
+        return
+    response_timeout = (
+        timeout_ms / 1000.0 + EXECD_RESPONSE_MARGIN_S
+        if timeout_ms
+        else EXECD_UNBOUNDED_RESPONSE_S
+    )
+    try:
+        result = session.exec(
+            command,
+            timeout_ms=timeout_ms,
+            response_timeout=response_timeout,
+        )
+    except (GuestExecRejected, ValueError) as error:
+        # The session stays in sync after a guest rejection or a rejected
+        # request; connection and framing failures are fatal to the daemon.
+        _execd_send(connection, {"error": str(error)})
+        return
+    _execd_send(connection, _execd_result_payload(result))
+
+
+def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
+    """Serve single-operator exec requests on one persistent control session.
+
+    Each connection sends one JSON line {"cmd": [...], "timeout_ms": N} and
+    receives one JSON line {"rc": int, "out": str, "err": str, "b64": bool}
+    (``out``/``err`` are base64 when ``b64`` is true). The unix socket is not
+    authenticated and is created mode 0600; the daemon exits non-zero once the
+    sandbox VM is gone so clients know to re-provision.
+    """
+    if os.name == "nt":
+        raise ScriptError("sandbox execd is unsupported on Windows")
+    # Default SIGTERM kills the process without running the finally below,
+    # leaving the socket file behind; exit through an exception instead so
+    # cleanup happens (ccz fork review F1). signal.signal only works from the
+    # main thread (ValueError otherwise) -- a thread-hosted daemon keeps the
+    # default behavior.
+    try:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    except ValueError:
+        pass
+    state_dir = _prepare_state_directory(state_path, create=False)
+    runtime, capability = _load_running(state_dir)
+    pid = int(runtime["pid"])
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    bound = False
+    try:
+        listener.bind(os.fspath(socket_path))
+        bound = True
+        os.chmod(socket_path, 0o600)
+        listener.listen(16)
+        listener.settimeout(EXECD_POLL_S)
+        with ControlSession.connect(
+            _endpoint(runtime), capability, timeout
+        ) as session:
+            while True:
+                if not _process_running(pid):
+                    raise ScriptError(
+                        "sandbox VM exited; sandbox execd is shutting down"
+                    )
+                try:
+                    connection, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                with connection:
+                    connection.settimeout(EXECD_REQUEST_TIMEOUT_S)
+                    _execd_serve_connection(connection, session)
+    finally:
+        listener.close()
+        if bound:
+            socket_path.unlink(missing_ok=True)
 
 
 def stop(state_path: Path, timeout: float) -> dict[str, Any]:
