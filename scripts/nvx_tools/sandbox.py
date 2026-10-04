@@ -32,6 +32,11 @@ MOUNT_ACCESS_MODES = ("ro", "rw")
 RESERVED_MOUNT_TARGETS = ("/proc", "/sys", "/dev", "/.nvx-agent")
 RESERVED_EXACT_MOUNT_TARGETS = ("/etc",)
 MAX_MOUNT_DENIED_PATHS = 128
+# Guest processor counts the microVM profile accepts. Matches the `run` profile.
+PROCESSOR_COUNTS = (1, 2, 4, 8)
+# Kernel command-line token that arms the guest capture point in the sandbox
+# init agent; see guest/common/nvx-init-agent.
+SNAPSHOT_TRIGGER_TOKEN = "sandboxsnap"
 # OpenVMM appends exactly these virtio-fs bootstrap tokens for a live share.
 _MOUNT_COMMAND_LINE_FRAGMENT = " virtfs_dir={} virtfs_tag=microvm virtfs_mode={}"
 
@@ -195,10 +200,16 @@ class SandboxLaunch:
     memory_max: int | None = None
     pids_max: int | None = None
     mount: SandboxMount | None = None
+    processors: int = 1
+    snapshot_capture: bool = False
 
     def __post_init__(self) -> None:
         if not 1 <= len(self.layers) <= len(LAYER_ROLES):
             raise ScriptError("a sandbox requires one to three read-only layers")
+        if self.processors not in PROCESSOR_COUNTS:
+            raise ScriptError(
+                f"--processors must be one of {', '.join(map(str, PROCESSOR_COUNTS))}"
+            )
         roles = [layer.role for layer in self.layers]
         duplicates = sorted({role for role in roles if roles.count(role) > 1})
         if duplicates:
@@ -244,8 +255,18 @@ class SandboxLaunch:
         by_role = {layer.role: layer for layer in self.layers}
         return tuple(by_role[role] for role in LAYER_ROLES if role in by_role)
 
-    def openvmm_arguments(self) -> list[str]:
+    def openvmm_arguments(self, *, restore: bool = False) -> list[str]:
+        """Host-side OpenVMM arguments for this sandbox.
+
+        A snapshot restore fixes the guest command line, so the workload
+        identity must not be re-declared, and OpenVMM supplies the scratch
+        itself from the snapshot's paired image -- only the read-only layers
+        are re-declared, so it can re-validate their identity against the
+        snapshot's device contract.
+        """
         arguments = ["--machine", "microvm"]
+        if self.processors != 1:
+            arguments.extend(("--processors", str(self.processors)))
         for layer in self.ordered_layers():
             arguments.extend(
                 (
@@ -253,14 +274,15 @@ class SandboxLaunch:
                     f"{layer.role}:file:{os.fspath(layer.path)},ro",
                 )
             )
-        arguments.extend(
-            (
-                "--microvm-sandbox-block",
-                f"scratch:file:{os.fspath(self.scratch)}",
-                "--microvm-workload-identity",
-                f"{self.workload_identity[0]}:{self.workload_identity[1]}",
+        if not restore:
+            arguments.extend(
+                (
+                    "--microvm-sandbox-block",
+                    f"scratch:file:{os.fspath(self.scratch)}",
+                    "--microvm-workload-identity",
+                    f"{self.workload_identity[0]}:{self.workload_identity[1]}",
+                )
             )
-        )
         if self.mount is not None:
             arguments.extend(self.mount.openvmm_arguments())
         return arguments
@@ -278,6 +300,11 @@ class SandboxLaunch:
                     f"{token.split('=', 1)[0]} is owned by the sandbox --mount option"
                 )
         tokens = [user_command_line.strip(), "nvx_sandbox=1"]
+        if self.snapshot_capture:
+            # Arms the capture point in the sandbox init agent. The VMM ignores
+            # the request when no snapshot destination is configured, so the
+            # token is harmless on a plain boot.
+            tokens.append(SNAPSHOT_TRIGGER_TOKEN)
         for layer in self.ordered_layers():
             tokens.append(
                 "nvx_layer="

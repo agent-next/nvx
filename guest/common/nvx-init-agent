@@ -362,6 +362,23 @@ mount_live_share
 workload_machine_id=$(tr -d - </proc/sys/kernel/random/uuid)
 printf '%s\n' "$workload_machine_id" >"$runtime/workload-machine-id"
 
+# sandboxsnap: optional pre-handoff capture point for the sandbox wake plane
+# (see `sandbox provision --snapshot-destination`). When the kernel command
+# line contains "sandboxsnap", ask the VMM to capture the sandbox at this
+# fully assembled point -- every read-only layer mounted, the scratch mounted,
+# the container overlay and live share up, and the workload identity resolved.
+# The VMM terminates the source on a successful capture; on a later restore
+# execution resumes at the next line and hands off to the workload or the
+# managed agent, so a restored sandbox is ready to serve work immediately.
+# On a plain cold boot (no --snapshot-destination) the VMM ignores the request
+# and this stays a no-op.
+case " $cmdline " in
+    *" sandboxsnap "*)
+        /sbin/nvx-snapshot --tier instance-checkpoint
+        # ---- on restore, execution resumes here ----
+        ;;
+esac
+
 if [ "$workload_lifecycle" = managed ]; then
     echo "NVX-SANDBOX-READY: managed layers=$layer_count"
     # The agent returns after a stop request, so managed sandboxes share the

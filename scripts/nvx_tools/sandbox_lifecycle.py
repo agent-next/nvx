@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import stat
 import subprocess
 import time
 import uuid
@@ -19,6 +20,7 @@ from .common import (
     ScriptError,
     artifact_path,
     openvmm_binary_path,
+    require_directory,
     require_file,
 )
 from .control_session import (
@@ -39,7 +41,17 @@ CONFIG_FORMAT = 1
 # Format-1 readers ignore unknown fields, so a configuration with a live share
 # uses a format that older NVX releases reject instead of starting without it.
 MOUNT_CONFIG_FORMAT = 2
-CONFIG_FORMATS = (CONFIG_FORMAT, MOUNT_CONFIG_FORMAT)
+# Same rule for a configuration that captures or restores a snapshot: an older
+# release must reject it rather than silently boot without the wake plane.
+SNAPSHOT_CONFIG_FORMAT = 3
+CONFIG_FORMATS = (CONFIG_FORMAT, MOUNT_CONFIG_FORMAT, SNAPSHOT_CONFIG_FORMAT)
+# A sandbox snapshot consumes tenant configuration (layer, scratch, entrypoint,
+# workload identity) and binds the layer identity, so OpenVMM's `platform` tier
+# is rejected for it: that tier carries only invariant command-line tokens and
+# leaves the layers unbound. `instance-checkpoint` is the tier that consumes the
+# full configuration, binds the layers, pairs the scratch, and resumes the
+# guest where the capture left it -- the wake plane a fleet wants.
+SNAPSHOT_CAPTURE_TIER = "instance-checkpoint"
 OUTCOME_SCHEMA_VERSION = 1
 
 
@@ -178,9 +190,12 @@ def _serialize_launch(
     network_proxy: str | None,
     host_loopback_forward: tuple[str, ...],
     cmdline: str,
+    snapshot_destination: Path | None = None,
+    restore_snapshot: Path | None = None,
 ) -> dict[str, Any]:
+    snapshot = snapshot_destination is not None or restore_snapshot is not None
     return {
-        "format": CONFIG_FORMAT if launch.mount is None else MOUNT_CONFIG_FORMAT,
+        "format": _config_format(launch, snapshot=snapshot),
         "layers": [
             {
                 "role": layer.role,
@@ -195,6 +210,7 @@ def _serialize_launch(
         "workload_gid": launch.workload_identity[1],
         "memory_max": launch.memory_max,
         "pids_max": launch.pids_max,
+        "processors": launch.processors,
         "hypervisor": hypervisor,
         "memory_mib": memory_mib,
         "net": net,
@@ -208,7 +224,22 @@ def _serialize_launch(
         "host_loopback_forward": list(host_loopback_forward),
         "cmdline": cmdline,
         "mount": _serialize_mount(launch.mount),
+        "snapshot_destination": (
+            None if snapshot_destination is None else os.fspath(snapshot_destination)
+        ),
+        "snapshot_tier": (
+            SNAPSHOT_CAPTURE_TIER if snapshot_destination is not None else None
+        ),
+        "restore_snapshot": (
+            None if restore_snapshot is None else os.fspath(restore_snapshot)
+        ),
     }
+
+
+def _config_format(launch: SandboxLaunch, *, snapshot: bool) -> int:
+    if snapshot:
+        return SNAPSHOT_CONFIG_FORMAT
+    return CONFIG_FORMAT if launch.mount is None else MOUNT_CONFIG_FORMAT
 
 
 def _serialize_mount(mount: SandboxMount | None) -> dict[str, Any] | None:
@@ -261,10 +292,21 @@ def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
             ),
             pids_max=None if config["pids_max"] is None else int(config["pids_max"]),
             mount=_deserialize_mount(config.get("mount")),
+            # Format 1 and 2 predate --processors and stored no value.
+            processors=int(config.get("processors", 1)),
+            # A restore never re-arms the guest capture point: the restored
+            # guest resumes past it from saved state. Only a capture config
+            # does, so it survives a stop/start cycle on the same sandbox.
+            snapshot_capture=config.get("snapshot_destination") is not None,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ScriptError("sandbox configuration is malformed") from error
-    if (config.get("format") == MOUNT_CONFIG_FORMAT) != (launch.mount is not None):
+    # Format 1 is the no-share configuration, format 2 exists only to carry a
+    # live share, and format 3 (snapshot) admits either.
+    config_format = config.get("format")
+    if (config_format == CONFIG_FORMAT and launch.mount is not None) or (
+        config_format == MOUNT_CONFIG_FORMAT and launch.mount is None
+    ):
         raise ScriptError("sandbox configuration format does not match its mount")
     return launch.validated()
 
@@ -342,12 +384,26 @@ def provision(
     network_proxy: str | None,
     host_loopback_forward: tuple[str, ...],
     cmdline: str,
+    snapshot_destination: Path | None = None,
+    restore_snapshot: Path | None = None,
 ) -> None:
     state_dir = _prepare_state_directory(state_path, create=True)
     config_path = state_dir / CONFIG_NAME
     runtime_path = state_dir / RUNTIME_NAME
     if config_path.exists() or runtime_path.exists():
         raise ScriptError("sandbox is already provisioned")
+    if snapshot_destination is not None and restore_snapshot is not None:
+        raise ScriptError(
+            "sandbox snapshot capture and restore are mutually exclusive"
+        )
+    if restore_snapshot is not None:
+        require_directory(restore_snapshot, "sandbox restore snapshot")
+    for snapshot, description in (
+        (snapshot_destination, "sandbox snapshot destination"),
+        (restore_snapshot, "sandbox restore snapshot"),
+    ):
+        if snapshot is not None:
+            _snapshot_namespace(snapshot, description)
     _write_json(
         config_path,
         _serialize_launch(
@@ -364,8 +420,61 @@ def provision(
             network_proxy=network_proxy,
             host_loopback_forward=host_loopback_forward,
             cmdline=cmdline,
+            snapshot_destination=snapshot_destination,
+            restore_snapshot=restore_snapshot,
         ),
     )
+
+
+def _snapshot_namespace(snapshot: Path, description: str) -> Path:
+    """Return the private directory that must hold a snapshot and its console.
+
+    OpenVMM binds a microVM console socket only inside the snapshot's own
+    device namespace, and only into a directory this user owns with mode
+    0700. That makes the snapshot's parent directory part of the sandbox
+    contract, so an unusable one is rejected before any VM state is written
+    rather than at boot.
+    """
+    parent = snapshot.parent if os.fspath(snapshot.parent) else Path(".")
+    try:
+        metadata = parent.lstat()
+    except OSError as error:
+        raise ScriptError(
+            f"{description} parent directory is unreadable: {parent}"
+        ) from error
+    mode = stat.S_IMODE(metadata.st_mode)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ScriptError(f"{description} parent must be a plain directory: {parent}")
+    if metadata.st_uid != os.geteuid():
+        raise ScriptError(
+            f"{description} parent must be owned by the current user: {parent}"
+        )
+    if mode != 0o700:
+        raise ScriptError(
+            f"{description} parent must have mode 0700 so only this user can "
+            f"reach the sandbox console socket: {parent} (found {mode:04o})"
+        )
+    return parent
+
+
+def _restore_snapshot_path(config: dict[str, Any]) -> Path | None:
+    """Return the configured snapshot restore source, if this sandbox restores."""
+    value = config.get("restore_snapshot")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ScriptError("sandbox configuration has an invalid restore snapshot")
+    return Path(value)
+
+
+def _snapshot_capture(config: dict[str, Any]) -> Path | None:
+    """Return the configured snapshot capture destination, if this sandbox captures."""
+    destination = config.get("snapshot_destination")
+    if destination is None:
+        return None
+    if not isinstance(destination, str) or not destination:
+        raise ScriptError("sandbox configuration has an invalid snapshot destination")
+    return Path(destination)
 
 
 def start(state_path: Path, timeout: float) -> None:
@@ -380,6 +489,8 @@ def start(state_path: Path, timeout: float) -> None:
     outcome_path = state_dir / OUTCOME_NAME
     outcome_path.unlink(missing_ok=True)
     launch = _deserialize_launch(config)
+    restore_snapshot = _restore_snapshot_path(config)
+    snapshot_destination = _snapshot_capture(config)
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
     kernel = require_file(
         artifact_path(KernelBuildConstants.BINARY_NAME), "Linux direct kernel"
@@ -390,27 +501,33 @@ def start(state_path: Path, timeout: float) -> None:
     capability = secrets.token_bytes(32)
     if capability == bytes(32):
         raise AssertionError("secrets.token_bytes returned an all-zero capability")
-    endpoint_value = (
-        f"//./pipe/openvmm-microvm-{uuid.uuid4().hex}"
-        if os.name == "nt"
-        else os.fspath(state_dir / CONTROL_SOCKET_NAME)
-    )
+    if os.name == "nt":
+        endpoint_value = f"//./pipe/openvmm-microvm-{uuid.uuid4().hex}"
+    else:
+        # OpenVMM binds the console into the snapshot's device namespace: the
+        # socket's parent directory must be exactly the snapshot directory's
+        # parent, or it refuses to start. A capture or restore therefore puts
+        # the control socket next to the snapshot directory.
+        snapshot_dir = restore_snapshot if restore_snapshot is not None else (
+            snapshot_destination
+        )
+        socket_dir = (
+            state_dir
+            if snapshot_dir is None
+            else _snapshot_namespace(snapshot_dir, "sandbox snapshot")
+        )
+        endpoint_value = os.fspath(socket_dir / CONTROL_SOCKET_NAME)
+    # A restore takes the guest kernel, command line, memory size, workload
+    # identity, lifecycle, and network from the snapshot itself, so those
+    # options are rejected by OpenVMM on this path; the layer and scratch
+    # devices are still required so the snapshot's device contract can be
+    # re-validated against the same files.
     command = [
         os.fspath(executable),
-        *launch.openvmm_arguments(),
-        "--microvm-lifecycle",
-        "managed",
+        *launch.openvmm_arguments(restore=restore_snapshot is not None),
         "--single-process",
         "--hypervisor",
         str(config["hypervisor"]),
-        "--memory",
-        f"{int(config['memory_mib'])}M",
-        "--kernel",
-        os.fspath(kernel),
-        "--initrd",
-        os.fspath(initrd),
-        "--cmdline",
-        launch.kernel_command_line(str(config["cmdline"])),
         "--virtio-console",
         "none",
         "--microvm-control-console",
@@ -419,13 +536,45 @@ def start(state_path: Path, timeout: float) -> None:
         "--microvm-report",
         os.fspath(outcome_path),
     ]
+    if restore_snapshot is not None:
+        command.extend(
+            ["--restore-snapshot", os.fspath(restore_snapshot), "--restore-entropy"]
+        )
+    else:
+        command.extend(
+            [
+                "--microvm-lifecycle",
+                "managed",
+                "--memory",
+                f"{int(config['memory_mib'])}M",
+                "--kernel",
+                os.fspath(kernel),
+                "--initrd",
+                os.fspath(initrd),
+                "--cmdline",
+                launch.kernel_command_line(str(config["cmdline"])),
+            ]
+        )
+        if snapshot_destination is not None:
+            command.extend(
+                [
+                    "--snapshot-destination",
+                    os.fspath(snapshot_destination),
+                    "--snapshot-tier",
+                    SNAPSHOT_CAPTURE_TIER,
+                ]
+            )
     net = config.get("net")
     network_profile = config.get("network_profile")
+    if restore_snapshot is not None:
+        # OpenVMM rejects network options on a restore: addressing, egress
+        # policy, and forwarding all come from the captured state.
+        net = None
     if net is not None:
         command.extend(["--net", str(net), "--network-profile", str(network_profile)])
     for name in ("network_egress", "network_ingress", "host_loopback"):
         value = config.get(name)
-        if value is not None:
+        if value is not None and restore_snapshot is None:
             command.extend([f"--{name.replace('_', '-')}", str(value)])
     for name in (
         "network_egress_allow",
@@ -435,10 +584,12 @@ def start(state_path: Path, timeout: float) -> None:
         values = config.get(name, [])
         if not isinstance(values, list):
             raise ScriptError("sandbox configuration is malformed")
+        if restore_snapshot is not None:
+            continue
         for value in cast(list[object], values):
             command.extend([f"--{name.replace('_', '-')}", str(value)])
     network_proxy = config.get("network_proxy")
-    if network_proxy is not None:
+    if network_proxy is not None and restore_snapshot is None:
         command.extend(["--network-proxy", str(network_proxy)])
 
     capability_path = state_dir / CAPABILITY_NAME
@@ -485,7 +636,7 @@ def start(state_path: Path, timeout: float) -> None:
                 process.wait(timeout=5)
         (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
         capability_path.unlink(missing_ok=True)
-        (state_dir / CONTROL_SOCKET_NAME).unlink(missing_ok=True)
+        Path(endpoint_value).unlink(missing_ok=True)
         raise
     finally:
         log.close()
@@ -526,13 +677,31 @@ def stop(state_path: Path, timeout: float) -> dict[str, Any]:
     finally:
         (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
         (state_dir / CAPABILITY_NAME).unlink(missing_ok=True)
-        (state_dir / CONTROL_SOCKET_NAME).unlink(missing_ok=True)
+        _unlink_control_socket(state_dir, runtime)
     return outcome
+
+
+def _unlink_control_socket(state_dir: Path, runtime: dict[str, Any]) -> None:
+    """Remove the control socket wherever the runtime recorded it.
+
+    A capture or restore binds the socket outside the state directory, into
+    the snapshot's parent namespace, so the recorded endpoint is the truth.
+    A relative endpoint predates that layout and names the state directory's
+    own socket.
+    """
+    try:
+        endpoint = _endpoint(runtime)
+    except ScriptError:
+        return
+    if not endpoint.is_absolute():
+        endpoint = state_dir / endpoint
+    endpoint.unlink(missing_ok=True)
 
 
 def deprovision(state_path: Path) -> None:
     state_dir = _prepare_state_directory(state_path, create=False)
     runtime_path = state_dir / RUNTIME_NAME
+    runtime: dict[str, Any] | None = None
     if runtime_path.is_file():
         runtime = _read_json(runtime_path, "sandbox runtime state")
         try:
@@ -543,6 +712,7 @@ def deprovision(state_path: Path) -> None:
             ) from error
         if running:
             raise ScriptError("sandbox must be stopped before deprovision")
+        _unlink_control_socket(state_dir, runtime)
     for name in (
         RUNTIME_NAME,
         CAPABILITY_NAME,
