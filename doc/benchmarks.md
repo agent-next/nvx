@@ -611,8 +611,8 @@ with other I/O-heavy work.
 
 The regression gate compares the target p50 with the median of the latest 10
 p50 values on the pull request's base branch and requires all 10
-matching history points. A metric regresses only when it is more than 50%
-worse. Lower-is-better millisecond metrics must also be more than 10 ms
+matching history points. A metric regresses only when it is more than 40%
+worse. Lower-is-better millisecond metrics must also be more than 5 ms
 slower; higher-is-better metrics use the percentage comparison alone.
 Missing or insufficient history is a warmup, not a failure. Successful `dev`
 builds append collected results to topology-specific files in `data/`. Every
