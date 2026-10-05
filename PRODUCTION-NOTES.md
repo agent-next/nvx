@@ -132,6 +132,24 @@ down the failed OpenVMM process and respawns it, so a retry is a clean boot. Ret
 log `sandbox start attempt N failed: ...` to stderr. `sandbox exec` is deliberately
 not retried: a managed exec failure stays honest.
 
+**Boot-tail variant (fixed here).** A rarer start failure (measured 0.2-0.46%
+of starts, ~30s each, occasionally a hard fail) is the endpoint never accepting:
+`TimeoutError: managed control endpoint did not become available`. Waiting the
+full `--timeout` (default 60s) for a boot that is already stalled wastes the
+whole window, so `sandbox start` now bounds the first attempt's
+`ControlSession.connect` window — the endpoint wait plus the attach handshake
+that shares that timeout — to ~8s (`NVX_START_FIRST_WAIT_S`, default `8`; the
+post-connect readiness ping still gets the full timeout). On the endpoint-unavailable
+`TimeoutError` the failed process is torn down by the same cleanup path as any
+other start failure (runtime/capability/socket state unlinked, process
+terminated), then one retry boots a fresh process with the full timeout; a
+second endpoint timeout propagates honestly. The inner retry sits inside
+`_with_control_retry`, so pipe-class `ConnectionError` retries still compose —
+each outer attempt is one short probe plus at most one full-timeout boot, and a
+single start call never runs more than one live OpenVMM process. Other
+`TimeoutError`s (e.g. `managed control response timed out` after the endpoint
+accepted) are not in this class and still propagate without a retry.
+
 ## 8. Persistent exec daemon (`sandbox execd`)
 
 `sandbox exec` pays a full Python cold start (~200 ms floor at low load) because it
