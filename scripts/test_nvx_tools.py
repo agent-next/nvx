@@ -13385,6 +13385,235 @@ class SandboxTests(unittest.TestCase):
             attempts.assert_called_once()
             sleep.assert_not_called()
 
+    def test_managed_start_retries_an_unavailable_endpoint_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=(
+                    TimeoutError(
+                        "managed control endpoint did not become available: "
+                        "control.sock"
+                    ),
+                    None,
+                )
+            )
+            stderr = io.StringIO()
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                patch.object(sys, "stderr", stderr),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(
+                attempts.call_args_list,
+                [
+                    call(state, 10, endpoint_wait_s=8.0),
+                    call(state, 10),
+                ],
+            )
+            sleep.assert_not_called()
+            self.assertIn("start attempt 1 failed", stderr.getvalue())
+            self.assertIn("did not become available", stderr.getvalue())
+            self.assertIn("full timeout", stderr.getvalue())
+
+    def test_managed_start_endpoint_timeout_retry_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=TimeoutError(
+                    "managed control endpoint did not become available: "
+                    "control.sock"
+                )
+            )
+            stderr = io.StringIO()
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                patch.object(sys, "stderr", stderr),
+                self.assertRaisesRegex(TimeoutError, "did not become available"),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(attempts.call_count, 2)
+            sleep.assert_not_called()
+
+    def test_managed_start_composes_endpoint_and_pipe_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=(
+                    BrokenPipeError(32, "broken pipe"),
+                    TimeoutError(
+                        "managed control endpoint did not become available: "
+                        "control.sock"
+                    ),
+                    None,
+                )
+            )
+            stderr = io.StringIO()
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                patch.object(sys, "stderr", stderr),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(
+                attempts.call_args_list,
+                [
+                    call(state, 10, endpoint_wait_s=8.0),
+                    call(state, 10, endpoint_wait_s=8.0),
+                    call(state, 10),
+                ],
+            )
+            sleep.assert_called_once_with(0.5)
+            output = stderr.getvalue()
+            self.assertIn("retrying in 0.5s", output)
+            self.assertIn("retrying once with the full timeout", output)
+
+    def test_managed_start_does_not_retry_other_timeouts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=TimeoutError("managed control response timed out")
+            )
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                self.assertRaisesRegex(TimeoutError, "response timed out"),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            attempts.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_managed_start_first_wait_env_override(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=(
+                    TimeoutError(
+                        "managed control endpoint did not become available: "
+                        "control.sock"
+                    ),
+                    None,
+                )
+            )
+            with (
+                patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": "3"}),
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep"),
+                patch.object(sys, "stderr", io.StringIO()),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(
+                attempts.call_args_list[0],
+                call(state, 10, endpoint_wait_s=3.0),
+            )
+            self.assertEqual(attempts.call_args_list[1], call(state, 10))
+
+        for raw in ("abc", "0", "-1"):
+            with (
+                patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": raw}),
+                self.assertRaisesRegex(
+                    common.ScriptError, "NVX_START_FIRST_WAIT_S"
+                ),
+            ):
+                sandbox_lifecycle._start_first_wait_s()
+
+    def test_managed_start_endpoint_retry_tears_down_before_reboot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            layer_path = root / "distro.erofs"
+            scratch_path = root / "scratch.ext4"
+            layer_path.write_bytes(b"layer")
+            scratch_path.write_bytes(b"scratch")
+            state = root / "state"
+            sandbox_lifecycle.provision(
+                state,
+                sandbox.SandboxLaunch(
+                    layers=(
+                        sandbox.SandboxLayer(
+                            role="distro",
+                            path=layer_path,
+                            uuid="11111111-1111-1111-1111-111111111111",
+                        ),
+                    ),
+                    scratch=scratch_path,
+                ),
+                hypervisor="whp",
+                memory_mib=256,
+                net=None,
+                network_profile=None,
+                network_egress=None,
+                network_ingress=None,
+                network_egress_allow=(),
+                network_egress_deny=(),
+                host_loopback=None,
+                network_proxy=None,
+                host_loopback_forward=(),
+                cmdline="quiet",
+            )
+            runtime_at_spawn: list[bool] = []
+            processes: list[MagicMock] = []
+
+            def spawn(*args: object, **kwargs: object) -> MagicMock:
+                runtime_at_spawn.append(
+                    (state / sandbox_lifecycle.RUNTIME_NAME).exists()
+                )
+                process = MagicMock()
+                process.pid = 100 + len(processes)
+                process.stdin = io.BytesIO()
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                processes.append(process)
+                return process
+
+            session = MagicMock()
+            context = MagicMock()
+            context.__enter__.return_value = session
+            connects = MagicMock(
+                side_effect=(
+                    TimeoutError(
+                        "managed control endpoint did not become available: "
+                        "control.sock"
+                    ),
+                    context,
+                )
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            stderr = io.StringIO()
+            with (
+                patch.object(
+                    sandbox_lifecycle, "require_file", side_effect=require
+                ),
+                patch.object(
+                    sandbox_lifecycle.subprocess, "Popen", side_effect=spawn
+                ),
+                patch.object(
+                    sandbox_lifecycle.ControlSession, "connect", connects
+                ),
+                patch.object(sys, "stderr", stderr),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(runtime_at_spawn, [False, False])
+            processes[0].terminate.assert_called_once_with()
+            processes[0].wait.assert_called_once_with(timeout=5)
+            processes[1].terminate.assert_not_called()
+            self.assertEqual(
+                [connect.args[2] for connect in connects.call_args_list],
+                [8.0, 10],
+            )
+            session.ping.assert_called_once_with(10)
+            self.assertIn("full timeout", stderr.getvalue())
+            self.assertTrue((state / sandbox_lifecycle.RUNTIME_NAME).exists())
+
     def test_managed_exec_stays_honest_without_retries(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
