@@ -16473,6 +16473,20 @@ class GitOutputTests(unittest.TestCase):
         )
 
 
+class SharedCommandTests(unittest.TestCase):
+    def test_commands_that_cannot_start_raise_script_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "missing-command"
+            for run in (common.run_checked, common.run_capture):
+                with self.subTest(helper=run.__name__):
+                    with self.assertRaisesRegex(
+                        common.ScriptError,
+                        f"^failed to run command {re.escape(str(missing))} --version: ",
+                    ) as raised:
+                        run([missing, "--version"])
+                    self.assertIsInstance(raised.exception.__cause__, FileNotFoundError)
+
+
 class SharedFileTests(unittest.TestCase):
     def test_checksum_manifest_detects_modified_file(self):
         with tempfile.TemporaryDirectory() as temporary:
