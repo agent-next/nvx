@@ -50,6 +50,11 @@ OUTCOME_SCHEMA_VERSION = 1
 # A control pipe that breaks while an OpenVMM process is starting is transient
 # under boot storms: the next attempt spawns a fresh process and endpoint.
 CONTROL_RETRY_BACKOFF_S = (0.5, 1.0)
+# A managed boot that never opens its control endpoint almost never recovers,
+# but the endpoint wait otherwise costs a full timeout: the first start attempt
+# bounds that wait so a stalled boot is torn down and retried once with the
+# full timeout instead of sitting on the tail of the distribution.
+START_FIRST_WAIT_S = 8.0
 EXECD_MAX_REQUEST_BYTES = 1_048_576
 EXECD_POLL_S = 0.5
 EXECD_REQUEST_TIMEOUT_S = 30.0
@@ -437,11 +442,48 @@ def _provision_once(
     )
 
 
+def _start_first_wait_s() -> float:
+    raw = os.environ.get("NVX_START_FIRST_WAIT_S")
+    if raw is None:
+        return START_FIRST_WAIT_S
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ScriptError(
+            f"NVX_START_FIRST_WAIT_S is not a number: {raw!r}"
+        ) from error
+    if not 0 < value < float("inf"):
+        raise ScriptError(f"NVX_START_FIRST_WAIT_S must be positive: {raw!r}")
+    return value
+
+
+def _start_with_endpoint_retry(state_path: Path, timeout: float) -> None:
+    try:
+        _start_once(
+            state_path, timeout, endpoint_wait_s=_start_first_wait_s()
+        )
+    except TimeoutError as error:
+        if "did not become available" not in str(error):
+            raise
+        print(
+            f"sandbox start attempt 1 failed: {error}; "
+            "retrying once with the full timeout",
+            file=sys.stderr,
+        )
+        _start_once(state_path, timeout)
+
+
 def start(state_path: Path, timeout: float) -> None:
-    _with_control_retry("start", lambda: _start_once(state_path, timeout))
+    _with_control_retry(
+        "start", lambda: _start_with_endpoint_retry(state_path, timeout)
+    )
 
 
-def _start_once(state_path: Path, timeout: float) -> None:
+def _start_once(
+    state_path: Path,
+    timeout: float,
+    endpoint_wait_s: float | None = None,
+) -> None:
     state_dir = _prepare_state_directory(state_path, create=False)
     config = _read_json(
         require_file(state_dir / CONFIG_NAME, "sandbox configuration"),
@@ -545,7 +587,9 @@ def _start_once(state_path: Path, timeout: float) -> None:
             },
         )
         with ControlSession.connect(
-            Path(endpoint_value), capability, timeout
+            Path(endpoint_value),
+            capability,
+            timeout if endpoint_wait_s is None else endpoint_wait_s,
         ) as session:
             session.ping(timeout)
     except BaseException:
