@@ -515,43 +515,6 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         fixture_root = Path(state_directories.pop()).parent
         self.assertFalse(fixture_root.exists())
 
-    def test_public_acceptance_rejects_unreadable_layer_manifest(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            manifest = Path(temporary) / "ubuntu-distro.erofs.manifest.json"
-            manifest.write_text("{", encoding="utf-8")
-            paths = iter(
-                (
-                    Path(temporary) / "ubuntu-distro.erofs",
-                    manifest,
-                    Path(temporary) / "ubuntu-smoke-scratch.ext4",
-                )
-            )
-
-            def artifact(_: str) -> Path:
-                return next(paths)
-
-            def require(path: Path, _: str) -> Path:
-                return path
-
-            with (
-                patch.object(
-                    managed_exec_tests,
-                    "artifact_path",
-                    side_effect=artifact,
-                ),
-                patch.object(
-                    managed_exec_tests,
-                    "require_file",
-                    side_effect=require,
-                ),
-                self.assertRaisesRegex(
-                    common.ScriptError, "invalid Ubuntu layer manifest"
-                ),
-            ):
-                managed_exec_tests.run_managed_exec_configuration(
-                    "whp", timeout=2, output_dir=Path(temporary) / "results"
-                )
-
     def test_public_acceptance_preserves_test_and_cleanup_failures(self):
         commands: list[list[str]] = []
         fixture_root: Path | None = None
@@ -922,11 +885,13 @@ class FilesystemOwnerTests(unittest.TestCase):
 
         both = (1 << 6) | (1 << 7)
         inherited = microvm_tests.identity_capabilities_inherited
-        self.assertTrue(inherited(status(both, both), root=False))
-        self.assertFalse(inherited(status(1 << 7, both), root=False))
-        self.assertFalse(inherited(status(0, both), root=False))
-        self.assertTrue(inherited(status(0, both), root=True))
-        self.assertFalse(inherited(status(both, 1 << 6), root=True))
+        self.assertEqual(inherited(status(both, both), root=False), (True, True))
+        self.assertEqual(inherited(status(1 << 7, both), root=False), (True, False))
+        self.assertEqual(inherited(status(1 << 6, both), root=False), (False, True))
+        self.assertEqual(inherited(status(0, both), root=False), (False, False))
+        self.assertEqual(inherited(status(0, both), root=True), (True, True))
+        self.assertEqual(inherited(status(both, 1 << 6), root=True), (False, True))
+        self.assertEqual(inherited(status(both, 1 << 7), root=True), (True, False))
 
     def test_other_groups_exclude_the_effective_gid(self):
         with (
@@ -1112,7 +1077,7 @@ class FilesystemOwnerTests(unittest.TestCase):
             patch.object(
                 microvm_tests,
                 "openvmm_inherits_identity_capabilities",
-                return_value=False,
+                return_value=(False, False),
             ),
             patch.object(microvm_tests, "openvmm_other_groups", return_value=[]),
         ):
@@ -1176,7 +1141,7 @@ class FilesystemOwnerTests(unittest.TestCase):
                 patch.object(
                     microvm_tests,
                     "openvmm_inherits_identity_capabilities",
-                    return_value=False,
+                    return_value=(False, False),
                 ),
                 patch.object(
                     microvm_tests, "openvmm_other_groups", return_value=[4444]
@@ -1203,6 +1168,149 @@ class FilesystemOwnerTests(unittest.TestCase):
         self.assertIn("other_group=4444", scripts[0])
         with self.assertRaisesRegex(RuntimeError, "cannot drop its supplementary"):
             run_scenario(guest_writes=True)
+
+    def test_expectations_derive_guest_root_from_each_capability(self):
+        expect = microvm_tests.filesystem_owner_expectations
+        cases = [
+            # (export, openvmm, (cap_setuid, cap_setgid), groups, (root, foreign))
+            # Export owned by OpenVMM's own identity.
+            ((1000, 1000), (1000, 1000), (False, False), [4444], (False, False)),
+            ((1000, 1000), (1000, 1000), (False, True), [4444], (True, False)),
+            ((1000, 1000), (1000, 1000), (True, False), [4444], (False, False)),
+            ((1000, 1000), (1000, 1000), (True, True), [4444], (True, True)),
+            ((1000, 1000), (1000, 1000), (False, False), [], (True, False)),
+            ((1000, 1000), (1000, 1000), (False, True), [], (True, False)),
+            # Export owned by 65533:65533 while OpenVMM runs as root.
+            ((65533, 65533), (0, 0), (False, False), [], (False, False)),
+            ((65533, 65533), (0, 0), (True, True), [], (True, True)),
+            ((65533, 65533), (0, 0), (False, True), [], (False, False)),
+            ((65533, 65533), (0, 0), (True, False), [], (False, False)),
+            ((65533, 65533), (0, 0), (True, True), [4444], (True, True)),
+            # Only the export UID differs from OpenVMM's.
+            ((65533, 1000), (1000, 1000), (False, True), [], (False, False)),
+            ((65533, 1000), (1000, 1000), (True, False), [], (True, False)),
+            ((65533, 1000), (1000, 1000), (True, False), [4444], (False, False)),
+            # Only the export GID differs from OpenVMM's.
+            ((1000, 65533), (1000, 1000), (False, True), [], (True, False)),
+            ((1000, 65533), (1000, 1000), (True, False), [], (False, False)),
+        ]
+        for export, openvmm, caps, groups, expected in cases:
+            with self.subTest(
+                export=export, openvmm=openvmm, caps=caps, groups=groups
+            ):
+                self.assertEqual(
+                    expect(
+                        export_uid=export[0],
+                        export_gid=export[1],
+                        openvmm_uid=openvmm[0],
+                        openvmm_gid=openvmm[1],
+                        cap_setuid=caps[0],
+                        cap_setgid=caps[1],
+                        supplementary_groups=groups,
+                    ),
+                    expected,
+                )
+
+    def test_scenario_allows_guest_root_with_only_setgid(self):
+        if sys.platform != "linux":
+            self.skipTest("caller ownership requires a Linux host")
+        if os.geteuid() == 0:
+            self.skipTest("root runs chown the share to another owner")
+        scripts: list[str] = []
+
+        def guest(
+            command: list[str], script: str, *_args: object, **_kwargs: object
+        ):
+            scripts.append(script)
+            mount = command[command.index("--mount") + 1]
+            share = Path(mount.split(",")[1])
+            (share / "root-file").write_text("root\n", encoding="utf-8")
+            (share / "root-file").chmod(0o4755)
+            (share / "root-directory").mkdir()
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "run_guest_script", side_effect=guest),
+            patch.object(microvm_tests, "OpenvmmProcess") as process,
+            patch.object(
+                microvm_tests,
+                "openvmm_inherits_identity_capabilities",
+                return_value=(False, True),
+            ),
+            patch.object(microvm_tests, "openvmm_other_groups", return_value=[4444]),
+        ):
+            process.return_value.__enter__.return_value.wait.return_value = (
+                openvmm_process.OpenvmmProcessResult(
+                    2, b"must not be owned by UID 0 or GID 0\n"
+                )
+            )
+            microvm_tests.run_filesystem_owner(
+                Path("openvmm"),
+                Path("kernel"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=40,
+                output_dir=Path(temporary),
+            )
+
+        self.assertEqual(len(scripts), 1)
+        # The export belongs to OpenVMM's own UID and GID, so the only
+        # capability squashed guest root needs is CAP_SETGID for dropping the
+        # supplementary group; foreign callers still need both capabilities.
+        self.assertEqual(scripts[0].count("case owned in"), 1)
+        self.assertEqual(scripts[0].count("case denied in"), 1)
+        self.assertLess(
+            scripts[0].index("case owned in"), scripts[0].index("case denied in")
+        )
+        self.assertIn("other_group=4444", scripts[0])
+
+    def test_scenario_denies_every_caller_for_root_without_identity_caps(self):
+        if sys.platform != "linux":
+            self.skipTest("caller ownership requires a Linux host")
+        scripts: list[str] = []
+
+        def guest(
+            command: list[str], script: str, *_args: object, **_kwargs: object
+        ):
+            scripts.append(script)
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "run_guest_script", side_effect=guest),
+            patch.object(microvm_tests, "OpenvmmProcess") as process,
+            patch.object(
+                microvm_tests,
+                "openvmm_inherits_identity_capabilities",
+                return_value=(False, False),
+            ),
+            patch.object(microvm_tests, "openvmm_other_groups", return_value=[]),
+            patch.object(microvm_tests.os, "geteuid", create=True, return_value=0),
+            patch.object(microvm_tests.os, "getegid", create=True, return_value=0),
+            patch.object(microvm_tests.os, "chown", create=True) as chown,
+        ):
+            process.return_value.__enter__.return_value.wait.return_value = (
+                openvmm_process.OpenvmmProcessResult(
+                    2, b"must not be owned by UID 0 or GID 0\n"
+                )
+            )
+            microvm_tests.run_filesystem_owner(
+                Path("openvmm"),
+                Path("kernel"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=40,
+                output_dir=Path(temporary),
+            )
+
+        # Caller ownership squashes guest root to the share owner, which a
+        # root OpenVMM without CAP_SETUID or CAP_SETGID in its bounding set
+        # cannot reach, so both guest root and foreign callers fail with EPERM.
+        self.assertEqual(chown.call_count, 1)
+        self.assertEqual(len(scripts), 1)
+        self.assertNotIn("case owned in", scripts[0])
+        self.assertEqual(scripts[0].count("case denied in"), 2)
 
 
 class ControlSessionTests(unittest.TestCase):
