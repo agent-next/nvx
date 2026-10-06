@@ -59,6 +59,15 @@ OpenVMM for every mutation. It also rejects three shares, nested guest
 targets, nested host directories, and ambiguous denied paths before boot, and
 round-trips both shares through a snapshot whose restore must supply both in
 capture order.
+Access-policy coverage narrows a read-write share's writes to a writable
+directory and file, and verifies guest writes, renames, and links inside them
+and `EROFS` from OpenVMM for every other mutation, including moves into and
+out of the writable paths and mutations through a second mount of the tag, as
+well as `EXDEV` for a hard link of a read-only file. It denies a directory
+except an allowed child, inside which a denied grandchild stays hidden, and
+verifies that the denied directory lists and exposes only the allowed child.
+It rejects invalid policies before boot and round-trips the policy through a
+snapshot whose restore requires the same policy and keeps a writable handle.
 The native suite targets KVM, MSHV, and WHP; a passing run on one backend is
 not a fresh result for the others.
 Coverage also includes
@@ -86,7 +95,7 @@ protocol against language-neutral golden vectors and boundary cases, the
 broker state machine and its save and restore, peer-identity and capability
 admission for local endpoints, workload identity and lifecycle ownership,
 the bounded outcome-report schema, egress-policy enforcement in the endpoint
-and virtio-net layers, the virtio-fs microVM profile and denied-path policy,
+and virtio-net layers, the virtio-fs microVM profile and its access policy,
 state-unit quiesce and rollback, management exclusion at the snapshot
 boundary, management-RPC guest-exit propagation, output-drain completion and
 failures, and the time ABI's rate, downtime, LAPIC, restore-packet, and

@@ -86,6 +86,7 @@ MICROVM_TEST_SCENARIOS = (
     "denied-filesystem-paths",
     "endpoint-policy-snapshot",
     "filesystem-owner",
+    "filesystem-policy",
     "filesystem-shares",
     "filesystem-snapshot",
     "guest-boot",
@@ -185,6 +186,9 @@ FILESYSTEM_LIVE_AFTER_MARKER = b"NVX-FILESYSTEM-LIVE-AFTER"
 FILESYSTEM_SHARES_MARKER = b"NVX-FILESYSTEM-SHARES-OK"
 FILESYSTEM_SHARES_BEFORE_MARKER = b"NVX-FILESYSTEM-SHARES-BEFORE"
 FILESYSTEM_SHARES_AFTER_MARKER = b"NVX-FILESYSTEM-SHARES-AFTER"
+FILESYSTEM_POLICY_MARKER = b"NVX-FILESYSTEM-POLICY-OK"
+FILESYSTEM_POLICY_BEFORE_MARKER = b"NVX-FILESYSTEM-POLICY-BEFORE"
+FILESYSTEM_POLICY_AFTER_MARKER = b"NVX-FILESYSTEM-POLICY-AFTER"
 NETWORK_BEFORE_MARKER = b"NVX-NETWORK-BEFORE"
 NETWORK_INVALIDATED_MARKER = b"NVX-NETWORK-OLD-FLOW-INVALIDATED"
 NETWORK_AFTER_MARKER = b"NVX-NETWORK-AFTER"
@@ -4420,6 +4424,226 @@ def run_filesystem_shares(
             raise RuntimeError("restored guest modified the read-only share")
 
 
+def _policy_arguments(share: Path) -> tuple[str, ...]:
+    """Return the access policy of the filesystem-policy scenario's share."""
+    return (
+        "--mount-deny",
+        str(share / "logs"),
+        "--mount-allow",
+        str(share / "logs" / "payloads"),
+        "--mount-deny",
+        str(share / "logs" / "payloads" / "private"),
+        "--mount-write",
+        str(share / "out"),
+        "--mount-write",
+        str(share / "build.log"),
+    )
+
+
+def _policy_protected_contents(share: Path) -> dict[str, bytes | None]:
+    """Return what the policy must keep unchanged: every entry of the share
+    other than the writable `out` and `build.log`, and everything below the
+    denied `logs`."""
+    contents: dict[str, bytes | None] = {
+        name: (share / name).read_bytes() if (share / name).is_file() else None
+        for name in os.listdir(share)
+        if name not in ("out", "build.log")
+    }
+    contents.update(
+        {
+            f"logs/{name}": value
+            for name, value in _tree_contents(share / "logs").items()
+        }
+    )
+    return contents
+
+
+def run_filesystem_policy(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Narrow a read-write share's writes and expose a path in a hidden subtree.
+
+    The share's `logs` directory is denied except for `logs/payloads`, inside
+    which `logs/payloads/private` is denied again, and only `out` and
+    `build.log` are writable.
+    """
+    with tempfile.TemporaryDirectory(prefix="nvx-filesystem-policy-") as temporary:
+        root = Path(temporary)
+        share = root / "share"
+        for directory in ("out", "logs/gateway", "logs/payloads/private"):
+            (share / directory).mkdir(parents=True)
+        for name, contents in (
+            ("seed", b"NVX-SEED"),
+            ("build.log", b"NVX-LOG"),
+            ("logs/secret", b"NVX-SECRET"),
+            ("logs/gateway/log", b"NVX-GATEWAY"),
+            ("logs/payloads/payload", b"NVX-PAYLOAD"),
+            ("logs/payloads/private/key", b"NVX-KEY"),
+        ):
+            (share / name).write_bytes(contents)
+        protected = _policy_protected_contents(share)
+        mount = f"/workspace,{share},rw"
+
+        def boot_command(mode: str = "rw") -> list[str]:
+            return workload_boot_command(
+                executable,
+                backend,
+                kernel,
+                initrd,
+                memory_mib,
+                "quiet loglevel=0",
+                mount=f"/workspace,{share},{mode}",
+            )
+
+        run_guest_script(
+            [*boot_command(), *_policy_arguments(share)],
+            _read_script("filesystem-policy.sh"),
+            FILESYSTEM_POLICY_MARKER,
+            timeout=timeout,
+            log_path=output_dir / "filesystem-policy.log",
+        )
+        if (share / "out" / "from-guest").read_bytes() != b"NVX-GUEST-WRITE\n":
+            raise RuntimeError("writable path did not accept a guest write")
+        if (share / "out" / "renamed").read_bytes() != b"nested\n":
+            raise RuntimeError("writable path did not accept a guest rename")
+        if (share / "build.log").read_bytes() != b"NVX-LOGAPPEND":
+            raise RuntimeError("writable file did not accept a guest append")
+        assert_guest_symlink(share / "out" / "seed-link", "../seed")
+        if _policy_protected_contents(share) != protected:
+            raise RuntimeError("guest modified the share outside its writable paths")
+
+        for name, arguments, expected in (
+            (
+                "read-only-share",
+                (
+                    *boot_command("ro"),
+                    "--mount-write",
+                    str(share / "out"),
+                ),
+                b"read-only microVM filesystem cannot have writable paths",
+            ),
+            (
+                "allow-outside-deny",
+                (*boot_command(), "--mount-allow", str(share / "out")),
+                b"must be inside a denied path",
+            ),
+            (
+                "hidden-write",
+                (
+                    *boot_command(),
+                    "--mount-deny",
+                    str(share / "logs"),
+                    "--mount-write",
+                    str(share / "logs" / "gateway"),
+                ),
+                b"hidden by a denied path",
+            ),
+            (
+                "overlapping-write",
+                (
+                    *boot_command(),
+                    "--mount-write",
+                    str(share / "logs"),
+                    "--mount-write",
+                    str(share / "logs" / "gateway"),
+                ),
+                b"writable paths overlap",
+            ),
+            (
+                "root-write",
+                (*boot_command(), "--mount-write", str(share)),
+                b"cannot be the complete filesystem export",
+            ),
+        ):
+            _expect_boot_failure(
+                list(arguments),
+                output_dir / f"filesystem-policy-{name}.log",
+                timeout,
+                expected,
+            )
+
+        # The policy belongs to the snapshot contract, and the restored guest
+        # keeps both its writable handle and the policy.
+        snapshot = root / "snapshot"
+        with OpenvmmProcess(
+            [
+                *boot_command(),
+                *_policy_arguments(share),
+                "--snapshot-destination",
+                str(snapshot),
+            ],
+            output_dir / "filesystem-policy-capture.log",
+        ) as process:
+            process.wait_for(BOOT_MARKER, timeout)
+            _stage_script(
+                process,
+                "/tmp/nvx-filesystem-policy",
+                "NVX_FILESYSTEM_POLICY",
+                _read_script("filesystem-policy-snapshot.sh"),
+            )
+            source = process.wait(timeout)
+        source_lines = _output_lines(source.output)
+        if source.returncode != 0 or (
+            source_lines.count(FILESYSTEM_POLICY_BEFORE_MARKER) != 1
+        ):
+            raise RuntimeError("share access-policy snapshot capture failed")
+        if FILESYSTEM_POLICY_AFTER_MARKER in source_lines:
+            raise RuntimeError(
+                "share access-policy snapshot source crossed the capture boundary"
+            )
+        fingerprint = _snapshot_fingerprint(snapshot)
+
+        for name, arguments in (
+            ("missing-policy", ()),
+            (
+                "changed-policy",
+                (
+                    "--mount-deny",
+                    str(share / "logs"),
+                    "--mount-write",
+                    str(share / "out"),
+                ),
+            ),
+        ):
+            invalid = snapshot_restore_command(executable, backend, snapshot)
+            invalid.extend(("--mount", mount, *arguments))
+            _expect_process_failure(
+                invalid,
+                output_dir / f"filesystem-policy-{name}.log",
+                timeout,
+                b"does not match the snapshot contract",
+                (FILESYSTEM_POLICY_AFTER_MARKER,),
+            )
+        restore = snapshot_restore_command(executable, backend, snapshot)
+        restore.extend(("--mount", mount, *_policy_arguments(share)))
+        with OpenvmmProcess(
+            restore, output_dir / "filesystem-policy-restore.log"
+        ) as process:
+            process.wait_for(FILESYSTEM_POLICY_AFTER_MARKER, timeout)
+            restored = process.wait(timeout)
+        if restored.returncode != 0:
+            raise RuntimeError(
+                f"share access-policy snapshot restore exited with {restored.returncode}"
+            )
+        if _snapshot_fingerprint(snapshot) != fingerprint:
+            raise RuntimeError(
+                "share access-policy snapshot restore modified snapshot artifacts"
+            )
+        if (share / "out" / "journal").read_bytes() != b"NVX-BEFORENVX-AFTER":
+            raise RuntimeError("writable path did not resume after restore")
+        if _policy_protected_contents(share) != protected:
+            raise RuntimeError(
+                "restored guest modified the share outside its writable paths"
+            )
+
+
 def _expect_boot_failure(
     command: list[str], log_path: Path, timeout: float, expected: bytes
 ) -> None:
@@ -5228,6 +5452,20 @@ def run(args: argparse.Namespace) -> int:
             f"on OpenVMM/{args.backend}"
         )
         run_filesystem_shares(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "filesystem-policy" in scenarios:
+        print(
+            "Running microVM share write narrowing and read masking "
+            f"on OpenVMM/{args.backend}"
+        )
+        run_filesystem_policy(
             executable,
             kernel,
             initrd,

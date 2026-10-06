@@ -238,7 +238,25 @@ cannot write into the read-only share; the host requires the guest's writes in
 the workspace, an unchanged tool cache, and unchanged denied files, both for a
 one-shot run and for a managed sandbox whose format-4 configuration must
 persist both shares and whose `stop` must leave a cleanly unmounted scratch
-filesystem. On Linux, a
+filesystem. Each backend then attaches a read-write `/workspace` share whose
+[access policy](run.md#access-policy) denies `nvx-denied`, allows
+`nvx-denied/nvx-allowed`, and makes only `nvx-writable` writable, with every
+host directory and file writable by every identity so that only OpenVMM can
+refuse a write. The smoke script's `policy` mode requires the workload's
+writes to succeed only in `nvx-writable` and to fail with `EROFS` everywhere
+else, a hard link of a read-only file into `nvx-writable` to fail, and
+`nvx-denied` to list only `nvx-allowed`, whose file stays readable while
+`nvx-denied/secret` stays hidden. The host requires the guest's writes in
+`nvx-writable` and no other change to the share, both for a one-shot run and
+for a managed sandbox whose format-5 configuration must persist the denied,
+allowed, and writable paths and whose `stop` must leave a cleanly unmounted
+scratch filesystem. The default `filesystem-policy` scenario of `test-microvm`
+covers the same policy as guest root, whose permission checks mode bits never
+stop: every mutation outside the writable paths, through a second mount of
+the tag as well, fails with `EROFS`, a hard link fails with `EXDEV`, a denied
+path nested inside an allowed path stays hidden, invalid policies are rejected
+before boot, and a snapshot restore requires the same policy and keeps a
+writable handle open across the capture. On Linux, a
 world-writable share then runs with `--mount-owner caller`. The runners grant
 OpenVMM neither `CAP_SETUID` nor `CAP_SETGID`, so it can neither assume the
 65534 workload identity nor drop the backend group through which it opens
