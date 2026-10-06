@@ -612,15 +612,17 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
 6. On MSHV and WHP, which pass reserved entries through, the hypervisor
    presents no non-zero CPUID entry outside the profile's tables, apart from
    the identity range and the topology leaves (`E_CPU_UNLISTED`).
-   - `--cpu-fingerprint` checks what a cold boot checks. On WHP, it creates a
-     second probe partition whose feature banks and XSAVE features derive
-     from the profile, as a cold boot's partition's do, and reads its VP 0 at
-     the host's candidates (below). The fingerprint's own probe partition
-     enables every available feature, so on a CET-capable host, such as a
-     twelfth-generation Core, it presents CET's XSAVE components `0xD.11` and
-     `0xD.12`, which no profile enables. On MSHV, the check still reads the
-     fingerprint's probe partition, at the entries its own enumeration
-     reaches.
+   - `--cpu-fingerprint` checks what a cold boot checks. On MSHV and WHP, it
+     creates a second probe partition whose feature banks and XSAVE
+     features derive from the profile, as a cold boot's partition's do, and
+     reads its VP 0 at the host's candidates (below). The fingerprint's own
+     probe partition enables every available feature, so on a CET-capable
+     host, such as a twelfth-generation Core on WHP, it presents CET's XSAVE
+     components `0xD.11` and `0xD.12`, which no profile enables. No
+     CET-capable MSHV host has run it: the Skylake-SP hosts predate CET, and
+     Azure withholds CET from the roots of its Emerald Rapids VMs. On MSHV,
+     the configured partition is created as a microVM's is, without x2APIC
+     or SMT, and reads zero at the Skylake-SP host's 7 candidates.
    - At every cold boot and restore, step 5's check covers it on VP 0's
      view. The candidates are the entries that the host's CPUID enumerates
      outside the profile's tables (`cpu_profile::unlisted_cpuid_candidates`),

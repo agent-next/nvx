@@ -146,9 +146,13 @@ PROFILE_HOST_UNKNOWN = "E_PROFILE_HOST_UNKNOWN"
 # The CPU vendors whose CPUs host profiles serve, as OpenVMM's
 # `cpu_profile::supports_host_profiles` decides.
 HOST_PROFILE_VENDORS = frozenset({"GenuineIntel", "AuthenticAMD"})
-# The issues that track CPU profiles for more CPUs, and for more AMD CPUs.
-CPU_SUPPORT_ISSUE = "https://github.com/microsoft/nvx/issues/390"
-AMD_SUPPORT_ISSUE = "https://github.com/microsoft/nvx/issues/396"
+# The issues that track built-in CPU profiles for more Intel and more AMD CPUs.
+# No issue tracks the CPUs of other vendors, which the time ABI does not serve
+# (doc/design/time-abi.md, "Non-goals").
+CPU_SUPPORT_ISSUES: Mapping[str, tuple[str, str]] = {
+    "GenuineIntel": ("Intel", "https://github.com/microsoft/nvx/issues/408"),
+    "AuthenticAMD": ("AMD", "https://github.com/microsoft/nvx/issues/396"),
+}
 
 
 @dataclass(frozen=True)
@@ -209,10 +213,10 @@ def host_cpu_unsupported_guidance(
             f"{HOST_PROFILE_GENERATION} to boot on a CPU profile derived from "
             'this host; doc/usage.md ("CPU profiles") explains its limits.'
         )
-    if host.vendor == "AuthenticAMD":
-        lines.append(f"nvx: {AMD_SUPPORT_ISSUE} tracks CPU profiles for more AMD CPUs.")
-    else:
-        lines.append(f"nvx: {CPU_SUPPORT_ISSUE} tracks CPU profiles for more CPUs.")
+    support = CPU_SUPPORT_ISSUES.get(host.vendor)
+    if support is not None:
+        vendor, issue = support
+        lines.append(f"nvx: {issue} tracks CPU profiles for more {vendor} CPUs.")
     return "\n".join(lines)
 
 
