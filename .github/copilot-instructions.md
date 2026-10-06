@@ -77,7 +77,12 @@
   `python3 scripts/nvx.py test-microvm --backend kvm --scenario NAME`, passing only
   the `--processors` counts the change needs, and `aci_edge_sandboxes` backend
   changes with `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`.
-  MSHV and WHP are never available there.
+  MSHV and WHP are never available there. The setup summary names the runner's
+  CPU. Built-in CPU profiles serve the runner CPUs met so far, the AMD EPYC
+  7763, 9V74, and 9V45 and the Intel Xeon 8573C, among the generations that
+  `doc/usage.md` lists. On a CPU that no built-in profile serves, such as the
+  Xeon 6973P-C (Granite Rapids), every microVM cold boot fails with
+  `E_PROFILE_HOST_UNKNOWN`, so leave the microVM scenarios to CI there.
 
 ## Pull Requests And CI
 
