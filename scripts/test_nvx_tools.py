@@ -1636,6 +1636,43 @@ class CliTests(unittest.TestCase):
             [Path("share/secrets"), Path("share/private")],
         )
 
+    def test_run_forwards_the_share_access_policy(self):
+        args = nvx.parse_args(
+            [
+                "run",
+                "--mount",
+                "/mnt/share,share,rw",
+                "--mount-write",
+                "share/out",
+                "--mount-allow",
+                "share/logs/payloads",
+                "--mount-deny",
+                "share/logs",
+                "--dry-run",
+            ]
+        )
+        with (
+            patch.object(nvx, "require_file", return_value=Path("artifact")),
+            patch.object(
+                nvx, "_format_command", return_value="formatted"
+            ) as format_command,
+        ):
+            nvx.command_run(args)
+
+        command = format_command.call_args.args[0]
+        self.assertEqual(
+            [
+                (value, command[index + 1])
+                for index, value in enumerate(command)
+                if value.startswith("--mount-")
+            ],
+            [
+                ("--mount-deny", str(Path("share/logs"))),
+                ("--mount-allow", str(Path("share/logs/payloads"))),
+                ("--mount-write", str(Path("share/out"))),
+            ],
+        )
+
     def test_run_forwards_mount_owner_and_requires_mount(self):
         args = nvx.parse_args(
             ["run", "--mount", "/mnt/share,share,rw", "--mount-owner", "caller"]
@@ -8171,6 +8208,8 @@ class SandboxSmokeShareTests(unittest.TestCase):
                 "check_share_ownership",
                 "check_share_denied",
                 "expect_eperm",
+                "check_share_policy",
+                "expect_erofs",
                 "check_share_symlinks",
                 "check_shares_isolated",
             )
@@ -8246,6 +8285,30 @@ class SandboxSmokeShareTests(unittest.TestCase):
         self.share.chmod(0o755)
         result = self._run('check_share "$share" ro')
         self.assertEqual(result.returncode, 1, result.stdout)
+
+    def test_policy_share_requires_openvmm_to_refuse_writes(self):
+        (self.share / "nvx-writable").mkdir()
+        allowed = self.share / "nvx-denied" / "nvx-allowed"
+        allowed.mkdir(parents=True)
+        (allowed / "payload").write_text("payload\n", encoding="utf-8")
+
+        # Only OpenVMM's access policy can make the share refuse writes
+        # outside nvx-writable, so a plain directory fails the checks.
+        result = self._run('check_share "$share" policy')
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertNotIn("NVX-UBUNTU-SANDBOX-POLICY-OK", result.stdout)
+
+        # A refusal other than EROFS, such as a permission check, fails too.
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is not None and geteuid() == 0:
+            return
+        (self.share / "nvx-guest-marker").unlink(missing_ok=True)
+        self.share.chmod(0o555)
+        self.addCleanup(self.share.chmod, 0o755)
+        result = self._run('check_share "$share" policy')
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("unexpected share error", result.stderr)
+        self.assertIn("Permission denied", result.stderr)
 
     def test_rw_share_link_cannot_write_into_ro_share(self):
         geteuid = getattr(os, "geteuid", None)
@@ -9647,6 +9710,72 @@ class SandboxTests(unittest.TestCase):
         ):
             sandbox.SandboxMount.parse("/workspace,host-dir", (), "root")
 
+    def test_mount_access_policy_is_validated_and_forwarded(self):
+        mount = sandbox.SandboxMount.parse(
+            "/tmp/gh-aw,host-dir,rw",
+            ("mcp-logs",),
+            allowed_paths=("mcp-logs/payloads",),
+            writable_paths=("agent", "cache"),
+        )
+        self.assertEqual(
+            sandbox.mounts_openvmm_arguments((mount,)),
+            [
+                "--mount",
+                f"/tmp/gh-aw,{os.fspath(Path('host-dir'))},rw",
+                "--mount-deny",
+                "mcp-logs",
+                "--mount-allow",
+                "mcp-logs/payloads",
+                "--mount-write",
+                "agent",
+                "--mount-write",
+                "cache",
+            ],
+        )
+        absolute = mount.absolute()
+        self.assertEqual(absolute.allowed_paths, ("mcp-logs/payloads",))
+        self.assertEqual(absolute.writable_paths, ("agent", "cache"))
+        # OpenVMM enforces the policy on the host, so the guest's bootstrap
+        # tokens are those of the plain share.
+        self.assertEqual(
+            mount.command_line_fragment(),
+            " virtfs_dir=/tmp/gh-aw virtfs_tag=microvm virtfs_mode=rw",
+        )
+        for create_mount, message in (
+            (
+                lambda: sandbox.SandboxMount.parse(
+                    "/w,host,ro", writable_paths=("out",)
+                ),
+                "/w is read-only",
+            ),
+            (
+                lambda: sandbox.SandboxMount.parse(
+                    "/w,host,rw", allowed_paths=("logs/payloads",)
+                ),
+                "which has none",
+            ),
+            (
+                lambda: sandbox.SandboxMount.parse(
+                    "/w,host,rw", ("logs",), allowed_paths=("logs/a", "logs/a")
+                ),
+                "allowed paths must be unique",
+            ),
+            (
+                lambda: sandbox.SandboxMount.parse("/w,host,rw", writable_paths=("",)),
+                "writable paths must be nonempty",
+            ),
+            (
+                lambda: sandbox.SandboxMount.parse(
+                    "/w,host,rw",
+                    writable_paths=tuple(f"path-{index}" for index in range(129)),
+                ),
+                "at most 128 writable paths",
+            ),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(common.ScriptError, message):
+                    create_mount()
+
     def test_caller_owner_requires_linux_and_a_directory_that_root_does_not_own(self):
         with patch.object(sandbox.os, "name", "nt"):
             with self.assertRaisesRegex(common.ScriptError, "requires a Linux host"):
@@ -10125,6 +10254,128 @@ class SandboxTests(unittest.TestCase):
                 with self.assertRaisesRegex(common.ScriptError, "only valid"):
                     nvx.command_sandbox(args)
 
+    def test_sandbox_command_attributes_policy_paths_to_the_preceding_mount(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            work = root / "work"
+            tools = root / "tools"
+            layer.write_bytes(b"distro")
+            scratch.write_bytes(b"scratch")
+            work.mkdir()
+            tools.mkdir()
+            common_args = [
+                "sandbox",
+                "--layer",
+                f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                "--scratch",
+                str(scratch),
+            ]
+            args = nvx.parse_args(
+                [
+                    *common_args,
+                    "--mount",
+                    f"/workspace,{work},rw",
+                    "--mount-deny",
+                    "logs",
+                    "--mount-allow",
+                    "logs/payloads",
+                    "--mount-write",
+                    "out",
+                    "--mount",
+                    f"/opt/hostedtoolcache,{tools},ro",
+                    "--mount-deny",
+                    "credentials",
+                    "--dry-run",
+                ]
+            )
+            workspace, toolcache = nvx._sandbox_mounts(args)
+            self.assertEqual(
+                (
+                    workspace.denied_paths,
+                    workspace.allowed_paths,
+                    workspace.writable_paths,
+                ),
+                (("logs",), ("logs/payloads",), ("out",)),
+            )
+            self.assertEqual(
+                (
+                    toolcache.denied_paths,
+                    toolcache.allowed_paths,
+                    toolcache.writable_paths,
+                ),
+                (("credentials",), (), ()),
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(nvx, "require_file", side_effect=require),
+                patch.object(
+                    nvx, "_format_command", return_value="formatted"
+                ) as format_command,
+            ):
+                nvx.command_sandbox(args)
+
+            command = format_command.call_args.args[0]
+
+            def values(option: str) -> list[str]:
+                return [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == option
+                ]
+
+            # With several shares, OpenVMM attributes absolute paths.
+            self.assertEqual(
+                values("--mount-allow"), [os.fspath(work / "logs" / "payloads")]
+            )
+            self.assertEqual(values("--mount-write"), [os.fspath(work / "out")])
+
+            for arguments, message in (
+                (["--mount-write", "out"], "--mount-write requires --mount"),
+                # A --mount-write after the read-only share would narrow it.
+                (
+                    [
+                        "--mount",
+                        f"/workspace,{work},rw",
+                        "--mount",
+                        f"/opt/hostedtoolcache,{tools},ro",
+                        "--mount-write",
+                        "cache",
+                    ],
+                    "is read-only",
+                ),
+                (
+                    [
+                        "--mount-allow",
+                        "logs",
+                        "--mount",
+                        f"/workspace,{work},rw",
+                        "--mount",
+                        f"/opt/hostedtoolcache,{tools}",
+                    ],
+                    "each --mount-allow must follow the --mount",
+                ),
+                # A path in one share cannot be attributed to the other.
+                (
+                    [
+                        "--mount",
+                        f"/workspace,{work},rw",
+                        "--mount-write",
+                        os.fspath(tools / "cache"),
+                        "--mount",
+                        f"/opt/hostedtoolcache,{tools}",
+                    ],
+                    "--mount-write .* is not inside the host directory",
+                ),
+            ):
+                with self.subTest(message=message):
+                    with self.assertRaisesRegex(common.ScriptError, message):
+                        nvx.command_sandbox(nvx.parse_args([*common_args, *arguments]))
+
     def test_sandbox_command_attributes_mount_deny_to_the_preceding_mount(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -10381,6 +10632,125 @@ class SandboxTests(unittest.TestCase):
                     os.fspath(work / "secrets"),
                 ],
             )
+
+    def test_managed_lifecycle_persists_and_replays_the_access_policy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            layer_path = root / "distro.erofs"
+            scratch_path = root / "scratch.ext4"
+            work = root / "work"
+            layer_path.write_bytes(b"layer")
+            scratch_path.write_bytes(b"scratch")
+            work.mkdir()
+            state = root / "state"
+            sandbox_lifecycle.provision(
+                state,
+                sandbox.SandboxLaunch(
+                    layers=(
+                        sandbox.SandboxLayer(
+                            role="distro",
+                            path=layer_path,
+                            uuid="11111111-1111-1111-1111-111111111111",
+                        ),
+                    ),
+                    scratch=scratch_path,
+                    mounts=(
+                        sandbox.SandboxMount.parse(
+                            f"/workspace,{work},rw",
+                            ("logs",),
+                            allowed_paths=("logs/payloads",),
+                            writable_paths=("out",),
+                        ),
+                    ),
+                ),
+                hypervisor="whp",
+                memory_mib=256,
+                net=None,
+                network_profile=None,
+                network_egress=None,
+                network_ingress=None,
+                network_egress_allow=(),
+                network_egress_deny=(),
+                host_loopback=None,
+                network_proxy=None,
+                host_loopback_forward=(),
+                cmdline="quiet",
+            )
+
+            config = json.loads(
+                (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(config["format"], sandbox_lifecycle.POLICY_CONFIG_FORMAT)
+            # Earlier releases read at most format 4, which would start the
+            # share without its policy, so they must reject format 5.
+            self.assertNotIn("mount", config)
+            with self.assertRaisesRegex(common.ScriptError, "unsupported format"):
+                sandbox_lifecycle._read_json(
+                    state / sandbox_lifecycle.CONFIG_NAME,
+                    "sandbox configuration",
+                    version=(1, 2, 3, 4),
+                )
+            self.assertEqual(
+                config["mounts"],
+                [
+                    {
+                        "guest_target": "/workspace",
+                        "host_path": os.fspath(work),
+                        "access": "rw",
+                        "denied_paths": ["logs"],
+                        "allowed_paths": ["logs/payloads"],
+                        "writable_paths": ["out"],
+                        "owner": "vmm",
+                    },
+                ],
+            )
+
+            process = MagicMock()
+            process.pid = 123
+            process.stdin = io.BytesIO()
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(sandbox_lifecycle, "require_file", side_effect=require),
+                patch.object(
+                    sandbox_lifecycle.subprocess, "Popen", return_value=process
+                ) as popen,
+                patch.object(
+                    sandbox_lifecycle, "_process_start_time", return_value=456
+                ),
+                patch.object(
+                    sandbox_lifecycle.ControlSession,
+                    "connect",
+                    return_value=MagicMock(),
+                ),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            command = popen.call_args.args[0]
+            self.assertEqual(
+                [
+                    (value, command[index + 1])
+                    for index, value in enumerate(command)
+                    if value.startswith("--mount")
+                ],
+                [
+                    ("--mount", f"/workspace,{work},rw"),
+                    ("--mount-deny", "logs"),
+                    ("--mount-allow", "logs/payloads"),
+                    ("--mount-write", "out"),
+                ],
+            )
+
+            # Format 5 holds an access policy, and only format 5 does.
+            config["mounts"][0]["allowed_paths"] = []
+            config["mounts"][0]["writable_paths"] = []
+            with (
+                patch.object(sandbox, "require_file", side_effect=require),
+                self.assertRaisesRegex(common.ScriptError, "does not match"),
+            ):
+                sandbox_lifecycle._deserialize_launch(config)
 
     def test_managed_configuration_format_binds_several_mounts(self):
         def entry(target: str, path: str, owner: str = "vmm") -> dict[str, object]:

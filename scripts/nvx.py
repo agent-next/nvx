@@ -86,6 +86,7 @@ from nvx_tools.release import (
 from nvx_tools.sandbox import (
     MAX_MOUNTS,
     MOUNT_OWNERS,
+    MOUNT_POLICY_OPTIONS,
     SandboxLaunch,
     SandboxLayer,
     SandboxMount,
@@ -101,8 +102,14 @@ MAX_ENVIRONMENT_FILE_BYTES = 1024 * 1024
 SYSTEMD_ENTRYPOINTS = frozenset(("/usr/lib/systemd/systemd", "/lib/systemd/systemd"))
 
 
-class _MountDenyAction(argparse.Action):
-    """Record each --mount-deny with the index of the --mount before it."""
+def _mount_policy_destination(option: str) -> str:
+    """Return the argparse destination of a share access-policy option."""
+    return option.removeprefix("--").replace("-", "_")
+
+
+class _MountPolicyPathAction(argparse.Action):
+    """Record each --mount-deny, --mount-allow, or --mount-write with the index
+    of the --mount before it."""
 
     def __call__(
         self,
@@ -112,34 +119,46 @@ class _MountDenyAction(argparse.Action):
         option_string: str | None = None,
     ) -> None:
         mounts = cast(list[str], getattr(namespace, "mount", None) or [])
-        denied = list(
+        paths = list(
             cast(list[tuple[int, str]], getattr(namespace, self.dest, None) or [])
         )
-        denied.append((len(mounts) - 1, cast(str, values)))
-        setattr(namespace, self.dest, denied)
+        paths.append((len(mounts) - 1, cast(str, values)))
+        setattr(namespace, self.dest, paths)
 
 
 def _sandbox_mounts(args: argparse.Namespace) -> tuple[SandboxMount, ...]:
-    """Attribute each --mount-deny to its share and parse the --mount options.
+    """Attribute each access-policy path to its share and parse the --mount
+    options.
 
-    With one --mount, every --mount-deny hides a path in it. With several, each
-    --mount-deny hides a path in the --mount that precedes it.
+    With one --mount, every --mount-deny, --mount-allow, and --mount-write
+    names a path in it. With several, each names a path in the --mount that
+    precedes it.
     """
     mounts = cast(list[str], args.mount)
-    denied: list[list[str]] = [[] for _ in mounts]
-    for index, path in cast(list[tuple[int, str]], args.mount_deny):
-        if len(mounts) == 1:
-            index = 0
-        elif index < 0:
-            raise ScriptError(
-                "with several --mount options, each --mount-deny must follow the "
-                "--mount whose host directory it hides"
-            )
-        denied[index].append(path)
+    attributed: dict[str, list[list[str]]] = {}
+    for kind, option in MOUNT_POLICY_OPTIONS.items():
+        paths: list[list[str]] = [[] for _ in mounts]
+        destination = _mount_policy_destination(option)
+        for index, path in cast(list[tuple[int, str]], getattr(args, destination)):
+            if len(mounts) == 1:
+                index = 0
+            elif index < 0:
+                raise ScriptError(
+                    f"with several --mount options, each {option} must follow the "
+                    "--mount whose host directory it names"
+                )
+            paths[index].append(path)
+        attributed[kind] = paths
     owner = args.mount_owner or "vmm"
     return tuple(
-        SandboxMount.parse(value, tuple(paths), owner)
-        for value, paths in zip(mounts, denied, strict=True)
+        SandboxMount.parse(
+            value,
+            tuple(attributed["denied"][index]),
+            owner,
+            allowed_paths=tuple(attributed["allowed"][index]),
+            writable_paths=tuple(attributed["writable"][index]),
+        )
+        for index, value in enumerate(mounts)
     )
 
 
@@ -452,8 +471,9 @@ def command_run(args: argparse.Namespace) -> None:
         command.extend(["--mount", mount])
     if args.mount_owner is not None and not args.mount:
         raise ScriptError("--mount-owner requires --mount")
-    for denied_path in args.mount_deny:
-        command.extend(["--mount-deny", str(denied_path)])
+    for option in MOUNT_POLICY_OPTIONS.values():
+        for path in getattr(args, _mount_policy_destination(option)):
+            command.extend([option, str(path)])
     if args.mount_owner is not None:
         require_mount_owner_supported(args.mount_owner)
         command.extend(["--mount-owner", args.mount_owner])
@@ -563,8 +583,9 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError(
             "--outcome-report is only valid for one-shot run or managed exec"
         )
-    if args.mount_deny and not args.mount:
-        raise ScriptError("--mount-deny requires --mount")
+    for option in MOUNT_POLICY_OPTIONS.values():
+        if getattr(args, _mount_policy_destination(option)) and not args.mount:
+            raise ScriptError(f"{option} requires --mount")
     if args.mount_owner is not None and not args.mount:
         raise ScriptError("--mount-owner requires --mount")
     if args.mount and operation not in ("run", "provision"):
@@ -968,6 +989,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--mount-deny", action="append", type=Path, default=[])
     run.add_argument(
+        "--mount-allow",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="HOST_PATH",
+        help="expose one existing path inside a --mount-deny path again",
+    )
+    run.add_argument(
+        "--mount-write",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="HOST_PATH",
+        help=(
+            "make one existing path one of the only writable parts of a "
+            "read-write --mount"
+        ),
+    )
+    run.add_argument(
         "--mount-owner",
         choices=MOUNT_OWNERS,
         help=(
@@ -1099,12 +1139,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     sandbox.add_argument(
         "--mount-deny",
-        action=_MountDenyAction,
+        action=_MountPolicyPathAction,
         default=[],
         metavar="HOST_PATH",
         help=(
             "hide one existing path inside a --mount host directory; with "
             "several --mount options, it applies to the --mount before it"
+        ),
+    )
+    sandbox.add_argument(
+        "--mount-allow",
+        action=_MountPolicyPathAction,
+        default=[],
+        metavar="HOST_PATH",
+        help=(
+            "expose one existing path inside a --mount-deny path of the same "
+            "share again; the hidden directories on the way list only it"
+        ),
+    )
+    sandbox.add_argument(
+        "--mount-write",
+        action=_MountPolicyPathAction,
+        default=[],
+        metavar="HOST_PATH",
+        help=(
+            "make one existing path one of the only writable parts of a "
+            "read-write --mount; the rest of the share is read-only"
         ),
     )
     sandbox.add_argument(

@@ -9,6 +9,11 @@ check_share() {
         echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
         return
     fi
+    if [ "$share_mode" = policy ]; then
+        check_share_policy "$share"
+        echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
+        return
+    fi
     [ "$(cat "$share/nvx-host-marker")" = host-to-guest ]
     [ ! -e "$share/nvx-denied" ]
     case "$share_mode" in
@@ -81,6 +86,73 @@ expect_eperm() {
         *'Operation not permitted'*) ;;
         *)
             echo "unexpected share error: $1" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# A read-write share with --mount-write nvx-writable, --mount-deny nvx-denied,
+# and --mount-allow nvx-denied/nvx-allowed. The host grants every guest
+# identity write permission, so only OpenVMM's policy can refuse a write:
+# outside nvx-writable, it refuses each one with EROFS. The denied directory
+# lists only the way to the allowed path, which stays readable.
+check_share_policy() {
+    share=$1
+    [ "$(cat "$share/nvx-host-marker")" = host-to-guest ]
+    expect_erofs "$share/nvx-guest-marker"
+    expect_erofs "$share/nvx-host-marker"
+    expect_erofs "$share/nvx-denied/nvx-allowed/nvx-guest-marker"
+    if (: >>"$share/nvx-denied/nvx-guest-marker") 2>/dev/null; then
+        exit 1
+    fi
+    if mkdir "$share/nvx-guest-directory" 2>/dev/null; then
+        exit 1
+    fi
+    if ln -s nvx-host-marker "$share/nvx-guest-link" 2>/dev/null; then
+        exit 1
+    fi
+    if rm "$share/nvx-host-marker" 2>/dev/null; then
+        exit 1
+    fi
+    if mv "$share/nvx-host-marker" "$share/nvx-writable/" 2>/dev/null; then
+        exit 1
+    fi
+    # A hard link would make a read-only file writable through the link.
+    if ln "$share/nvx-host-marker" "$share/nvx-writable/nvx-hard-link" 2>/dev/null; then
+        exit 1
+    fi
+
+    # The workload creates, renames, and removes entries in the writable path.
+    printf 'guest-to-host\n' >"$share/nvx-writable/nvx-guest-marker"
+    mkdir "$share/nvx-writable/nvx-guest-directory"
+    printf 'temporary\n' >"$share/nvx-writable/nvx-temporary"
+    mv "$share/nvx-writable/nvx-temporary" "$share/nvx-writable/nvx-renamed"
+    rm "$share/nvx-writable/nvx-renamed"
+    if mv "$share/nvx-writable/nvx-guest-marker" "$share/" 2>/dev/null; then
+        exit 1
+    fi
+
+    [ "$(ls -A "$share/nvx-denied")" = nvx-allowed ]
+    [ "$(cat "$share/nvx-denied/nvx-allowed/payload")" = payload ]
+    if cat "$share/nvx-denied/secret" >/dev/null 2>&1; then
+        exit 1
+    fi
+    if ls "$share/nvx-denied/secret" >/dev/null 2>&1; then
+        exit 1
+    fi
+    echo "NVX-UBUNTU-SANDBOX-POLICY-OK target=$share"
+}
+
+# Opening `$1` to append must fail with EROFS. The shell reports a failed
+# redirection with the C library's message.
+expect_erofs() {
+    if error=$( (: >>"$1") 2>&1); then
+        exit 1
+    fi
+    case "$error" in
+        *'Read-only file system'*) ;;
+        *)
+            echo "unexpected share error: $error" >&2
             exit 1
             ;;
     esac

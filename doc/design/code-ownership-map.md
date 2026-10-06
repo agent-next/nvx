@@ -21,7 +21,7 @@ contracts between them.
 | Virtio transport, shared interrupt status, and device-private saved state | OpenVMM virtio transport and device models |
 | Control-session protocol, authenticated broker, and local peer identity | OpenVMM virtio-console broker and serial socket and named-pipe backends |
 | Portable networking, egress policy, and endpoint quiesce | OpenVMM Consomme endpoint, egress policy, and virtio-net device |
-| HostFs profile, denied paths, and filesystem saved state | OpenVMM microVM virtio-fs profile |
+| HostFs profile, denied, allowed, and writable paths, and filesystem saved state | OpenVMM microVM virtio-fs profile |
 | State-unit quiesce, start, rollback, inventory, and downtime advance | OpenVMM state-unit framework |
 | Snapshot format, machine contract, publication, and artifact validation | OpenVMM snapshot helpers and platform file primitives |
 | Backend CPU contracts and snapshot clocks | KVM, MSHV, and WHP backends |
