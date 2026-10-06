@@ -2843,7 +2843,8 @@ def run_filesystem_owner(
             if any(root.iterdir()):
                 raise RuntimeError(
                     "a guest caller wrote to the share although OpenVMM cannot "
-                    "drop its supplementary groups"
+                    "assume the export UID/GID identity (missing CAP_SETUID/"
+                    "CAP_SETGID or unable to drop supplementary groups)"
                 )
         else:
             status = (root / "root-file").lstat()
