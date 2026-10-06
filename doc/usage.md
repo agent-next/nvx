@@ -590,19 +590,28 @@ built-in profile of the host's CPU generation:
 | `intel.emeraldrapids.v1` | `emeraldrapids` | Intel Xeon Scalable, fifth generation (6/207) |
 | `intel.alderlake.v1` | `alderlake` | Intel Core, twelfth generation (6/151 and 6/154) |
 | `amd.milan.v1` | `milan` | AMD EPYC, third generation (25/1, Milan-X included) |
+| `amd.genoa.v1` | `genoa` | AMD EPYC, fourth generation (25/17, Genoa-X included) |
+| `amd.turin.v1` | `turin` | AMD EPYC, fifth generation (26/2) |
 
-Any other CPU, including Cascade Lake, Sapphire Rapids, Tiger Lake, Raptor
-Lake, and AMD's Genoa and Ryzen CPUs, fails with `E_PROFILE_HOST_UNKNOWN`. A
-host of a listed generation can still fail with `E_PROFILE_UNSUPPORTED` if its
-SKU or hypervisor lacks a feature of the profile, and on an Intel or AMD CPU
-OpenVMM's error then names `--cpu-profile host`: `intel.alderlake.v1` derives
-from one Core i9-12900H on WHP, and `amd.milan.v1` from one EPYC 7763 Azure
-VM on WHP, so Alder Lake and Milan hosts on KVM and MSHV, and SKUs without
-their features, are unverified. The Milan profile leaves out what KVM cannot
-present, `BTC_NO` and PSFD without a `SPEC_CTRL` control, and presents none
-of the speculation controls that the Azure VM's WHP withholds, so its Linux
-guests use retpolines and report SSB, SRSO, and TSA as vulnerable on every
-host.
+Any other CPU, including Cascade Lake, Sapphire Rapids, Granite Rapids, Tiger
+Lake, Raptor Lake, and AMD's Ryzen CPUs, fails with `E_PROFILE_HOST_UNKNOWN`.
+A host of a listed generation can still fail with `E_PROFILE_UNSUPPORTED` if
+its SKU or hypervisor lacks a feature of the profile, and on an Intel or AMD
+CPU OpenVMM's error then names `--cpu-profile host`. `intel.alderlake.v1`
+derives from one Core i9-12900H on WHP, `amd.milan.v1` from one EPYC 7763
+Azure VM on WHP, and `amd.genoa.v1` and `amd.turin.v1` from KVM on one
+GitHub-hosted Actions runner each, an Azure VM with an EPYC 9V74 or 9V45.
+GitHub's runners with an EPYC 7763, 9V74, or 9V45 pass their profiles' full
+`test-microvm` suite on KVM. Alder Lake hosts on KVM and MSHV, Milan, Genoa,
+and Turin hosts on MSHV, Genoa and Turin hosts on WHP, bare-metal AMD hosts,
+and SKUs without the profiles' features are unverified. The AMD profiles leave
+out what KVM cannot present, `BTC_NO` and PSFD without a `SPEC_CTRL` control,
+and the enumerations of Intel's speculation controls that KVM adds on AMD
+hosts. They present none of AMD's speculation controls, `IBRS`, `STIBP`, and
+`SSBD`, because the Azure VMs' hypervisors withhold them; `amd.milan.v1`'s
+Linux guests therefore use retpolines and report SSB, SRSO, and TSA as
+vulnerable on every host. `amd.genoa.v1` pins the TSA immunities that Azure
+presents on Genoa, which a bare-metal Genoa host's KVM does not report.
 
 On an Intel or AMD development host that no built-in profile serves, or whose
 hypervisor does not support its built-in profile, `run --cpu-profile host`
@@ -624,7 +633,7 @@ the time ABI requires. A host profile is for development only:
 
 [#408](https://github.com/microsoft/nvx/issues/408) tracks built-in profiles
 for more Intel CPUs, such as Tiger Lake and Meteor Lake, and
-[#396](https://github.com/microsoft/nvx/issues/396) for more AMD CPUs; host
+[#409](https://github.com/microsoft/nvx/issues/409) for more AMD CPUs; host
 profiles serve no CPU of another vendor than Intel and AMD. A profile derives
 from fingerprints of its generation's hosts on every backend that it serves;
 see `vmm_core/cpu_profile` in the OpenVMM submodule.
