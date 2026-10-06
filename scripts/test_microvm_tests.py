@@ -515,6 +515,43 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         fixture_root = Path(state_directories.pop()).parent
         self.assertFalse(fixture_root.exists())
 
+    def test_public_acceptance_rejects_unreadable_layer_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = Path(temporary) / "ubuntu-distro.erofs.manifest.json"
+            manifest.write_text("{", encoding="utf-8")
+            paths = iter(
+                (
+                    Path(temporary) / "ubuntu-distro.erofs",
+                    manifest,
+                    Path(temporary) / "ubuntu-smoke-scratch.ext4",
+                )
+            )
+
+            def artifact(_: str) -> Path:
+                return next(paths)
+
+            def require(path: Path, _: str) -> Path:
+                return path
+
+            with (
+                patch.object(
+                    managed_exec_tests,
+                    "artifact_path",
+                    side_effect=artifact,
+                ),
+                patch.object(
+                    managed_exec_tests,
+                    "require_file",
+                    side_effect=require,
+                ),
+                self.assertRaisesRegex(
+                    common.ScriptError, "invalid Ubuntu layer manifest"
+                ),
+            ):
+                managed_exec_tests.run_managed_exec_configuration(
+                    "whp", timeout=2, output_dir=Path(temporary) / "results"
+                )
+
     def test_public_acceptance_preserves_test_and_cleanup_failures(self):
         commands: list[list[str]] = []
         fixture_root: Path | None = None
@@ -1215,7 +1252,7 @@ class FilesystemOwnerTests(unittest.TestCase):
         if sys.platform != "linux":
             self.skipTest("caller ownership requires a Linux host")
         if os.geteuid() == 0:
-            self.skipTest("root runs chown the share to another owner")
+            self.skipTest("root would chown the share to another owner")
         scripts: list[str] = []
 
         def guest(
