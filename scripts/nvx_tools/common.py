@@ -58,6 +58,10 @@ def artifact_path(name: str) -> Path:
     return BuildConstants.BUILD_DIR / name
 
 
+def path_exists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
 def cache_root() -> Path:
     configured = os.environ.get(BuildConstants.CACHE_ENVIRONMENT_VARIABLE)
     return (
