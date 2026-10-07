@@ -123,14 +123,17 @@ class CpuGeneration:
 # the submodule. Doctor uses it only without OpenVMM (--no-openvmm), and run
 # to explain a failed cold boot on a CPU that it lacks; otherwise OpenVMM
 # reports the generation and the profile itself. Model 85 also covers Cascade
-# Lake (steppings 5-7) and Cooper Lake (10-11), which have no profile; AMD's
-# family 25 model 1 is Milan's in every stepping, Milan-X's 2 included.
+# Lake (steppings 5-7) and Cooper Lake (10-11), which have no profile. AMD's
+# family 25 model 1 is Milan's in every stepping, Milan-X's 2 included, family
+# 25 model 17 Genoa's, Genoa-X's included, and family 26 model 2 Turin's.
 CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
     CpuGeneration("skylake-sp", "GenuineIntel", (CpuModel(6, 85, range(5)),)),
     CpuGeneration("icelake-sp", "GenuineIntel", (CpuModel(6, 106),)),
     CpuGeneration("emeraldrapids", "GenuineIntel", (CpuModel(6, 207),)),
     CpuGeneration("alderlake", "GenuineIntel", (CpuModel(6, 151), CpuModel(6, 154))),
     CpuGeneration("milan", "AuthenticAMD", (CpuModel(25, 1),)),
+    CpuGeneration("genoa", "AuthenticAMD", (CpuModel(25, 17),)),
+    CpuGeneration("turin", "AuthenticAMD", (CpuModel(26, 2),)),
 )
 
 
@@ -151,7 +154,7 @@ HOST_PROFILE_VENDORS = frozenset({"GenuineIntel", "AuthenticAMD"})
 # (doc/design/time-abi.md, "Non-goals").
 CPU_SUPPORT_ISSUES: Mapping[str, tuple[str, str]] = {
     "GenuineIntel": ("Intel", "https://github.com/microsoft/nvx/issues/408"),
-    "AuthenticAMD": ("AMD", "https://github.com/microsoft/nvx/issues/396"),
+    "AuthenticAMD": ("AMD", "https://github.com/microsoft/nvx/issues/409"),
 }
 
 

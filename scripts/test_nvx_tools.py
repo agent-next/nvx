@@ -1745,7 +1745,7 @@ class CliTests(unittest.TestCase):
         status, output = run(1, None, host=zen3)
         self.assertIn("AuthenticAMD 25/33/0", output)
         self.assertIn("rerun with --cpu-profile host", output)
-        self.assertIn("https://github.com/microsoft/nvx/issues/396", output)
+        self.assertIn("https://github.com/microsoft/nvx/issues/409", output)
         self.assertNotIn("issues/408", output)
         self.assertEqual(run(1, "host", host=zen3), (1, ""))
         # Host profiles serve only Intel and AMD CPUs, so another vendor's
