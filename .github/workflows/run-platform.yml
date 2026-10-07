@@ -108,12 +108,15 @@ jobs:
         shell: bash
         run: chmod +x openvmm/target/release/openvmm
 
-      # Qualification verifies the downloaded OpenVMM's time ABI preflight.
+      # Qualification verifies the downloaded OpenVMM's time ABI preflight and,
+      # because the benchmarks boot guests without the microVM scenarios' warp
+      # probes, runs the guest warp probe.
       - name: Validate runner
         uses: ./.github/actions/validate-runner
         with:
           backend: ${{ inputs.backend }}
           verify-openvmm: "true"
+          warp-probe: "true"
 
       - name: Run benchmark
         uses: ./.github/actions/run-benchmark

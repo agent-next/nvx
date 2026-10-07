@@ -180,7 +180,7 @@ jobs:
           fi
           ls -l /dev/kvm
           if ! grep -qw nonstop_tsc /proc/cpuinfo; then
-            echo "::notice::The host CPU has no invariant TSC; snapshot restore tests may be unstable"
+            echo "::notice::The host CPU has no invariant TSC; the microVM scenarios' guest warp probe measures the cross-vCPU skew that this can cause"
           fi
 
       - name: Restore guest artifacts built by CI

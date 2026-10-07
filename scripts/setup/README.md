@@ -73,10 +73,13 @@ Docker on a GitHub-hosted runner instead.
 Linux provisioning runs through the SSH administrator, but the listener and
 workflow jobs run as the dedicated `nvx-runner` account, which has neither sudo
 nor Docker access.
-Linux provisioning and check mode stop unless the host CPU exposes an invariant
-TSC (`nonstop_tsc` in `/proc/cpuinfo`). Guests on an Azure VM without one hit
-cross-vCPU TSC warps during CPU activation, so redeploy such a VM instead of
-registering it.
+Linux provisioning and check mode warn, but don't stop, when the host CPU
+doesn't expose an invariant TSC (`nonstop_tsc` in `/proc/cpuinfo`). The flag
+is evidence only. Before the time ABI, guests on such an Azure VM hit
+cross-vCPU TSC warps during CPU activation (#265); under it, the guest warp
+probe (H6) checks their skew against the ABI's 1 µs bound, so qualify such a
+VM with `python3 scripts/nvx.py doctor --backend <backend>` before
+registering it. CI's microVM and platform jobs run the probe on every runner.
 Persistent runners execute pushes and same-repository pull requests only. Fork
 pull requests remain on GitHub-hosted jobs until a maintainer stages the change
 on a trusted repository branch.
