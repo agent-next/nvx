@@ -353,7 +353,11 @@ absolute path, and it applies to the mapping whose root contains it. Denied
 names are omitted from directory listings and remain
 inaccessible through `..`, a symlink/junction, or another mount of the same
 virtio-fs device. Unsafe, external, duplicate, overlapping, and nested-mount
-rules are rejected before boot.
+rules are rejected before boot. A repeatable `--mount-allow HOST_PATH`
+exposes a path inside a denied path again, and a repeatable
+`--mount-write HOST_PATH` makes a path one of the only writable parts of an
+`rw` mapping; see [Access policy](#access-policy). A snapshot captured with
+these paths requires the same denied, allowed, and writable paths.
 In an `rw` mapping, the guest can create symbolic links, and OpenVMM stores
 each target exactly as given. The guest resolves links in its own namespace;
 OpenVMM never follows a link while resolving a host path, so a link to an
@@ -417,7 +421,13 @@ verifies that the workload owns what it creates, populates a directory it
 created, and creates links in its own `nvx-caller-links` directory, while
 `--arg eperm` requires reading and listing the share to fail with `EPERM` and
 writes to fail, which is the result when OpenVMM cannot assume the workload
-identity.
+identity. `--arg policy` checks an `rw` share whose
+[access policy](#access-policy) denies `nvx-denied`, allows
+`nvx-denied/nvx-allowed`, and makes only `nvx-writable` writable: the workload
+writes only inside `nvx-writable`, gets `EROFS` everywhere else, cannot
+hard-link a read-only file into `nvx-writable`, and sees only `nvx-allowed`,
+which stays readable, in `nvx-denied`. The share's other directories and files
+must be writable by every identity, so that only OpenVMM can refuse a write.
 
 The layer UUID is the EROFS superblock UUID, not a content digest. The command
 validates the files before launch, orders roles independently of option order,
@@ -447,10 +457,12 @@ enters only the assembled root with `chroot`, because Linux cannot
 
 `sandbox run` and `sandbox provision` accept up to two
 `--mount GUEST_TARGET,HOST_PATH[,ro|rw]` (default `ro`) options, each with its
-own guest target and access mode, plus repeatable `--mount-deny HOST_PATH`
-rules. OpenVMM exports each host directory through its own microVM virtio-fs
-device and enforces its access mode and denied paths on the host side, so
-edits are visible in both directions without staging or copy-back:
+own guest target and access mode, plus repeatable `--mount-deny HOST_PATH`,
+`--mount-allow HOST_PATH`, and `--mount-write HOST_PATH` rules (see
+[Access policy](#access-policy)). OpenVMM exports each host directory through
+its own microVM virtio-fs device and enforces its access mode and policy on
+the host side, so edits are visible in both directions without staging or
+copy-back:
 
 ```bash
 python3 scripts/nvx.py sandbox \
@@ -462,10 +474,10 @@ python3 scripts/nvx.py sandbox \
   --entrypoint /bin/sh
 ```
 
-A relative `--mount-deny` path is resolved inside its share's host directory.
-With one share, every `--mount-deny` applies to it. With two, each
-`--mount-deny` applies to the `--mount` before it and must name a path inside
-that share's directory. The guest targets and the host directories of the two
+A relative `--mount-deny`, `--mount-allow`, or `--mount-write` path is
+resolved inside its share's host directory. With one share, every such path
+applies to it. With two, each applies to the `--mount` before it and must name
+a path inside that share's directory. The guest targets and the host directories of the two
 shares must not equal or contain one another, because one share could
 otherwise hide the other or reach its files under a different access mode.
 NVX and OpenVMM compare the host directories by resolved path and by file
@@ -499,10 +511,63 @@ An `rw` share supports the symbolic links that package managers and
 language toolchains create; see
 [virtio-fs host mapping](#virtio-fs-host-mapping) for their semantics. The
 existing OpenVMM file-identity policy applies to each share. A managed
-sandbox stores each share's absolute host path, mode, and denied paths and
-the ownership mode in its configuration, and reattaches every share on each
-`start`. A configuration with two shares uses format 4, which earlier NVX
-releases reject rather than start without the second share.
+sandbox stores each share's absolute host path, mode, denied, allowed, and
+writable paths and the ownership mode in its configuration, and reattaches
+every share on each `start`. A configuration with two shares uses format 4,
+which earlier NVX releases reject rather than start without the second share.
+A configuration with allowed or writable paths uses format 5, which earlier
+NVX releases reject rather than start a share without its access policy.
+
+#### Access policy
+
+Each share can narrow what the workload can see and modify inside it, as AWF's
+staged mount tree does for its Cloud Hypervisor backend. OpenVMM enforces the
+policy on the host for every request, whichever guest mount, path, or link
+reaches the share:
+
+- `--mount-deny HOST_PATH` hides a path and everything below it.
+- `--mount-allow HOST_PATH` exposes a path inside a denied path, and
+  everything below it, again. The hidden directories on the way to it are
+  traverse-only: the workload can enter and list them, but the listing shows
+  only the entries that lead to allowed paths, any other name fails with
+  `EACCES` (`Permission denied`), and the workload cannot modify them. A
+  denied path may in turn lie inside an allowed path.
+- `--mount-write HOST_PATH`, on an `rw` share, makes a file or directory, and
+  everything below it, one of the only writable parts of the share. Every
+  other write fails with `EROFS` (`Read-only file system`), including
+  creating, removing, or renaming an entry in a read-only directory, which
+  also stops a rename into or out of a writable path. A hard link from a
+  writable path to a read-only file fails with `EXDEV` (`Invalid cross-device
+  link`), so the link cannot make the file writable.
+
+Each path must exist inside the share's host directory, must not cross a
+symbolic link or junction, and is attributed to a share like `--mount-deny`.
+Allowed paths follow the share's write policy: without `--mount-write`, an
+allowed path in an `rw` share is writable; with it, an allowed path is
+writable only inside a writable path. For example,
+the following share hides the MCP gateway's logs except the tool payloads
+that it spills below them, which stay readable, and lets the workload write
+only to `agent` and `cache`:
+
+```bash
+python3 scripts/nvx.py sandbox \
+  --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
+  --scratch /var/lib/nvx/scratch.ext4 \
+  --mount /tmp/gh-aw,/tmp/gh-aw,rw \
+  --mount-deny mcp-logs \
+  --mount-allow mcp-logs/mcp-payloads \
+  --mount-write agent \
+  --mount-write cache \
+  --entrypoint /bin/sh
+```
+
+OpenVMM rejects an allowed path outside a denied path, a writable path inside
+a hidden part of the share or inside another writable path, and a writable
+path on an `ro` share before boot. The policy applies to names inside the
+share: a host hard link or bind mount that makes a read-only file reachable
+inside a writable path makes it writable, and one that makes part of a denied
+path reachable elsewhere exposes that part, so do not create such aliases
+inside a shared directory.
 
 #### File ownership
 

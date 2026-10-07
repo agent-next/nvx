@@ -428,6 +428,8 @@ python3 scripts/nvx.py run
     [--cpu-profile ID]
     [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]...
     [--mount-deny HOST_PATH]...
+    [--mount-allow HOST_PATH]...
+    [--mount-write HOST_PATH]...
     [--mount-owner {vmm,caller}]
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
@@ -459,6 +461,8 @@ python3 scripts/nvx.py run
 | `--cpu-profile ID` | `auto` | Select the guest's [CPU profile](#cpu-profiles): `auto` for the built-in profile of the host's CPU, a built-in profile ID, or `host` for a development profile derived from this host. A restore uses the snapshot's profile, which `auto` and, for a host profile, `host` also name. |
 | `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Expose a host directory at the absolute guest target. Repeat once to expose a second directory with its own target and mode; targets and directories must not overlap. An `rw` mapping accepts guest-created symbolic links, which the host never follows. Active snapshot restore requires the same mappings in the same order, with the same canonical paths, targets, modes, and ownership mode; a dormant-slot restore may attach one new mapping that the resumed guest mounts explicitly. |
 | `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside a mounted host root; repeat to deny multiple paths. With two mappings, the path must be absolute. |
+| `--mount-allow HOST_PATH` | none | Expose one existing file or directory inside a `--mount-deny` path again; the hidden directories on the way list only the entries that lead to it. Repeat to allow multiple paths. With two mappings, the path must be absolute. See [Access policy](run.md#access-policy). |
+| `--mount-write HOST_PATH` | none | Make one existing file or directory one of the only writable parts of an `rw` mapping; the guest's writes anywhere else in it fail with `EROFS`. Repeat to declare multiple writable paths. With two mappings, the path must be absolute. Active snapshot restore requires the same denied, allowed, and writable paths. |
 | `--mount-owner {vmm,caller}` | `vmm` | Select the host identity of the guest's operations on every `--mount` directory. `caller` performs each one as the guest caller's UID and GID and squashes guest root to the directory owner; it requires a Linux host. See [Run](run.md#file-ownership). |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with the static guest IPv4 address and prefix. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
@@ -517,6 +521,8 @@ python3 scripts/nvx.py sandbox
     [--hypervisor {auto,whp,kvm,mshv}]
     [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]...
     [--mount-deny HOST_PATH]...
+    [--mount-allow HOST_PATH]...
+    [--mount-write HOST_PATH]...
     [--mount-owner {vmm,caller}]
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
@@ -558,6 +564,8 @@ launches.
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the host hypervisor. |
 | `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Live-share a host directory at the absolute target inside the container rootfs for `run` or `provision`; defaults to `ro`. Repeat once to attach a second share with its own target and mode, for example a read-write workspace and a read-only tool cache; targets and host directories must not overlap. An `rw` share accepts guest-created symbolic links, which the host never follows. `/`, `/etc`, and the `/proc`, `/sys`, `/dev`, and `/.nvx-agent` trees are reserved. |
 | `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside a `--mount` host directory; relative paths are resolved inside it. With two shares, it applies to the `--mount` before it. Repeat to deny multiple paths. |
+| `--mount-allow HOST_PATH` | none | Expose one existing file or directory inside a `--mount-deny` path of the same share again, for example a readable `mcp-payloads` directory inside hidden logs. The hidden directories on the way list only the entries that lead to it, and the workload cannot modify them. Relative paths are resolved inside the share; with two shares, it applies to the `--mount` before it. Repeat to allow multiple paths. See [Access policy](run.md#access-policy). |
+| `--mount-write HOST_PATH` | none | Make one existing file or directory one of the only writable parts of an `rw` share; the workload's writes anywhere else in the share fail with `EROFS`. Relative paths are resolved inside the share; with two shares, it applies to the `--mount` before it, which must be `rw`. Repeat to declare multiple writable paths. `provision` persists the denied, allowed, and writable paths. |
 | `--mount-owner {vmm,caller}` | `vmm` | Select the host identity of the shares' file operations for `run` or `provision`. `vmm` performs them as OpenVMM; `caller` performs them as the workload's UID and GID, squashes guest root to the owner of each host directory, and fails them with `EPERM` when OpenVMM cannot assume that identity. `caller` requires a Linux host and is persisted by `provision`. See [File ownership](run.md#file-ownership). |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with a static guest address. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |

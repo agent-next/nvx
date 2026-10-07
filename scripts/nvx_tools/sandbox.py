@@ -38,7 +38,16 @@ MOUNT_OWNERS = ("vmm", "caller")
 # them.
 RESERVED_MOUNT_TARGETS = ("/proc", "/sys", "/dev", "/.nvx-agent")
 RESERVED_EXACT_MOUNT_TARGETS = ("/etc",)
-MAX_MOUNT_DENIED_PATHS = 128
+# OpenVMM accepts at most this many denied, allowed, and writable paths each.
+MAX_MOUNT_POLICY_PATHS = 128
+# The option that requests each kind of share access-policy path. `--mount-deny`
+# hides a path, `--mount-allow` exposes a path inside a denied path again, and
+# `--mount-write` makes a path one of the only writable parts of its share.
+MOUNT_POLICY_OPTIONS = {
+    "denied": "--mount-deny",
+    "allowed": "--mount-allow",
+    "writable": "--mount-write",
+}
 # OpenVMM appends exactly these virtio-fs bootstrap tokens for each live share.
 _MOUNT_COMMAND_LINE_FRAGMENT = " virtfs_dir={} virtfs_tag={} virtfs_mode={}"
 
@@ -118,17 +127,30 @@ def require_mount_owner_supported(owner: str) -> None:
 
 @dataclass(frozen=True)
 class SandboxMount:
-    """A live virtio-fs share mounted inside the sandbox container rootfs."""
+    """A live virtio-fs share mounted inside the sandbox container rootfs.
+
+    `denied_paths` hide paths in the share, `allowed_paths` expose paths
+    inside denied paths again, and `writable_paths`, when present, are the
+    only paths of a read-write share that the workload can modify.
+    """
 
     guest_target: str
     host_path: Path
     access: str = "ro"
     denied_paths: tuple[str, ...] = ()
     owner: str = "vmm"
+    allowed_paths: tuple[str, ...] = ()
+    writable_paths: tuple[str, ...] = ()
 
     @classmethod
     def parse(
-        cls, value: str, denied_paths: tuple[str, ...] = (), owner: str = "vmm"
+        cls,
+        value: str,
+        denied_paths: tuple[str, ...] = (),
+        owner: str = "vmm",
+        *,
+        allowed_paths: tuple[str, ...] = (),
+        writable_paths: tuple[str, ...] = (),
     ) -> SandboxMount:
         fields = value.split(",")
         if len(fields) not in (2, 3):
@@ -143,6 +165,8 @@ class SandboxMount:
             access=access,
             denied_paths=denied_paths,
             owner=owner,
+            allowed_paths=allowed_paths,
+            writable_paths=writable_paths,
         )
 
     def __post_init__(self) -> None:
@@ -164,15 +188,35 @@ class SandboxMount:
             raise ScriptError(
                 f"sandbox mount host path contains a parent component: {raw_path}"
             )
-        if len(self.denied_paths) > MAX_MOUNT_DENIED_PATHS:
+        for kind, paths in self.policy_paths():
+            if len(paths) > MAX_MOUNT_POLICY_PATHS:
+                raise ScriptError(
+                    f"a sandbox mount permits at most {MAX_MOUNT_POLICY_PATHS} "
+                    f"{kind} paths"
+                )
+            for path in paths:
+                if not path or "\0" in path:
+                    raise ScriptError(f"sandbox mount {kind} paths must be nonempty")
+            if len(set(paths)) != len(paths):
+                raise ScriptError(f"sandbox mount {kind} paths must be unique")
+        if self.allowed_paths and not self.denied_paths:
             raise ScriptError(
-                f"a sandbox mount permits at most {MAX_MOUNT_DENIED_PATHS} denied paths"
+                "--mount-allow exposes a path inside a --mount-deny path of the "
+                "same share, which has none"
             )
-        for denied in self.denied_paths:
-            if not denied or "\0" in denied:
-                raise ScriptError("sandbox mount denied paths must be nonempty")
-        if len(set(self.denied_paths)) != len(self.denied_paths):
-            raise ScriptError("sandbox mount denied paths must be unique")
+        if self.writable_paths and self.access != "rw":
+            raise ScriptError(
+                "--mount-write narrows the writes of a read-write share; "
+                f"--mount {self.guest_target} is read-only"
+            )
+
+    def policy_paths(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Return each kind of access-policy path with its requested paths."""
+        return (
+            ("denied", self.denied_paths),
+            ("allowed", self.allowed_paths),
+            ("writable", self.writable_paths),
+        )
 
     def validated(self) -> SandboxMount:
         require_mount_owner_supported(self.owner)
@@ -203,14 +247,22 @@ class SandboxMount:
             access=self.access,
             denied_paths=self.denied_paths,
             owner=self.owner,
+            allowed_paths=self.allowed_paths,
+            writable_paths=self.writable_paths,
         )
 
-    def absolute_denied_paths(self) -> tuple[str, ...]:
-        """Return the denied paths, with relative paths joined to the share."""
+    def _absolute_paths(self, paths: tuple[str, ...]) -> tuple[str, ...]:
         host_path = self.absolute().host_path
         return tuple(
-            denied if Path(denied).is_absolute() else os.fspath(host_path / denied)
-            for denied in self.denied_paths
+            path if Path(path).is_absolute() else os.fspath(host_path / path)
+            for path in paths
+        )
+
+    def absolute_policy_paths(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Return each kind of access-policy path, with relative paths joined
+        to the share."""
+        return tuple(
+            (kind, self._absolute_paths(paths)) for kind, paths in self.policy_paths()
         )
 
     def command_line_fragment(self, tag: str = MOUNT_TAGS[0]) -> str:
@@ -271,13 +323,15 @@ def validate_mount_host_paths(mounts: tuple[SandboxMount, ...]) -> None:
                     "same directory, or one is inside the other through a bind mount"
                 )
     for mount, root in zip(mounts, roots, strict=True):
-        for denied in mount.absolute_denied_paths():
-            if root not in Path(denied).resolve().parents:
-                raise ScriptError(
-                    f"--mount-deny {denied} is not inside the host directory of "
-                    f"--mount {mount.guest_target}; with several shares, each "
-                    "--mount-deny follows the --mount whose directory it hides"
-                )
+        for kind, paths in mount.absolute_policy_paths():
+            option = MOUNT_POLICY_OPTIONS[kind]
+            for path in paths:
+                if root not in Path(path).resolve().parents:
+                    raise ScriptError(
+                        f"{option} {path} is not inside the host directory of "
+                        f"--mount {mount.guest_target}; with several shares, each "
+                        f"{option} follows the --mount whose directory it names"
+                    )
 
 
 def mounts_openvmm_arguments(mounts: tuple[SandboxMount, ...]) -> list[str]:
@@ -291,13 +345,14 @@ def mounts_openvmm_arguments(mounts: tuple[SandboxMount, ...]) -> list[str]:
             )
         )
     for mount in mounts:
-        # OpenVMM resolves a relative denied path in the only share, and
-        # attributes absolute denied paths to the share that contains them.
-        denied_paths = (
-            mount.denied_paths if len(mounts) == 1 else mount.absolute_denied_paths()
+        # OpenVMM resolves a relative policy path in the only share, and
+        # attributes absolute policy paths to the share that contains them.
+        policy_paths = (
+            mount.policy_paths() if len(mounts) == 1 else mount.absolute_policy_paths()
         )
-        for denied in denied_paths:
-            arguments.extend(("--mount-deny", denied))
+        for kind, paths in policy_paths:
+            for path in paths:
+                arguments.extend((MOUNT_POLICY_OPTIONS[kind], path))
     if mounts and mounts[0].owner != "vmm":
         arguments.extend(("--mount-owner", mounts[0].owner))
     return arguments

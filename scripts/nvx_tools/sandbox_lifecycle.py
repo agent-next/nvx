@@ -44,11 +44,17 @@ OWNER_CONFIG_FORMAT = 3
 # And earlier readers know only the single `mount` share, so a configuration
 # with several shares lists them under `mounts` in a format they reject.
 MULTI_MOUNT_CONFIG_FORMAT = 4
+# Format-4 readers would ignore allowed and writable paths and start a share
+# without them, writable everywhere or with its allowed paths hidden, so a
+# configuration with either lists every share under `mounts` in a format that
+# they reject.
+POLICY_CONFIG_FORMAT = 5
 CONFIG_FORMATS = (
     CONFIG_FORMAT,
     MOUNT_CONFIG_FORMAT,
     OWNER_CONFIG_FORMAT,
     MULTI_MOUNT_CONFIG_FORMAT,
+    POLICY_CONFIG_FORMAT,
 )
 OUTCOME_SCHEMA_VERSION = 1
 
@@ -218,14 +224,20 @@ def _serialize_launch(
         "host_loopback_forward": list(host_loopback_forward),
         "cmdline": cmdline,
     }
-    if len(launch.mounts) > 1:
-        config["mounts"] = [_serialize_mount(mount) for mount in launch.mounts]
+    config_format = _config_format(launch.mounts)
+    if config_format in (MULTI_MOUNT_CONFIG_FORMAT, POLICY_CONFIG_FORMAT):
+        config["mounts"] = [
+            _serialize_mount(mount, policy=config_format == POLICY_CONFIG_FORMAT)
+            for mount in launch.mounts
+        ]
     else:
         config["mount"] = _serialize_mount(launch.mounts[0]) if launch.mounts else None
     return config
 
 
 def _config_format(mounts: tuple[SandboxMount, ...]) -> int:
+    if any(mount.allowed_paths or mount.writable_paths for mount in mounts):
+        return POLICY_CONFIG_FORMAT
     if len(mounts) > 1:
         return MULTI_MOUNT_CONFIG_FORMAT
     if len(mounts) == 1 and mounts[0].owner == "caller":
@@ -233,40 +245,54 @@ def _config_format(mounts: tuple[SandboxMount, ...]) -> int:
     return MOUNT_CONFIG_FORMAT if mounts else CONFIG_FORMAT
 
 
-def _serialize_mount(mount: SandboxMount) -> dict[str, Any]:
+def _serialize_mount(mount: SandboxMount, *, policy: bool = False) -> dict[str, Any]:
     absolute = mount.absolute()
-    return {
+    serialized: dict[str, Any] = {
         "guest_target": absolute.guest_target,
         "host_path": os.fspath(absolute.host_path),
         "access": absolute.access,
         "denied_paths": list(absolute.denied_paths),
         "owner": absolute.owner,
     }
+    if policy:
+        serialized["allowed_paths"] = list(absolute.allowed_paths)
+        serialized["writable_paths"] = list(absolute.writable_paths)
+    return serialized
 
 
-def _deserialize_mount(value: object) -> SandboxMount:
+def _deserialize_paths(mount: dict[str, Any], key: str) -> tuple[str, ...]:
+    paths = mount[key]
+    if not isinstance(paths, list):
+        raise TypeError(f"sandbox mount {key.replace('_', ' ')} must be a list")
+    return tuple(str(path) for path in cast(list[object], paths))
+
+
+def _deserialize_mount(value: object, *, policy: bool = False) -> SandboxMount:
     if not isinstance(value, dict):
         raise TypeError("sandbox mount configuration must be an object")
     mount = cast(dict[str, Any], value)
-    denied_paths = mount["denied_paths"]
-    if not isinstance(denied_paths, list):
-        raise TypeError("sandbox mount denied paths must be a list")
     return SandboxMount(
         guest_target=str(mount["guest_target"]),
         host_path=Path(str(mount["host_path"])),
         access=str(mount["access"]),
-        denied_paths=tuple(str(path) for path in cast(list[object], denied_paths)),
+        denied_paths=_deserialize_paths(mount, "denied_paths"),
         # Configurations written before ownership modes ran shares as the VMM.
         owner=str(mount.get("owner", "vmm")),
+        allowed_paths=_deserialize_paths(mount, "allowed_paths") if policy else (),
+        writable_paths=_deserialize_paths(mount, "writable_paths") if policy else (),
     )
 
 
 def _deserialize_mounts(config: dict[str, Any]) -> tuple[SandboxMount, ...]:
-    if config.get("format") == MULTI_MOUNT_CONFIG_FORMAT:
+    if config.get("format") in (MULTI_MOUNT_CONFIG_FORMAT, POLICY_CONFIG_FORMAT):
         mounts = config["mounts"]
         if not isinstance(mounts, list):
             raise TypeError("sandbox mounts configuration must be a list")
-        return tuple(_deserialize_mount(mount) for mount in cast(list[object], mounts))
+        policy = config.get("format") == POLICY_CONFIG_FORMAT
+        return tuple(
+            _deserialize_mount(mount, policy=policy)
+            for mount in cast(list[object], mounts)
+        )
     mount = config.get("mount")
     return () if mount is None else (_deserialize_mount(mount),)
 

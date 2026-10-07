@@ -375,10 +375,21 @@ create untracked host state.
 Read-only mode rejects mutation in the host device before invoking host
 filesystem operations; read-write mode exposes only the supported common host
 contract.
-Denied host paths are canonicalized into a bounded, non-overlapping relative
-set and enforced before HostFs operations. Prefix checks hide complete
-subtrees, while denied root device/inode identities block hard-link, junction,
-and bind-mount aliases. The policy is unchanged by a second guest mount.
+Denied host paths are canonicalized into a bounded relative set and enforced
+before HostFs operations. Prefix checks hide complete subtrees, while denied
+root device/inode identities block hard-link, junction, and bind-mount
+aliases. The policy is unchanged by a second guest mount.
+Allowed host paths expose subtrees of denied paths again; the nearest policy
+path that contains a path decides whether the guest can see it, and denied
+and allowed paths alternate, so neither kind is redundant. A hidden directory
+on the way to an allowed path is traverse-only: the guest can look it up as a
+directory and list only the entries that lead to allowed paths, and its object
+identity is accepted only at its own path. Writable host paths, when present,
+are the only parts of a read-write export that the guest can modify. Every
+namespace mutation checks its directories and the entry paths that it
+creates, removes, or replaces, and every object mutation checks every name
+that the guest has used for the object; refused writes fail with `EROFS`, and
+a hard link to a read-only object from a writable path fails with `EXDEV`.
 
 The ownership mode selects the host identity of guest operations. By default,
 HostFs performs them as the VMM. With `--mount-owner caller`, a Linux host
@@ -392,17 +403,22 @@ or GID 0. A request whose identity cannot be assumed fails with `EPERM` rather
 than running as the VMM. Windows hosts reject the mode.
 
 The exported directory is external live state, not part of the VM snapshot.
-An active capture saves its exact canonical host path, denied-path set,
-ownership mode, FUSE negotiation, node
+An active capture saves its exact canonical host path, denied, allowed, and
+writable paths, ownership mode, FUSE negotiation, node
 and handle allocation, aliases (including those of symbolic links), lookup
 counts, directory snapshots and cookies, and the identities needed to reopen
 objects. Restore requires the same path,
-target, mode, denied-path set, ownership mode, root identity, and reopenable
-objects for every captured attachment, supplied in slot order; the contract
+target, mode, denied, allowed, and writable paths, ownership mode, root
+identity, and reopenable objects for every captured attachment, supplied in
+slot order; the contract
 records the second attachment separately, so a restore can neither drop nor
 add it. A caller-owned
 capture records device-private schema version 6, which earlier releases reject
-instead of restoring the attachment as the VMM. A dormant capture instead
+instead of restoring the attachment as the VMM. A capture with allowed or
+writable paths records its complete access policy in device-private schema
+version 7, which earlier releases reject instead of restoring the attachment
+without its policy, and a restore rejects a handle open for writing outside
+the writable paths. A dormant capture instead
 saves explicit unattached state and may restore with no attachment or bind a
 new HostFs backend. The resumed guest then mounts tag `microvm` explicitly;
 the cold-boot mount hook has already run. Snapshots without this capability

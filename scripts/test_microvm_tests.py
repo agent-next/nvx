@@ -1345,6 +1345,166 @@ class FilesystemSharesScenarioTests(unittest.TestCase):
             self.assertIn("nvx-exit 0", script)
 
 
+class FilesystemPolicyScenarioTests(unittest.TestCase):
+    """The filesystem-policy scenario with OpenVMM and the guest simulated."""
+
+    @staticmethod
+    def _values(command: list[str], option: str) -> list[str]:
+        return [
+            command[index + 1] for index, value in enumerate(command) if value == option
+        ]
+
+    def _run(self, *, guest_writes_outside: bool = False) -> list[list[str]]:
+        launched: list[list[str]] = []
+        values = self._values
+
+        def share_of(command: list[str]) -> Path:
+            return Path(values(command, "--mount")[0].split(",", 2)[1])
+
+        def guest(
+            command: list[str], script: str, marker: bytes, **_kwargs: object
+        ) -> None:
+            launched.append(command)
+            self.assertEqual(marker, microvm_tests.FILESYSTEM_POLICY_MARKER)
+            self.assertIn("mount -t virtiofs microvm /mnt/second", script)
+            share = share_of(command)
+            (share / "out" / "from-guest").write_bytes(b"NVX-GUEST-WRITE\n")
+            (share / "out" / "renamed").write_bytes(b"nested\n")
+            with (share / "build.log").open("ab") as log:
+                log.write(b"APPEND")
+            if guest_writes_outside:
+                (share / "logs" / "payloads" / "mutation").write_bytes(b"")
+
+        class FakeProcess:
+            def __init__(self, command: list[str], _log_path: Path) -> None:
+                launched.append(command)
+                self.command = command
+
+            def __enter__(self) -> "FakeProcess":
+                return self
+
+            def __exit__(self, *_exception: object) -> None:
+                return None
+
+            def wait_for(self, _marker: bytes, _timeout: float) -> None:
+                return None
+
+            def send_bytes(self, _data: bytes) -> None:
+                return None
+
+            def wait(self, _timeout: float) -> openvmm_process.OpenvmmProcessResult:
+                command = self.command
+                share = share_of(command)
+                policy = microvm_tests._policy_arguments(share)
+                if "--snapshot-destination" in command:
+                    snapshot = Path(
+                        command[command.index("--snapshot-destination") + 1]
+                    )
+                    snapshot.mkdir()
+                    for name in ("manifest.bin", "state.bin", "memory.bin"):
+                        (snapshot / name).write_bytes(name.encode())
+                    (share / "out" / "journal").write_bytes(b"NVX-BEFORE")
+                    return openvmm_process.OpenvmmProcessResult(
+                        0, b"NVX-FILESYSTEM-POLICY-BEFORE\n"
+                    )
+                if "--restore-snapshot" in command:
+                    if tuple(command[-len(policy) :]) != policy:
+                        return openvmm_process.OpenvmmProcessResult(
+                            1,
+                            b"restore-time filesystem access policy does not "
+                            b"match the snapshot contract\n",
+                        )
+                    with (share / "out" / "journal").open("ab") as journal:
+                        journal.write(b"NVX-AFTER")
+                    return openvmm_process.OpenvmmProcessResult(
+                        0, b"NVX-FILESYSTEM-POLICY-AFTER\n"
+                    )
+                writes = values(command, "--mount-write")
+                if values(command, "--mount")[0].endswith(",ro"):
+                    error = b"a read-only microVM filesystem cannot have writable paths"
+                elif values(command, "--mount-allow"):
+                    error = b"allowed path 'out' must be inside a denied path"
+                elif values(command, "--mount-deny"):
+                    error = b"writable path 'logs/gateway' is hidden by a denied path"
+                elif len(writes) == 2:
+                    error = b"microVM filesystem writable paths overlap"
+                else:
+                    error = b"writable path cannot be the complete filesystem export"
+                return openvmm_process.OpenvmmProcessResult(2, error + b"\n")
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "run_guest_script", side_effect=guest),
+            patch.object(microvm_tests, "OpenvmmProcess", FakeProcess),
+            patch.object(microvm_tests, "assert_guest_symlink") as symlink,
+        ):
+            microvm_tests.run_filesystem_policy(
+                Path("openvmm"),
+                Path("kernel"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=40,
+                output_dir=Path(temporary),
+            )
+        link, target = symlink.call_args.args
+        self.assertEqual((link.name, target), ("seed-link", "../seed"))
+        return launched
+
+    def test_scenario_narrows_writes_and_restores_the_policy(self):
+        launched = self._run()
+        boot = launched[0]
+        (mount,) = self._values(boot, "--mount")
+        self.assertTrue(mount.startswith("/workspace,") and mount.endswith(",rw"))
+        share = Path(mount.split(",", 2)[1])
+        self.assertEqual(
+            [
+                Path(path).relative_to(share).as_posix()
+                for path in self._values(boot, "--mount-deny")
+            ],
+            ["logs", "logs/payloads/private"],
+        )
+        self.assertEqual(
+            [
+                Path(path).relative_to(share).as_posix()
+                for path in self._values(boot, "--mount-allow")
+            ],
+            ["logs/payloads"],
+        )
+        self.assertEqual(
+            [
+                Path(path).relative_to(share).as_posix()
+                for path in self._values(boot, "--mount-write")
+            ],
+            ["out", "build.log"],
+        )
+
+        # Five invalid policies fail before boot, then a capture with the
+        # policy, two restores with another policy, and the restore with it.
+        self.assertEqual(len(launched), 1 + 5 + 1 + 3)
+        capture = launched[6]
+        self.assertIn("--snapshot-destination", capture)
+        self.assertEqual(
+            self._values(capture, "--mount-write"), self._values(boot, "--mount-write")
+        )
+        self.assertEqual(self._values(launched[7], "--mount-deny"), [])
+        self.assertEqual(len(self._values(launched[8], "--mount-deny")), 1)
+        self.assertEqual(
+            self._values(launched[9], "--mount-allow"),
+            self._values(boot, "--mount-allow"),
+        )
+
+    def test_scenario_rejects_a_write_outside_the_writable_paths(self):
+        with self.assertRaisesRegex(RuntimeError, "outside its writable paths"):
+            self._run(guest_writes_outside=True)
+
+    def test_scenario_is_a_default_correctness_scenario(self):
+        self.assertIn("filesystem-policy", microvm_tests.MICROVM_TEST_SCENARIOS)
+        for name in ("filesystem-policy.sh", "filesystem-policy-snapshot.sh"):
+            script = microvm_tests._read_script(name)
+            self.assertIn("nvx-exit 0", script)
+
+
 class ControlSessionTests(unittest.TestCase):
     def test_named_pipe_connect_retries_transient_invalid_argument(self):
         error = OSError(control_session.errno.EINVAL, "Invalid argument")
