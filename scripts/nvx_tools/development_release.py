@@ -514,6 +514,12 @@ def _publish_development_release_draft(
     raise ScriptError(f"development release {tag} remained a draft after publication")
 
 
+def development_release_tag(version: str, target_sha: str) -> str:
+    """Names the development release that CI publishes for a commit."""
+
+    return f"v{version}-dev.{target_sha[:12]}"
+
+
 def publish_development_release(
     repository: str,
     target_sha: str,
@@ -545,7 +551,7 @@ def publish_development_release(
         raise ScriptError("development release package names must be unique")
 
     short_sha = target_sha[:12]
-    tag = f"v{version}-dev.{short_sha}"
+    tag = development_release_tag(version, target_sha)
     release = _query_development_release(repository, tag)
     if release is None:
         release = _create_development_release(

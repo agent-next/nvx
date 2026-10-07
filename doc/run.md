@@ -1,6 +1,8 @@
 # Run
 
-Download and install the latest release matching the host before the first run:
+Download and install the host platform's package from the release for `HEAD`,
+or from its nearest released first-parent ancestor when `HEAD` has no such
+package, before the first run:
 
 ```bash
 python3 scripts/nvx.py download

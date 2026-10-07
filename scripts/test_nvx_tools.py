@@ -30,6 +30,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import cast
 from unittest.mock import MagicMock, call, patch
@@ -15025,7 +15026,7 @@ class BenchmarkTests(unittest.TestCase):
         args = nvx.parse_args(["download", "--repository", "example/nvx"])
         expected_platform = "windows-whp" if os.name == "nt" else "linux-kvm"
 
-        with patch.object(nvx, "download_latest_release") as download_release:
+        with patch.object(nvx, "download_checkout_release") as download_release:
             args.handler(args)
 
         download_release.assert_called_once_with("example/nvx", expected_platform)
@@ -15034,13 +15035,44 @@ class BenchmarkTests(unittest.TestCase):
         args = nvx.parse_args(["download"])
         expected_platform = "windows-whp" if os.name == "nt" else "linux-kvm"
 
-        with patch.object(nvx, "download_latest_release") as download_release:
+        with patch.object(nvx, "download_checkout_release") as download_release:
             args.handler(args)
 
         download_release.assert_called_once_with("microsoft/nvx", expected_platform)
 
 
 AUTHORIZATION_VALUE = "Bearer placeholder-value"
+
+
+def _git_history(*commits: tuple[str, str | None]) -> Callable[..., str]:
+    """Fakes git_output for HEAD's first-parent history and its VERSION files."""
+
+    versions = dict(commits)
+
+    def git_output(*arguments: str) -> str:
+        if arguments[:2] == ("rev-list", "--first-parent") and arguments[3:] == (
+            "HEAD",
+        ):
+            limit = int(arguments[2].removeprefix("--max-count="))
+            return "\n".join(list(versions)[:limit])
+        if arguments[0] != "show" or not arguments[1].endswith(":VERSION"):
+            raise AssertionError(f"unexpected git command: {arguments}")
+        version = versions[arguments[1].removesuffix(":VERSION")]
+        if version is None:
+            raise subprocess.CalledProcessError(128, ["git", *arguments])
+        return version
+
+    return git_output
+
+
+def _missing_release() -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "https://api.github.invalid/releases/tags/missing",
+        404,
+        "Not Found",
+        http.client.HTTPMessage(),
+        io.BytesIO(b'{"message": "Not Found"}'),
+    )
 
 
 class ReleaseTests(unittest.TestCase):
@@ -15151,58 +15183,300 @@ class ReleaseTests(unittest.TestCase):
                 },
             )
 
-    def test_selects_latest_matching_prerelease_asset(self):
-        releases = [
-            {
-                "draft": True,
-                "tag_name": "v1.2.4-draft",
-                "assets": [
-                    {
-                        "name": "nvx-1.2.4-linux-kvm.tar.gz",
-                        "url": "https://api.example.invalid/draft",
-                        "size": 100,
-                    }
-                ],
-            },
-            {
-                "draft": False,
-                "prerelease": True,
-                "tag_name": "v1.2.3-dev.abc123",
-                "assets": [
-                    {
-                        "name": "nvx-invalid-linux-kvm.tar.gz",
-                        "url": "https://api.example.invalid/invalid",
-                        "size": True,
-                    },
-                    {
-                        "name": "nvx-1.2.3-windows-whp.zip",
-                        "url": "https://api.example.invalid/windows",
-                        "size": 200,
-                    },
-                    {
-                        "name": "nvx-1.2.3-linux-kvm.tar.gz",
-                        "url": "https://api.example.invalid/linux",
-                        "size": 300,
-                    },
-                ],
-            },
-        ]
-        response = io.BytesIO(json.dumps(releases).encode("utf-8"))
+    def test_downloads_release_built_from_head(self):
+        published = {
+            "draft": False,
+            "prerelease": True,
+            "tag_name": "v1.2.3-dev.aaaaaaaaaaaa",
+            "assets": [
+                {
+                    "name": "nvx-invalid-linux-kvm.tar.gz",
+                    "url": "https://api.example.invalid/invalid",
+                    "size": True,
+                },
+                {
+                    "name": "nvx-1.2.3-windows-whp.zip",
+                    "url": "https://api.example.invalid/windows",
+                    "size": 200,
+                },
+                {
+                    "name": "nvx-1.2.3-linux-kvm.tar.gz",
+                    "url": "https://api.example.invalid/linux",
+                    "size": 300,
+                },
+            ],
+        }
 
-        with patch(
-            "nvx_tools.release.urllib.request.OpenerDirector.open",
-            return_value=response,
+        with (
+            patch.object(
+                release,
+                "git_output",
+                side_effect=_git_history(("a" * 40, "1.2.3"), ("b" * 40, "1.2.3")),
+            ) as git_output,
+            patch(
+                "nvx_tools.release.urllib.request.OpenerDirector.open",
+                return_value=io.BytesIO(json.dumps(published).encode("utf-8")),
+            ) as opener_open,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
-            asset = release._latest_release_asset(
+            asset = release._checkout_release_asset(
                 "example/nvx",
                 "linux-kvm",
                 "token",
             )
 
-        self.assertEqual(asset.tag, "v1.2.3-dev.abc123")
-        self.assertEqual(asset.name, "nvx-1.2.3-linux-kvm.tar.gz")
-        self.assertEqual(asset.url, "https://api.example.invalid/linux")
-        self.assertEqual(asset.size, 300)
+        self.assertEqual(
+            git_output.call_args_list[0],
+            call(
+                "rev-list",
+                "--first-parent",
+                f"--max-count={release._RELEASE_SEARCH_COMMITS}",
+                "HEAD",
+            ),
+        )
+        self.assertEqual(opener_open.call_count, 1)
+        self.assertEqual(
+            opener_open.call_args.args[0].full_url,
+            "https://api.github.com/repos/example/nvx/releases/tags/"
+            "v1.2.3-dev.aaaaaaaaaaaa",
+        )
+        self.assertEqual(
+            asset,
+            release._ReleaseAsset(
+                "v1.2.3-dev.aaaaaaaaaaaa",
+                "nvx-1.2.3-linux-kvm.tar.gz",
+                "https://api.example.invalid/linux",
+                300,
+            ),
+        )
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_skips_draft_release_built_from_head(self):
+        def response(commit: str, draft: bool) -> io.BytesIO:
+            tag = f"v1.2.3-dev.{commit[:12]}"
+            document = {
+                "draft": draft,
+                "tag_name": tag,
+                "assets": [
+                    {
+                        "name": "nvx-1.2.3-linux-kvm.tar.gz",
+                        "url": f"https://api.example.invalid/{tag}/linux-kvm.tar.gz",
+                        "size": 300,
+                    }
+                ],
+            }
+            return io.BytesIO(json.dumps(document).encode("utf-8"))
+
+        with (
+            patch.object(
+                release,
+                "git_output",
+                side_effect=_git_history(("a" * 40, "1.2.3"), ("b" * 40, "1.2.3")),
+            ),
+            patch(
+                "nvx_tools.release.urllib.request.OpenerDirector.open",
+                side_effect=[
+                    response("a" * 40, True),
+                    response("b" * 40, False),
+                ],
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            asset = release._checkout_release_asset(
+                "example/nvx",
+                "linux-kvm",
+                "token",
+            )
+
+        self.assertEqual(asset.tag, "v1.2.3-dev.bbbbbbbbbbbb")
+        self.assertEqual(
+            stdout.getvalue(),
+            ">> no linux-kvm release for HEAD; using v1.2.3-dev.bbbbbbbbbbbb, "
+            "1 first-parent commit earlier\n",
+        )
+
+    def test_walks_first_parent_history_to_the_nearest_release(self):
+        def published(version: str, commit: str, *packages: str) -> io.BytesIO:
+            tag = f"v{version}-dev.{commit[:12]}"
+            document = {
+                "tag_name": tag,
+                "assets": [
+                    {
+                        "name": f"nvx-{version}-{package}",
+                        "url": f"https://api.example.invalid/{tag}/{package}",
+                        "size": 100,
+                    }
+                    for package in packages
+                ],
+            }
+            return io.BytesIO(json.dumps(document).encode("utf-8"))
+
+        # HEAD has no release, b has no VERSION file, c's release has no KVM
+        # package, and d's release predates a version bump.
+        history = _git_history(
+            ("a" * 40, "1.2.3"),
+            ("b" * 40, None),
+            ("c" * 40, "1.2.3"),
+            ("d" * 40, "1.2.2"),
+            ("e" * 40, "1.2.2"),
+        )
+        responses = [
+            _missing_release(),
+            published("1.2.3", "c" * 40, "windows-whp.zip"),
+            published("1.2.2", "d" * 40, "windows-whp.zip", "linux-kvm.tar.gz"),
+        ]
+
+        with (
+            patch.object(release, "git_output", side_effect=history),
+            patch(
+                "nvx_tools.release.urllib.request.OpenerDirector.open",
+                side_effect=responses,
+            ) as opener_open,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            asset = release._checkout_release_asset("example/nvx", "linux-kvm", None)
+
+        tags = "https://api.github.com/repos/example/nvx/releases/tags"
+        self.assertEqual(
+            [request.args[0].full_url for request in opener_open.call_args_list],
+            [
+                f"{tags}/v1.2.3-dev.aaaaaaaaaaaa",
+                f"{tags}/v1.2.3-dev.cccccccccccc",
+                f"{tags}/v1.2.2-dev.dddddddddddd",
+            ],
+        )
+        self.assertEqual(asset.tag, "v1.2.2-dev.dddddddddddd")
+        self.assertEqual(
+            asset.url,
+            "https://api.example.invalid/v1.2.2-dev.dddddddddddd/linux-kvm.tar.gz",
+        )
+        self.assertEqual(
+            stdout.getvalue(),
+            ">> no linux-kvm release for HEAD; using v1.2.2-dev.dddddddddddd, "
+            "3 first-parent commits earlier\n",
+        )
+
+    def test_reports_when_no_searched_commit_has_a_release(self):
+        with (
+            patch.object(
+                release,
+                "git_output",
+                side_effect=_git_history(("a" * 40, "1.2.3"), ("b" * 40, "1.2.3")),
+            ),
+            patch(
+                "nvx_tools.release.urllib.request.OpenerDirector.open",
+                side_effect=[_missing_release(), _missing_release(), io.BytesIO(b"{}")],
+            ) as opener_open,
+            self.assertRaisesRegex(
+                release.ScriptError,
+                r"no example/nvx release with an NVX package for linux-kvm was built "
+                r"from HEAD or its first-parent ancestors \(2 commits searched\)",
+            ),
+        ):
+            release._checkout_release_asset("example/nvx", "linux-kvm", None)
+
+        self.assertEqual(
+            opener_open.call_args.args[0].full_url,
+            "https://api.github.com/repos/example/nvx",
+        )
+
+    def test_download_requires_a_git_checkout(self):
+        failure = subprocess.CalledProcessError(
+            128,
+            ["git", "rev-list"],
+            stderr="fatal: not a git repository (or any of the parent directories)\n",
+        )
+
+        with (
+            patch.object(release, "git_output", side_effect=failure),
+            patch(
+                "nvx_tools.release.urllib.request.OpenerDirector.open"
+            ) as opener_open,
+            self.assertRaisesRegex(
+                release.ScriptError,
+                "download needs a Git checkout to find its release: "
+                "fatal: not a git repository",
+            ),
+        ):
+            release._checkout_release_asset("example/nvx", "linux-kvm", None)
+
+        opener_open.assert_not_called()
+
+    def test_version_lookup_reports_git_execution_failures(self):
+        commit = "a" * 40
+        failures = (
+            OSError("git unavailable"),
+            subprocess.TimeoutExpired(["git", "show"], 30),
+        )
+        for failure in failures:
+            with (
+                self.subTest(failure=type(failure).__name__),
+                patch.object(release, "git_output", side_effect=failure),
+                self.assertRaisesRegex(
+                    release.ScriptError,
+                    f"download failed to read VERSION at {commit}",
+                ) as raised,
+            ):
+                release._version_at(commit)
+
+            self.assertIs(raised.exception.__cause__, failure)
+
+    def test_first_parent_history_and_versions_come_from_git(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith("GIT_CONFIG_")
+            }
+            environment.update(
+                GIT_AUTHOR_NAME="NVX Tests",
+                GIT_AUTHOR_EMAIL="nvx-tests@example.com",
+                GIT_COMMITTER_NAME="NVX Tests",
+                GIT_COMMITTER_EMAIL="nvx-tests@example.com",
+            )
+
+            def git(*args: str, data: bytes = b"") -> str:
+                result = subprocess.run(
+                    ["git", "-C", str(root), *args],
+                    input=data,
+                    env=environment,
+                    capture_output=True,
+                    check=True,
+                )
+                return result.stdout.decode("ascii").strip()
+
+            def commit(version: str | None, *parents: str) -> str:
+                entries = b""
+                if version is not None:
+                    blob = git(
+                        "hash-object", "-w", "--stdin", data=f"{version}\n".encode()
+                    )
+                    entries = f"100644 blob {blob}\tVERSION\n".encode()
+                tree = git("mktree", data=entries)
+                parent_arguments = [
+                    argument for parent in parents for argument in ("-p", parent)
+                ]
+                return git(
+                    "commit-tree", "--no-gpg-sign", tree, *parent_arguments, "-m", "x"
+                )
+
+            git("init", "-q")
+            first = commit("1.2.2")
+            merged = commit("9.9.9", first)
+            second = commit("1.2.3", first)
+            merge = commit("1.2.3", second, merged)
+            head = commit(None, merge)
+            git("update-ref", "HEAD", head)
+
+            with patch.object(BuildConstants, "REPO_ROOT", root):
+                commits = release._first_parent_commits(10)
+                limited = release._first_parent_commits(2)
+                versions = [release._version_at(commit_id) for commit_id in commits]
+
+        self.assertEqual(commits, [head, merge, second, first])
+        self.assertEqual(limited, [head, merge])
+        self.assertEqual(versions, [None, "1.2.3", "1.2.3", "1.2.2"])
 
     def test_forbidden_release_query_reports_github_message_and_hint(self):
         error = urllib.error.HTTPError(
@@ -15218,13 +15492,18 @@ class ReleaseTests(unittest.TestCase):
         )
 
         with (
+            patch.object(
+                release,
+                "git_output",
+                side_effect=_git_history(("a" * 40, "1.2.3")),
+            ),
             patch(
                 "nvx_tools.release.urllib.request.OpenerDirector.open",
                 side_effect=error,
             ),
             self.assertRaises(release.ScriptError) as context,
         ):
-            release._latest_release_asset("example/nvx", "linux-kvm", "token")
+            release._checkout_release_asset("example/nvx", "linux-kvm", "token")
 
         message = str(context.exception)
         self.assertIn("HTTP 403", message)
@@ -15240,14 +15519,22 @@ class ReleaseTests(unittest.TestCase):
             io.BytesIO(b"not json"),
         )
 
+        # The release lookup's 404 is a miss; the repository's 404 is the error.
         with (
+            patch.object(
+                release,
+                "git_output",
+                side_effect=_git_history(("a" * 40, "1.2.3")),
+            ),
             patch(
                 "nvx_tools.release.urllib.request.OpenerDirector.open",
                 side_effect=error,
-            ),
-            self.assertRaisesRegex(release.ScriptError, "set GH_TOKEN"),
+            ) as opener_open,
+            self.assertRaisesRegex(release.ScriptError, "HTTP 404.*set GH_TOKEN"),
         ):
-            release._latest_release_asset("example/nvx", "linux-kvm", None)
+            release._checkout_release_asset("example/nvx", "linux-kvm", None)
+
+        self.assertEqual(opener_open.call_count, 2)
 
     def test_exhausted_rate_limit_reports_retry_hint(self):
         headers = http.client.HTTPMessage()
@@ -15261,13 +15548,18 @@ class ReleaseTests(unittest.TestCase):
         )
 
         with (
+            patch.object(
+                release,
+                "git_output",
+                side_effect=_git_history(("a" * 40, "1.2.3")),
+            ),
             patch(
                 "nvx_tools.release.urllib.request.OpenerDirector.open",
                 side_effect=error,
             ),
             self.assertRaisesRegex(release.ScriptError, "rate limit is exhausted"),
         ):
-            release._latest_release_asset("example/nvx", "linux-kvm", "token")
+            release._checkout_release_asset("example/nvx", "linux-kvm", "token")
 
     def test_forbidden_query_falls_back_to_public_release(self):
         error = urllib.error.HTTPError(
@@ -15283,30 +15575,33 @@ class ReleaseTests(unittest.TestCase):
         )
         public_response = io.BytesIO(
             json.dumps(
-                [
-                    {
-                        "draft": False,
-                        "tag_name": "v1.2.3",
-                        "assets": [
-                            {
-                                "name": "nvx-1.2.3-linux-kvm.tar.gz",
-                                "url": "https://api.example.invalid/linux",
-                                "size": 300,
-                            }
-                        ],
-                    }
-                ]
+                {
+                    "draft": False,
+                    "tag_name": "v1.2.3-dev.aaaaaaaaaaaa",
+                    "assets": [
+                        {
+                            "name": "nvx-1.2.3-linux-kvm.tar.gz",
+                            "url": "https://api.example.invalid/linux",
+                            "size": 300,
+                        }
+                    ],
+                }
             ).encode("utf-8")
         )
 
         with (
+            patch.object(
+                release,
+                "git_output",
+                side_effect=_git_history(("a" * 40, "1.2.3")),
+            ),
             patch(
                 "nvx_tools.release.urllib.request.OpenerDirector.open",
                 side_effect=[error, public_response],
             ) as opener_open,
             patch("sys.stderr", io.StringIO()) as stderr,
         ):
-            asset, download_token = release._latest_release_asset_with_fallback(
+            asset, download_token = release._checkout_release_asset_with_fallback(
                 "example/nvx",
                 "linux-kvm",
                 "token",
@@ -15317,7 +15612,7 @@ class ReleaseTests(unittest.TestCase):
         public_request = opener_open.call_args_list[1].args[0]
         self.assertIsNotNone(authenticated_request.get_header("Authorization"))
         self.assertIsNone(public_request.get_header("Authorization"))
-        self.assertEqual(asset.tag, "v1.2.3")
+        self.assertEqual(asset.tag, "v1.2.3-dev.aaaaaaaaaaaa")
         self.assertIsNone(download_token)
         self.assertIn("retrying without credentials", stderr.getvalue())
 
@@ -15393,14 +15688,14 @@ class ReleaseTests(unittest.TestCase):
             patch.dict(os.environ, {"GH_TOKEN": "token"}),
             patch.object(
                 release,
-                "_latest_release_asset",
+                "_checkout_release_asset",
                 side_effect=[authenticated_error, asset],
             ) as latest_release_asset,
             patch.object(release, "download", side_effect=write_archive) as download,
             patch.object(release, "_install_release_archive") as install,
             patch("sys.stderr", stderr),
         ):
-            release.download_latest_release("example/nvx", "linux-kvm")
+            release.download_checkout_release("example/nvx", "linux-kvm")
 
         self.assertEqual(
             latest_release_asset.call_args_list,
@@ -15427,7 +15722,7 @@ class ReleaseTests(unittest.TestCase):
             patch.dict(os.environ, {"GH_TOKEN": "token"}),
             patch.object(
                 release,
-                "_latest_release_asset",
+                "_checkout_release_asset",
                 side_effect=[authenticated_error, public_error],
             ),
             patch("sys.stderr", io.StringIO()),
@@ -15436,7 +15731,7 @@ class ReleaseTests(unittest.TestCase):
                 "authenticated query failed",
             ),
         ):
-            release.download_latest_release("example/nvx", "linux-kvm")
+            release.download_checkout_release("example/nvx", "linux-kvm")
 
     def test_authenticated_asset_download_uses_credential_safe_opener(self):
         asset = release._ReleaseAsset(
@@ -15463,11 +15758,11 @@ class ReleaseTests(unittest.TestCase):
 
         with (
             patch.dict(os.environ, {"GH_TOKEN": "token"}),
-            patch.object(release, "_latest_release_asset", return_value=asset),
+            patch.object(release, "_checkout_release_asset", return_value=asset),
             patch.object(release, "download", side_effect=write_archive) as download,
             patch.object(release, "_install_release_archive") as install,
         ):
-            release.download_latest_release("example/nvx", "linux-kvm")
+            release.download_checkout_release("example/nvx", "linux-kvm")
 
         self.assertEqual(download.call_count, 1)
         install.assert_called_once()
