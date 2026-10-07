@@ -1096,7 +1096,7 @@ class FilesystemOwnerTests(unittest.TestCase):
     def test_scenario_runs_as_caller_and_checks_host_ownership(self):
         if sys.platform == "linux":
             if os.geteuid() == 0:
-                self.skipTest("root runs chown the share to another owner")
+                self.skipTest("root would chown the share to another owner")
         scripts: list[str] = []
 
         def guest(command: list[str], script: str, *_args: object, **_kwargs: object):
@@ -1158,7 +1158,7 @@ class FilesystemOwnerTests(unittest.TestCase):
         if sys.platform != "linux":
             self.skipTest("caller ownership requires a Linux host")
         if os.geteuid() == 0:
-            self.skipTest("root runs chown the share to another owner")
+            self.skipTest("root would chown the share to another owner")
         scripts: list[str] = []
 
         def run_scenario(*, guest_writes: bool) -> None:
