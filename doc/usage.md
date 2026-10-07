@@ -622,11 +622,12 @@ the time ABI requires. A host profile is for development only:
 - `doctor` never qualifies it, so benchmark and CI hosts need a built-in
   profile.
 
-[#390](https://github.com/microsoft/nvx/issues/390) tracks built-in profiles
-for more CPUs, and [#396](https://github.com/microsoft/nvx/issues/396) for
-more AMD CPUs; host profiles serve no CPU of another vendor than Intel and
-AMD. A profile derives from fingerprints of its generation's hosts on every
-backend that it serves; see `vmm_core/cpu_profile` in the OpenVMM submodule.
+[#408](https://github.com/microsoft/nvx/issues/408) tracks built-in profiles
+for more Intel CPUs, such as Tiger Lake and Meteor Lake, and
+[#396](https://github.com/microsoft/nvx/issues/396) for more AMD CPUs; host
+profiles serve no CPU of another vendor than Intel and AMD. A profile derives
+from fingerprints of its generation's hosts on every backend that it serves;
+see `vmm_core/cpu_profile` in the OpenVMM submodule.
 
 ## Benchmarking
 

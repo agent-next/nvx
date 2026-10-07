@@ -270,7 +270,11 @@ class FieldParsingTests(unittest.TestCase):
         )
         self.assertIn(time_abi.describe_cpu_generations(), guidance)
         self.assertIn("rerun with --cpu-profile host", guidance)
-        self.assertIn("https://github.com/microsoft/nvx/issues/390", guidance)
+        self.assertIn(
+            "https://github.com/microsoft/nvx/issues/408 tracks CPU profiles for "
+            "more Intel CPUs.",
+            guidance,
+        )
         self.assertEqual(
             guidance, time_abi.host_cpu_unsupported_guidance("auto", tiger_lake)
         )
@@ -292,16 +296,21 @@ class FieldParsingTests(unittest.TestCase):
         )
         self.assertIn(time_abi.describe_cpu_generations(), guidance)
         self.assertIn("rerun with --cpu-profile host", guidance)
-        self.assertIn("https://github.com/microsoft/nvx/issues/396", guidance)
-        self.assertNotIn("issues/390", guidance)
+        self.assertIn(
+            "https://github.com/microsoft/nvx/issues/396 tracks CPU profiles for "
+            "more AMD CPUs.",
+            guidance,
+        )
+        self.assertNotIn("issues/408", guidance)
         self.assertIsNone(time_abi.host_cpu_unsupported_guidance("host", genoa))
-        # Another vendor gets no suggestion, with either request.
+        # Another vendor gets no suggestion, with either request, and no
+        # issue: the time ABI does not serve its CPUs.
         hygon = time_abi.HostCpu("HygonGenuine", 24, 0, 1)
         guidance = time_abi.host_cpu_unsupported_guidance("auto", hygon)
         assert guidance is not None
         self.assertNotIn("rerun with", guidance)
         self.assertIn("host CPU profiles serve only Intel and AMD CPUs", guidance)
-        self.assertIn("https://github.com/microsoft/nvx/issues/390", guidance)
+        self.assertNotIn("github.com", guidance)
         self.assertEqual(
             guidance, time_abi.host_cpu_unsupported_guidance("host", hygon)
         )

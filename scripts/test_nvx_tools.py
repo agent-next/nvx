@@ -1736,7 +1736,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertIn("alderlake 6/151 and 6/154", output)
         self.assertIn("rerun with --cpu-profile host", output)
-        self.assertIn("https://github.com/microsoft/nvx/issues/390", output)
+        self.assertIn("https://github.com/microsoft/nvx/issues/408", output)
         self.assertEqual(run(1, "auto"), (1, output))
         # Host profiles serve AMD CPUs too, so an AMD host that no built-in
         # profile serves gets the same suggestion, with the issue that tracks
@@ -1746,7 +1746,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("AuthenticAMD 25/33/0", output)
         self.assertIn("rerun with --cpu-profile host", output)
         self.assertIn("https://github.com/microsoft/nvx/issues/396", output)
-        self.assertNotIn("issues/390", output)
+        self.assertNotIn("issues/408", output)
         self.assertEqual(run(1, "host", host=zen3), (1, ""))
         # Host profiles serve only Intel and AMD CPUs, so another vendor's
         # host gets no such suggestion, with either request.
