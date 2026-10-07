@@ -58,11 +58,12 @@ steps:
     continue-on-error: true
     run: |
       set -euo pipefail
-      # Keep the toolchain in sync with the `toolchain` input of
-      # .github/actions/check-aci-edge-sandboxes/action.yml. The crate's minimum
-      # supported Rust version comes from its manifest, as it does in that action.
-      toolchain="1.93"
+      # Use the toolchains of .github/actions/check-aci-edge-sandboxes/action.yml:
+      # the release that rust-toolchain.toml pins, and the crate's minimum supported
+      # Rust version from its manifest.
+      toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
       msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' aci_edge_sandboxes/Cargo.toml)
+      test -n "${toolchain}"
       test -n "${msrv}"
       # Later steps and the sandboxed agent inherit these variables. The
       # baseline script reads both toolchains, and the skip value keeps every

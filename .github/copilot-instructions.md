@@ -46,8 +46,9 @@
   agents panel, run on a GitHub-hosted Ubuntu runner that
   [copilot-setup-steps](./workflows/copilot-setup-steps.yml) prepares. It
   initializes `openvmm/`; installs `requirements-dev.txt` into a Python virtual
-  environment on `PATH`, Rust stable with the OpenVMM test targets, the
-  `aci_edge_sandboxes` toolchains, cargo-nextest, and the native guest build
+  environment on `PATH`, the Rust release that `rust-toolchain.toml` pins with
+  the OpenVMM test targets, the `aci_edge_sandboxes` minimum supported Rust
+  version, cargo-nextest, and the native guest build
   prerequisites; grants `/dev/kvm` access; pulls the pinned shell linter images;
   and stages the pinned Linux and Ubuntu Base archives in `.cache/downloads`.
   When CI has cached them for the checked-out inputs, it also restores the guest

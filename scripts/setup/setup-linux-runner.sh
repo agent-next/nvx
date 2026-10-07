@@ -2,8 +2,8 @@
 
 set -eu
 
-RUST_TOOLCHAIN=stable
-RUST_MINIMUM_VERSION=1.95.0
+# The release that rust-toolchain.toml pins.
+RUST_TOOLCHAIN=1.95.0
 RUSTUP_VERSION=1.29.1
 RUSTUP_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
 CARGO_NEXTEST_VERSION=0.9.133
@@ -478,8 +478,8 @@ install_rust_tools() {
         RUSTUP_HOME="$trusted_rustup_home" \
         RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" \
         "$rustc" --version | awk '{print $2}')
-    version_at_least "$rust_version" "$RUST_MINIMUM_VERSION" ||
-        die "Rust ${RUST_MINIMUM_VERSION} or newer is required"
+    [ "$rust_version" = "$RUST_TOOLCHAIN" ] ||
+        die "Rust ${RUST_TOOLCHAIN} is required, found ${rust_version}"
     if [ ! -x "$nextest" ] ||
         ! "$nextest" --version | grep -Fq "cargo-nextest ${CARGO_NEXTEST_VERSION}"; then
         run_as_root env \
@@ -626,8 +626,8 @@ check_environment() {
         die "Python 3.10.0 or newer is required"
     rust_version=$(run_as_runner env RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN \
         rustc --version | awk '{print $2}')
-    version_at_least "$rust_version" "$RUST_MINIMUM_VERSION" ||
-        die "Rust ${RUST_MINIMUM_VERSION} or newer is required"
+    [ "$rust_version" = "$RUST_TOOLCHAIN" ] ||
+        die "Rust ${RUST_TOOLCHAIN} is required, found ${rust_version}"
     run_as_runner cargo nextest --version |
         grep -Fq "cargo-nextest ${CARGO_NEXTEST_VERSION}" ||
         die "cargo-nextest ${CARGO_NEXTEST_VERSION} is not installed"

@@ -120,7 +120,7 @@ class OpenVMMBuildConstants:
     TARGET_DIRECTORY_NAME: Final = "target"
     BUILD_PROFILE: Final = "release"
     MUSL_SYSROOT: Final = Path(".packages") / "extracted" / "x86_64-sysroot"
-    RUST_TOOLCHAIN: Final = "stable"
+    RUST_TOOLCHAIN: Final = "1.95.0"
     GNU_RUST_TARGET: Final = "x86_64-unknown-linux-gnu"
     MUSL_RUST_TARGET: Final = "x86_64-unknown-linux-musl"
     WINDOWS_RUST_TARGET: Final = "x86_64-pc-windows-msvc"
@@ -415,6 +415,7 @@ class ReleaseBuildConstants:
         "VERSION",
         "pyproject.toml",
         "requirements-dev.txt",
+        "rust-toolchain.toml",
     )
     GUEST_ARTIFACT_NAMES: Final = (
         KernelBuildConstants.BINARY_NAME,

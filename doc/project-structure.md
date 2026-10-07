@@ -106,6 +106,7 @@ nvx/
 |-- pyproject.toml               Pyright and Ruff configuration
 |-- README.md                    Project overview and documentation index
 |-- requirements-dev.txt         Pinned Python development tools
+|-- rust-toolchain.toml          Pinned Rust release
 |-- SOURCE-MANIFEST.json         Pinned source versions, hashes, and outputs
 |-- THIRD_PARTY_NOTICES.md       Third-party attribution and notices
 `-- VERSION                      NVX release version
@@ -212,6 +213,7 @@ covering those utilities.
 | `README.md` | Project overview and documentation index |
 | `pyproject.toml` | Strict Pyright policy plus Ruff lint and format settings |
 | `requirements-dev.txt` | Pinned Python tools used by contributors and CI |
+| `rust-toolchain.toml` | Rust release that builds OpenVMM, its test guests, and the repository's Rust code |
 | `SOURCE-MANIFEST.json` | Exact Linux, Alpine, and Ubuntu source identities and output locations |
 | `VERSION` | Distribution version consumed by packaging tools |
 | `.gitmodules` | OpenVMM repository URL, path, and tracking branch |

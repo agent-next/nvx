@@ -313,6 +313,7 @@ def _prepare_openvmm_test_environment(
     backend: str,
     rustup: str,
 ) -> dict[str, str]:
+    toolchain = OpenVMMBuildConstants.RUST_TOOLCHAIN
     targets = OpenVMMBuildConstants.TEST_RUST_TARGETS[backend]
     installed = run_capture(
         [
@@ -321,26 +322,30 @@ def _prepare_openvmm_test_environment(
             "list",
             "--installed",
             "--toolchain",
-            OpenVMMBuildConstants.RUST_TOOLCHAIN,
+            toolchain,
         ]
     )
-    require_success(installed, "installed Rust target query")
-    installed_targets = set(installed.stdout.decode("utf-8").splitlines())
+    # rustup rejects the query when the pinned toolchain is not installed.
+    toolchain_installed = installed.returncode == 0
+    installed_targets: set[str] = set()
+    if toolchain_installed:
+        installed_targets.update(installed.stdout.decode("utf-8").splitlines())
 
     environment = os.environ.copy()
-    environment["RUSTUP_TOOLCHAIN"] = OpenVMMBuildConstants.RUST_TOOLCHAIN
+    environment["RUSTUP_TOOLCHAIN"] = toolchain
     runner_temp_value = os.environ.get("RUNNER_TEMP")
     if not installed_targets.issuperset(targets):
         if runner_temp_value:
             environment["RUSTUP_HOME"] = os.fspath(
                 Path(runner_temp_value) / OpenVMMBuildConstants.RUSTUP_DIRECTORY_NAME
             )
+        if runner_temp_value or not toolchain_installed:
             run_checked(
                 [
                     rustup,
                     "toolchain",
                     "install",
-                    OpenVMMBuildConstants.RUST_TOOLCHAIN,
+                    toolchain,
                     "--profile",
                     "minimal",
                 ],
@@ -354,7 +359,7 @@ def _prepare_openvmm_test_environment(
                 "add",
                 *targets,
                 "--toolchain",
-                OpenVMMBuildConstants.RUST_TOOLCHAIN,
+                toolchain,
             ],
             env=environment,
         )
