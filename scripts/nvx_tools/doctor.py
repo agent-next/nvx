@@ -16,7 +16,6 @@ import itertools
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -26,7 +25,12 @@ from pathlib import Path
 from .benchmark import run_guest_script, workload_boot_command
 from .build_constants import AlpineBuildConstants, BuildConstants, KernelBuildConstants
 from .ci import OPENVMM_TEST_BACKENDS
-from .common import ScriptError, artifact_path, openvmm_binary_path
+from .common import (
+    ScriptError,
+    artifact_path,
+    openvmm_binary_path,
+    require_tool,
+)
 from .time_abi import (
     CI_WARP_GAPS,
     LAPIC_HZ,
@@ -165,9 +169,7 @@ def build_probe(directory: Path) -> Path:
     target = probe_path(directory)
     if target.is_file():
         return target
-    rustc = shutil.which("rustc")
-    if rustc is None:
-        raise ScriptError("rustc is required to build the host time probe")
+    rustc = require_tool("rustc", "rustc is required to build the host time probe")
     directory.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.stem}-{os.getpid()}{target.suffix}")
     completed = subprocess.run(
