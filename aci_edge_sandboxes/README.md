@@ -3,12 +3,15 @@
 `aci_edge_sandboxes` is the Rust interface to the ACI Edge Sandboxes lifecycle.
 It exposes provision, start, exec, stop, and deprovision through a pluggable
 backend. The default backend drives the `openvmm` binary directly; no daemon or
-Python tooling is involved at runtime.
+Python tooling is involved at runtime. The optional `agent` backend uses a
+separately supplied native library, `aci_edge_agent`, and a different, image-backed guest.
 
-Each sandbox is a microVM that runs the NVX guest's Alpine Linux userland
-directly from its initramfs. There are no image layers, scratch disks, or
-container namespaces; workloads run as a non-root user in the guest itself, and
-guest state lives in memory until the sandbox stops.
+By default, each sandbox is a microVM that runs the NVX guest's Alpine Linux
+userland directly from its initramfs. That backend has no image layers, scratch
+disks, or container namespaces; workloads run as a non-root user in the guest
+itself, and guest state lives in memory until the sandbox stops. The opt-in
+native backend instead runs commands against a caller-supplied, read-only GPT
+image with a RAM overlay.
 
 The Cargo package, library, and directory are named `aci_edge_sandboxes`.
 
@@ -95,19 +98,281 @@ envelope (`version`, `phase`, and `containment`) belongs to the caller.
 - Backends in this crate:
   - `openvmm::OpenVmmBackend` (feature `openvmm`, default) drives the `openvmm`
     executable.
+  - `agent::AgentBackend` (feature `agent`) forwards the lifecycle to a separately
+    supplied native library, which drives OpenVMM and an image-backed guest.
   - `testing::MockBackend` (feature `testing`) implements the state machine in
     memory for consumers' unit tests.
 - `AsyncAciEdgeSandbox` (feature `async`) wraps `AciEdgeSandbox` for Tokio. Lifecycle calls run on
   the blocking pool, and output arrives as `AsyncRead` streams. A call keeps
   running when its future is dropped. A dropped `exec` requests the
   cancellation of its workload as soon as the workload starts, but only
-  backends whose `capabilities().exec.cancel` is true, such as the OpenVMM
-  backend, honor the request; with other backends, the workload runs until it
-  ends. The other calls complete, so the sandbox's state shows their effects.
+  backends whose `capabilities().exec.cancel` is true, such as the OpenVMM and
+  agent backends, honor the request; with other backends, the workload
+  runs until it ends. The other calls complete, so the sandbox's state shows
+  their effects.
 
 To add a backend, implement `Backend`. Declare only the capabilities it can
 enforce, and report state-machine violations with the codes listed in the
 [error mapping](#error-mapping).
+
+## Agent backend (opt-in)
+
+Enable `agent` to use `AciEdgeSandbox::agent(AgentConfig)`. This backend is a thin client of a
+separately supplied native library, `aci_edge_agent.dll` (`libaci_edge_agent.so` on Linux),
+which owns the whole sandbox lifecycle: the state root and its records, the OpenVMM processes
+and their boot consoles, the guest sessions, and the guest images. The default direct-OpenVMM
+backend and its Alpine guest are unchanged. The crate does **not** build, download, or publish
+the library.
+
+`AgentConfig` names the library, the SHA-256 of the library that the caller's own policy
+approved, and a `SetupConfig`, which the library applies once per process:
+
+```jsonc
+{
+  "stateRoot": "C:\\nvx-edge-state",
+  // A release bundle trusted through its manifest's SHA-256, or explicit files:
+  // "runtime": { "files": { "openvmm": "…", "kernel": "…", "initrd": "…" } }
+  "runtime": { "bundle": { "path": "C:\\nvx\\edge", "manifestSha256": "<64 hex digits>" } },
+  "hypervisor": "whp",          // optional; KVM on Linux and WHP on Windows otherwise
+  "cpuProfile": "auto",         // or "host"
+  "timeouts": { "startMs": 60000, "controlMs": 60000, "stopMs": 30000, "execGraceMs": 30000 },
+  "defaults": {                 // what a sandbox inherits unless its spec sets it
+    "image": { "path": "C:\\images\\layers.gpt" },
+    "resources": { "vcpus": 1, "memoryMib": 256 },
+    "guestNetwork": "10.0.0.2/24"
+  },
+  "diagnostics": { "guestDebug": false, "contentVerification": false }
+}
+```
+
+Every field except `stateRoot` and `runtime` has a default. A bundle directory holds a format-1
+`SOURCE-MANIFEST.json` of the `edge` profile, `bin/openvmm[.exe]`, `guest/vmlinux`, and
+`guest/initramfs-edge.cpio.gz`; the manifest pins every file's SHA-256 and the guest's runtime
+ABI. Explicit files can be pinned with `RuntimeFiles::approved_sha256`.
+
+A `SandboxSpec`, passed to `AciEdgeSandbox::provision_with` beside the provision request, sets
+one sandbox's image (`ImageSource::Path` of a local GPT disk, or `ImageSource::Digest` of a
+registered image), its resources, its guest network, and its forwarded ports. Every guest has one
+virtual processor, so `resources.vcpus` may only be 1, and `resources.memoryMib` sets its memory.
+`Capabilities::spec` lists the fields that the library honors; image references and hostnames
+are not among them yet. A request may still set `microvm.provision.memoryMib`, but not together
+with `spec.resources.memoryMib`.
+
+- **Loading.** `AgentBackend::new` checks the library's SHA-256 and sandbox ABI version and
+  loads it once per process; it stays loaded until the process exits. It loads the bytes that it
+  checked. On Linux it loads them from a sealed in-memory copy, and fails if the kernel refuses
+  to create or execute one. On Windows, its open handle keeps writers out of the file and keeps
+  the file and its directories from being renamed or deleted until the library is loaded. Other
+  hosts cannot load the library. A missing, wrong-version, or wrong-digest library fails rather
+  than falling back.
+- **Opening.** The first backend that a process opens for a setup verifies the runtime files, or
+  checks the seals that an earlier process recorded under the state root, and registers the
+  default image. Later backends for the same setup reuse that host without touching a file, so
+  a caller may create a backend for every operation; the operations check the files that they
+  use. One that finds a runtime file changed makes the next backend verify the files again, and
+  one that finds the default image changed or unregistered makes it register the image again.
+  Hosts, guest sessions, and boot-console capture stay in the library for the life of the
+  process; dropping a backend leaves its sandboxes running.
+- **Images.** The library registers images under the state root by their content ID,
+  `sha256:<hex>` (`ImageId`). Registration hashes an image once; `ImageDigest::Expect`
+  additionally requires a digest, and `ImageDigest::Trusted` records a digest that the caller's
+  own policy verified, without reading the file. A later registration, in any process, reuses
+  one that the file still matches without reading it. Provision records the image ID and the
+  runtime digests. Start compares each file's seal (volume, file ID, length, and last-write
+  time, plus the change time on Linux) with the one taken when it was hashed, instead of hashing
+  again, and fails with `backend_unavailable` if anything changed, so a start costs about the
+  guest's boot time. A seal detects replacement or modification, not a writer that deliberately
+  restores timestamps. On Windows, start also keeps writers out of the files until OpenVMM has
+  opened them. Register a changed image again with `register_image`: unchanged content keeps its
+  ID, so sandboxes that use it start again. `images` lists the registrations and whether each
+  file still matches, `verify_image` hashes one again, and `unregister_image` refuses while a
+  provisioned sandbox uses the image. `Diagnostics::content_verification` hashes the image and
+  runtime files again before every start, as a diagnostic.
+- **The guest.** The image is attached read-only; the edge guest validates its GPT and p2+ ext4
+  layers and keeps its writable layer in RAM, so it needs no scratch disk. Start sends OpenVMM a
+  fresh 32-byte capability through standard input, checks the process that serves the control
+  endpoint, and waits until the guest agent is ready.
+- **Guest sessions.** OpenVMM accepts one host session per VM at a time. The library keeps one
+  per running sandbox for the process that uses it, and that process's operations share it, so
+  they never wait for each other's sessions, and its executions run side by side over it.
+  Another process waits until the holder releases the session, on stop, deprovision, or exit.
+  `guestSession.hold: false` releases a session once it has been idle for `lingerMs`, for
+  callers that drive one sandbox from several long-lived processes.
+- **Interrupted starts.** Start claims the sandbox's OpenVMM log before launching, and OpenVMM
+  inherits the claim. If the caller dies before recording OpenVMM's identity, the next operation
+  waits up to the start timeout for that OpenVMM to open its endpoint and then terminates it;
+  once nothing holds the log, the sandbox is usable again.
+- **Boot console.** The library copies the guest boot console to the console log that
+  `AgentBackend::diagnostics` names, from the process that started or last used the sandbox.
+  OpenVMM serves one console client at a time and holds guest output while none is connected, so
+  a guest that writes enough console output stalls until a listener reconnects: keep that
+  process running, or use the sandbox from its successor, whose listener takes the capture over.
+- **Metadata.** Start reports `bootMilliseconds`, `guestBuildId`, and `phases` (`spawnMs`,
+  `attachMs`, and `readyMs`). Stop reports `forced`, `phases` (`shutdownMs` and `exitMs`), and,
+  after a failed graceful shutdown, `gracefulError`. A capture failure never fails stop or
+  deprovision: both report it as `consoleError`. `AgentBackend::guest_logs` reads a bounded
+  snapshot of the guest's log while it runs.
+
+Executions run shell commands or argv and stream while they run. Output arrives as the command
+writes it, with no size limit, `ExecIo::stdin` feeds the command's standard input, and
+`ExecControl` cancels it. Each execution's flow control bounds the output that the library
+buffers for it, so a caller that stops reading pauses that command, not the others. At most 16
+executions run at once per sandbox; one more fails with `backend_error`. A timeout is rounded up
+to whole milliseconds, can be up to an hour, and ends the command as `TimedOut`. When it elapses
+before the outcome arrives, `wait` closes the output streams, as cancellation does, so that a
+stream that the caller holds without reading cannot delay the outcome; an execution that loses
+output that way ends as `TimedOut`.
+Snapshot/restore and image pulls are not part of this profile.
+
+[`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) runs one lifecycle. It needs
+`--host-library`, `--host-sha256`, `--state-root`, `--image`, and either `--openvmm`, `--kernel`,
+and `--initrd` or `--bundle` and `--bundle-sha256`, and the command after `--`. `--image-sha256`
+requires the image's digest when it is registered, and `--hypervisor`, `--cpu-profile auto|host`,
+`--memory-mib`, and `--guest-debug` adjust the setup. The repeatable `--readonly`,
+`--readwrite`, and `--denied` options map host paths, and `--egress allow|deny` with the
+repeatable `--egress-allow` and `--egress-deny` options, each taking `CIDR` or
+`CIDR:tcp|udp:PORT`, attach a network. `--network-proxy URL` routes the guest's traffic through
+a host proxy, and `--host-loopback allow|deny` with the repeatable
+`--host-loopback-forward tcp|udp:HOST:GUEST` publishes guest ports on host loopback. The
+repeatable `--env KEY=VALUE`, layered over the guest's environment, and `--cwd PATH` apply to the
+command. The ignored `tests/agent_guest.rs` exercises an actual guest when the corresponding
+`EDGE_AGENT_TEST_*` paths and approved library digest are set: under WHP on Windows, or under the
+hypervisor that `EDGE_AGENT_TEST_HYPERVISOR` names, such as `mshv` on Linux.
+`EDGE_AGENT_TEST_CPU_PROFILE=host` boots its guests on a host CPU profile.
+
+For example, from `aci_edge_sandboxes` on a Windows WHP host, set the following paths to
+compatible, separately built artifacts and a caller-prepared GPT disk with p2+ ext4 layers (not
+a container image reference). Use the **edge** guest initramfs, not the default Alpine or
+standard container guest initramfs:
+
+```powershell
+$openvmm = 'C:\path\to\openvmm.exe'
+$kernel = 'C:\path\to\vmlinux'
+$initrd = 'C:\path\to\nvx-edge-initramfs.cpio.gz'
+$image = 'C:\path\to\layers.gpt'
+$hostLibrary = 'C:\path\to\aci_edge_agent.dll'
+$approvedHostSha256 = '<64 hexadecimal digits from an independent trust policy>'
+$stateRoot = 'C:\nvx-edge-state'
+
+cargo run --release --locked --features agent --example agent_lifecycle -- `
+    --openvmm $openvmm --kernel $kernel --initrd $initrd --image $image `
+    --host-library $hostLibrary --host-sha256 $approvedHostSha256 `
+    --state-root $stateRoot -- 'printf READY'
+```
+
+To map `C:\work\src` read-only and `C:\work\out` read-write, and let the guest reach only
+`192.0.2.10` on TCP port 443, add
+`--readonly C:\work\src --readwrite C:\work\out --egress deny --egress-allow 192.0.2.10:tcp:443`
+before `--`; `openvmm::resolve_guest_path` gives the guest paths, here `/mnt/c/work/src` and
+`/mnt/c/work/out`. To let the guest out only through a proxy that listens on host port 3128, add
+`--egress deny --network-proxy http://127.0.0.1:3128` instead; to reach a guest service on port
+8080 at host `127.0.0.1:18080`, add
+`--egress allow --host-loopback allow --host-loopback-forward tcp:18080:8080`.
+
+Build the native library and the static edge initramfs separately from their matching sources;
+this example neither fetches nor builds them. Use the pinned OpenVMM, which includes the
+scratchless RAM-overlay topology, and the NVX kernel that its time ABI requires, such as a
+release's `guest/vmlinux`. OpenVMM selects a [CPU profile](../doc/usage.md#cpu-profiles) at
+every cold boot, so start fails with `backend_error` on a host that none of its built-in
+profiles serves, or whose hypervisor does not support its profile; the OpenVMM log that the
+error names gives the reason. On such a development host, `cpuProfile: "host"` (the example's
+`--cpu-profile host`) boots the guests on a host profile, which OpenVMM derives from the host's
+hypervisor at every cold boot and does not pin. On Linux, supply a matching
+`libaci_edge_agent.so` and OpenVMM build and select `--hypervisor mshv`.
+
+### Native host paths and network
+
+The native backend accepts the same `filesystem` and `network` policies as the direct
+backend: it maps host paths to the same guest paths under the same rules and expands network
+rules the same way; see [Host paths](#host-paths) and [Network rules](#network-rules). It also
+refuses mappings that would show workloads its state root, described below. Its workloads run
+as the guest's root. The library plans the policies at provision: it resolves the mapped and
+denied paths, chooses the export, pins the objects inside read-write mappings, and expands the
+network rules, and the sandbox's record keeps the resulting plan. Every start checks the plan
+again against every planning rule that needs no host access, and checks the pinned objects: if
+one was replaced, start fails with `backend_error`, and the sandbox must be deprovisioned and
+provisioned again to accept the change.
+
+- The state root holds the record, and so the plan, of every sandbox, which decides what the
+  next start exports, which egress it allows, and which host loopback ports the guest reaches
+  or publishes. Start's checks catch a damaged plan, but not one changed into another plan that
+  planning could have produced, so only the caller may write the state root. Provision
+  therefore refuses, with `policy_validation`, a mapped path inside the state root, and one that
+  contains it unless a denied path inside the mapping hides it.
+- OpenVMM exports the deepest directory that contains every mapped path through one
+  virtio-fs device, read-only unless a path is read-write, and hides the denied paths. The
+  guest mounts the export where workloads cannot reach it and bind-mounts each mapped path
+  into the RAM overlay at its guest path, read-only where requested. The bind mounts travel on
+  the guest's 1024-byte kernel command line, which leaves room for roughly a dozen typical
+  paths; provision rejects a policy whose mounts do not fit with `policy_validation`.
+- Denied paths stay hidden through their aliases: `..`, host symbolic links and junctions,
+  links that workloads create, and other names of a denied object, such as a host hard link to
+  a denied file. OpenVMM never follows a link on the host, so the guest resolves every link
+  itself, and each lookup of a denied path fails with `EACCES`; an absolute Windows symbolic
+  link or a junction cannot be followed at all (`EPERM`). OpenVMM recognizes only the denied
+  objects themselves: a host hard link that already joins a file inside a denied directory to a
+  name outside it stays readable through that name. A directory that holds a host hard link to
+  a denied file may list the link's name, and a listing that also looks its entries up, as the
+  guest's first read of a directory does, fails with `EACCES`.
+- Workloads run as the guest's root with only the default container capabilities (`CHOWN`,
+  `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID`, `SETUID`, `NET_BIND_SERVICE`, and
+  `AUDIT_WRITE`), with `no_new_privs`, and without user namespaces, so they cannot remount or
+  unmount the mapped paths or mount the export again. Host-side changes through read-write
+  mappings, including modes and ownership, happen with the credentials of the account that
+  runs OpenVMM, so run OpenVMM unprivileged. A host hard link that already joins a file in a
+  read-write mapping to one in a read-only mapping stays writable through the read-write
+  path.
+- A policy that denies egress without allow rules or a proxy attaches no network device.
+  Otherwise the guest gets its spec's `guestNetwork`, or the setup's default (`10.0.0.2/24`
+  unless set), behind OpenVMM's NAT gateway, the network's first address, and names that
+  gateway as its DNS server in `/etc/resolv.conf` when the policy allows TCP or UDP port 53 to
+  it. Choose a guest network that contains no address the guest must reach. Ingress must be
+  `deny`, and host-loopback access must be `deny` unless ports are forwarded, as described next.
+
+### Native proxy and forwarded ports
+
+Two provision options connect the guest to host loopback without opening it in general. They
+are exclusive: a proxy needs host-loopback access denied, and forwarded ports need it allowed.
+
+- `runtimeConfig.networkProxy` (`ProvisionRequest::with_network_proxy`) names an HTTP or HTTPS
+  proxy that listens on host IPv4 loopback, such as `http://127.0.0.1:3128` or
+  `http://localhost:3128`: an explicit port, and at most a trailing `/` after it. As in MXC's
+  schema, the proxy is the guest's only way out, so the network policy must deny egress without
+  allow or deny rules; provision rejects other policies, and IPv6 or remote proxies, with
+  `policy_validation`. The guest's only reachable destination is TCP to its gateway at the
+  proxy's port, which OpenVMM connects to the proxy; it cannot reach a DNS server, so the proxy
+  resolves names. Every workload gets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and
+  `https_proxy` naming the proxy at the gateway, such as `http://10.0.0.1:3128`, and `NO_PROXY`
+  and `no_proxy` set to `localhost,127.0.0.1`; an HTTPS proxy's certificate must therefore be
+  valid for the gateway's address.
+- `hostLoopbackForwards` of the sandbox spec (`SandboxSpec::with_host_loopback_forward`, passed
+  to `AciEdgeSandbox::provision_with`) publishes up to 64 guest ports on host loopback: OpenVMM listens on
+  `127.0.0.1:hostPort` and relays each TCP connection or UDP datagram to the guest's
+  `guestPort`. Ports are nonzero, and a host port appears at most once per protocol. Forwarded
+  ports need `network.ingress.hostLoopback: allow`, which also lets the guest reach every host
+  loopback service through its gateway; `allow` without forwarded ports is rejected. The guest
+  answers forwarded traffic at addresses that OpenVMM assigns inside the guest network, so the
+  egress default must be `allow`, which leaves the guest's other egress open, and no deny rule
+  may cover the guest network.
+
+Only the guest sets the proxy variables: an exec whose `process.env` names one of them, in any
+case, fails with `policy_validation`, with or without a proxy.
+
+### Native working directories and environments
+
+`process.cwd` must be an absolute guest path without `..` of at most 4095 bytes, as with the
+direct backend; `openvmm::resolve_guest_path` gives the guest path of a mapped host path. A
+directory that the workload cannot enter ends the command with exit code 126 and an
+`NVX-EDGE-STAGE-ERROR` line on standard error. The guest's default environment holds only
+`PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) and the proxy
+variables. `process.env` can only be layered over it, with `inheritDefaultEnv: true`, as at
+most 256 entries of at most 32 KiB in total; replacing it fails with `policy_validation`. A
+later entry for a name replaces an earlier one, and an entry replaces the default of the same
+name.
+
+The caller must independently approve and protect the native asset. Checking a caller-supplied
+digest does not make a writable path or a self-declared digest trustworthy; use this profile
+only with an immutable, externally authorized library installation.
 
 ## OpenVMM backend
 
@@ -185,7 +450,9 @@ Defaults:
 | `stop_timeout`, `exec_response_grace` | 30 s |
 
 Each timeout must be at most 30 days (`OpenVmmConfig::MAX_TIMEOUT`), and all
-but `exec_response_grace` must be positive.
+but `exec_response_grace` must be positive. `guest_network` must be an address
+that OpenVMM accepts: a /1 to /30 prefix, and neither the network's own address,
+its broadcast address, nor its first address, which is the gateway.
 
 Choose a `state_root` that only the current user can access.
 `OpenVmmConfig::default_state_root` returns `%LOCALAPPDATA%\nvx\sandboxes` on
@@ -340,9 +607,10 @@ translation, for example to turn a host working directory into a
   Exporting a whole volume (`/` or `C:\`) is refused, so mapped paths must
   share a directory below it.
 - Denied paths inside the export are hidden by OpenVMM itself: they are absent
-  from listings and inaccessible through any name. OpenVMM requires hidden
-  paths below the export to contain no whitespace, colons, or backslashes and
-  no links, and accepts at most 128 of them.
+  from listings and inaccessible through any name, except a host hard link to a
+  file inside a denied directory, which OpenVMM cannot tell from any other file.
+  OpenVMM requires hidden paths below the export to contain no whitespace,
+  colons, or backslashes and no links, and accepts at most 128 of them.
 - Mapped paths must exist, be directories or regular files, and share one
   volume. A path listed both read-only and read-write is mapped read-only. A
   denied path must not contain a mapped path, and a denied path that does not
@@ -486,6 +754,7 @@ An MXC `StatefulSandboxBackend` adapter maps onto this crate as follows:
 | `policy.network_egress` rules | `EgressPolicy` rules, field for field |
 | `working_directory` | `ExecRequest::with_cwd(guest_path(...))`; a directory that the workload cannot enter ends with `Failed(WorkingDirectory)` |
 | `process.env`, `process.inheritDefaultEnv` | `ProcessSpec::env`, `None` when omitted, and `inherit_default_env`, or `ExecRequest::with_envs` and `with_inherit_default_env`; see [Environment](#environment) |
+| `runtimeConfig.networkProxy` | `ProvisionRequest::with_network_proxy` with the `agent` backend; see [Native proxy and forwarded ports](#native-proxy-and-forwarded-ports) |
 
 A proof-of-concept MXC adapter, `nvx_backend`, implements this mapping. It
 runs each phase in its own process against a real VM and consumes exec pipes

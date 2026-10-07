@@ -47,6 +47,8 @@
 //! - `bundled`: stages the OpenVMM executable, guest kernel, and control initramfs at build time;
 //!   see `openvmm::Artifacts::bundled`.
 //! - `async`: Tokio wrappers ([`AsyncAciEdgeSandbox`], [`AsyncExecution`]) around the synchronous core.
+//! - `agent`: the [`agent`] backend, a thin client of a separately supplied native library
+//!   that owns the sandbox lifecycle.
 //! - `testing`: an in-memory [`testing::MockBackend`] for consumers' own tests.
 
 // The data model lives in `aci_edge_sandboxes_model`; these keep its modules at their crate paths.
@@ -60,6 +62,8 @@ mod exec;
 mod input;
 mod stream;
 
+#[cfg(feature = "agent")]
+pub mod agent;
 #[cfg(feature = "async")]
 mod async_api;
 #[cfg(feature = "openvmm")]

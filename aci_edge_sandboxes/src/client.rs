@@ -44,6 +44,12 @@ impl AciEdgeSandbox {
         Ok(Self::new(crate::openvmm::OpenVmmBackend::new(config)?))
     }
 
+    /// Creates a sandbox client over a separately supplied agent library, `aci_edge_agent`.
+    #[cfg(feature = "agent")]
+    pub fn agent(config: crate::agent::AgentConfig) -> Result<Self> {
+        Ok(Self::new(crate::agent::AgentBackend::new(config)?))
+    }
+
     /// Returns the backend.
     pub fn backend(&self) -> &dyn Backend {
         self.backend.as_ref()

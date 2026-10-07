@@ -1,14 +1,16 @@
 use std::fmt;
 use std::io::{self, PipeReader, PipeWriter, Read};
 use std::sync::Arc;
-#[cfg(any(feature = "openvmm", feature = "testing"))]
+#[cfg(any(feature = "openvmm", feature = "agent", feature = "testing"))]
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread;
+#[cfg(feature = "agent")]
+use std::time::Instant;
 
 use crate::backend::ExecControl;
 use crate::error::{Error, Result};
 
-#[cfg(any(feature = "openvmm", feature = "testing"))]
+#[cfg(any(feature = "openvmm", feature = "agent", feature = "testing"))]
 #[derive(Default)]
 enum CompletionState {
     #[default]
@@ -17,14 +19,14 @@ enum CompletionState {
     Collected,
 }
 
-#[cfg(any(feature = "openvmm", feature = "testing"))]
+#[cfg(any(feature = "openvmm", feature = "agent", feature = "testing"))]
 #[derive(Default)]
 pub(crate) struct Completion {
     state: Mutex<CompletionState>,
     finished: Condvar,
 }
 
-#[cfg(any(feature = "openvmm", feature = "testing"))]
+#[cfg(any(feature = "openvmm", feature = "agent", feature = "testing"))]
 impl Completion {
     pub(crate) fn finish(&self, outcome: Result<ExecOutcome>) {
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -51,6 +53,26 @@ impl Completion {
                 }
             }
         }
+    }
+
+    /// Returns what [`wait`](Self::wait) returns, or `None` if the outcome has not arrived by
+    /// `deadline`.
+    #[cfg(feature = "agent")]
+    pub(crate) fn wait_until(&self, deadline: Instant) -> Option<Result<ExecOutcome>> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while matches!(*state, CompletionState::Running) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            state = self
+                .finished
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        drop(state);
+        Some(self.wait())
     }
 }
 
