@@ -9,18 +9,32 @@
 pub mod capabilities;
 pub mod cidr;
 pub mod error;
+pub mod hex;
 pub mod id;
+pub mod image;
 pub mod model;
+pub mod outcome;
+pub mod setup;
+pub mod spec;
 pub mod validate;
+pub mod wire;
 
 pub use capabilities::{
-    Capabilities, ExecCapabilities, FilesystemCapabilities, NetworkCapabilities,
+    Capabilities, ExecCapabilities, FilesystemCapabilities, NetworkCapabilities, SpecCapabilities,
 };
 pub use error::{Error, ErrorBody, ErrorCode, Result};
 pub use id::SandboxId;
+pub use image::{ImageDigest, ImageId, RegisteredImage};
 pub use model::{
-    Access, Command, DeprovisionResult, EgressPolicy, ExecRequest, FilesystemPolicy, IngressPolicy,
-    Metadata, MicrovmConfig, MicrovmProvision, NetworkPeer, NetworkPolicy, NetworkPort,
-    NetworkRule, ProcessSpec, Protocol, ProvisionRequest, ProvisionResult, StartResult, StdinMode,
-    StopResult,
+    Access, Command, DeprovisionResult, EgressPolicy, ExecRequest, FilesystemPolicy,
+    ForwardProtocol, HostLoopbackForward, IngressPolicy, Metadata, MicrovmConfig, MicrovmProvision,
+    NetworkPeer, NetworkPolicy, NetworkPort, NetworkRule, ProcessSpec, Protocol, ProvisionRequest,
+    ProvisionResult, RuntimeConfig, StartResult, StdinMode, StopResult,
 };
+pub use outcome::{ExecFailure, ExecOutcome};
+pub use setup::{
+    BundleSource, CpuProfile, Diagnostics, ExecSettings, GuestSessionPolicy, Hypervisor,
+    ImageSettings, RuntimeDigests, RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
+    Timeouts,
+};
+pub use spec::{ImageSource, Resources, SandboxSpec};

@@ -20,6 +20,7 @@ use crate::model::{
     Command, DeprovisionResult, ExecRequest, ProvisionRequest, ProvisionResult, StartResult,
     StopResult,
 };
+use crate::spec::SandboxSpec;
 
 type ExecHandler = dyn Fn(&ExecRequest) -> MockExec + Send + Sync;
 
@@ -45,6 +46,7 @@ pub struct MockExec {
 
 struct MockSandbox {
     request: ProvisionRequest,
+    spec: SandboxSpec,
     running: bool,
 }
 
@@ -91,6 +93,16 @@ impl MockBackend {
         network.host_loopback_allow = true;
         network.host_loopback_deny = true;
         network.egress_rules = true;
+        network.network_proxy = true;
+        let spec = &mut capabilities.spec;
+        spec.image_path = true;
+        spec.image_digest = true;
+        spec.image_reference = true;
+        spec.vcpus = true;
+        spec.memory = true;
+        spec.guest_network = true;
+        spec.hostname = true;
+        spec.host_loopback_forwards = true;
         let filesystem = &mut capabilities.filesystem;
         filesystem.readonly_paths = true;
         filesystem.readwrite_paths = true;
@@ -130,6 +142,13 @@ impl MockBackend {
         self.lock()
             .get(sandbox_id)
             .map(|sandbox| sandbox.request.clone())
+    }
+
+    /// Returns the sandbox spec that provisioned a sandbox.
+    pub fn provision_spec(&self, sandbox_id: &SandboxId) -> Option<SandboxSpec> {
+        self.lock()
+            .get(sandbox_id)
+            .map(|sandbox| sandbox.spec.clone())
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<SandboxId, MockSandbox>> {
@@ -179,11 +198,20 @@ impl Backend for MockBackend {
     }
 
     fn provision(&self, request: &ProvisionRequest) -> Result<ProvisionResult> {
+        self.provision_with(request, &SandboxSpec::new())
+    }
+
+    fn provision_with(
+        &self,
+        request: &ProvisionRequest,
+        spec: &SandboxSpec,
+    ) -> Result<ProvisionResult> {
         let sandbox_id = SandboxId::generate()?;
         self.lock().insert(
             sandbox_id.clone(),
             MockSandbox {
                 request: request.clone(),
+                spec: spec.clone(),
                 running: false,
             },
         );

@@ -3,6 +3,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::capabilities::Capabilities;
+use crate::error::Error;
 use crate::error::Result;
 use crate::exec::ExecOutcome;
 use crate::id::SandboxId;
@@ -10,6 +11,7 @@ use crate::input::InputSource;
 use crate::model::{
     DeprovisionResult, ExecRequest, ProvisionRequest, ProvisionResult, StartResult, StopResult,
 };
+use crate::spec::SandboxSpec;
 
 /// Implementation of the ACI Edge Sandboxes lifecycle.
 ///
@@ -43,6 +45,20 @@ pub trait Backend: Send + Sync + fmt::Debug {
         Ok(())
     }
 
+    /// Checks deterministic provision policies of a request and its sandbox spec without probing
+    /// the host or changing state.
+    ///
+    /// Called after structural and capability validation, which already rejects spec fields that
+    /// [`Backend::capabilities`] does not honor. The default implementation checks the request
+    /// with [`Backend::validate_provision`].
+    fn validate_provision_with(
+        &self,
+        request: &ProvisionRequest,
+        _spec: &SandboxSpec,
+    ) -> Result<()> {
+        self.validate_provision(request)
+    }
+
     /// Checks deterministic exec policies without probing the host or changing state.
     ///
     /// Called after structural and capability validation. Override this when the backend has
@@ -54,6 +70,25 @@ pub trait Backend: Send + Sync + fmt::Debug {
 
     /// Allocates a sandbox without starting it.
     fn provision(&self, request: &ProvisionRequest) -> Result<ProvisionResult>;
+
+    /// Allocates a sandbox with creation settings outside the request.
+    ///
+    /// The default implementation honors only an empty spec, which it provisions with
+    /// [`Backend::provision`]; backends that advertise spec capabilities override it.
+    fn provision_with(
+        &self,
+        request: &ProvisionRequest,
+        spec: &SandboxSpec,
+    ) -> Result<ProvisionResult> {
+        if spec.is_empty() {
+            self.provision(request)
+        } else {
+            Err(Error::unsupported(format!(
+                "the {} backend does not accept a sandbox spec",
+                self.name()
+            )))
+        }
+    }
 
     /// Moves a provisioned sandbox to the running state.
     fn start(&self, sandbox_id: &SandboxId) -> Result<StartResult>;

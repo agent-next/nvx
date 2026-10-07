@@ -52,7 +52,7 @@
 // The data model lives in `aci_edge_sandboxes_model`; these keep its modules at their crate paths.
 #[cfg(feature = "openvmm")]
 pub(crate) use aci_edge_sandboxes_model::cidr;
-pub(crate) use aci_edge_sandboxes_model::{capabilities, error, id, model, validate};
+pub(crate) use aci_edge_sandboxes_model::{capabilities, error, id, model, spec, validate};
 
 mod backend;
 mod client;
@@ -71,7 +71,7 @@ pub mod testing;
 pub use async_api::{AsyncAciEdgeSandbox, AsyncExecution, InputStream, OutputStream};
 pub use backend::{Backend, ExecControl, ExecIo, OutputCloser, OutputSink};
 pub use capabilities::{
-    Capabilities, ExecCapabilities, FilesystemCapabilities, NetworkCapabilities,
+    Capabilities, ExecCapabilities, FilesystemCapabilities, NetworkCapabilities, SpecCapabilities,
 };
 pub use client::AciEdgeSandbox;
 pub use error::{Error, ErrorBody, ErrorCode, Result};
@@ -79,8 +79,9 @@ pub use exec::{Canceller, ExecFailure, ExecOutcome, ExecOutput, Execution};
 pub use id::SandboxId;
 pub use input::{InputCloser, InputSource};
 pub use model::{
-    Access, Command, DeprovisionResult, EgressPolicy, ExecRequest, FilesystemPolicy, IngressPolicy,
-    Metadata, MicrovmConfig, MicrovmProvision, NetworkPeer, NetworkPolicy, NetworkPort,
-    NetworkRule, ProcessSpec, Protocol, ProvisionRequest, ProvisionResult, StartResult, StdinMode,
-    StopResult,
+    Access, Command, DeprovisionResult, EgressPolicy, ExecRequest, FilesystemPolicy,
+    ForwardProtocol, HostLoopbackForward, IngressPolicy, Metadata, MicrovmConfig, MicrovmProvision,
+    NetworkPeer, NetworkPolicy, NetworkPort, NetworkRule, ProcessSpec, Protocol, ProvisionRequest,
+    ProvisionResult, RuntimeConfig, StartResult, StdinMode, StopResult,
 };
+pub use spec::{ImageSource, Resources, SandboxSpec};

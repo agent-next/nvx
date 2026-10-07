@@ -67,6 +67,13 @@ impl SandboxId {
         Ok(Self(value.to_owned()))
     }
 
+    /// Builds the ID of a sandbox from its opaque token, returning
+    /// [`ErrorCode::MalformedId`](crate::ErrorCode::MalformedId) unless the token is 32 lowercase
+    /// hexadecimal digits.
+    pub fn from_token(token: &str) -> Result<Self> {
+        Self::parse(&format!("{}:{token}", Self::PREFIX))
+    }
+
     /// Returns the full ID, including its prefix.
     pub fn as_str(&self) -> &str {
         &self.0

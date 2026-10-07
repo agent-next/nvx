@@ -12,6 +12,7 @@ use crate::model::{
     DeprovisionResult, ExecRequest, ProvisionRequest, ProvisionResult, StartResult, StdinMode,
     StopResult,
 };
+use crate::spec::SandboxSpec;
 use crate::stream;
 use crate::validate;
 
@@ -60,8 +61,18 @@ impl AciEdgeSandbox {
 
     /// Allocates a sandbox without starting it.
     pub fn provision(&self, request: &ProvisionRequest) -> Result<ProvisionResult> {
-        self.validate_provision(request)?;
-        self.backend.provision(request)
+        self.provision_with(request, &SandboxSpec::new())
+    }
+
+    /// Allocates a sandbox with creation settings outside the request, such as its image and
+    /// resources, without starting it.
+    pub fn provision_with(
+        &self,
+        request: &ProvisionRequest,
+        spec: &SandboxSpec,
+    ) -> Result<ProvisionResult> {
+        self.validate_provision_with(request, spec)?;
+        self.backend.provision_with(request, spec)
     }
 
     /// Checks a provision request the way [`AciEdgeSandbox::provision`] does, without running anything.
@@ -71,9 +82,19 @@ impl AciEdgeSandbox {
     /// need the host, such as file existence, happen only in
     /// [`AciEdgeSandbox::provision`]. Callers with a separate validation phase or dry run use this.
     pub fn validate_provision(&self, request: &ProvisionRequest) -> Result<()> {
-        validate::provision_structure(request)?;
-        validate::provision_capabilities(request, &self.backend.capabilities())?;
-        self.backend.validate_provision(request)
+        self.validate_provision_with(request, &SandboxSpec::new())
+    }
+
+    /// Checks a provision request and its sandbox spec the way [`AciEdgeSandbox::provision_with`]
+    /// does, without running anything.
+    pub fn validate_provision_with(
+        &self,
+        request: &ProvisionRequest,
+        spec: &SandboxSpec,
+    ) -> Result<()> {
+        validate::provision_structure(request, spec)?;
+        validate::provision_capabilities(request, spec, &self.backend.capabilities())?;
+        self.backend.validate_provision_with(request, spec)
     }
 
     /// Moves a provisioned sandbox to the running state.

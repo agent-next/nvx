@@ -19,6 +19,9 @@ pub struct Capabilities {
     pub network: NetworkCapabilities,
     /// Host filesystem mapping features.
     pub filesystem: FilesystemCapabilities,
+    /// Sandbox spec features.
+    #[serde(default)]
+    pub spec: SpecCapabilities,
 }
 
 impl Capabilities {
@@ -75,12 +78,38 @@ pub struct NetworkCapabilities {
     pub ingress_allow: bool,
     /// Honors `network.ingress.default: deny`.
     pub ingress_deny: bool,
-    /// Honors `network.ingress.hostLoopback: allow`.
+    /// Honors `network.ingress.hostLoopback: allow` without forwarded ports.
     pub host_loopback_allow: bool,
     /// Honors `network.ingress.hostLoopback: deny`.
     pub host_loopback_deny: bool,
     /// Honors `network.egress.allow` and `network.egress.deny` rules.
     pub egress_rules: bool,
+    /// Honors `runtimeConfig.networkProxy`.
+    #[serde(default)]
+    pub network_proxy: bool,
+}
+
+/// Sandbox spec fields a backend can honor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SpecCapabilities {
+    /// Honors `image.path`: a local GPT disk image.
+    pub image_path: bool,
+    /// Honors `image.digest`: an image registered with the backend.
+    pub image_digest: bool,
+    /// Honors `image.reference`: a container image reference.
+    pub image_reference: bool,
+    /// Honors `resources.vcpus`.
+    pub vcpus: bool,
+    /// Honors `resources.memoryMib`.
+    pub memory: bool,
+    /// Honors `guestNetwork`.
+    pub guest_network: bool,
+    /// Honors `hostname`.
+    pub hostname: bool,
+    /// Honors `hostLoopbackForwards`, with `network.ingress.hostLoopback: allow`.
+    pub host_loopback_forwards: bool,
 }
 
 /// Host filesystem mappings a backend can honor.
@@ -94,4 +123,27 @@ pub struct FilesystemCapabilities {
     pub readwrite_paths: bool,
     /// Honors `filesystem.deniedPaths`.
     pub denied_paths: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_without_the_proxy_or_spec_fields_leave_them_unsupported() {
+        let mut capabilities = Capabilities::new("older");
+        capabilities.exec.argv = true;
+        capabilities.network.egress_deny = true;
+        let mut payload = serde_json::to_value(&capabilities).unwrap();
+        payload["network"]
+            .as_object_mut()
+            .unwrap()
+            .remove("networkProxy")
+            .unwrap();
+        payload.as_object_mut().unwrap().remove("spec").unwrap();
+        assert_eq!(
+            serde_json::from_value::<Capabilities>(payload).unwrap(),
+            capabilities
+        );
+    }
 }

@@ -54,77 +54,7 @@ impl Completion {
     }
 }
 
-/// Terminal outcome of an execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ExecOutcome {
-    /// The workload exited with this status code.
-    Exited(i32),
-    /// The workload was terminated by this signal number.
-    Signaled(i32),
-    /// The workload overran `process.timeout` and is no longer running.
-    TimedOut,
-    /// The workload was cancelled through its [`Canceller`] and is no longer running.
-    Cancelled,
-    /// The workload could not run to completion.
-    Failed(ExecFailure),
-}
-
-impl ExecOutcome {
-    /// Returns whether the workload exited with status zero.
-    pub fn success(self) -> bool {
-        self == Self::Exited(0)
-    }
-
-    /// Returns the exit status of an [`ExecOutcome::Exited`] workload.
-    pub fn exit_code(self) -> Option<i32> {
-        match self {
-            Self::Exited(code) => Some(code),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for ExecOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Exited(code) => write!(formatter, "exited with status {code}"),
-            Self::Signaled(signal) => write!(formatter, "terminated by signal {signal}"),
-            Self::TimedOut => formatter.write_str("timed out"),
-            Self::Cancelled => formatter.write_str("cancelled"),
-            Self::Failed(failure) => write!(formatter, "failed: {failure}"),
-        }
-    }
-}
-
-/// Reason an execution failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ExecFailure {
-    /// The sandbox could not launch the workload.
-    LaunchFailed,
-    /// The workload's working directory (`process.cwd`, or the backend's default) does not exist,
-    /// is not a directory, or is not accessible to the workload, so the workload did not run.
-    WorkingDirectory,
-    /// The workload exceeded the backend's output limit and was terminated.
-    OutputLimitExceeded,
-    /// The sandbox lost track of the workload's exit status.
-    Workload,
-}
-
-impl fmt::Display for ExecFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::LaunchFailed => "the workload could not be launched",
-            Self::WorkingDirectory => {
-                "the workload's working directory does not exist, is not a directory, or is not \
-                 accessible to the workload"
-            }
-            Self::OutputLimitExceeded => "the workload exceeded the output limit",
-            Self::Workload => "the workload's exit status could not be determined",
-        })
-    }
-}
+pub use aci_edge_sandboxes_model::outcome::{ExecFailure, ExecOutcome};
 
 /// Collected result of [`Execution::wait_with_output`].
 #[derive(Debug, Clone, PartialEq, Eq)]

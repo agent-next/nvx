@@ -1,100 +1,13 @@
-use std::fmt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
+
+use aci_edge_sandboxes_model::spec::{is_valid_guest_network, is_valid_hostname};
 
 use super::artifacts::{Artifacts, absolute};
 use super::launch;
 use crate::error::{Error, Result};
 
-/// Hypervisor that OpenVMM uses to run the sandbox VM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Hypervisor {
-    /// Linux KVM through `/dev/kvm`.
-    Kvm,
-    /// Linux Microsoft Hypervisor through `/dev/mshv`.
-    Mshv,
-    /// Windows Hypervisor Platform.
-    Whp,
-}
-
-impl Hypervisor {
-    /// Returns the OpenVMM spelling of this hypervisor.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Kvm => "kvm",
-            Self::Mshv => "mshv",
-            Self::Whp => "whp",
-        }
-    }
-
-    /// Environment variable that overrides [`Hypervisor::from_env_or_default`]: `kvm`, `mshv`, or
-    /// `whp`.
-    pub const ENV: &'static str = "NVX_HYPERVISOR";
-
-    /// Returns the hypervisor named by [`Hypervisor::ENV`], or the
-    /// [platform default](Self::platform_default) when the variable is unset.
-    ///
-    /// Fails with [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable) when the
-    /// variable names an unknown hypervisor or the host has no default.
-    pub fn from_env_or_default() -> Result<Self> {
-        match std::env::var(Self::ENV) {
-            Ok(value) if !value.is_empty() => value.parse(),
-            Ok(_) | Err(std::env::VarError::NotPresent) => {
-                Self::platform_default().ok_or_else(|| {
-                    Error::backend_unavailable(format!(
-                        "this host has no default hypervisor; set {}",
-                        Self::ENV
-                    ))
-                })
-            }
-            Err(error) => Err(Error::backend_unavailable(format!(
-                "{} is not valid Unicode",
-                Self::ENV
-            ))
-            .with_source(error)),
-        }
-    }
-
-    /// Returns the conventional hypervisor for this host: KVM on Linux and WHP on Windows.
-    pub fn platform_default() -> Option<Self> {
-        if cfg!(target_os = "linux") {
-            Some(Self::Kvm)
-        } else if cfg!(windows) {
-            Some(Self::Whp)
-        } else {
-            None
-        }
-    }
-
-    fn supported_on_host(self) -> bool {
-        match self {
-            Self::Kvm | Self::Mshv => cfg!(target_os = "linux"),
-            Self::Whp => cfg!(windows),
-        }
-    }
-}
-
-impl fmt::Display for Hypervisor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Hypervisor {
-    type Err = Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "kvm" => Ok(Self::Kvm),
-            "mshv" => Ok(Self::Mshv),
-            "whp" => Ok(Self::Whp),
-            _ => Err(Error::backend_unavailable(format!(
-                "unknown hypervisor {value:?}; choose kvm, mshv, or whp"
-            ))),
-        }
-    }
-}
+pub use aci_edge_sandboxes_model::setup::Hypervisor;
 
 /// Configuration of the [`OpenVmmBackend`](super::OpenVmmBackend).
 ///
@@ -308,15 +221,16 @@ impl OpenVmmConfig {
         if self.workload_uid == 0 || self.workload_gid == 0 {
             return invalid("workloads must run as a non-root UID and GID".to_owned());
         }
-        if !valid_hostname(&self.hostname) {
+        if !is_valid_hostname(&self.hostname) {
             return invalid(format!(
                 "hostname {:?} must be a lowercase RFC 1123 label of up to 63 characters",
                 self.hostname
             ));
         }
-        if !valid_guest_network(&self.guest_network) {
+        if !is_valid_guest_network(&self.guest_network) {
             return invalid(format!(
-                "guest_network {:?} must be an IPv4 address with a /1 to /30 prefix",
+                "guest_network {:?} must be an IPv4 address with a /1 to /30 prefix that is not \
+                 its network's network, broadcast, or gateway (first) address",
                 self.guest_network
             ));
         }
@@ -364,25 +278,6 @@ impl OpenVmmConfig {
         }
         Ok(())
     }
-}
-
-fn valid_hostname(hostname: &str) -> bool {
-    let bytes = hostname.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 63
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-        && bytes.first() != Some(&b'-')
-        && bytes.last() != Some(&b'-')
-}
-
-fn valid_guest_network(value: &str) -> bool {
-    let Some((address, prefix)) = value.split_once('/') else {
-        return false;
-    };
-    address.parse::<std::net::Ipv4Addr>().is_ok()
-        && crate::cidr::parse_prefix_length(prefix).is_some_and(|prefix| (1..=30).contains(&prefix))
 }
 
 /// Describes why extra kernel parameters are unacceptable, if they are.
@@ -487,18 +382,24 @@ mod tests {
 
     #[test]
     fn helpers_accept_expected_values() {
-        assert!(valid_hostname("nvx-sandbox"));
-        assert!(!valid_hostname("-nvx"));
-        assert!(!valid_hostname(&"a".repeat(64)));
-        assert!(valid_guest_network("10.0.0.2/24"));
-        assert!(!valid_guest_network("10.0.0.2"));
-        assert!(!valid_guest_network("10.0.0.256/24"));
+        assert!(is_valid_hostname("nvx-sandbox"));
+        assert!(!is_valid_hostname("-nvx"));
+        assert!(!is_valid_hostname(&"a".repeat(64)));
+        assert!(is_valid_guest_network("10.0.0.2/24"));
+        assert!(is_valid_guest_network("10.0.0.254/24"));
+        assert!(!is_valid_guest_network("10.0.0.2"));
+        assert!(!is_valid_guest_network("10.0.0.256/24"));
         for prefix in ["", "0", "024", "+24", "-24", " 24"] {
             assert!(
-                !valid_guest_network(&format!("10.0.0.2/{prefix}")),
+                !is_valid_guest_network(&format!("10.0.0.2/{prefix}")),
                 "{prefix:?}"
             );
         }
+        // OpenVMM rejects the network, broadcast, and gateway addresses as guest addresses.
+        for reserved in ["10.0.0.0/24", "10.0.0.255/24", "10.0.0.1/24", "10.0.0.5/30"] {
+            assert!(!is_valid_guest_network(reserved), "{reserved}");
+        }
+        assert!(is_valid_guest_network("10.0.0.6/30"));
         assert!(kernel_command_line_problem("quiet loglevel=0").is_none());
         assert!(kernel_command_line_problem("tsc=reliable").is_some());
         assert!(kernel_command_line_problem("hostname=other").is_some());

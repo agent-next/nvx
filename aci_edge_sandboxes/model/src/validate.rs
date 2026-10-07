@@ -16,11 +16,13 @@ use crate::model::{
     Access, Command, ExecRequest, FilesystemPolicy, NetworkRule, Protocol, ProvisionRequest,
     StdinMode, duration_millis,
 };
+use crate::spec::{self, ImageSource, SandboxSpec};
 
-/// Checks the structure of a provision request, reporting [`ErrorCode::MalformedRequest`].
+/// Checks the structure of a provision request and its sandbox spec, reporting
+/// [`ErrorCode::MalformedRequest`].
 ///
 /// [`ErrorCode::MalformedRequest`]: crate::ErrorCode::MalformedRequest
-pub fn provision_structure(request: &ProvisionRequest) -> Result<()> {
+pub fn provision_structure(request: &ProvisionRequest, spec: &SandboxSpec) -> Result<()> {
     if request.microvm.provision.memory_mib == Some(0) {
         return Err(Error::malformed_request(
             "microvm.provision.memoryMib must be positive",
@@ -41,6 +43,51 @@ pub fn provision_structure(request: &ProvisionRequest) -> Result<()> {
             for (index, rule) in rules.iter().enumerate() {
                 rule_structure(rule, &format!("{field}[{index}]"))?;
             }
+        }
+    }
+    if let Some(proxy) = request
+        .runtime_config
+        .as_ref()
+        .and_then(|config| config.network_proxy.as_deref())
+    {
+        if proxy.trim().is_empty() {
+            return Err(Error::malformed_request(
+                "runtimeConfig.networkProxy is empty",
+            ));
+        }
+        no_nul(proxy, "runtimeConfig.networkProxy")?;
+    }
+    spec_structure(spec)?;
+    let memory_in_spec = spec
+        .resources
+        .is_some_and(|resources| resources.memory_mib.is_some());
+    if request.microvm.provision.memory_mib.is_some() && memory_in_spec {
+        return Err(Error::malformed_request(
+            "set the guest memory in microvm.provision.memoryMib or in spec.resources.memoryMib, \
+             not both",
+        ));
+    }
+    Ok(())
+}
+
+fn spec_structure(spec: &SandboxSpec) -> Result<()> {
+    if let Some(image) = &spec.image {
+        image.validate("spec.image")?;
+    }
+    if let Some(resources) = &spec.resources {
+        resources.validate("spec.resources")?;
+    }
+    if let Some(guest_network) = &spec.guest_network {
+        spec::guest_network(guest_network, "spec.guestNetwork")?;
+    }
+    if let Some(hostname) = &spec.hostname {
+        spec::hostname(hostname, "spec.hostname")?;
+    }
+    for (index, forward) in spec.host_loopback_forwards.iter().enumerate() {
+        if forward.host_port == 0 || forward.guest_port == 0 {
+            return Err(Error::malformed_request(format!(
+                "spec.hostLoopbackForwards[{index}]: ports must be between 1 and 65535"
+            )));
         }
     }
     Ok(())
@@ -87,12 +134,13 @@ fn rule_structure(rule: &NetworkRule, field: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks that `capabilities` honor every feature a provision request uses, reporting
-/// [`ErrorCode::PolicyValidation`].
+/// Checks that `capabilities` honor every feature a provision request and its sandbox spec use,
+/// reporting [`ErrorCode::PolicyValidation`].
 ///
 /// [`ErrorCode::PolicyValidation`]: crate::ErrorCode::PolicyValidation
 pub fn provision_capabilities(
     request: &ProvisionRequest,
+    spec: &SandboxSpec,
     capabilities: &Capabilities,
 ) -> Result<()> {
     let backend = &capabilities.backend;
@@ -130,11 +178,14 @@ pub fn provision_capabilities(
             check_access(backend, field, access, allow, deny)?;
         }
         if let Some(access) = network.ingress.host_loopback {
+            // Forwarded ports are the only host-loopback access a backend may honor.
+            let forwarded =
+                capabilities.spec.host_loopback_forwards && !spec.host_loopback_forwards.is_empty();
             check_access(
                 backend,
                 "network.ingress.hostLoopback",
                 access,
-                supported.host_loopback_allow,
+                supported.host_loopback_allow || forwarded,
                 supported.host_loopback_deny,
             )?;
         }
@@ -142,6 +193,57 @@ pub fn provision_capabilities(
         if has_rules && !supported.egress_rules {
             return Err(Error::policy_validation(format!(
                 "the {backend} backend cannot enforce network.egress allow or deny rules"
+            )));
+        }
+    }
+    let proxy = request
+        .runtime_config
+        .as_ref()
+        .is_some_and(|config| config.network_proxy.is_some());
+    if proxy && !capabilities.network.network_proxy {
+        return Err(Error::policy_validation(format!(
+            "the {backend} backend cannot enforce runtimeConfig.networkProxy"
+        )));
+    }
+    spec_capabilities(spec, capabilities)
+}
+
+fn spec_capabilities(spec: &SandboxSpec, capabilities: &Capabilities) -> Result<()> {
+    let backend = &capabilities.backend;
+    let supported = &capabilities.spec;
+    let image = spec.image.as_ref().map(|image| match image {
+        ImageSource::Reference(_) => ("spec.image.reference", supported.image_reference),
+        ImageSource::Digest(_) => ("spec.image.digest", supported.image_digest),
+        ImageSource::Path(_) => ("spec.image.path", supported.image_path),
+    });
+    let resources = spec.resources.unwrap_or_default();
+    let checks = [
+        image.unwrap_or(("spec.image", true)),
+        (
+            "spec.resources.vcpus",
+            resources.vcpus.is_none() || supported.vcpus,
+        ),
+        (
+            "spec.resources.memoryMib",
+            resources.memory_mib.is_none() || supported.memory,
+        ),
+        (
+            "spec.guestNetwork",
+            spec.guest_network.is_none() || supported.guest_network,
+        ),
+        (
+            "spec.hostname",
+            spec.hostname.is_none() || supported.hostname,
+        ),
+        (
+            "spec.hostLoopbackForwards",
+            spec.host_loopback_forwards.is_empty() || supported.host_loopback_forwards,
+        ),
+    ];
+    for (field, honored) in checks {
+        if !honored {
+            return Err(Error::policy_validation(format!(
+                "the {backend} backend cannot honor {field}"
             )));
         }
     }
@@ -322,22 +424,27 @@ mod tests {
         result.unwrap_err().code()
     }
 
+    fn structure(request: &ProvisionRequest) -> Result<()> {
+        provision_structure(request, &SandboxSpec::new())
+    }
+
+    fn capabilities_of(request: &ProvisionRequest, capabilities: &Capabilities) -> Result<()> {
+        provision_capabilities(request, &SandboxSpec::new(), capabilities)
+    }
+
     #[test]
     fn provision_structure_rejects_shape_errors() {
         assert_eq!(
-            code(provision_structure(&request().with_memory_mib(0))),
+            code(structure(&request().with_memory_mib(0))),
             ErrorCode::MalformedRequest
         );
         let relative = request().with_filesystem(FilesystemPolicy {
             readonly_paths: vec![PathBuf::from("source")],
             ..FilesystemPolicy::default()
         });
-        assert_eq!(
-            code(provision_structure(&relative)),
-            ErrorCode::MalformedRequest
-        );
-        provision_structure(&request()).unwrap();
-        provision_structure(&request().with_memory_mib(512)).unwrap();
+        assert_eq!(code(structure(&relative)), ErrorCode::MalformedRequest);
+        structure(&request()).unwrap();
+        structure(&request().with_memory_mib(512)).unwrap();
     }
 
     #[test]
@@ -348,20 +455,20 @@ mod tests {
             ..FilesystemPolicy::default()
         });
         assert_eq!(
-            code(provision_capabilities(&filesystem, &capabilities)),
+            code(capabilities_of(&filesystem, &capabilities)),
             ErrorCode::PolicyValidation
         );
         let mut ingress = NetworkPolicy::deny_all();
         ingress.ingress.default = Access::Allow;
         let network = request().with_network(ingress);
         assert_eq!(
-            code(provision_capabilities(&network, &capabilities)),
+            code(capabilities_of(&network, &capabilities)),
             ErrorCode::PolicyValidation
         );
         let empty_filesystem = request()
             .with_filesystem(FilesystemPolicy::default())
             .with_network(NetworkPolicy::deny_all());
-        provision_capabilities(&empty_filesystem, &capabilities).unwrap();
+        capabilities_of(&empty_filesystem, &capabilities).unwrap();
     }
 
     #[test]
@@ -412,7 +519,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                code(provision_structure(&with_rule(rule.clone()))),
+                code(structure(&with_rule(rule.clone()))),
                 ErrorCode::MalformedRequest,
                 "{rule:?}"
             );
@@ -424,14 +531,124 @@ mod tests {
             }],
             ports: vec![port(Protocol::Tcp, Some(80), Some(81))],
         });
-        provision_structure(&valid).unwrap();
+        structure(&valid).unwrap();
         assert_eq!(
-            code(provision_capabilities(&valid, &capabilities())),
+            code(capabilities_of(&valid, &capabilities())),
             ErrorCode::PolicyValidation
         );
         let mut supported = capabilities();
         supported.network.egress_rules = true;
-        provision_capabilities(&valid, &supported).unwrap();
+        capabilities_of(&valid, &supported).unwrap();
+    }
+
+    #[test]
+    fn proxies_and_forwards_need_their_capabilities() {
+        use crate::model::{ForwardProtocol, HostLoopbackForward};
+
+        let proxied = request()
+            .with_network(NetworkPolicy::deny_all())
+            .with_network_proxy("http://127.0.0.1:8080");
+        structure(&proxied).unwrap();
+        assert_eq!(
+            code(capabilities_of(&proxied, &capabilities())),
+            ErrorCode::PolicyValidation
+        );
+        let mut supported = capabilities();
+        supported.network.network_proxy = true;
+        capabilities_of(&proxied, &supported).unwrap();
+        for proxy in ["", "  ", "http://127.0.0.1:80\0"] {
+            assert_eq!(
+                code(structure(&request().with_network_proxy(proxy))),
+                ErrorCode::MalformedRequest,
+                "{proxy:?}"
+            );
+        }
+
+        let mut loopback = NetworkPolicy::egress(Access::Allow);
+        loopback.ingress.host_loopback = Some(Access::Allow);
+        let forward = HostLoopbackForward::new(ForwardProtocol::Tcp, 3000, 8080);
+        let network = request().with_network(loopback.clone());
+        let forwarded = SandboxSpec::new().with_host_loopback_forward(forward);
+        provision_structure(&network, &forwarded).unwrap();
+        assert_eq!(
+            code(provision_capabilities(
+                &network,
+                &forwarded,
+                &capabilities()
+            )),
+            ErrorCode::PolicyValidation
+        );
+        let mut supported = capabilities();
+        supported.spec.host_loopback_forwards = true;
+        provision_capabilities(&network, &forwarded, &supported).unwrap();
+        // Without forwarded ports, host-loopback access needs the generic capability.
+        assert_eq!(
+            code(capabilities_of(
+                &request().with_network(loopback),
+                &supported
+            )),
+            ErrorCode::PolicyValidation
+        );
+        for (host_port, guest_port) in [(0, 53), (53, 0)] {
+            let zero = SandboxSpec::new().with_host_loopback_forward(HostLoopbackForward::new(
+                ForwardProtocol::Udp,
+                host_port,
+                guest_port,
+            ));
+            assert_eq!(
+                code(provision_structure(&request(), &zero)),
+                ErrorCode::MalformedRequest
+            );
+        }
+    }
+
+    #[test]
+    fn specs_are_checked_for_shape_support_and_conflicts() {
+        use crate::spec::ImageSource;
+
+        for bad in [
+            SandboxSpec::new().with_memory_mib(0),
+            SandboxSpec::new().with_vcpus(0),
+            SandboxSpec::new().with_guest_network("10.0.0.1/24"),
+            SandboxSpec::new().with_hostname("Upper"),
+            SandboxSpec::new().with_image(ImageSource::Path("relative.vhd".into())),
+            SandboxSpec::new().with_image(ImageSource::Reference(" ".into())),
+        ] {
+            assert_eq!(
+                code(provision_structure(&request(), &bad)),
+                ErrorCode::MalformedRequest,
+                "{bad:?}"
+            );
+        }
+        let both = request().with_memory_mib(512);
+        let memory = SandboxSpec::new().with_memory_mib(512);
+        assert_eq!(
+            code(provision_structure(&both, &memory)),
+            ErrorCode::MalformedRequest
+        );
+        provision_structure(&request(), &memory).unwrap();
+
+        let image = SandboxSpec::new().with_image(ImageSource::Path(absolute("image.vhd")));
+        provision_structure(&request(), &image).unwrap();
+        let mut supported = capabilities();
+        for spec in [&memory, &image] {
+            assert_eq!(
+                code(provision_capabilities(&request(), spec, &supported)),
+                ErrorCode::PolicyValidation,
+                "{spec:?}"
+            );
+        }
+        supported.spec.memory = true;
+        supported.spec.image_path = true;
+        for spec in [&memory, &image] {
+            provision_capabilities(&request(), spec, &supported).unwrap();
+        }
+        let reference =
+            SandboxSpec::new().with_image(ImageSource::Reference("mcr.microsoft.com/a:1".into()));
+        assert_eq!(
+            code(provision_capabilities(&request(), &reference, &supported)),
+            ErrorCode::PolicyValidation
+        );
     }
 
     #[test]

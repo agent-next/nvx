@@ -20,6 +20,7 @@ use crate::model::{
     DeprovisionResult, ExecRequest, ProvisionRequest, ProvisionResult, StartResult, StdinMode,
     StopResult,
 };
+use crate::spec::SandboxSpec;
 use crate::stream::{self, QueueReader, QueueWriter};
 
 /// Asynchronous counterpart of [`AciEdgeSandbox`].
@@ -76,6 +77,16 @@ impl AsyncAciEdgeSandbox {
     pub async fn provision(&self, request: ProvisionRequest) -> Result<ProvisionResult> {
         let nvx = self.nvx.clone();
         blocking(move || nvx.provision(&request)).await
+    }
+
+    /// Allocates a sandbox with creation settings outside the request, without starting it.
+    pub async fn provision_with(
+        &self,
+        request: ProvisionRequest,
+        spec: SandboxSpec,
+    ) -> Result<ProvisionResult> {
+        let nvx = self.nvx.clone();
+        blocking(move || nvx.provision_with(&request, &spec)).await
     }
 
     /// Moves a provisioned sandbox to the running state.
