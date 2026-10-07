@@ -7918,8 +7918,7 @@ class SandboxTests(unittest.TestCase):
     def test_managed_exec_outcome_rejects_existing_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            target = directory / "target"
-            target.write_text("existing", encoding="utf-8")
+            target = directory / "missing-target"
             path = directory / "outcome.json"
             try:
                 path.symlink_to(target)
