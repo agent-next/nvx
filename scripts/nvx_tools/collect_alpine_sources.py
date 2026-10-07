@@ -295,6 +295,10 @@ def _extract_recipe(
     result = _run(
         [
             "git",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.eol=lf",
             "-C",
             cache,
             "archive",

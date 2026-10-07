@@ -4979,6 +4979,35 @@ class AlpineSourceCollectionTests(unittest.TestCase):
 
                 self.assertIn("package manifest", str(context.exception))
 
+    def test_recipe_collection_preserves_blob_line_endings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "aports"
+            apkbuild = b"pkgname=foo\npkgver=1.0\npkgrel=0\n"
+            commit = self._aports_commit(
+                cache,
+                {"main/foo/APKBUILD": ("100644", apkbuild)},
+            )
+            subprocess.run(
+                ["git", "-C", str(cache), "config", "core.autocrlf", "true"],
+                check=True,
+            )
+            output = root / "alpine"
+
+            with (
+                patch.object(collect_alpine_sources, "_prepare_aports"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                collect_alpine_sources.collect_alpine_sources(
+                    [self._package_manifest(root, commit)],
+                    output,
+                    cache,
+                    skip_upstream=True,
+                )
+
+            collected = output / "recipes" / commit / "main/foo/APKBUILD"
+            self.assertEqual(collected.read_bytes(), apkbuild)
+
     def test_recipe_symlink_is_collected_as_verified_regular_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
