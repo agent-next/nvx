@@ -2302,7 +2302,7 @@ class CiTests(unittest.TestCase):
                     os.fspath(root / backend),
                 )
 
-    def test_openvmm_tests_pin_stable_toolchain_without_runner_temp(self):
+    def test_openvmm_tests_pin_toolchain_without_runner_temp(self):
         installed_targets = common.CommandResult(
             args=("rustup", "target", "list"),
             returncode=0,
@@ -2401,6 +2401,68 @@ class CiTests(unittest.TestCase):
             )
             for command in (install_targets, restore, tests):
                 self.assertIs(command.kwargs["env"], environment)
+
+    def test_openvmm_tests_install_missing_pinned_toolchain(self):
+        missing_toolchain = common.CommandResult(
+            args=("rustup", "target", "list"),
+            returncode=1,
+            stdout=b"",
+            stderr=(
+                f"error: toolchain '{OpenVMMBuildConstants.RUST_TOOLCHAIN}' "
+                "is not installed\n"
+            ).encode(),
+        )
+        install_toolchain = [
+            "rustup",
+            "toolchain",
+            "install",
+            OpenVMMBuildConstants.RUST_TOOLCHAIN,
+            "--profile",
+            "minimal",
+        ]
+        add_targets = [
+            "rustup",
+            "target",
+            "add",
+            *OpenVMMBuildConstants.TEST_RUST_TARGETS["kvm"],
+            "--toolchain",
+            OpenVMMBuildConstants.RUST_TOOLCHAIN,
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            for runner_temp in (None, temporary):
+                with (
+                    self.subTest(runner_temp=runner_temp),
+                    patch.object(ci, "run_capture", return_value=missing_toolchain),
+                    patch.object(ci, "run_checked") as run_checked,
+                    patch.dict(
+                        os.environ,
+                        {} if runner_temp is None else {"RUNNER_TEMP": runner_temp},
+                        clear=True,
+                    ),
+                ):
+                    environment = ci._prepare_openvmm_test_environment("kvm", "rustup")
+
+                    self.assertEqual(
+                        [command.args[0] for command in run_checked.call_args_list],
+                        [install_toolchain, add_targets],
+                    )
+                    for command in run_checked.call_args_list:
+                        self.assertIs(command.kwargs["env"], environment)
+                    self.assertEqual(
+                        environment["RUSTUP_TOOLCHAIN"],
+                        OpenVMMBuildConstants.RUST_TOOLCHAIN,
+                    )
+                    if runner_temp is None:
+                        self.assertNotIn("RUSTUP_HOME", environment)
+                    else:
+                        self.assertEqual(
+                            environment["RUSTUP_HOME"],
+                            os.fspath(
+                                Path(runner_temp)
+                                / OpenVMMBuildConstants.RUSTUP_DIRECTORY_NAME
+                            ),
+                        )
 
     def test_openvmm_tests_define_each_backend_filter(self):
         self.assertEqual(
@@ -3882,6 +3944,98 @@ class CiConfigurationTests(unittest.TestCase):
             "x86_64-w64-mingw32-dlltool",
         ):
             self.assertNotIn(cross_platform_tool, linux_setup)
+
+    def test_repository_pins_one_exact_rust_toolchain(self):
+        root = BuildConstants.REPO_ROOT
+        [toolchain] = re.findall(
+            r'^channel = "([^"]*)"$',
+            (root / "rust-toolchain.toml").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        # A floating channel such as `stable` lets runners drift apart (#402).
+        self.assertRegex(toolchain, r"^[0-9]+\.[0-9]+\.[0-9]+$")
+        self.assertEqual(OpenVMMBuildConstants.RUST_TOOLCHAIN, toolchain)
+        self.assertIn("rust-toolchain.toml", ReleaseBuildConstants.PROJECT_SOURCE_PATHS)
+
+        setup = root / "scripts" / "setup"
+        for path, pattern in (
+            (setup / "setup-linux-runner.sh", r"^RUST_TOOLCHAIN=(.*)$"),
+            (setup / "setup-linux-mshv.sh", r"^RUST_TOOLCHAIN=(.*)$"),
+            (setup / "setup-windows-whp.ps1", r'^\$RustToolchain = "(.*)"$'),
+            (root / ".github" / "specula" / "setup-runner.sh", r"^RUST_VERSION=(.*)$"),
+        ):
+            with self.subTest(path=path.name):
+                self.assertEqual(
+                    re.findall(pattern, path.read_text(encoding="utf-8"), re.MULTILINE),
+                    [toolchain],
+                )
+
+    def test_ci_takes_rust_toolchain_from_repository_pin(self):
+        github = BuildConstants.REPO_ROOT / ".github"
+        workflows = github / "workflows"
+
+        validate_runner = (
+            github / "actions" / "validate-runner" / "action.yml"
+        ).read_text(encoding="utf-8")
+        for step_name in ("Validate Linux toolchain", "Validate Windows toolchain"):
+            with self.subTest(step=step_name):
+                step = _composite_action_step(validate_runner, step_name)
+                self.assertIn("rust-toolchain.toml", step)
+                # Report a missing toolchain without writing the trusted RUSTUP_HOME.
+                self.assertEqual(_yaml_field(step, "RUSTUP_AUTO_INSTALL"), ['"0"'])
+
+        crate_action = (
+            github / "actions" / "check-aci-edge-sandboxes" / "action.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(_yaml_field(crate_action, "default"), ['""'])
+        install = _composite_action_step(crate_action, "Install Rust toolchains")
+        self.assertIn("../rust-toolchain.toml", install)
+        self.assertIn("REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}", install)
+        self.assertEqual(crate_action.count("${{ inputs.toolchain }}"), 1)
+
+        setup = (workflows / "copilot-setup-steps.yml").read_text(encoding="utf-8")
+        self.assertIn("      - rust-toolchain.toml\n", setup)
+        self.assertIn(
+            "rust-toolchain.toml",
+            _workflow_step(
+                setup, "copilot-setup-steps", "Resolve pinned tool versions"
+            ),
+        )
+        rust = _workflow_step(setup, "copilot-setup-steps", "Install Rust toolchains")
+        self.assertIn('rustup default "${RUST_TOOLCHAIN}"', rust)
+        self.assertNotIn("stable", rust)
+
+        shared = (workflows / "shared" / "code-improvement.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("rust-toolchain.toml", shared)
+        self.assertNotRegex(shared, r'toolchain="[0-9]')
+        for name in (
+            "code-deduplication",
+            "code-documentation",
+            "code-quality",
+            "code-reusability",
+        ):
+            with self.subTest(workflow=name):
+                lock = (workflows / f"{name}.lock.yml").read_text(encoding="utf-8")
+                self.assertIn("rust-toolchain.toml", lock)
+
+        # A binary built by another compiler must not satisfy the cache.
+        build_action = (github / "actions" / "build-openvmm" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            build_action.count(
+                "${{ hashFiles('rust-toolchain.toml') }}-${{ steps.openvmm.outputs.sha }}"
+            ),
+            4,
+        )
+
+        ci_workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
+        [relevant_paths] = [
+            line for line in ci_workflow.splitlines() if "relevant_paths='" in line
+        ]
+        self.assertIn(r"|rust-toolchain\.toml$", relevant_paths)
 
     def test_release_actions_use_deterministic_immutable_tooling(self):
         package_action = (

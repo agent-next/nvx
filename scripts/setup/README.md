@@ -93,10 +93,35 @@ sh scripts/setup/setup-linux-runner.sh \
   -RunnerOnly -RunnerName azure-windows-3 -CheckOnly
 ```
 
+### Rust toolchain
+
+The runner scripts install the Rust release that the repository's
+[`rust-toolchain.toml`](../../rust-toolchain.toml) pins, with its OpenVMM
+targets, into the read-only trusted toolchain, and check mode requires exactly
+that release. The `validate-runner` action fails a job on a runner that lacks
+it, so update every runner before a change to the pin merges. A pass without a
+runner name installs the new release next to the existing ones and leaves the
+runner service and the default toolchain unchanged; jobs select the release
+through `rust-toolchain.toml`. Stage the updated script, then run that pass and
+validate the runner:
+
+```bash
+scp scripts/setup/setup-linux-runner.sh HOST:/tmp/setup-linux-runner.sh
+ssh HOST 'sh /tmp/setup-linux-runner.sh --backend kvm'
+ssh HOST 'sh /tmp/setup-linux-runner.sh --backend kvm --runner-name azure-kvm-3 --check-only'
+```
+
+```powershell
+ssh HOST powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File C:\setup-windows-whp.ps1 -RunnerOnly
+ssh HOST powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File C:\setup-windows-whp.ps1 -RunnerOnly -RunnerName azure-windows-3 -CheckOnly
+```
+
 ## Linux / MSHV
 
 The Linux script supports distributions with `apt-get`, `dnf`, or `tdnf`. It
-installs native build dependencies, stable Rust 1.95 or newer, and
+installs native build dependencies, the pinned Rust release, and
 cargo-nextest 0.9.133. It installs Docker with Buildx and configures
 group-based access to Docker and `/dev/mshv`.
 
@@ -133,7 +158,7 @@ separate `build-guest` invocation without provisioning or rebuilding the host.
 ## Windows / WHP
 
 Run the complete bootstrap from an elevated Windows PowerShell session. It uses
-WinGet to install missing tools, installs stable Rust 1.95 or newer and
+WinGet to install missing tools, installs the pinned Rust release and
 cargo-nextest 0.9.133, enables Windows Hypervisor Platform, and builds OpenVMM.
 Runner-only provisioning additionally enables Hyper-V for its in-box PCAT and
 SVGA firmware. The script never reboots automatically.

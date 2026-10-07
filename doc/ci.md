@@ -386,13 +386,49 @@ time ABI boot, so the microVM boot and restore scenarios run CI's warp
 schedule after every boot and restore and assert its verdict. H5 and H7 remain
 available for interactive qualification.
 
+## Rust toolchain
+
+[`rust-toolchain.toml`](../rust-toolchain.toml) pins the exact Rust release
+that builds OpenVMM, its test guests, the `aci_edge_sandboxes` crate, and the
+host tools that NVX compiles, such as the doctor's time probe and the Windows
+curl shim. Rustup applies the file to every `cargo` and `rustc` run in the
+checkout, including in the `openvmm` submodule, and `test-openvmm` also exports
+the release as `RUSTUP_TOOLCHAIN` because flowey can run Cargo outside the
+checkout. The pin is an exact release rather than `stable`, so runners
+provisioned at different times build with the same compiler (#402). Rust 1.99.0
+cannot link OpenVMM's `guest_test_uefi`, failing with `undefined symbol: wcslen`
+([rust-lang/rust#163614](https://github.com/rust-lang/rust/issues/163614)).
+
+Self-hosted runners keep the release in a trusted `RUSTUP_HOME` that jobs
+cannot modify, so the [runner setup scripts](../scripts/setup/README.md#rust-toolchain)
+install it with its OpenVMM targets. `validate-runner` disables rustup's
+automatic installation and fails a job before it builds anything when its runner
+lacks the release, naming the setup script to rerun. The OpenVMM binary cache
+key includes a hash of the file, so a new release rebuilds OpenVMM, and a change
+to the file runs the OpenVMM test matrix.
+
+To move the pin, first confirm that `guest_test_uefi` links with the new
+release:
+
+```bash
+rustup toolchain install RELEASE --profile minimal --target x86_64-unknown-uefi
+cd openvmm
+cargo +RELEASE build -p guest_test_uefi --target x86_64-unknown-uefi --profile release
+```
+
+Then change the release in `rust-toolchain.toml`,
+`OpenVMMBuildConstants.RUST_TOOLCHAIN`, the three setup scripts in
+`scripts/setup`, and the Specula runner setup together; a test in
+`scripts/test_nvx_tools.py` fails while they differ. Update every self-hosted
+runner as the setup guide describes before the change merges.
+
 ## Rust crate
 
 The required `aci-edge-sandboxes` job checks the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) on
 GitHub-hosted Ubuntu and Windows runners through the
 [`check-aci-edge-sandboxes`](../.github/actions/check-aci-edge-sandboxes/action.yml) action. The action
 runs rustfmt, Clippy with warnings denied, and rustdoc, all on the Rust
-toolchain that MXC pins. It also runs the unit, mock, and fake-OpenVMM
+release that `rust-toolchain.toml` pins. It also runs the unit, mock, and fake-OpenVMM
 integration tests, checks the declared minimum Rust version, and cross-checks
 the macOS build that MXC compiles. The fake-OpenVMM tests drive the real
 OpenVMM backend through its control protocol without a hypervisor.
@@ -449,7 +485,7 @@ the public OpenVMM submodule without a deploy key, grants access to the
 runner's `/dev/kvm`, installs the Python development tools into a virtual
 environment on the image's Python 3, which `validate-nvx` also uses, and
 installs Rust and cargo-nextest at the versions that
-`check-aci-edge-sandboxes`, the crate manifest, and the Linux runner bootstrap
+`rust-toolchain.toml`, the crate manifest, and the Linux runner bootstrap
 pin. It restores the shared guest artifacts
 through the `restore-only` input of
 [`build-guest-artifacts`](../.github/actions/build-guest-artifacts/action.yml)

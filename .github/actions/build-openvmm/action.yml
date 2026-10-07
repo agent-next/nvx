@@ -85,7 +85,7 @@ runs:
         path: |
           build/openvmm.provenance.json
           ${{ inputs.binary-path }}
-        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm.outputs.sha }}
+        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ steps.openvmm.outputs.sha }}
 
     - name: Restore OpenVMM binary on Windows
       id: restore-openvmm-binary-windows
@@ -95,7 +95,7 @@ runs:
         path: |
           build/openvmm.provenance.json
           ${{ inputs.binary-path }}
-        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm.outputs.sha }}
+        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ steps.openvmm.outputs.sha }}
 
     - name: Restore shared Cargo cache on Linux
       id: restore-cargo-linux
@@ -177,7 +177,7 @@ runs:
         path: |
           build/openvmm.provenance.json
           ${{ inputs.binary-path }}
-        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm.outputs.sha }}
+        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ steps.openvmm.outputs.sha }}
 
     - name: Save OpenVMM binary on Windows
       if: >-
@@ -191,4 +191,4 @@ runs:
         path: |
           build/openvmm.provenance.json
           ${{ inputs.binary-path }}
-        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm.outputs.sha }}
+        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ steps.openvmm.outputs.sha }}

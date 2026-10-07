@@ -43,8 +43,8 @@ if (-not $RunnerOnly) {
     $Workspace = (Resolve-Path -LiteralPath $Workspace).Path
 }
 
-$RustToolchain = "stable"
-$MinimumRustVersion = [version]"1.95.0"
+# The release that rust-toolchain.toml pins.
+$RustToolchain = "1.95.0"
 $RustupVersion = "1.29.1"
 $RustupSha256 = "6f4bef66261261fcb43131be8720bab817d403a09edec7455c371974b90bdb7e"
 $CargoNextestVersion = "0.9.133"
@@ -1438,11 +1438,11 @@ function Assert-Environment {
 
     $rustVersion = & (Get-RequiredCommand "rustup.exe") `
         run $RustToolchain rustc --version
-    Assert-LastExitCode "stable Rust"
+    Assert-LastExitCode "Rust $RustToolchain"
     $rustVersionText = $rustVersion -join "`n"
     if ($rustVersionText -notmatch "rustc ([0-9]+\.[0-9]+\.[0-9]+)" -or
-        [version]$Matches[1] -lt $MinimumRustVersion) {
-        throw "Rust $MinimumRustVersion or newer is required"
+        $Matches[1] -ne $RustToolchain) {
+        throw "Rust $RustToolchain is required, found $rustVersionText"
     }
     $nextestVersion = & (Get-RequiredCommand "cargo-nextest.exe") --version
     Assert-LastExitCode "cargo-nextest --version"

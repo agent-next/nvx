@@ -19,6 +19,10 @@ runs:
     - name: Validate Linux toolchain
       if: runner.os != 'Windows'
       shell: bash
+      env:
+        # Report a missing pinned toolchain instead of installing it into the
+        # read-only RUSTUP_HOME.
+        RUSTUP_AUTO_INSTALL: "0"
       run: |
         set -euo pipefail
         test -n "${CARGO_HOME:-}" || {
@@ -27,7 +31,19 @@ runs:
         }
         mkdir -p "${CARGO_HOME}/bin"
         python3 --version
-        rustc --version
+        toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+        test -n "${toolchain}"
+        if ! rustup toolchain list | awk -v name="${toolchain}" \
+          'index($1, name "-") == 1 { found = 1 } END { exit !found }'; then
+          echo "::error::Rust ${toolchain}, which rust-toolchain.toml pins, is not installed; rerun scripts/setup/setup-linux-runner.sh" >&2
+          exit 1
+        fi
+        rust_version=$(rustc --version)
+        echo "${rust_version}"
+        if [[ "${rust_version}" != "rustc ${toolchain} "* ]]; then
+          echo "::error::${rust_version} does not match Rust ${toolchain}, which rust-toolchain.toml pins" >&2
+          exit 1
+        fi
         cargo --version
         cargo nextest --version
         sccache --version
@@ -58,6 +74,10 @@ runs:
     - name: Validate Windows toolchain
       if: runner.os == 'Windows'
       shell: powershell
+      env:
+        # Report a missing pinned toolchain instead of installing it into the
+        # read-only RUSTUP_HOME.
+        RUSTUP_AUTO_INSTALL: "0"
       run: |
         if ([string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
             throw "CARGO_HOME is not configured"
@@ -65,7 +85,23 @@ runs:
         New-Item -ItemType Directory -Path "$env:CARGO_HOME\bin" -Force |
             Out-Null
         python --version
-        rustc --version
+        $channel = Select-String -LiteralPath "rust-toolchain.toml" `
+          -Pattern '^channel = "([^"]+)"' | Select-Object -First 1
+        if ($null -eq $channel) {
+          throw "rust-toolchain.toml does not pin a Rust release"
+        }
+        $toolchain = $channel.Matches[0].Groups[1].Value
+        $installed = @(rustup toolchain list | ForEach-Object {
+            ($_ -split '\s+')[0]
+          } | Where-Object { $_.StartsWith("$toolchain-") })
+        if ($installed.Count -eq 0) {
+          throw "Rust $toolchain, which rust-toolchain.toml pins, is not installed; rerun scripts\setup\setup-windows-whp.ps1"
+        }
+        $rustVersion = rustc --version
+        $rustVersion
+        if ($rustVersion -notlike "rustc $toolchain *") {
+          throw "$rustVersion does not match Rust $toolchain, which rust-toolchain.toml pins"
+        }
         cargo --version
         cargo nextest --version
         sccache --version

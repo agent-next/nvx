@@ -23,6 +23,7 @@ on:
       - aci_edge_sandboxes/Cargo.toml
       - openvmm
       - requirements-dev.txt
+      - rust-toolchain.toml
       - scripts/nvx.py
       - scripts/nvx_tools/**
       - scripts/setup/setup-linux-runner.sh
@@ -109,28 +110,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          crate_toolchain=$(sed -n '/^  toolchain:/,/^  [^ ]/ s/^    default: "\(.*\)"$/\1/p' \
-            .github/actions/check-aci-edge-sandboxes/action.yml)
+          rust_toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           crate_msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' aci_edge_sandboxes/Cargo.toml)
           nextest=$(sed -n 's/^CARGO_NEXTEST_VERSION=//p' scripts/setup/setup-linux-runner.sh)
           {
-            echo "crate-toolchain=${crate_toolchain}"
+            echo "rust-toolchain=${rust_toolchain}"
             echo "crate-msrv=${crate_msrv}"
             echo "nextest=${nextest}"
           } | tee -a "${GITHUB_OUTPUT}"
-          test -n "${crate_toolchain}" && test -n "${crate_msrv}" && test -n "${nextest}"
+          test -n "${rust_toolchain}" && test -n "${crate_msrv}" && test -n "${nextest}"
 
-      # OpenVMM builds with stable plus its guest, UEFI, and musl targets. The
-      # aci_edge_sandboxes checks use the MXC toolchain, the crate MSRV, and a
-      # macOS target. OpenVMM keeps full debug info in release builds, so the
-      # session limits debug info and disables incremental artifacts to save
-      # disk space and link time.
+      # The toolchain that rust-toolchain.toml pins builds OpenVMM with its
+      # guest, UEFI, and musl targets and runs the aci_edge_sandboxes checks,
+      # which also need a macOS target and the crate MSRV. OpenVMM keeps full
+      # debug info in release builds, so the session limits debug info and
+      # disables incremental artifacts to save disk space and link time.
       - name: Install Rust toolchains
         id: rust
         continue-on-error: true
         shell: bash
         env:
-          CRATE_TOOLCHAIN: ${{ steps.versions.outputs.crate-toolchain }}
+          RUST_TOOLCHAIN: ${{ steps.versions.outputs.rust-toolchain }}
           CRATE_MSRV: ${{ steps.versions.outputs.crate-msrv }}
         run: |
           set -euo pipefail
@@ -139,12 +139,10 @@ jobs:
             echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only"
             echo "CARGO_PROFILE_RELEASE_DEBUG=line-tables-only"
           } >> "${GITHUB_ENV}"
-          rustup toolchain install stable --profile minimal \
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal \
             --component clippy,rustfmt \
-            --target x86_64-unknown-linux-musl,x86_64-unknown-none,x86_64-unknown-uefi
-          rustup default stable
-          rustup toolchain install "${CRATE_TOOLCHAIN}" --profile minimal \
-            --component clippy,rustfmt --target aarch64-apple-darwin
+            --target x86_64-unknown-linux-musl,x86_64-unknown-none,x86_64-unknown-uefi,aarch64-apple-darwin
+          rustup default "${RUST_TOOLCHAIN}"
           rustup toolchain install "${CRATE_MSRV}" --profile minimal
           rustup toolchain list
 
@@ -222,7 +220,7 @@ jobs:
           path: |
             build/openvmm.provenance.json
             openvmm/target/release/openvmm
-          key: openvmm-binary-v6-kvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm-cache.outputs.sha }}
+          key: openvmm-binary-v6-kvm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ steps.openvmm-cache.outputs.sha }}
 
       # Native guest builds are the in-session way to rebuild guest artifacts.
       # Install the Debian/Ubuntu prerequisites listed in doc/setup.md. Alpine's

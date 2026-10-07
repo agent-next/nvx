@@ -2,8 +2,8 @@
 
 set -eu
 
-RUST_TOOLCHAIN=stable
-RUST_MINIMUM_VERSION=1.95.0
+# The release that rust-toolchain.toml pins.
+RUST_TOOLCHAIN=1.95.0
 RUSTUP_VERSION=1.29.1
 RUSTUP_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
 PYTHON_MINIMUM_VERSION=3.10.0
@@ -107,8 +107,8 @@ install_rust_tools() {
 
     rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
     rust_version=$(RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN rustc --version | awk '{print $2}')
-    version_at_least "$rust_version" "$RUST_MINIMUM_VERSION" ||
-        die "Rust ${RUST_MINIMUM_VERSION} or newer is required"
+    [ "$rust_version" = "$RUST_TOOLCHAIN" ] ||
+        die "Rust ${RUST_TOOLCHAIN} is required, found ${rust_version}"
     if ! command -v cargo-nextest >/dev/null 2>&1 ||
         ! cargo nextest --version | grep -Fq "cargo-nextest ${CARGO_NEXTEST_VERSION}"; then
         cargo +"$RUST_TOOLCHAIN" install --locked cargo-nextest \
@@ -175,8 +175,8 @@ check_environment() {
     version_at_least "$python_version" "$PYTHON_MINIMUM_VERSION" ||
         die "Python ${PYTHON_MINIMUM_VERSION} or newer is required"
     rust_version=$(RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN rustc --version | awk '{print $2}')
-    version_at_least "$rust_version" "$RUST_MINIMUM_VERSION" ||
-        die "Rust ${RUST_MINIMUM_VERSION} or newer is required"
+    [ "$rust_version" = "$RUST_TOOLCHAIN" ] ||
+        die "Rust ${RUST_TOOLCHAIN} is required, found ${rust_version}"
     cargo nextest --version | grep -Fq "cargo-nextest ${CARGO_NEXTEST_VERSION}" ||
         die "cargo-nextest ${CARGO_NEXTEST_VERSION} is not installed"
     require_command docker
