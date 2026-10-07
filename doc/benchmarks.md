@@ -561,10 +561,9 @@ follow the same flow with their own platform jobs:
 - `Required status check` fails unless every job that the change schedules, including
   `platform-kvm`, `performance-gate`, and `nvx-microvm-tests-kvm`, has its expected result.
 
-Linux CI uses a reduced device contract of zero warmups and one retained attempt. Windows CI
-discards one warmup and retains five attempts so file initialization cannot dominate its p50.
-Both CI contracts use one-second operation windows. Canonical baseline collection uses the
-full `5 + 30` contract.
+Linux and Windows CI use a reduced device contract of one warmup and ten retained attempts.
+Both CI contracts use one-second operation windows. Canonical baseline collection uses the full
+`5 + 30` contract.
 
 The current workflow collects 10 measured lifecycle samples after one warmup.
 Linux and Windows CI validate the lifecycle result before starting the remaining
