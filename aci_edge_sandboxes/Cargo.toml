@@ -27,10 +27,10 @@ async = ["dep:tokio"]
 testing = []
 
 [dependencies]
+aci_edge_sandboxes_model = { path = "model", version = "0.1.0" }
 getrandom = "0.4"
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.120"
-thiserror = "2"
 tokio = { version = "1.40", default-features = false, features = ["rt", "sync"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -64,6 +64,9 @@ doc = false
 [[example]]
 name = "lifecycle"
 required-features = ["openvmm"]
+
+[workspace]
+members = ["model"]
 
 [lints.rust]
 missing_docs = "warn"

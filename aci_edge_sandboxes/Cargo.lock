@@ -6,15 +6,25 @@ version = 4
 name = "aci_edge_sandboxes"
 version = "0.1.0"
 dependencies = [
+ "aci_edge_sandboxes_model",
  "getrandom",
  "libc",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror",
  "tokio",
  "windows-sys",
+]
+
+[[package]]
+name = "aci_edge_sandboxes_model"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

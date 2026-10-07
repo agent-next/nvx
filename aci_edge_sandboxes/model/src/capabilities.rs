@@ -1,8 +1,10 @@
+//! The features a backend honors, which double as its policy honor matrix.
+
 use serde::{Deserialize, Serialize};
 
 /// Features a backend can honor.
 ///
-/// [`AciEdgeSandbox`](crate::AciEdgeSandbox) rejects requests that use unsupported features with
+/// `AciEdgeSandbox` rejects requests that use unsupported features with
 /// [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation) before the backend runs
 /// anything. The structure doubles as the backend's policy honor matrix.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,7 +42,7 @@ pub struct ExecCapabilities {
     pub argv: bool,
     /// Streams live standard input ([`StdinMode::Piped`](crate::StdinMode::Piped)).
     pub stdin: bool,
-    /// Cancels a live execution through its [`Canceller`](crate::Canceller).
+    /// Cancels a live execution through its `Canceller`.
     pub cancel: bool,
     /// Honors `process.cwd`.
     pub cwd: bool,

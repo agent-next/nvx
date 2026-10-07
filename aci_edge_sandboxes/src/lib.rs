@@ -49,17 +49,16 @@
 //! - `async`: Tokio wrappers ([`AsyncAciEdgeSandbox`], [`AsyncExecution`]) around the synchronous core.
 //! - `testing`: an in-memory [`testing::MockBackend`] for consumers' own tests.
 
+// The data model lives in `aci_edge_sandboxes_model`; these keep its modules at their crate paths.
+#[cfg(feature = "openvmm")]
+pub(crate) use aci_edge_sandboxes_model::cidr;
+pub(crate) use aci_edge_sandboxes_model::{capabilities, error, id, model, validate};
+
 mod backend;
-mod capabilities;
-mod cidr;
 mod client;
-mod error;
 mod exec;
-mod id;
 mod input;
-mod model;
 mod stream;
-mod validate;
 
 #[cfg(feature = "async")]
 mod async_api;

@@ -17,7 +17,10 @@ use crate::model::{
     StdinMode, duration_millis,
 };
 
-pub(crate) fn provision_structure(request: &ProvisionRequest) -> Result<()> {
+/// Checks the structure of a provision request, reporting [`ErrorCode::MalformedRequest`].
+///
+/// [`ErrorCode::MalformedRequest`]: crate::ErrorCode::MalformedRequest
+pub fn provision_structure(request: &ProvisionRequest) -> Result<()> {
     if request.microvm.provision.memory_mib == Some(0) {
         return Err(Error::malformed_request(
             "microvm.provision.memoryMib must be positive",
@@ -84,7 +87,11 @@ fn rule_structure(rule: &NetworkRule, field: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn provision_capabilities(
+/// Checks that `capabilities` honor every feature a provision request uses, reporting
+/// [`ErrorCode::PolicyValidation`].
+///
+/// [`ErrorCode::PolicyValidation`]: crate::ErrorCode::PolicyValidation
+pub fn provision_capabilities(
     request: &ProvisionRequest,
     capabilities: &Capabilities,
 ) -> Result<()> {
@@ -141,7 +148,10 @@ pub(crate) fn provision_capabilities(
     Ok(())
 }
 
-pub(crate) fn exec_structure(request: &ExecRequest) -> Result<()> {
+/// Checks the structure of an exec request, reporting [`ErrorCode::MalformedRequest`].
+///
+/// [`ErrorCode::MalformedRequest`]: crate::ErrorCode::MalformedRequest
+pub fn exec_structure(request: &ExecRequest) -> Result<()> {
     let process = &request.process;
     match &process.command {
         Command::CommandLine(command_line) => {
@@ -184,7 +194,11 @@ pub(crate) fn exec_structure(request: &ExecRequest) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn exec_capabilities(request: &ExecRequest, capabilities: &Capabilities) -> Result<()> {
+/// Checks that `capabilities` honor every feature an exec request uses, reporting
+/// [`ErrorCode::PolicyValidation`].
+///
+/// [`ErrorCode::PolicyValidation`]: crate::ErrorCode::PolicyValidation
+pub fn exec_capabilities(request: &ExecRequest, capabilities: &Capabilities) -> Result<()> {
     let backend = &capabilities.backend;
     let supported = &capabilities.exec;
     let process = &request.process;

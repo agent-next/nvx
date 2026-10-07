@@ -1,3 +1,5 @@
+//! Sandbox identifiers.
+
 use std::fmt;
 use std::str::FromStr;
 

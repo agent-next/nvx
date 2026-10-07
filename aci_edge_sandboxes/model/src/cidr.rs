@@ -5,14 +5,14 @@ use std::net::{IpAddr, Ipv4Addr};
 
 /// An IPv4 or IPv6 network whose host bits are zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Cidr {
+pub struct Cidr {
     address: IpAddr,
     prefix: u8,
 }
 
 impl Cidr {
     /// Parses `ADDRESS` or `ADDRESS/PREFIX`. Host bits must be zero.
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, String> {
         let (address, prefix) = match value.split_once('/') {
             Some((address, prefix)) => (address, Some(prefix)),
             None => (value, None),
@@ -38,7 +38,7 @@ impl Cidr {
     }
 
     /// Returns the IPv4 network as an address and prefix length.
-    pub(crate) fn ipv4(self) -> Option<Ipv4Cidr> {
+    pub fn ipv4(self) -> Option<Ipv4Cidr> {
         match self.address {
             IpAddr::V4(address) => Some(Ipv4Cidr {
                 address: u32::from(address),
@@ -49,7 +49,7 @@ impl Cidr {
     }
 
     /// Returns whether `other` lies within this network.
-    pub(crate) fn contains(self, other: Self) -> bool {
+    pub fn contains(self, other: Self) -> bool {
         match (self.address, other.address) {
             (IpAddr::V4(_), IpAddr::V4(_)) => {
                 let (outer, inner) = (self.ipv4().unwrap(), other.ipv4().unwrap());
@@ -74,7 +74,7 @@ impl Cidr {
 }
 
 /// Parses a prefix length in canonical form: decimal digits without a sign or leading zeros.
-pub(crate) fn parse_prefix_length(text: &str) -> Option<u8> {
+pub fn parse_prefix_length(text: &str) -> Option<u8> {
     let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
     // `u8::from_str` alone would also accept a leading `+`.
     if digits && (text.len() == 1 || !text.starts_with('0')) {
@@ -102,13 +102,11 @@ fn mask128(address: u128, prefix: u8) -> u128 {
 
 /// An IPv4 network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Ipv4Cidr {
+pub struct Ipv4Cidr {
     address: u32,
     prefix: u8,
 }
 
-// Only the OpenVMM backend expands rules into networks.
-#[cfg_attr(not(feature = "openvmm"), allow(dead_code))]
 impl Ipv4Cidr {
     fn contains(self, other: Self) -> bool {
         self.prefix <= other.prefix && mask32(other.address, self.prefix) == self.address
@@ -138,7 +136,7 @@ impl Ipv4Cidr {
     /// Each exclusion is followed only into the half of a network that contains it, and expansion
     /// stops as soon as the result exceeds `limit`, so the work grows linearly with the number of
     /// exclusions rather than with that number times the size of the result.
-    pub(crate) fn subtract(self, excluded: &[Self], limit: usize) -> Option<Vec<Self>> {
+    pub fn subtract(self, excluded: &[Self], limit: usize) -> Option<Vec<Self>> {
         let mut overlapping: Vec<Self> = excluded
             .iter()
             .copied()

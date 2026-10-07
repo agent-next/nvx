@@ -1,3 +1,6 @@
+//! Lifecycle requests and results: provision and exec requests, their policies, and the results
+//! of each operation.
+
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,7 +14,7 @@ use crate::id::SandboxId;
 /// Callers must not depend on a metadata field unless the backend documents it.
 pub type Metadata = serde_json::Map<String, serde_json::Value>;
 
-/// Inputs to [`AciEdgeSandbox::provision`](crate::AciEdgeSandbox::provision).
+/// Inputs to `AciEdgeSandbox::provision`.
 ///
 /// The serialized form matches the policy fields of the contract's provision request
 /// (`filesystem`, `network`, and `microvm`). Envelope fields such as `version` and `phase` belong
@@ -318,7 +321,7 @@ impl fmt::Display for Access {
     }
 }
 
-/// Inputs to [`AciEdgeSandbox::exec`](crate::AciEdgeSandbox::exec).
+/// Inputs to `AciEdgeSandbox::exec`.
 ///
 /// The serialized form is the contract's exec request body, `{ "process": { ... } }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,7 +433,7 @@ pub enum StdinMode {
     #[default]
     Null,
     /// The caller writes the workload's standard input through
-    /// [`Execution::take_stdin`](crate::Execution::take_stdin).
+    /// `Execution::take_stdin`.
     Piped,
 }
 
@@ -538,7 +541,7 @@ where
 }
 
 /// Converts a duration to whole milliseconds, rounding a nonzero sub-millisecond duration up.
-pub(crate) fn duration_millis(duration: Duration) -> u64 {
+pub fn duration_millis(duration: Duration) -> u64 {
     let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
     if millis == 0 && !duration.is_zero() {
         1
@@ -547,7 +550,7 @@ pub(crate) fn duration_millis(duration: Duration) -> u64 {
     }
 }
 
-/// Result of [`AciEdgeSandbox::provision`](crate::AciEdgeSandbox::provision).
+/// Result of `AciEdgeSandbox::provision`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProvisionResult {
@@ -558,7 +561,7 @@ pub struct ProvisionResult {
     pub metadata: Option<Metadata>,
 }
 
-/// Result of [`AciEdgeSandbox::start`](crate::AciEdgeSandbox::start).
+/// Result of `AciEdgeSandbox::start`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartResult {
@@ -567,7 +570,7 @@ pub struct StartResult {
     pub metadata: Option<Metadata>,
 }
 
-/// Result of [`AciEdgeSandbox::stop`](crate::AciEdgeSandbox::stop).
+/// Result of `AciEdgeSandbox::stop`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopResult {
@@ -576,7 +579,7 @@ pub struct StopResult {
     pub metadata: Option<Metadata>,
 }
 
-/// Result of [`AciEdgeSandbox::deprovision`](crate::AciEdgeSandbox::deprovision).
+/// Result of `AciEdgeSandbox::deprovision`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeprovisionResult {
