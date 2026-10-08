@@ -930,11 +930,28 @@ class _FakeSandboxCli:
             log.write("OpenVMM started\n")
         config = json.loads((state / "config.json").read_text(encoding="utf-8"))
         if config["user"] != "65534:65534":
-            # The guest refuses the identity and powers off.
-            (state / "outcome.json").write_text("{}", encoding="utf-8")
+            # The guest refuses the identity and powers off, and OpenVMM reports
+            # its status before it exits.
+            if "failed-start-kills-reporter" in self.faults:
+                # OpenVMM ended while it published its report (issue #438).
+                (state / ".tmpAbC123").write_text("{", encoding="utf-8")
+            else:
+                (state / "outcome.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "outcome": sandbox_lifecycle_tests.MANAGED_REFUSAL,
+                            "network_policy": {},
+                            "teardown": {},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
             if "failed-start-keeps-runtime" in self.faults:
                 (state / "runtime.json").write_text("{}", encoding="utf-8")
-            return self._error("managed control endpoint closed")
+            if "failed-start-hides-status" in self.faults:
+                return self._error("managed control endpoint closed")
+            return self._error("OpenVMM exited during startup: guest-exit status 125")
         pid = self.next_pid
         self.next_pid += 1
         self.running[pid] = True
@@ -1224,6 +1241,7 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 "sandbox-lifecycle-checks.json",
                 "sandbox-lifecycle-identity-run.log",
                 "sandbox-lifecycle-identity-openvmm.log",
+                "sandbox-lifecycle-identity-outcome.json",
                 "sandbox-lifecycle-runtime.json",
                 "sandbox-lifecycle-probe.log",
                 "sandbox-lifecycle-output-limit-outcome.json",
@@ -1273,7 +1291,14 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
     def test_acceptance_detects_lifecycle_regressions(self):
         regressions = {
             "run-starts-workload": "run returned 0, expected 125",
-            "failed-start-keeps-runtime": "a failed start left lifecycle state behind",
+            "failed-start-keeps-runtime": (
+                "after a refused managed start: the state directory holds "
+                "['config.json', 'openvmm.log', 'outcome.json', 'runtime.json']"
+            ),
+            "failed-start-hides-status": (
+                "start returned 1, expected 1 with 'error: OpenVMM exited during "
+                "startup: guest-exit status 125'"
+            ),
             "duplicate-start": "start returned 0, expected 1",
             "exec-loses-state": "the state-reading request returned status 1",
             "probe-fails": "exec returned 1, expected 0",
@@ -1300,6 +1325,28 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 self.assertTrue(
                     (root / "results" / "sandbox-lifecycle-checks.json").is_file()
                 )
+
+    def test_acceptance_detects_a_leaked_report_staging_file(self):
+        # A start that ends OpenVMM while it publishes its outcome report leaves
+        # the report's staging file, which deprovision refuses to remove, so the
+        # acceptance preserves its fixture, as on the WHP runners in issue #438.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = _FakeSandboxCli("failed-start-kills-reporter")
+            with self.assertRaises(RuntimeError) as raised:
+                self._run(root, fake)
+            fixtures = list(root.glob("nvx-public-lifecycle-*"))
+
+        message = str(raised.exception)
+        for fragment in (
+            "after a refused managed start: the state directory holds "
+            "['.tmpAbC123', 'config.json', 'openvmm.log']",
+            "sandbox state directory contains files not owned by NVX: .tmpAbC123",
+            "fixture preserved for recovery",
+        ):
+            self.assertIn(fragment, message)
+        self.assertEqual(len(fixtures), 1)
+        self.assertFalse(any(fake.running.values()))
 
     def test_evidence_keeps_the_end_of_long_logs(self):
         with tempfile.TemporaryDirectory() as temporary:

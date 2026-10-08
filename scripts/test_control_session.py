@@ -5,7 +5,9 @@ import socket
 import struct
 import sys
 import threading
+import time
 import unittest
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -548,6 +550,100 @@ class ControlSessionTests(unittest.TestCase):
             str(refusal),
             "managed guest rejected exec (status=2, category=cwd-failed)",
         )
+
+    def test_session_reset_is_not_a_closed_endpoint(self):
+        # A reset comes from an OpenVMM that still serves the endpoint, so it must
+        # not look like the closure with which OpenVMM shuts down.
+        client, server = socket.socketpair()
+        instance = bytes.fromhex("11" * 16)
+        session = control_session.ControlSession(control_session._SocketStream(client))
+        session._instance_id = instance
+        session._epoch = 1
+        server.sendall(
+            control_session.OUTER_HEADER.pack(
+                b"NVXS", 1, control_session.OUTER_RESET, 0, instance, 1, 0, 0
+            )
+        )
+        try:
+            with self.assertRaisesRegex(
+                ConnectionError, "^managed control session was reset$"
+            ) as raised:
+                session.ping(5)
+        finally:
+            session.close()
+            server.close()
+
+        self.assertNotIsInstance(
+            raised.exception, control_session.ControlEndpointClosed
+        )
+
+
+class SocketStreamTests(unittest.TestCase):
+    def test_read_reports_a_closed_endpoint(self):
+        client, server = socket.socketpair()
+        stream = control_session._SocketStream(client)
+        server.close()
+        try:
+            with self.assertRaisesRegex(
+                control_session.ControlEndpointClosed,
+                "^managed control endpoint closed$",
+            ):
+                stream.read_exact(1, time.monotonic() + 5)
+        finally:
+            stream.close()
+
+    def test_reset_and_broken_pipe_report_a_closed_endpoint(self):
+        # OpenVMM may close the socket before it reads everything that the client
+        # sent, which resets the client's reads, and a later write fails with a
+        # broken pipe.
+        if sys.platform != "linux":
+            self.skipTest("Unix-domain socket closure semantics require Linux")
+        client, server = socket.socketpair()
+        stream = control_session._SocketStream(client)
+        stream.write_all(b"unread request")
+        server.close()
+        try:
+            with self.assertRaises(control_session.ControlEndpointClosed) as raised:
+                stream.read_exact(1, time.monotonic() + 5)
+            self.assertIsInstance(raised.exception.__cause__, ConnectionResetError)
+            with self.assertRaises(control_session.ControlEndpointClosed) as raised:
+                stream.write_all(b"record")
+            self.assertIsInstance(raised.exception.__cause__, BrokenPipeError)
+        finally:
+            stream.close()
+
+
+class NamedPipeStreamTests(unittest.TestCase):
+    def test_write_reports_a_closed_endpoint(self):
+        # OpenVMM closes the pipe as it tears the VM down, and the CRT reports a
+        # later write to it as EINVAL rather than as a broken pipe.
+        if sys.platform != "win32":
+            self.skipTest("named pipes require a Windows host")
+        import _winapi
+
+        name = rf"\\.\pipe\nvx-control-session-test-{uuid.uuid4().hex}"
+        server = _winapi.CreateNamedPipe(
+            name,
+            _winapi.PIPE_ACCESS_DUPLEX,
+            _winapi.PIPE_WAIT,
+            1,
+            65536,
+            65536,
+            0,
+            _winapi.NULL,
+        )
+        try:
+            stream = control_session._NamedPipeStream.connect(Path(name), 5)
+        finally:
+            _winapi.CloseHandle(server)
+        try:
+            with self.assertRaisesRegex(
+                control_session.ControlEndpointClosed,
+                "^managed control endpoint closed$",
+            ):
+                stream.write_all(b"record")
+        finally:
+            stream.close()
 
 
 if __name__ == "__main__":

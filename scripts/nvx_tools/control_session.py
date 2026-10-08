@@ -102,6 +102,22 @@ class ManagedExecRefused(ScriptError):
         self.stderr = stderr
 
 
+class ControlEndpointClosed(ConnectionError):
+    """OpenVMM closed the managed control endpoint, as it does when it shuts down.
+
+    A session reset, which comes from an OpenVMM that still serves the endpoint,
+    is a plain ConnectionError instead.
+    """
+
+    def __init__(self, message: str = "managed control endpoint closed") -> None:
+        super().__init__(message)
+
+
+# A peer that closes with data that it has not read resets the connection, and a
+# write after the peer closed fails with a broken pipe.
+_PEER_CLOSED = (BrokenPipeError, ConnectionResetError)
+
+
 class _SocketStream:
     def __init__(self, connection: socket.socket) -> None:
         self._connection = connection
@@ -137,13 +153,18 @@ class _SocketStream:
                 chunk = self._connection.recv(length - len(output))
             except TimeoutError:
                 continue
+            except _PEER_CLOSED as error:
+                raise ControlEndpointClosed() from error
             if not chunk:
-                raise ConnectionError("managed control endpoint closed")
+                raise ControlEndpointClosed()
             output.extend(chunk)
         return bytes(output)
 
     def write_all(self, data: bytes) -> None:
-        self._connection.sendall(data)
+        try:
+            self._connection.sendall(data)
+        except _PEER_CLOSED as error:
+            raise ControlEndpointClosed() from error
 
     def close(self) -> None:
         self._connection.close()
@@ -211,7 +232,7 @@ class _NamedPipeStream:
         ):
             error = ctypes.get_last_error()
             if error in (109, 233):
-                raise ConnectionError("managed control endpoint closed")
+                raise ControlEndpointClosed()
             raise OSError(error, "PeekNamedPipe failed")
         return int(available.value)
 
@@ -226,16 +247,23 @@ class _NamedPipeStream:
                 continue
             chunk = os.read(self._fd, min(length - len(output), available))
             if not chunk:
-                raise ConnectionError("managed control endpoint closed")
+                raise ControlEndpointClosed()
             output.extend(chunk)
         return bytes(output)
 
     def write_all(self, data: bytes) -> None:
         remaining = memoryview(data)
         while remaining:
-            count = os.write(self._fd, remaining)
+            try:
+                count = os.write(self._fd, remaining)
+            except OSError as error:
+                # The CRT reports a write to a pipe that the server closed as
+                # EINVAL, so report it as a closure, as reads do.
+                if error.errno == errno.EINVAL:
+                    self._available()
+                raise
             if count <= 0:
-                raise ConnectionError("managed control endpoint closed")
+                raise ControlEndpointClosed()
             remaining = remaining[count:]
 
     def close(self) -> None:

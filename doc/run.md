@@ -692,11 +692,16 @@ python3 scripts/nvx.py sandbox deprovision \
 
 Lifecycle transitions fail closed: `start` rejects an already-running or stale
 runtime record, `exec` and `stop` require a live OpenVMM process, and
-`deprovision` refuses to remove a running sandbox or unknown files. The runtime
-record identifies OpenVMM by its process ID and start time, so these checks
-treat OpenVMM as gone once it exits, even if no process reaps it or another
-process reuses its ID. A record that an earlier NVX version wrote lacks the
-start time and identifies OpenVMM by its process ID alone. Managed
+`deprovision` refuses to remove a running sandbox or unknown files. If the guest
+exits while `start` waits for it to become ready, for example because it refuses
+the workload identity, OpenVMM closes the control endpoint and shuts down.
+`start` then waits up to `--timeout` seconds for OpenVMM to publish
+`outcome.json` and exit, and fails with the report's category and status, such
+as `guest-exit status 125`. It terminates OpenVMM only if OpenVMM outlives that
+wait. The runtime record identifies OpenVMM by its process ID and start time, so
+these checks treat OpenVMM as gone once it exits, even if no process reaps it or
+another process reuses its ID. A record that an earlier NVX version wrote lacks
+the start time and identifies OpenVMM by its process ID alone. Managed
 workload arguments use the bounded control protocol rather than the kernel
 command line and may contain whitespace. Managed execution can select an
 absolute working directory and either repeated inline `KEY=VALUE` entries or a
@@ -757,8 +762,10 @@ named. It checks that:
 
 - `provision` rejects a root `--workload-user` before it creates any state, and
   the guest refuses an identity that the Ubuntu image lacks before a one-shot
-  workload starts, and in a managed `start`, which then fails without leaving
-  a runtime record, capability, control socket, or OpenVMM process;
+  workload starts, and in a managed `start`, which then fails with
+  `guest-exit status 125` from OpenVMM's outcome report and leaves only
+  `config.json`, `openvmm.log`, and that `outcome.json`, without a runtime
+  record, capability, control socket, report staging file, or OpenVMM process;
 - every operation fails on a state directory that was never provisioned, a
   repeated `provision` leaves the configuration unchanged, and `exec` and
   `stop` fail before `start`;
