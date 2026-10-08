@@ -520,10 +520,9 @@ NVX releases reject rather than start a share without its access policy.
 
 #### Access policy
 
-Each share can narrow what the workload can see and modify inside it, as AWF's
-staged mount tree does for its Cloud Hypervisor backend. OpenVMM enforces the
-policy on the host for every request, whichever guest mount, path, or link
-reaches the share:
+Each share can narrow what the workload can see and modify inside it. OpenVMM
+enforces the policy on the host for every request, whichever guest mount, path,
+or link reaches the share:
 
 - `--mount-deny HOST_PATH` hides a path and everything below it.
 - `--mount-allow HOST_PATH` exposes a path inside a denied path, and
@@ -553,7 +552,7 @@ only to `agent` and `cache`:
 python3 scripts/nvx.py sandbox \
   --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
   --scratch /var/lib/nvx/scratch.ext4 \
-  --mount /tmp/gh-aw,/tmp/gh-aw,rw \
+  --mount /tmp/mcp-runtime,/tmp/mcp-runtime,rw \
   --mount-deny mcp-logs \
   --mount-allow mcp-logs/mcp-payloads \
   --mount-write agent \

@@ -519,4 +519,4 @@ and shell linter versions, `requirements-dev.txt`, `SOURCE-MANIFEST.json`,
 Copilot code review uses
 [`copilot-code-review.yml`](../.github/workflows/copilot-code-review.yml)
 instead. Reviews do not build code, so it only checks out the repository and
-installs the `gh-aw` extension for the MCP server in `.github/mcp.json`.
+does not install the build and test dependencies used by cloud agent sessions.

@@ -27,8 +27,8 @@ Open a pull request for the current branch.
   an existing upstream when it is valid; do not assume the remote is named `origin`. Never force-push.
 - Derive the title from the commits that will be included, using a single commit's subject when
   appropriate. Follow commit, contribution, and pull-request conventions discovered in the repository.
-  Ignore automation-generated pull requests and commits, such as gh-aw `[workflow-id]` title prefixes,
-  `[bot]` authors, and merge commits, when inferring those conventions.
+  Ignore automation-generated pull requests and commits, `[bot]` authors, and merge commits when
+  inferring those conventions.
 - Write a concise body explaining **what** changed and **why**, based on the commits and the diff against
   the discovered default branch. Honor any repository pull-request template without dumping the full
   diff. Reference an issue supplied in the input only when the relationship and closing semantics are

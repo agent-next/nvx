@@ -2,7 +2,7 @@ name: "Copilot Code Review Setup Steps"
 
 # Copilot code review uses this file instead of copilot-setup-steps.yml.
 # Reviews read code without building it, so this environment only checks out
-# the repository and installs the gh-aw MCP server used by .github/mcp.json.
+# the repository.
 on:
   workflow_dispatch:
   push:
@@ -29,8 +29,3 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Install gh-aw extension
-        uses: github/gh-aw-actions/setup-cli@5e508589e03a7757a7e05b26e834292f5445bfb6 # v0.88.7
-        with:
-          version: v0.88.7

@@ -4036,21 +4036,6 @@ class CiConfigurationTests(unittest.TestCase):
         self.assertIn('rustup default "${RUST_TOOLCHAIN}"', rust)
         self.assertNotIn("stable", rust)
 
-        shared = (workflows / "shared" / "code-improvement.md").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("rust-toolchain.toml", shared)
-        self.assertNotRegex(shared, r'toolchain="[0-9]')
-        for name in (
-            "code-deduplication",
-            "code-documentation",
-            "code-quality",
-            "code-reusability",
-        ):
-            with self.subTest(workflow=name):
-                lock = (workflows / f"{name}.lock.yml").read_text(encoding="utf-8")
-                self.assertIn("rust-toolchain.toml", lock)
-
         # A binary built by another compiler must not satisfy the cache.
         build_action = (github / "actions" / "build-openvmm" / "action.yml").read_text(
             encoding="utf-8"
@@ -9926,7 +9911,7 @@ class SandboxTests(unittest.TestCase):
 
     def test_mount_access_policy_is_validated_and_forwarded(self):
         mount = sandbox.SandboxMount.parse(
-            "/tmp/gh-aw,host-dir,rw",
+            "/tmp/mcp-runtime,host-dir,rw",
             ("mcp-logs",),
             allowed_paths=("mcp-logs/payloads",),
             writable_paths=("agent", "cache"),
@@ -9935,7 +9920,7 @@ class SandboxTests(unittest.TestCase):
             sandbox.mounts_openvmm_arguments((mount,)),
             [
                 "--mount",
-                f"/tmp/gh-aw,{os.fspath(Path('host-dir'))},rw",
+                f"/tmp/mcp-runtime,{os.fspath(Path('host-dir'))},rw",
                 "--mount-deny",
                 "mcp-logs",
                 "--mount-allow",
@@ -9953,7 +9938,7 @@ class SandboxTests(unittest.TestCase):
         # tokens are those of the plain share.
         self.assertEqual(
             mount.command_line_fragment(),
-            " virtfs_dir=/tmp/gh-aw virtfs_tag=microvm virtfs_mode=rw",
+            " virtfs_dir=/tmp/mcp-runtime virtfs_tag=microvm virtfs_mode=rw",
         )
         for create_mount, message in (
             (
