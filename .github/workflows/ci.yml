@@ -584,14 +584,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The suites run once per OS: the tests that need /dev/kvm or
+        # /dev/mshv are ignored, so the KVM and MSHV runners ran the same
+        # tests. The MSHV pool has the most runners.
         include:
-          - name: Linux / KVM
-            backend: kvm
-            runner: '["self-hosted", "linux", "kvm", "virtual-machine"]'
-          - name: Linux / MSHV
+          - name: Linux
             backend: mshv
             runner: '["self-hosted", "linux", "mshv", "virtual-machine"]'
-          - name: Windows / WHP
+          - name: Windows
             backend: whp
             runner: '["self-hosted", "windows", "whp", "virtual-machine"]'
     steps:

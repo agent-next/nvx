@@ -7,9 +7,11 @@ Jobs target the shared backend labels so any available matching runner can
 execute them. This allows the backend lanes to execute concurrently without
 binding a workload to a specific host. `openvmm-vmm-tests` downloads the NVX
 guest artifacts and uses the Linux-direct kernel and Alpine initramfs to
-exercise OpenVMM's Linux MP-table lifecycle, TTRPC, and snapshot contracts.
-`openvmm-unit-tests` runs the OpenVMM unit and documentation tests independently
-on the same backend matrix.
+exercise OpenVMM's Linux MP-table lifecycle, TTRPC, and snapshot contracts on
+each backend. `openvmm-unit-tests` runs the OpenVMM unit and documentation
+tests once per operating system, on an MSHV runner and a WHP runner. The tests
+that need `/dev/kvm` or `/dev/mshv` are ignored, so the KVM and MSHV runners
+used to run the same 4,820 tests, and the MSHV pool has the most runners.
 Failed `openvmm-vmm-tests` jobs upload Petri's `test_results` directory,
 including guest and VMM logs, screenshots, and watchdog inspection data.
 These seven-day artifacts are named

@@ -3513,13 +3513,59 @@ class CiConfigurationTests(unittest.TestCase):
                         job,
                     )
 
-    def test_ci_runs_openvmm_tests_and_unit_tests_on_each_backend(self):
+    def test_ci_runs_openvmm_vmm_tests_per_backend_and_unit_tests_per_os(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
         vmm_tests_job = _workflow_job(workflow, "openvmm-vmm-tests")
         unit_tests_job = _workflow_job(workflow, "openvmm-unit-tests")
 
+        def legs(job: str) -> list[tuple[str, str, str]]:
+            return re.findall(
+                r"^          - name: (.+)\n"
+                r"            backend: (\S+)\n"
+                r"            runner: '(.+)'$",
+                job,
+                re.MULTILINE,
+            )
+
+        self.assertEqual(
+            legs(vmm_tests_job),
+            [
+                (
+                    "Linux / KVM",
+                    "kvm",
+                    '["self-hosted", "linux", "kvm", "virtual-machine"]',
+                ),
+                (
+                    "Linux / MSHV",
+                    "mshv",
+                    '["self-hosted", "linux", "mshv", "virtual-machine"]',
+                ),
+                (
+                    "Windows / WHP",
+                    "whp",
+                    '["self-hosted", "windows", "whp", "virtual-machine"]',
+                ),
+            ],
+        )
+        # The unit tests that need /dev/kvm or /dev/mshv are ignored, so one
+        # Linux runner covers both Linux backends.
+        self.assertEqual(
+            legs(unit_tests_job),
+            [
+                (
+                    "Linux",
+                    "mshv",
+                    '["self-hosted", "linux", "mshv", "virtual-machine"]',
+                ),
+                (
+                    "Windows",
+                    "whp",
+                    '["self-hosted", "windows", "whp", "virtual-machine"]',
+                ),
+            ],
+        )
         self.assertIn(
             """      - name: Run OpenVMM unit tests on Linux
         if: runner.os != 'Windows'
