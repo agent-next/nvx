@@ -1,8 +1,10 @@
+//! Errors and their stable classification.
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Result type used throughout this crate.
+/// Result type used throughout the edge sandbox crates.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Boxed error type accepted as the source of an [`Error`].
@@ -78,7 +80,7 @@ impl fmt::Display for ErrorCode {
     }
 }
 
-/// Error returned by every fallible operation in this crate.
+/// Error returned by every fallible edge sandbox operation.
 #[derive(Debug, thiserror::Error)]
 #[error("{code}: {message}")]
 pub struct Error {
@@ -127,46 +129,55 @@ impl Error {
     }
 }
 
-// Which helpers are used depends on the enabled backends.
-#[allow(dead_code)]
+/// Constructors for each [`ErrorCode`].
 impl Error {
-    pub(crate) fn malformed_request(message: impl Into<String>) -> Self {
+    /// Creates an error for a structurally invalid request.
+    pub fn malformed_request(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::MalformedRequest, message)
     }
 
-    pub(crate) fn malformed_id(message: impl Into<String>) -> Self {
+    /// Creates an error for a structurally invalid sandbox ID.
+    pub fn malformed_id(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::MalformedId, message)
     }
 
-    pub(crate) fn stale_id(message: impl Into<String>) -> Self {
+    /// Creates an error for an ID that no longer refers to a provisioned sandbox.
+    pub fn stale_id(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::StaleId, message)
     }
 
-    pub(crate) fn not_started(message: impl Into<String>) -> Self {
+    /// Creates an error for an operation that needs a running sandbox.
+    pub fn not_started(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::NotStarted, message)
     }
 
-    pub(crate) fn already_started(message: impl Into<String>) -> Self {
+    /// Creates an error for a sandbox that is already running.
+    pub fn already_started(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::AlreadyStarted, message)
     }
 
-    pub(crate) fn already_stopped(message: impl Into<String>) -> Self {
+    /// Creates an error for a sandbox that is already stopped.
+    pub fn already_stopped(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::AlreadyStopped, message)
     }
 
-    pub(crate) fn policy_validation(message: impl Into<String>) -> Self {
+    /// Creates an error for a request the backend cannot represent or enforce.
+    pub fn policy_validation(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::PolicyValidation, message)
     }
 
-    pub(crate) fn backend_unavailable(message: impl Into<String>) -> Self {
+    /// Creates an error for a missing or unusable runtime dependency.
+    pub fn backend_unavailable(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::BackendUnavailable, message)
     }
 
-    pub(crate) fn unsupported(message: impl Into<String>) -> Self {
+    /// Creates an error for an operation the backend does not implement.
+    pub fn unsupported(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Unsupported, message)
     }
 
-    pub(crate) fn backend_error(message: impl Into<String>) -> Self {
+    /// Creates an error for any other backend failure.
+    pub fn backend_error(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::BackendError, message)
     }
 }

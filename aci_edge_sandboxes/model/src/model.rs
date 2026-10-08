@@ -1,3 +1,6 @@
+//! Lifecycle requests and results: provision and exec requests, their policies, and the results
+//! of each operation.
+
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,12 +14,12 @@ use crate::id::SandboxId;
 /// Callers must not depend on a metadata field unless the backend documents it.
 pub type Metadata = serde_json::Map<String, serde_json::Value>;
 
-/// Inputs to [`AciEdgeSandbox::provision`](crate::AciEdgeSandbox::provision).
+/// Inputs to `AciEdgeSandbox::provision`.
 ///
 /// The serialized form matches the policy fields of the contract's provision request
-/// (`filesystem`, `network`, and `microvm`). Envelope fields such as `version` and `phase` belong
-/// to the caller's wire layer and are rejected here. Every field is optional, so `{}` provisions a
-/// sandbox with the backend defaults.
+/// (`filesystem`, `network`, `runtimeConfig`, and `microvm`). Envelope fields such as `version`
+/// and `phase` belong to the caller's wire layer and are rejected here. Every field is optional,
+/// so `{}` provisions a sandbox with the backend defaults.
 ///
 /// The sandbox runs the guest's own Alpine Linux userland directly; there are no image layers or
 /// scratch disks. Guest state lives in memory and lasts until the sandbox stops.
@@ -29,6 +32,10 @@ pub struct ProvisionRequest {
     /// Network posture. `None` attaches no network device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkPolicy>,
+    /// Runtime connectivity. The sandbox takes it at provision because its network is fixed
+    /// when the microVM starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_config: Option<RuntimeConfig>,
     /// MicroVM configuration.
     #[serde(default, skip_serializing_if = "MicrovmConfig::is_default")]
     pub microvm: MicrovmConfig,
@@ -60,6 +67,27 @@ impl ProvisionRequest {
         self.microvm.provision.memory_mib = Some(memory_mib);
         self
     }
+
+    /// Routes the guest's traffic through a proxy on host loopback, such as
+    /// `http://127.0.0.1:8080`; see [`RuntimeConfig::network_proxy`].
+    #[must_use]
+    pub fn with_network_proxy(mut self, url: impl Into<String>) -> Self {
+        self.runtime_config
+            .get_or_insert_with(RuntimeConfig::default)
+            .network_proxy = Some(url.into());
+        self
+    }
+}
+
+/// The contract's `runtimeConfig` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// An HTTP or HTTPS proxy on host loopback with an explicit port, such as
+    /// `http://127.0.0.1:8080`. It must be the guest's only way out: the network's egress default
+    /// is `deny`, without allow or deny rules. Workloads receive the proxy variables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_proxy: Option<String>,
 }
 
 /// The contract's `microvm` section.
@@ -85,6 +113,49 @@ pub struct MicrovmProvision {
     /// default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u32>,
+}
+
+/// A host loopback port forwarded to a guest port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostLoopbackForward {
+    /// Transport protocol.
+    pub protocol: ForwardProtocol,
+    /// Port on host loopback (`127.0.0.1`).
+    pub host_port: u16,
+    /// Port inside the guest.
+    pub guest_port: u16,
+}
+
+impl HostLoopbackForward {
+    /// Forwards `host_port` on host loopback to `guest_port` in the guest.
+    pub fn new(protocol: ForwardProtocol, host_port: u16, guest_port: u16) -> Self {
+        Self {
+            protocol,
+            host_port,
+            guest_port,
+        }
+    }
+}
+
+/// Transport protocol of a [`HostLoopbackForward`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardProtocol {
+    /// TCP.
+    Tcp,
+    /// UDP.
+    Udp,
+}
+
+impl ForwardProtocol {
+    /// Returns the contract spelling of this protocol.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
 }
 
 /// The contract's `filesystem` section.
@@ -318,7 +389,7 @@ impl fmt::Display for Access {
     }
 }
 
-/// Inputs to [`AciEdgeSandbox::exec`](crate::AciEdgeSandbox::exec).
+/// Inputs to `AciEdgeSandbox::exec`.
 ///
 /// The serialized form is the contract's exec request body, `{ "process": { ... } }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,7 +501,7 @@ pub enum StdinMode {
     #[default]
     Null,
     /// The caller writes the workload's standard input through
-    /// [`Execution::take_stdin`](crate::Execution::take_stdin).
+    /// `Execution::take_stdin`.
     Piped,
 }
 
@@ -538,7 +609,7 @@ where
 }
 
 /// Converts a duration to whole milliseconds, rounding a nonzero sub-millisecond duration up.
-pub(crate) fn duration_millis(duration: Duration) -> u64 {
+pub fn duration_millis(duration: Duration) -> u64 {
     let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
     if millis == 0 && !duration.is_zero() {
         1
@@ -547,7 +618,7 @@ pub(crate) fn duration_millis(duration: Duration) -> u64 {
     }
 }
 
-/// Result of [`AciEdgeSandbox::provision`](crate::AciEdgeSandbox::provision).
+/// Result of `AciEdgeSandbox::provision`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProvisionResult {
@@ -558,7 +629,7 @@ pub struct ProvisionResult {
     pub metadata: Option<Metadata>,
 }
 
-/// Result of [`AciEdgeSandbox::start`](crate::AciEdgeSandbox::start).
+/// Result of `AciEdgeSandbox::start`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartResult {
@@ -567,7 +638,7 @@ pub struct StartResult {
     pub metadata: Option<Metadata>,
 }
 
-/// Result of [`AciEdgeSandbox::stop`](crate::AciEdgeSandbox::stop).
+/// Result of `AciEdgeSandbox::stop`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopResult {
@@ -576,7 +647,7 @@ pub struct StopResult {
     pub metadata: Option<Metadata>,
 }
 
-/// Result of [`AciEdgeSandbox::deprovision`](crate::AciEdgeSandbox::deprovision).
+/// Result of `AciEdgeSandbox::deprovision`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeprovisionResult {

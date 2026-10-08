@@ -1,5 +1,5 @@
 name: Check aci_edge_sandboxes
-description: Format, lint, document, and test the aci_edge_sandboxes crate
+description: Format, lint, document, and test the aci_edge_sandboxes crate and its data model
 
 inputs:
   toolchain:
@@ -35,7 +35,7 @@ runs:
     - name: Check formatting
       shell: bash
       working-directory: aci_edge_sandboxes
-      run: cargo "+${{ steps.toolchains.outputs.toolchain }}" fmt --check
+      run: cargo "+${{ steps.toolchains.outputs.toolchain }}" fmt --all --check
 
     - name: Lint
       shell: bash
@@ -45,9 +45,9 @@ runs:
         ACI_EDGE_SANDBOXES_BUNDLE: skip
       run: |
         set -euo pipefail
-        cargo "+${{ steps.toolchains.outputs.toolchain }}" clippy --locked --all-targets --all-features \
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" clippy --locked --workspace --all-targets --all-features \
           -- -D warnings
-        cargo "+${{ steps.toolchains.outputs.toolchain }}" clippy --locked --lib --no-default-features \
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" clippy --locked --workspace --lib --no-default-features \
           -- -D warnings
 
     - name: Test
@@ -58,8 +58,8 @@ runs:
         ACI_EDGE_SANDBOXES_BUNDLE: skip
       run: |
         set -euo pipefail
-        cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked --all-features
-        cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked --workspace --all-features
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked --workspace
 
     - name: Check artifact bundling
       shell: bash
@@ -89,7 +89,7 @@ runs:
       env:
         ACI_EDGE_SANDBOXES_BUNDLE: skip
         RUSTDOCFLAGS: -D warnings
-      run: cargo "+${{ steps.toolchains.outputs.toolchain }}" doc --locked --no-deps --all-features
+      run: cargo "+${{ steps.toolchains.outputs.toolchain }}" doc --locked --workspace --no-deps --all-features
 
     - name: Check the minimum supported Rust version
       shell: bash
@@ -99,7 +99,7 @@ runs:
         ACI_EDGE_SANDBOXES_BUNDLE: skip
       run: >-
         cargo "+${{ steps.toolchains.outputs.msrv }}" check
-        --locked --all-targets --all-features
+        --locked --workspace --all-targets --all-features
 
     - name: Check the macOS build
       if: runner.os == 'Linux'
@@ -111,5 +111,5 @@ runs:
       run: |
         set -euo pipefail
         rustup target add --toolchain "${{ steps.toolchains.outputs.toolchain }}" aarch64-apple-darwin
-        cargo "+${{ steps.toolchains.outputs.toolchain }}" check --locked --all-targets --all-features \
+        cargo "+${{ steps.toolchains.outputs.toolchain }}" check --locked --workspace --all-targets --all-features \
           --target aarch64-apple-darwin
