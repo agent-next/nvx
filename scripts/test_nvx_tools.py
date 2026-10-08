@@ -4974,6 +4974,27 @@ Write-Output (Get-BenchmarkScratchDirectory)
             ],
         )
 
+    def test_cli_validation_runs_every_script_test_module(self):
+        # Each scripts/test_*.py module must run in both CLI validation jobs;
+        # test_control_session.py once ran in neither (#229).
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "validate-nvx"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        modules = {
+            path.name
+            for path in (BuildConstants.REPO_ROOT / "scripts").glob("test_*.py")
+        }
+        self.assertIn("test_control_session.py", modules)
+        for step in ("Validate NVX CLI on Linux", "Validate NVX CLI on Windows"):
+            with self.subTest(step=step):
+                script = _composite_action_script(action, step)
+                invoked = re.findall(r"(?:^|\s)scripts[/\\](test_\w+\.py)", script)
+                self.assertEqual(sorted(invoked), sorted(modules))
+
     def test_ci_runs_the_public_sandbox_acceptance_on_every_backend(self):
         workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
         workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
