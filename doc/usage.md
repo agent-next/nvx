@@ -303,7 +303,7 @@ check and the subset that CI runs.
 | `--ci-schedule` | off | Run `H4` and `H6` on CI's short schedules: 3 rate samples 1 s apart instead of 13 samples 10 s apart, and two warp-probe runs instead of five. |
 | `--probe-dir PATH` | `$RUNNER_TOOL_CACHE/nvx-host-time-probe`, or `build/host-time-probe` | Select the cache directory for the host probe, which the doctor builds with `rustc`. |
 | `--summary PATH` | none | Append a Markdown summary, for example to `$GITHUB_STEP_SUMMARY`. |
-| `--timeout SECONDS` | `120` | Set the seconds allowed for each probe or guest. |
+| `--timeout SECONDS` | `120` | Set the seconds allowed for each probe or guest. `H4` gets its sampling window on top. |
 
 ### `test-aci-edge-sandboxes`
 

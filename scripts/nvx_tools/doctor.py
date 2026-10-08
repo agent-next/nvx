@@ -203,16 +203,20 @@ def build_probe(directory: Path) -> Path:
 
 
 def run_probe(
-    context: DoctorContext, *arguments: str
+    context: DoctorContext, *arguments: str, duration: float = 0.0
 ) -> list[tuple[str, dict[str, str]]]:
-    """Run the host probe and parse its ``NVX-HOST-TIME-PROBE`` records."""
+    """Run the host probe and parse its ``NVX-HOST-TIME-PROBE`` records.
+
+    ``duration`` is the time the probe spends sleeping by design, which the
+    timeout allows on top of ``context.timeout``.
+    """
     if context.probe is None:
         context.probe = build_probe(context.probe_directory)
     completed = subprocess.run(
         [os.fspath(context.probe), *arguments],
         capture_output=True,
         text=True,
-        timeout=context.timeout,
+        timeout=context.timeout + duration,
         check=False,
     )
     if completed.returncode != 0:
@@ -702,6 +706,8 @@ def check_rate(context: DoctorContext) -> CheckResult:
         clocksource = host_clocksource()
         context.facts["host_clocksource"] = clocksource
     schedule = context.schedule
+    # The probe sleeps between samples for the whole window, 120 s on the
+    # qualification schedule, so the timeout covers the window as well.
     records = run_probe(
         context,
         "rate",
@@ -709,6 +715,7 @@ def check_rate(context: DoctorContext) -> CheckResult:
         str(schedule.rate_samples),
         "--interval-ms",
         str(schedule.rate_interval_ms),
+        duration=(schedule.rate_samples - 1) * schedule.rate_interval_ms / 1000,
     )
     clocks = {fields.get("role"): fields for kind, fields in records if kind == "clock"}
     for role in ("rate", "stability"):
@@ -1158,7 +1165,8 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         "--timeout",
         type=float,
         default=120.0,
-        help="seconds allowed for each probe or guest (default: 120)",
+        help="seconds allowed for each probe or guest, on top of H4's sampling "
+        "window (default: 120)",
     )
     parser.add_argument(
         "--openvmm-arg",

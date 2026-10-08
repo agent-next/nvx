@@ -12,6 +12,13 @@ inputs:
       artifacts must be in their build paths
     required: false
     default: "false"
+  warp-probe:
+    description: >-
+      Also run the guest warp probe (doctor H6) on CI's schedule, for jobs
+      that boot guests without the microVM scenarios' own probes; requires
+      verify-openvmm
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -160,23 +167,20 @@ runs:
           throw "Hyper-V SVGA firmware was not found: $svgaFirmware"
         }
 
-    # Host time. On Linux, the nonstop_tsc gate stays fail-closed in front of
-    # the time ABI host qualification (doc/design/time-abi.md, "Host
-    # qualification"), which then checks the backend, the CPU fingerprint and
+    # Host time. The time ABI host qualification (doc/design/time-abi.md,
+    # "Host qualification") checks the backend, the CPU fingerprint and
     # generation, and the TSC rate stability on its short CI schedule, and,
     # in jobs that downloaded OpenVMM, its CPU profile check (H2) and
-    # preflight (H3); other jobs qualify without OpenVMM. These checks are
-    # host-level, and the guest warp probe (H6) runs only in the microVM
-    # scenarios, so the gate keeps a host whose guests warp (#265) out of
-    # every other job.
-    - name: Validate host TSC
+    # preflight (H3); other jobs qualify without OpenVMM. Jobs whose guests
+    # run without the microVM scenarios' warp probes add the guest warp probe
+    # (H6). The host's invariant-TSC flags are evidence only: the guest warp
+    # probe measures the cross-vCPU skew that a host without one can cause
+    # (#265).
+    - name: Report host TSC
       if: runner.os != 'Windows'
       shell: bash
       run: |
         set -euo pipefail
-        # Guests on a host without an invariant TSC intermittently see
-        # cross-vCPU TSC warps, which make Linux mark the guest TSC unstable
-        # (#211).
         echo "Kernel: $(uname -r)"
         echo "CPU: $(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo)"
         echo "Clocksource: $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null || echo unknown)"
@@ -190,8 +194,7 @@ runs:
         case "${flags}" in
           *" nonstop_tsc "*) ;;
           *)
-            echo "::error::Runner host does not expose an invariant TSC (nonstop_tsc); redeploy the VM on a host that does" >&2
-            exit 1
+            echo "::notice::Runner host does not expose an invariant TSC (nonstop_tsc); the guest warp probe measures the cross-vCPU skew that this can cause (#265)"
             ;;
         esac
 
@@ -202,6 +205,7 @@ runs:
         python3 scripts/nvx.py doctor
         --backend "${{ inputs.backend }}"
         --checks H1 H2 H4
+        ${{ inputs.warp-probe == 'true' && 'H6' || '' }}
         ${{ inputs.verify-openvmm == 'true' && 'H3 --cpu-fingerprint "${RUNNER_TEMP}/nvx-cpu-fingerprint.json"' || '--no-openvmm' }}
         --ci-schedule
         --summary "${GITHUB_STEP_SUMMARY}"
@@ -213,6 +217,7 @@ runs:
         python scripts\nvx.py doctor
         --backend "${{ inputs.backend }}"
         --checks H1 H2 H4
+        ${{ inputs.warp-probe == 'true' && 'H6' || '' }}
         ${{ inputs.verify-openvmm == 'true' && 'H3 --cpu-fingerprint "$env:RUNNER_TEMP\nvx-cpu-fingerprint.json"' || '--no-openvmm' }}
         --ci-schedule
         --summary "$env:GITHUB_STEP_SUMMARY"

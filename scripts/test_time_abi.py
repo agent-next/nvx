@@ -2025,6 +2025,16 @@ class DoctorTests(unittest.TestCase):
                     str(context.schedule.rate_interval_ms),
                 ),
             )
+            # The probe sleeps through its sampling window, which the timeout
+            # allows on top of --timeout (120 s on the qualification schedule).
+            self.assertEqual(
+                run.call_args.kwargs,
+                {
+                    "duration": (context.schedule.rate_samples - 1)
+                    * context.schedule.rate_interval_ms
+                    / 1000
+                },
+            )
             return result
 
         def ci_context(backend: str = "kvm") -> doctor.DoctorContext:
@@ -2494,8 +2504,11 @@ class DoctorTests(unittest.TestCase):
             "noise\nNVX-HOST-TIME-PROBE rate index=1 tsc_hz=1.5\n"
             "NVX-HOST-TIME-PROBE skew pairs=1 cpus=0-1\n"
         )
-        with patch.object(doctor.subprocess, "run", return_value=completed(output)):
+        with patch.object(
+            doctor.subprocess, "run", return_value=completed(output)
+        ) as run:
             records = doctor.run_probe(context, "skew")
+        self.assertEqual(run.call_args.kwargs["timeout"], context.timeout)
         self.assertEqual(
             records,
             [
@@ -2503,6 +2516,11 @@ class DoctorTests(unittest.TestCase):
                 ("skew", {"pairs": "1", "cpus": "0-1"}),
             ],
         )
+        with patch.object(
+            doctor.subprocess, "run", return_value=completed(output)
+        ) as run:
+            doctor.run_probe(context, "rate", duration=120.0)
+        self.assertEqual(run.call_args.kwargs["timeout"], context.timeout + 120.0)
         with patch.object(
             doctor.subprocess, "run", return_value=completed("", 3, "no CPU")
         ):

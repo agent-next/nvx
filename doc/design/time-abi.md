@@ -1789,17 +1789,17 @@ failure by the status together with its `NVX-TIME-ABI-VIOLATION` event.
 
 `nvx.py doctor --backend <backend>` qualifies a host by running every check,
 with `H4` and `H6` on their long schedules. The `validate-runner` action runs
-`H1`, `H2`, and the short `H4` before every CI job and `H3` in microVM jobs,
-and every CI microVM boot and restore scenario runs the CI warp schedule;
-`H5` and `H7` run in `doctor` only. Both tools print one
-`NVX-DOCTOR: check=<id> status=<pass|fail> detail=...` line per check and
-fail if any check fails. In CI, `validate-runner` first requires
-`nonstop_tsc` in `/proc/cpuinfo` on Linux runners and fails without it, as
-before the time ABI, and the Linux runner setup script requires it at
-provisioning. This gate stays until every job that runs guests also runs
-`H6`: only the microVM jobs do, while the OpenVMM vmm-tests and the platform
-benchmarks run guests after host-level checks, which a host without an
-invariant TSC can pass.
+`H1`, `H2`, and the short `H4` before every CI job, `H3` in microVM and
+platform jobs, and `H6` on the CI schedule in platform jobs, whose benchmarks
+boot guests without the scenarios' probes; every CI microVM boot and restore
+scenario runs the CI warp schedule. `H5` and `H7` run in `doctor` only. Both
+tools print one `NVX-DOCTOR: check=<id> status=<pass|fail> detail=...` line
+per check and fail if any check fails. In CI, `validate-runner` reports
+`nonstop_tsc` in `/proc/cpuinfo` on Linux runners as evidence, and the Linux
+runner setup script warns without it; neither gates on it (see [Qualification
+gates](#qualification-gates)). The OpenVMM vmm-tests run no warp probe: they
+boot OpenVMM's own test guests, whose verdicts don't depend on the cross-vCPU
+skew bound.
 
 | ID | Check |
 | --- | --- |
@@ -1900,15 +1900,17 @@ of the warps in #265:
   passes the boot check, and runs the probe five times, with idle gaps of
   0.1, 1, 5, and 1 s; a 1-vCPU microVM then boots and runs it once.
 - CI: every microVM boot and restore scenario runs the probe twice, with a
-  1 s idle gap, after boot and after every restore.
+  1 s idle gap, after boot and after every restore. The platform jobs run
+  `H6` on this schedule before their benchmarks: the larger microVM runs the
+  probe twice, 1 s apart, and the 1-vCPU microVM runs it once.
 
 ### Qualification gates
 
 The doctor qualifies alike on every backend, on measured properties only: the
 CPU profile (`H2`, `H3`), rate stability (`H4`), and the idle-scheduled warp
-probe (`H6`, and the CI schedule in every microVM job). It records the host
-OS's invariant-TSC bit and the host clocksource as evidence and never gates
-on them, on any backend:
+probe (`H6`, and the CI schedule in every microVM and platform job). It
+records the host OS's invariant-TSC bit and the host clocksource as evidence
+and never gates on them, on any backend:
 
 - On Azure, WHP and nested MSHV cannot offer the invariant-TSC bit to their
   guests through their feature banks, although the host OS sees an invariant
@@ -1924,10 +1926,14 @@ on them, on any backend:
   cause.
 
 That 8370C MSHV runner, whose host OS lacks the bit and which showed the
-#265 warps, is out of rotation and unqualified because our account cannot run
-guests there, not because of the doctor's rules; CI's `nonstop_tsc` gate
-would also reject it. Its host-level warp probe saw backward steps of at
-most 2.1 ns.
+#265 warps before the time ABI, qualifies. With `H4` and `H6` on their long
+schedules, `H1` to `H7` pass, and `H6` measures at most 26 ns; its CPU profile
+check passes with the same surface digest before and after the MSHV probe
+partition fix (#411). Its guests' warp probes, over the full microVM suite on
+the production and debug kernels and ten more rounds of `smp`,
+`smp-snapshot`, and `restore-processors` (288 runs), measured at most 36 ns of
+offset and 4 ns of backward step. Its host-level warp probe saw backward steps
+of at most 2.1 ns.
 
 ### Generations and runner placement
 
@@ -2354,9 +2360,9 @@ Migration impact:
   profile of their generation pins.
 - Hosts that fail qualification cannot run microVMs on a pinned profile until
   replaced; an Intel development host can boot on a host profile
-  (`--cpu-profile host`) instead.
-  One 8370C MSHV runner stays out of rotation and unqualified because our
-  account cannot run guests there.
+  (`--cpu-profile host`) instead. A host without an invariant TSC, such as
+  the 8370C MSHV runner, qualifies when its guests stay within the skew
+  bound (see [Qualification gates](#qualification-gates)).
 - Per-PR CI captures and restores on the same runner. Same-generation
   cross-VM restore is validated by the fleet restore matrix on WHP only; no
   usable KVM or MSHV pair of one generation exists, so the simulated host

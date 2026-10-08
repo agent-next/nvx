@@ -3750,7 +3750,7 @@ class CiConfigurationTests(unittest.TestCase):
             ):
                 self.assertIn(firmware, configuration)
 
-    def test_linux_runners_require_an_invariant_tsc(self):
+    def test_linux_runners_report_the_invariant_tsc_as_evidence(self):
         validate_runner = (
             BuildConstants.REPO_ROOT
             / ".github"
@@ -3762,18 +3762,21 @@ class CiConfigurationTests(unittest.TestCase):
             BuildConstants.REPO_ROOT / "scripts" / "setup" / "setup-linux-runner.sh"
         ).read_text(encoding="utf-8")
 
-        step = validate_runner.split("    - name: Validate host TSC\n", 1)[1]
+        # Neither CI nor provisioning rejects a host without an invariant
+        # TSC: the guest warp probe measures what its guests observe (#265).
+        step = validate_runner.split("    - name: Report host TSC\n", 1)[1]
         step = step.split("\n\n    - name: ", 1)[0]
         self.assertIn("      if: runner.os != 'Windows'\n", step)
         check = "\n".join(
             line.removeprefix("        ")
             for line in step.split("      run: |\n", 1)[1].splitlines()
         )
-        function = linux_setup.split("require_invariant_tsc() {\n", 1)[1]
-        function = "require_invariant_tsc() {\n" + function.split("\n}\n", 1)[0]
+        function = linux_setup.split("report_invariant_tsc() {\n", 1)[1]
+        function = "report_invariant_tsc() {\n" + function.split("\n}\n", 1)[0]
         function += "\n}\n"
+        self.assertNotRegex(function, r"\bdie\b")
         self.assertLess(
-            linux_setup.index("require_invariant_tsc /proc/cpuinfo\n"),
+            linux_setup.index("report_invariant_tsc /proc/cpuinfo\n"),
             linux_setup.index('sudo -n true || die "passwordless sudo is required"'),
         )
         if os.name != "posix":
@@ -3798,28 +3801,37 @@ class CiConfigurationTests(unittest.TestCase):
                         timeout=10,
                         check=False,
                     )
-                    self.assertEqual(result.returncode == 0, invariant, result.stderr)
+                    self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("CPU: Test CPU", result.stdout)
+                    self.assertIn(
+                        "TSC flag nonstop_tsc: "
+                        + ("present" if invariant else "absent"),
+                        result.stdout,
+                    )
                     self.assertEqual(
-                        "::error::Runner host does not expose an invariant TSC"
-                        in result.stderr,
+                        "::notice::Runner host does not expose an invariant TSC"
+                        in result.stdout,
                         not invariant,
                     )
+                    self.assertNotIn("::error::", result.stdout + result.stderr)
                 with self.subTest(flags=flags, check="setup-linux-runner"):
                     result = subprocess.run(
                         [
                             "sh",
                             "-c",
-                            'die() { echo "$*" >&2; exit 1; }\n'
-                            f"{function}"
-                            f"require_invariant_tsc '{cpuinfo}'\n",
+                            f"set -eu\n{function}report_invariant_tsc '{cpuinfo}'\n",
                         ],
                         capture_output=True,
                         text=True,
                         timeout=10,
                         check=False,
                     )
-                    self.assertEqual(result.returncode == 0, invariant, result.stderr)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        "warning: host does not expose an invariant TSC"
+                        in result.stderr,
+                        not invariant,
+                    )
 
     def test_runners_qualify_their_host_time_before_every_job(self):
         validate_runner = (
@@ -3830,12 +3842,13 @@ class CiConfigurationTests(unittest.TestCase):
             / "action.yml"
         ).read_text(encoding="utf-8")
 
-        # The doctor adds to the nonstop_tsc gate, which stays first and
-        # fail-closed on Linux: the backend, the CPU fingerprint and
-        # generation, and the TSC rate stability. Jobs that haven't downloaded
-        # OpenVMM skip its CPU profile check (H2) and preflight (H3).
+        # The doctor follows the host TSC report on Linux: the backend, the CPU
+        # fingerprint and generation, and the TSC rate stability. Jobs that
+        # haven't downloaded OpenVMM skip its CPU profile check (H2) and
+        # preflight (H3), and only jobs that ask for it run the guest warp
+        # probe (H6).
         self.assertLess(
-            validate_runner.index("    - name: Validate host TSC\n"),
+            validate_runner.index("    - name: Report host TSC\n"),
             validate_runner.index("    - name: Qualify host time on Linux\n"),
         )
         for name, shell, command, summary in (
@@ -3859,6 +3872,9 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertIn(command, step)
                 self.assertIn('--backend "${{ inputs.backend }}"', step)
                 self.assertIn("--checks H1 H2 H4\n", step)
+                self.assertIn(
+                    "${{ inputs.warp-probe == 'true' && 'H6' || '' }}\n", step
+                )
                 fingerprint = (
                     '"${RUNNER_TEMP}/nvx-cpu-fingerprint.json"'
                     if shell == "bash"
@@ -3878,6 +3894,11 @@ class CiConfigurationTests(unittest.TestCase):
         self.assertEqual(args.checks, ["H1", "H2", "H4", "H3"])
         self.assertEqual(args.cpu_fingerprint, Path("fingerprint.json"))
         args = nvx.parse_args(
+            ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4", "H6", "H3"]
+            + ["--cpu-fingerprint", "fingerprint.json", "--ci-schedule"]
+        )
+        self.assertEqual(args.checks, ["H1", "H2", "H4", "H6", "H3"])
+        args = nvx.parse_args(
             ["doctor", "--backend", "kvm", "--checks", "H1", "H2", "H4"]
             + ["--no-openvmm", "--ci-schedule"]
         )
@@ -3885,6 +3906,10 @@ class CiConfigurationTests(unittest.TestCase):
         self.assertTrue(args.ci_schedule)
         self.assertIn("  verify-openvmm:\n", validate_runner)
         self.assertIn('    default: "false"\n', validate_runner)
+        warp_probe = validate_runner.split("  warp-probe:\n", 1)[1]
+        warp_probe = warp_probe.split("\nruns:\n", 1)[0]
+        self.assertIn("requires\n      verify-openvmm\n", warp_probe)
+        self.assertIn('    default: "false"\n', warp_probe)
         # A failed CPU profile check keeps OpenVMM's fingerprint.
         upload = validate_runner.split("    - name: Upload the CPU fingerprint\n")[1]
         upload = upload.split("\n\n", 1)[0]
@@ -3909,6 +3934,12 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertEqual(workflow.count("      - name: Validate runner\n"), 1)
                 self.assertIn(
                     'verify-openvmm: "true"', workflow[validate : validate + 220]
+                )
+                # The microVM scenarios probe after every boot and restore;
+                # the benchmarks boot guests without such probes.
+                self.assertEqual(
+                    'warp-probe: "true"' in workflow[validate : validate + 260],
+                    workflow_name == "run-platform.yml",
                 )
                 for step in (
                     "      - name: Download guest artifacts\n",
