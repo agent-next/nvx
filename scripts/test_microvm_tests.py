@@ -3061,6 +3061,11 @@ class MicrovmTests(unittest.TestCase):
         self.assertIn("[ -e /run/nvx/workload-ran ]", workload)
         self.assertIn("/sbin/nvx-snapshot\n", checkpoint)
         self.assertIn("captured-workload-id", checkpoint)
+        self.assertIn(
+            "printf 'restored-direct-claimed\\n' "
+            ">/run/nvx/scratch/direct-claimed\nsync",
+            checkpoint,
+        )
         self.assertNotIn("@CAPTURE_ACTION@", checkpoint)
 
     def test_restored_tier_guests_report_their_restore_checks_before_exiting(self):

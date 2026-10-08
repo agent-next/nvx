@@ -307,9 +307,10 @@ Restore proceeds in the opposite direction from capture:
    snapshot, before worker construction;
 4. create a writable private copy-on-write mapping from the exact opened
    `memory.bin` handle, add fresh private backing for selected expansion
-   ranges, transfer the artifact generation guards to the worker, and use
-   either a verified private scratch copy or a caller-supplied fresh scratch
-   file;
+   ranges, transfer the artifact generation guards to the worker, and
+   materialize scratch according to its recorded policy as a verified private
+   copy, a reflink-only copy-on-write clone, an exact-file hard link from a
+   claimed continuation, or a caller-supplied fresh file;
 5. construct the partition and exact device inventory with the selected active
    RAM and the snapshot's immutable capacity;
 6. run the [time ABI preflight](time-abi.md#restore-algorithm) (backend, CPU

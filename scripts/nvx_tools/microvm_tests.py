@@ -4998,6 +4998,8 @@ done
 [ "$(cat /run/nvx/workload-machine-id)" = captured-workload-id ]
 [ "$(nsenter -t "$(cat /run/nvx/container.pid)" -m -r cat /etc/machine-id)" = captured-workload-id ]
 [ "$(nsenter -t "$(cat /run/nvx/container.pid)" -u hostname)" = captured-workload ]
+printf 'restored-direct-claimed\\n' >/run/nvx/scratch/direct-claimed
+sync
 echo {repair_marker}"""
 
     pre_capture_action = (
@@ -5163,7 +5165,7 @@ def _run_snapshot_tier(
             for marker in (repair_marker, input_marker, released_marker)
         ):
             raise RuntimeError(f"{tier} source crossed its terminal capture boundary")
-        fingerprint = _snapshot_fingerprint(snapshot)
+        fingerprint = _scratch_snapshot_fingerprint(snapshot)
 
         restore_layer = replacement_layer if platform else source_layer
         restore_command = snapshot_restore_command(
@@ -5253,8 +5255,16 @@ def _run_snapshot_tier(
             processors=int(restore_command[restore_command.index("--processors") + 1]),
             context=f"{tier} restore",
         )
-        if _snapshot_fingerprint(snapshot) != fingerprint:
+        restored_fingerprint = _scratch_snapshot_fingerprint(snapshot)
+        if restored_fingerprint[:3] != fingerprint[:3]:
             raise RuntimeError(f"{tier} restore modified snapshot payloads")
+        if instance_checkpoint:
+            if restored_fingerprint[3] == fingerprint[3]:
+                raise RuntimeError(
+                    "instance-checkpoint restore did not modify direct-claimed scratch"
+                )
+        elif restored_fingerprint != fingerprint:
+            raise RuntimeError(f"{tier} restore modified reusable snapshot scratch")
 
         if workload_start:
             timeout_command = [

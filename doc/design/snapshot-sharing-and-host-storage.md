@@ -31,11 +31,12 @@ retention policy, or protection against host-side copying.
 
 ## Snapshot identity and admission
 
-The common trusted-storage path identifies a sealed snapshot by its immutable
-storage generation, artifact roles, exact sizes, and block geometry. The
-generation must be authenticated by the publisher or storage control plane and
-bound to the exact immutable object versions. Restore compares that metadata;
-it does not reread every logical byte merely to reconstruct a content digest.
+The common trusted-storage path identifies a snapshot's consumed sealed block
+objects by one immutable storage generation, their artifact roles, exact sizes,
+and block geometry. The generation must be authenticated by the publisher or
+storage control plane and bound to the exact immutable block-object versions.
+Restore compares that block metadata; it does not reread every logical block
+byte merely to reconstruct a content digest.
 
 Whole-file SHA-256 remains an optional diagnostic, export, deduplication, or
 deep-verification identity. If an external transport supplies SHA-256, compute
