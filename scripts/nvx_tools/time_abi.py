@@ -9,9 +9,13 @@ probe's 1 us skew bound and the CPU generation names used in reports.
 
 from __future__ import annotations
 
+import json
 import re
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import cast
 
 MARKER_PREFIX = "NVX-TIME-ABI: "
 VIOLATION_PREFIX = "NVX-TIME-ABI-VIOLATION: "
@@ -120,12 +124,15 @@ class CpuGeneration:
 
 # A copy of the generations of OpenVMM's pinned CPU profiles
 # (openvmm/vmm_core/cpu_profile/profiles), which test_time_abi compares with
-# the submodule. Doctor uses it only without OpenVMM (--no-openvmm), and run
-# to explain a failed cold boot on a CPU that it lacks; otherwise OpenVMM
-# reports the generation and the profile itself. Model 85 also covers Cascade
-# Lake (steppings 5-7) and Cooper Lake (10-11), which have no profile. AMD's
-# family 25 model 1 is Milan's in every stepping, Milan-X's 2 included, family
-# 25 model 17 Genoa's, Genoa-X's included, and family 26 model 2 Turin's.
+# the submodule. Doctor uses it only without OpenVMM (--no-openvmm), and run to
+# explain a failed cold boot on a CPU that it lacks; benchmark reads the
+# profiles of the OpenVMM checkout that it builds instead
+# (openvmm_cpu_generations), and otherwise OpenVMM reports the generation and
+# the profile itself.
+# Model 85 also covers Cascade Lake (steppings 5-7) and Cooper Lake (10-11),
+# which have no profile. AMD's family 25 model 1 is Milan's in every stepping,
+# Milan-X's 2 included, family 25 model 17 Genoa's, Genoa-X's included, and
+# family 26 model 2 Turin's.
 CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
     CpuGeneration("skylake-sp", "GenuineIntel", (CpuModel(6, 85, range(5)),)),
     CpuGeneration("icelake-sp", "GenuineIntel", (CpuModel(6, 106),)),
@@ -137,18 +144,106 @@ CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
 )
 
 
-def describe_cpu_generations() -> str:
-    """The catalog's generations as messages list them."""
-    return ", ".join(generation.describe() for generation in CPU_GENERATIONS)
+def describe_cpu_generations(
+    generations: Sequence[CpuGeneration] = CPU_GENERATIONS,
+) -> str:
+    """The generations of a catalog, by default NVX's copy, as messages list
+    them."""
+    return ", ".join(generation.describe() for generation in generations)
 
 
-# OpenVMM fails a cold boot with this code when no pinned CPU profile serves
-# the host's CPU, and `--cpu-profile host` is the opt-in alternative on the
-# CPUs that host profiles serve.
+# The directory of an OpenVMM checkout that holds its pinned CPU profiles, one
+# `<id>.json` document each, from which OpenVMM generates the catalog that
+# `--cpu-profile auto` selects from.
+OPENVMM_CPU_PROFILES = Path("vmm_core", "cpu_profile", "profiles")
+
+
+def _profile_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"its {name} is not an integer")
+    return value
+
+
+def _profile_generation(document: object) -> CpuGeneration:
+    """Return the generation of the pinned CPU profile whose decoded JSON is
+    ``document``: its vendor, and its generation's name and CPU models, each a
+    family, a model, and the first and last of its steppings."""
+    if not isinstance(document, dict):
+        raise ValueError("it is not a JSON object")
+    profile = cast(dict[str, object], document)
+    vendor = profile.get("vendor")
+    generation_value = profile.get("generation")
+    if not isinstance(vendor, str) or not isinstance(generation_value, dict):
+        raise ValueError("it names no vendor or generation")
+    generation = cast(dict[str, object], generation_value)
+    name = generation.get("name")
+    cpus_value = generation.get("cpus")
+    if not isinstance(name, str) or not isinstance(cpus_value, list):
+        raise ValueError("its generation names no CPU models")
+    cpus: list[CpuModel] = []
+    for cpu_value in cast(list[object], cpus_value):
+        if not isinstance(cpu_value, dict):
+            raise ValueError("a CPU model of its generation is not a JSON object")
+        cpu = cast(dict[str, object], cpu_value)
+        steppings_value = cpu.get("steppings")
+        if not isinstance(steppings_value, list):
+            raise ValueError("a CPU model of its generation names no steppings")
+        steppings = cast(list[object], steppings_value)
+        if len(steppings) != 2:
+            raise ValueError("a CPU model's steppings are not a first and a last")
+        first = _profile_int(steppings[0], "first stepping")
+        last = _profile_int(steppings[1], "last stepping")
+        if not 0 <= first <= last:
+            raise ValueError(f"its steppings {first} to {last} are not a range")
+        cpus.append(
+            CpuModel(
+                _profile_int(cpu.get("family"), "family"),
+                _profile_int(cpu.get("model"), "model"),
+                range(first, last + 1),
+            )
+        )
+    if not cpus:
+        raise ValueError("its generation names no CPU models")
+    return CpuGeneration(name, vendor, tuple(cpus))
+
+
+def openvmm_cpu_generations(openvmm_dir: Path) -> tuple[CpuGeneration, ...]:
+    """Return the generations of the pinned CPU profiles in the OpenVMM
+    checkout ``openvmm_dir``, from which the OpenVMM that it builds selects
+    with ``--cpu-profile auto``, each once.
+
+    Raises ValueError if the checkout holds no pinned profile, or one that
+    cannot be read or names no generation."""
+    directory = openvmm_dir / OPENVMM_CPU_PROFILES
+    generations: list[CpuGeneration] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            generation = _profile_generation(json.loads(path.read_bytes()))
+        except (OSError, ValueError) as error:
+            raise ValueError(f"cannot read the CPU profile {path}: {error}") from error
+        if generation not in generations:
+            generations.append(generation)
+    if not generations:
+        raise ValueError(f"the OpenVMM checkout {openvmm_dir} pins no CPU profile")
+    return tuple(generations)
+
+
+# OpenVMM fails a cold boot with this code where no CPU profile serves the
+# host's CPU: no pinned profile, and, on a CPU of another vendor than Intel and
+# AMD, no host profile either.
 PROFILE_HOST_UNKNOWN = "E_PROFILE_HOST_UNKNOWN"
 # The CPU vendors whose CPUs host profiles serve, as OpenVMM's
-# `cpu_profile::supports_host_profiles` decides.
+# `cpu_profile::supports_host_profiles` decides. On such a CPU that no pinned
+# profile serves, `--cpu-profile auto` falls back to a host profile.
 HOST_PROFILE_VENDORS = frozenset({"GenuineIntel", "AuthenticAMD"})
+# OpenVMM leads the warning of every cold boot whose `--cpu-profile auto` falls
+# back to a host profile with this marker, followed by the host CPU and the
+# profile with its digest (doc/design/time-abi.md, "Selection").
+CPU_PROFILE_FALLBACK_MARKER = "NVX-CPU-PROFILE-FALLBACK:"
+_CPU_PROFILE_FALLBACK = re.compile(
+    rf"{re.escape(CPU_PROFILE_FALLBACK_MARKER)} .*?, so --cpu-profile auto fell back"
+    r" to ([a-z0-9-]+\.host\.v[1-9][0-9]*) \(sha256:[0-9a-f]{64}\), "
+)
 # The issues that track built-in CPU profiles for more Intel and more AMD CPUs.
 # No issue tracks the CPUs of other vendors, which the time ABI does not serve
 # (doc/design/time-abi.md, "Non-goals").
@@ -156,71 +251,202 @@ CPU_SUPPORT_ISSUES: Mapping[str, tuple[str, str]] = {
     "GenuineIntel": ("Intel", "https://github.com/microsoft/nvx/issues/408"),
     "AuthenticAMD": ("AMD", "https://github.com/microsoft/nvx/issues/409"),
 }
+# The issue form that requests a built-in CPU profile for a CPU
+# (.github/ISSUE_TEMPLATE/cpu-profile.yml), which OpenVMM's fallback warning,
+# run, and benchmark link to, prefilling the CPU fields that the form defines.
+CPU_PROFILE_REQUEST_URL = (
+    "https://github.com/microsoft/nvx/issues/new?template=cpu-profile.yml"
+)
 
 
 @dataclass(frozen=True)
 class HostCpu:
-    """A host CPU as the host OS identifies it: its CPUID vendor, and its
-    display family, model, and stepping."""
+    """A host CPU as the host OS identifies it: its CPUID vendor, its display
+    family, model, and stepping, and its brand string, if known."""
 
     vendor: str
     family: int
     model: int
     stepping: int
+    brand: str = ""
 
-    def describe(self) -> str:
-        """The CPU as messages name it, such as ``GenuineIntel 6/140/1``."""
+    def signature(self) -> str:
+        """The CPU's vendor and display family, model, and stepping, such as
+        ``GenuineIntel 6/140/1``."""
         return f"{self.vendor} {self.family}/{self.model}/{self.stepping}"
 
+    def describe(self) -> str:
+        """The CPU as messages name it: its signature and its brand string, if
+        known, such as ``GenuineIntel 6/173/1 (Intel(R) Xeon(R) 6973P-C)``."""
+        if not self.brand:
+            return self.signature()
+        return f"{self.signature()} ({self.brand})"
 
-def host_cpu_unsupported_guidance(
-    cpu_profile: str | None, host: HostCpu | None
+
+def cpu_profile_request_url(host: HostCpu) -> str:
+    """Return the link to the CPU profile request form for ``host``, which
+    prefills the form's title and CPU fields as OpenVMM's fallback warning
+    does."""
+    fields = {
+        "title": f"CPU profile: {host.describe()}",
+        "signature": host.signature(),
+    }
+    if host.brand:
+        fields["cpu"] = host.brand
+    query = urllib.parse.urlencode(fields, quote_via=urllib.parse.quote)
+    return f"{CPU_PROFILE_REQUEST_URL}&{query}"
+
+
+def cpu_profile_request_lines(host: HostCpu, openvmm: str, hypervisor: str) -> str:
+    """Return the lines that ask the user to request a built-in CPU profile for
+    ``host`` with the fingerprint that ``openvmm`` writes for ``hypervisor``."""
+    return (
+        "Help NVX add a built-in profile for this CPU: run\n"
+        f"  {openvmm} --hypervisor {hypervisor} --cpu-fingerprint fingerprint.json\n"
+        "and attach fingerprint.json to a CPU profile request:\n"
+        f"  {cpu_profile_request_url(host)}"
+    )
+
+
+def parse_cpu_profile_fallback(output: str) -> str | None:
+    """Return the host profile that OpenVMM's fallback warning in ``output``
+    names, or None without one.
+
+    Raises ValueError for more than one warning, or for one whose first line
+    names no host profile and digest: one cold boot falls back at most once."""
+    lines = [
+        line for line in output.splitlines() if CPU_PROFILE_FALLBACK_MARKER in line
+    ]
+    if not lines:
+        return None
+    if len(lines) > 1:
+        raise ValueError(
+            f"OpenVMM logged {len(lines)} {CPU_PROFILE_FALLBACK_MARKER} warnings"
+        )
+    match = _CPU_PROFILE_FALLBACK.search(lines[0])
+    if match is None:
+        raise ValueError(
+            f"malformed {CPU_PROFILE_FALLBACK_MARKER} warning: {lines[0].strip()!r}"
+        )
+    return match.group(1)
+
+
+def host_cpu_profile_guidance(
+    cpu_profile: str | None, host: HostCpu | None, openvmm: str, hypervisor: str
 ) -> str | None:
     """Return the next steps after OpenVMM failed a cold boot with
     ``--cpu-profile cpu_profile``, or with its default, ``auto``, if
-    ``cpu_profile`` is None, on the CPU ``host``, or None unless that request
-    cannot boot on the CPU because no built-in profile serves it.
+    ``cpu_profile`` is None, on the CPU ``host`` with the ``hypervisor``
+    backend, or None unless no built-in profile serves the CPU.
 
-    Such a CPU fails ``auto`` with ``E_PROFILE_HOST_UNKNOWN``, and, unless host
-    profiles serve it, ``host`` too. An explicit profile ID fails with its own
-    code, which needs no guidance. OpenVMM keeps its standard error on the
-    terminal, so the caller cannot read the code that ended the run: the
-    guidance says what such a cold boot does on the CPU, and OpenVMM's own
-    error names this run's cause."""
+    On such an Intel or AMD CPU, ``auto`` falls back to a host profile, so the
+    failure may not be the profile's: the guidance says what ``auto`` does on
+    the CPU, and asks for the CPU's fingerprint, which ``openvmm`` writes, to
+    add a built-in profile for it. OpenVMM's own error names this run's cause,
+    and says so where the host profile cannot boot. On another vendor's CPU,
+    ``auto`` and ``host`` fail with ``E_PROFILE_HOST_UNKNOWN``. An explicit
+    profile ID fails with its own code, and ``host`` on an Intel or AMD CPU
+    with OpenVMM's own explanation, which need no guidance. OpenVMM keeps its
+    standard error on the terminal, so the caller cannot read the code that
+    ended the run."""
     if host is None or (
         cpu_generation(host.vendor, host.family, host.model, host.stepping) is not None
     ):
         return None
     host_profiles = host.vendor in HOST_PROFILE_VENDORS
     auto = cpu_profile in (None, "auto")
-    # A host profile fails with the same code on a CPU that it cannot serve.
-    host_unknown = auto or (
-        cpu_profile == HOST_PROFILE_GENERATION and not host_profiles
-    )
-    if not host_unknown:
+    if not (auto or (cpu_profile == HOST_PROFILE_GENERATION and not host_profiles)):
         return None
-    lines = [
-        f"nvx: no built-in CPU profile serves this host's CPU, {host.describe()}, "
-        "so a cold boot with --cpu-profile auto, the default, fails on it with "
-        f"{PROFILE_HOST_UNKNOWN}; the built-in profiles cover "
-        f"{describe_cpu_generations()}."
-    ]
+    unserved = f"nvx: no built-in CPU profile serves this host's CPU, {host.describe()}"
+    generations = f"the built-in profiles cover {describe_cpu_generations()}."
     if not host_profiles:
-        lines.append(
-            f"nvx: --cpu-profile {HOST_PROFILE_GENERATION} cannot boot on it "
-            "either: host CPU profiles serve only Intel and AMD CPUs."
+        return "\n".join(
+            (
+                f"{unserved}, so a cold boot with --cpu-profile auto, the default, "
+                f"fails on it with {PROFILE_HOST_UNKNOWN}; {generations}",
+                f"nvx: --cpu-profile {HOST_PROFILE_GENERATION} cannot boot on it "
+                "either: host CPU profiles serve only Intel and AMD CPUs.",
+            )
         )
-    elif auto:
-        lines.append(
-            f"nvx: on a development host, rerun with --cpu-profile "
-            f"{HOST_PROFILE_GENERATION} to boot on a CPU profile derived from "
-            'this host; doc/usage.md ("CPU profiles") explains its limits.'
-        )
-    support = CPU_SUPPORT_ISSUES.get(host.vendor)
-    if support is not None:
-        vendor, issue = support
-        lines.append(f"nvx: {issue} tracks CPU profiles for more {vendor} CPUs.")
+    vendor, issue = CPU_SUPPORT_ISSUES[host.vendor]
+    lines = [
+        f"{unserved}, so --cpu-profile auto, the default, falls back on it to a "
+        "CPU profile derived from this host, which OpenVMM warns about with "
+        f"{CPU_PROFILE_FALLBACK_MARKER}; {generations}",
+        "nvx: OpenVMM's error above names the cause of this failure, and says "
+        'so where the host profile cannot boot; doc/usage.md ("CPU profiles") '
+        "explains a host profile's limits.",
+    ]
+    lines.extend(
+        f"nvx: {line}"
+        for line in cpu_profile_request_lines(host, openvmm, hypervisor).splitlines()
+    )
+    lines.append(f"nvx: {issue} tracks CPU profiles for more {vendor} CPUs.")
     return "\n".join(lines)
+
+
+def benchmark_cpu_profile_refusal(
+    host: HostCpu | None,
+    openvmm: str,
+    hypervisor: str,
+    generations: Sequence[CpuGeneration] = CPU_GENERATIONS,
+) -> str | None:
+    """Return why benchmark refuses this host, whose CPU is ``host``, or None
+    if it does not, where the OpenVMM that it benchmarks pins the profiles of
+    ``generations``.
+
+    Benchmark refuses a CPU that no built-in profile serves. On such an Intel
+    or AMD CPU, ``--cpu-profile auto`` falls back to a host profile, whose cold
+    boots fingerprint the hypervisor first and which no baseline shares, so its
+    results compare with no other host's; on another vendor's CPU, every cold
+    boot fails. It refuses a CPU that it cannot identify too: OpenVMM, which
+    identifies the CPU itself, could fall back on it. And it refuses a CPU that
+    profiles of more than one generation cover, which ``auto`` rejects as a
+    catalog defect without falling back, as OpenVMM's ``select_auto`` does;
+    revisions of one generation's profile select its latest."""
+    host_profile = (
+        "a CPU profile derived from this host, whose every cold boot fingerprints "
+        "the hypervisor first, and whose results no baseline shares"
+    )
+    covered = f"The built-in profiles cover {describe_cpu_generations(generations)}."
+    if host is None:
+        return (
+            "benchmark refuses this host: it cannot identify the host's CPU from "
+            "/proc/cpuinfo or the Windows processor identifier, so it cannot "
+            "confirm that a built-in CPU profile serves it. On an Intel or AMD "
+            f"CPU that none serves, --cpu-profile auto falls back to {host_profile}, "
+            "and on another vendor's CPU, every cold boot fails with "
+            f"{PROFILE_HOST_UNKNOWN}. {covered}"
+        )
+    serving = sorted(
+        {
+            generation.name
+            for generation in generations
+            if generation.contains(host.vendor, host.family, host.model, host.stepping)
+        }
+    )
+    if len(serving) == 1:
+        return None
+    if serving:
+        return (
+            f"benchmark refuses this host: its CPU, {host.describe()}, is in more "
+            f"than one generation of the built-in CPU profiles ({', '.join(serving)}), "
+            "so every cold boot with --cpu-profile auto fails with "
+            f"{PROFILE_HOST_UNKNOWN}. {covered}"
+        )
+    unserved = (
+        "benchmark refuses this host: no built-in CPU profile serves its CPU, "
+        f"{host.describe()}"
+    )
+    if host.vendor not in HOST_PROFILE_VENDORS:
+        return (
+            f"{unserved}, and host CPU profiles serve only Intel and AMD CPUs, so "
+            f"every cold boot fails with {PROFILE_HOST_UNKNOWN}. {covered}"
+        )
+    return (
+        f"{unserved}, so --cpu-profile auto would fall back to {host_profile}. "
+        f"{covered}\n{cpu_profile_request_lines(host, openvmm, hypervisor)}"
+    )
 
 
 def is_catalog_profile_id(profile_id: str) -> bool:

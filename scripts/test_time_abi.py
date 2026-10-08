@@ -64,6 +64,40 @@ def warp_output(
     )
 
 
+def write_openvmm_profiles(
+    checkout: Path, *generations: time_abi.CpuGeneration, revision: int = 1
+) -> Path:
+    """Write ``generations`` as revision ``revision`` of the pinned CPU
+    profiles of an OpenVMM checkout at ``checkout``, with the fields that NVX
+    reads, and return the checkout."""
+    directory = checkout / time_abi.OPENVMM_CPU_PROFILES
+    directory.mkdir(parents=True, exist_ok=True)
+    for generation in generations:
+        profile_id = (
+            f"{time_abi.PROFILE_VENDORS[generation.vendor]}.{generation.name}"
+            f".v{revision}"
+        )
+        document = {
+            "id": profile_id,
+            "vendor": generation.vendor,
+            "generation": {
+                "name": generation.name,
+                "cpus": [
+                    {
+                        "family": cpu.family,
+                        "model": cpu.model,
+                        "steppings": [cpu.steppings.start, cpu.steppings.stop - 1],
+                    }
+                    for cpu in generation.cpus
+                ],
+            },
+        }
+        (directory / f"{profile_id}.json").write_text(
+            json.dumps(document), encoding="utf-8"
+        )
+    return checkout
+
+
 class FieldParsingTests(unittest.TestCase):
     def test_parses_plain_and_quoted_fields_with_guest_escapes(self):
         fields = time_abi.parse_fields(
@@ -220,11 +254,17 @@ class FieldParsingTests(unittest.TestCase):
         )
         assert listing is not None
         pinned: dict[str, tuple[str, str, tuple[tuple[int, int, range], ...]]] = {}
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        checkout = Path(temporary.name)
+        profiles = checkout / time_abi.OPENVMM_CPU_PROFILES
+        profiles.mkdir(parents=True)
         for path in sorted(listing.split("\0")):
             if not path.endswith(".json"):
                 continue
             content = git(submodule, "show", f"{pin}:{path}")
             assert content is not None
+            (profiles / Path(path).name).write_text(content, encoding="utf-8")
             document = json.loads(content)
             generation = document["generation"]
             # Keyed by profile ID, so that a second pinned revision of a
@@ -253,6 +293,107 @@ class FieldParsingTests(unittest.TestCase):
             for generation in time_abi.CPU_GENERATIONS
         }
         self.assertEqual(copy, pinned)
+        # benchmark reads the same generations from these documents, as it
+        # reads them from the OpenVMM checkout that it builds.
+        self.assertEqual(
+            set(time_abi.openvmm_cpu_generations(checkout)),
+            set(time_abi.CPU_GENERATIONS),
+        )
+
+    def test_reads_the_cpu_profiles_of_an_openvmm_checkout(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        directory = Path(temporary.name)
+        icelake, alderlake = time_abi.CPU_GENERATIONS[1], time_abi.CPU_GENERATIONS[3]
+        granite_rapids = time_abi.CpuGeneration(
+            "graniterapids", "GenuineIntel", (time_abi.CpuModel(6, 173),)
+        )
+        checkout = write_openvmm_profiles(
+            directory / "openvmm", icelake, alderlake, granite_rapids
+        )
+        # A second revision of a generation's profile adds no generation.
+        write_openvmm_profiles(checkout, icelake, revision=2)
+        generations = time_abi.openvmm_cpu_generations(checkout)
+        self.assertEqual(set(generations), {icelake, alderlake, granite_rapids})
+        self.assertEqual(len(generations), 3)
+        # A CPU that only the checkout's profiles cover is benchmarked with
+        # them, and not with NVX's copy of the catalog.
+        granite_rapids_host = time_abi.HostCpu("GenuineIntel", 6, 173, 1)
+        self.assertIsNone(
+            time_abi.benchmark_cpu_profile_refusal(
+                granite_rapids_host, "openvmm", "kvm", generations
+            )
+        )
+        self.assertIsNotNone(
+            time_abi.benchmark_cpu_profile_refusal(
+                granite_rapids_host, "openvmm", "kvm"
+            )
+        )
+        # A checkout that pins no profile, and a malformed profile, are errors,
+        # naming the checkout or the profile.
+        with self.assertRaisesRegex(ValueError, "pins no CPU profile"):
+            time_abi.openvmm_cpu_generations(directory / "empty")
+        valid = {
+            "vendor": "GenuineIntel",
+            "generation": {
+                "name": "icelake-sp",
+                "cpus": [{"family": 6, "model": 106, "steppings": [0, 15]}],
+            },
+        }
+        cases: tuple[tuple[str, object, str], ...] = (
+            ("not-json", None, "cannot read the CPU profile .*not-json.json"),
+            ("list", [], "it is not a JSON object"),
+            ("no-generation", {"vendor": "GenuineIntel"}, "names no vendor"),
+            (
+                "no-cpus",
+                {**valid, "generation": {"name": "icelake-sp", "cpus": []}},
+                "names no CPU models",
+            ),
+            (
+                "stepping-pair",
+                {
+                    **valid,
+                    "generation": {
+                        "name": "icelake-sp",
+                        "cpus": [{"family": 6, "model": 106, "steppings": [3]}],
+                    },
+                },
+                "not a first and a last",
+            ),
+            (
+                "stepping-order",
+                {
+                    **valid,
+                    "generation": {
+                        "name": "icelake-sp",
+                        "cpus": [{"family": 6, "model": 106, "steppings": [9, 3]}],
+                    },
+                },
+                "steppings 9 to 3 are not a range",
+            ),
+            (
+                "boolean-family",
+                {
+                    **valid,
+                    "generation": {
+                        "name": "icelake-sp",
+                        "cpus": [{"family": True, "model": 106, "steppings": [0, 1]}],
+                    },
+                },
+                "its family is not an integer",
+            ),
+        )
+        for name, document, message in cases:
+            with self.subTest(name=name):
+                malformed = directory / name
+                profiles = malformed / time_abi.OPENVMM_CPU_PROFILES
+                profiles.mkdir(parents=True)
+                (profiles / f"{name}.json").write_text(
+                    "{" if document is None else json.dumps(document),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    time_abi.openvmm_cpu_generations(malformed)
 
     def test_tells_catalog_profiles_from_host_profiles(self):
         for profile_id, catalog, host in (
@@ -274,63 +415,84 @@ class FieldParsingTests(unittest.TestCase):
                 self.assertEqual(time_abi.is_host_profile_id(profile_id), host)
 
     def test_guides_hosts_that_no_built_in_profile_serves(self):
-        tiger_lake = time_abi.HostCpu("GenuineIntel", 6, 140, 1)
-        guidance = time_abi.host_cpu_unsupported_guidance(None, tiger_lake)
+        def guide(cpu_profile: str | None, host: time_abi.HostCpu | None) -> str | None:
+            return time_abi.host_cpu_profile_guidance(
+                cpu_profile, host, "/nvx/openvmm", "kvm"
+            )
+
+        tiger_lake = time_abi.HostCpu(
+            "GenuineIntel", 6, 140, 1, "11th Gen Intel(R) Core(TM) i7-1185G7"
+        )
+        guidance = guide(None, tiger_lake)
         assert guidance is not None
-        # The guidance says what a cold boot with auto does on the CPU, not
-        # which code ended this run, which run cannot read.
-        self.assertIn(
-            "this host's CPU, GenuineIntel 6/140/1, so a cold boot with "
-            "--cpu-profile auto, the default, fails on it with "
-            "E_PROFILE_HOST_UNKNOWN;",
-            guidance,
-        )
-        self.assertIn(time_abi.describe_cpu_generations(), guidance)
-        self.assertIn("rerun with --cpu-profile host", guidance)
-        self.assertIn(
-            "https://github.com/microsoft/nvx/issues/408 tracks CPU profiles for "
-            "more Intel CPUs.",
-            guidance,
-        )
+        lines = guidance.splitlines()
+        self.assertTrue(all(line.startswith("nvx: ") for line in lines), guidance)
+        # auto falls back on the CPU, so the guidance says what auto does there,
+        # not which code ended this run, which run cannot read.
         self.assertEqual(
-            guidance, time_abi.host_cpu_unsupported_guidance("auto", tiger_lake)
+            lines[0],
+            "nvx: no built-in CPU profile serves this host's CPU, GenuineIntel "
+            "6/140/1 (11th Gen Intel(R) Core(TM) i7-1185G7), so --cpu-profile "
+            "auto, the default, falls back on it to a CPU profile derived from "
+            "this host, which OpenVMM warns about with NVX-CPU-PROFILE-FALLBACK:; "
+            f"the built-in profiles cover {time_abi.describe_cpu_generations()}.",
         )
-        # Host profiles serve Intel CPUs, so a host profile fails on this one
-        # for another reason, which OpenVMM's own error explains.
-        self.assertIsNone(time_abi.host_cpu_unsupported_guidance("host", tiger_lake))
+        self.assertIn("OpenVMM's error above names the cause", lines[1])
+        self.assertNotIn("E_PROFILE_HOST_UNKNOWN", guidance)
+        self.assertNotIn("rerun with", guidance)
+        # It asks for the CPU's fingerprint through the CPU profile request
+        # form, which the link prefills with the CPU.
+        self.assertEqual(
+            lines[2:],
+            [
+                "nvx: Help NVX add a built-in profile for this CPU: run",
+                "nvx:   /nvx/openvmm --hypervisor kvm --cpu-fingerprint "
+                "fingerprint.json",
+                "nvx: and attach fingerprint.json to a CPU profile request:",
+                f"nvx:   {time_abi.cpu_profile_request_url(tiger_lake)}",
+                "nvx: https://github.com/microsoft/nvx/issues/408 tracks CPU "
+                "profiles for more Intel CPUs.",
+            ],
+        )
+        self.assertEqual(guidance, guide("auto", tiger_lake))
+        # A host profile that fails on this CPU fails for a reason that
+        # OpenVMM's own error explains.
+        self.assertIsNone(guide("host", tiger_lake))
 
         # Host profiles serve AMD CPUs too: an AMD CPU without a built-in
-        # profile, such as Raphael (Ryzen 7000), gets the same suggestion as
-        # an Intel one, and the issue that tracks profiles for more AMD CPUs.
+        # profile, such as Raphael (Ryzen 7000), falls back as an Intel one
+        # does, with the issue that tracks profiles for more AMD CPUs.
         raphael = time_abi.HostCpu("AuthenticAMD", 25, 97, 2)
-        guidance = time_abi.host_cpu_unsupported_guidance(None, raphael)
+        guidance = guide(None, raphael)
         assert guidance is not None
         self.assertIn(
-            "this host's CPU, AuthenticAMD 25/97/2, so a cold boot with "
-            "--cpu-profile auto, the default, fails on it with "
-            "E_PROFILE_HOST_UNKNOWN;",
+            "this host's CPU, AuthenticAMD 25/97/2, so --cpu-profile auto, the "
+            "default, falls back on it",
             guidance,
         )
-        self.assertIn(time_abi.describe_cpu_generations(), guidance)
-        self.assertIn("rerun with --cpu-profile host", guidance)
+        self.assertIn(time_abi.cpu_profile_request_url(raphael), guidance)
         self.assertIn(
             "https://github.com/microsoft/nvx/issues/409 tracks CPU profiles for "
             "more AMD CPUs.",
             guidance,
         )
         self.assertNotIn("issues/408", guidance)
-        self.assertIsNone(time_abi.host_cpu_unsupported_guidance("host", raphael))
-        # Another vendor gets no suggestion, with either request, and no
-        # issue: the time ABI does not serve its CPUs.
+        self.assertIsNone(guide("host", raphael))
+        # Another vendor's CPU fails with either request, and gets no request
+        # form and no issue: the time ABI does not serve its CPUs.
         hygon = time_abi.HostCpu("HygonGenuine", 24, 0, 1)
-        guidance = time_abi.host_cpu_unsupported_guidance("auto", hygon)
+        guidance = guide("auto", hygon)
         assert guidance is not None
-        self.assertNotIn("rerun with", guidance)
-        self.assertIn("host CPU profiles serve only Intel and AMD CPUs", guidance)
-        self.assertNotIn("github.com", guidance)
-        self.assertEqual(
-            guidance, time_abi.host_cpu_unsupported_guidance("host", hygon)
+        self.assertIn(
+            "this host's CPU, HygonGenuine 24/0/1, so a cold boot with "
+            "--cpu-profile auto, the default, fails on it with "
+            "E_PROFILE_HOST_UNKNOWN;",
+            guidance,
         )
+        self.assertIn("host CPU profiles serve only Intel and AMD CPUs", guidance)
+        self.assertNotIn("falls back", guidance)
+        self.assertNotIn("github.com", guidance)
+        self.assertEqual(guidance, guide("host", hygon))
 
         # A CPU that a built-in profile serves, an explicit profile, and an
         # unknown CPU get none.
@@ -349,12 +511,248 @@ class FieldParsingTests(unittest.TestCase):
             ("intel.alderlake.v1", tiger_lake),
             ("intel.alderlake.v1", raphael),
             ("intel.skylake-sp.v1", milan),
+            ("intel.skylake-sp.v1", hygon),
             (None, None),
         ):
             with self.subTest(cpu_profile=cpu_profile, host=host):
+                self.assertIsNone(guide(cpu_profile, host))
+
+    def test_names_cpus_and_prefills_cpu_profile_requests(self):
+        granite_rapids = time_abi.HostCpu(
+            "GenuineIntel", 6, 173, 1, "Intel(R) Xeon(R) 6973P-C"
+        )
+        self.assertEqual(granite_rapids.signature(), "GenuineIntel 6/173/1")
+        self.assertEqual(
+            granite_rapids.describe(), "GenuineIntel 6/173/1 (Intel(R) Xeon(R) 6973P-C)"
+        )
+        # The link that OpenVMM's fallback warning gives the same CPU
+        # (openvmm_core's time_abi tests).
+        self.assertEqual(
+            time_abi.cpu_profile_request_url(granite_rapids),
+            "https://github.com/microsoft/nvx/issues/new?template=cpu-profile.yml"
+            "&title=CPU%20profile%3A%20GenuineIntel%206%2F173%2F1%20%28Intel%28R%29"
+            "%20Xeon%28R%29%206973P-C%29&signature=GenuineIntel%206%2F173%2F1"
+            "&cpu=Intel%28R%29%20Xeon%28R%29%206973P-C",
+        )
+        # A CPU without a brand string prefills only its signature.
+        brandless = time_abi.HostCpu("GenuineIntel", 6, 173, 1)
+        self.assertEqual(brandless.describe(), "GenuineIntel 6/173/1")
+        self.assertEqual(
+            time_abi.cpu_profile_request_url(brandless),
+            f"{time_abi.CPU_PROFILE_REQUEST_URL}&title=CPU%20profile%3A%20"
+            "GenuineIntel%206%2F173%2F1&signature=GenuineIntel%206%2F173%2F1",
+        )
+        self.assertIn(
+            "%26%3D%3F%23%25%2B",
+            time_abi.cpu_profile_request_url(
+                time_abi.HostCpu("GenuineIntel", 6, 173, 1, "&=?#%+")
+            ),
+        )
+
+    def test_parses_the_cpu_profile_fallback_warning(self):
+        digest = "ab" * 32
+        warning = (
+            "   0.012345s  WARN openvmm_core::worker::dispatch::time_abi: "
+            "NVX-CPU-PROFILE-FALLBACK: no built-in CPU profile serves this host's "
+            "CPU, GenuineIntel 6/173/1 (Intel(R) Xeon(R) 6973P-C), so --cpu-profile "
+            f"auto fell back to intel.host.v1 (sha256:{digest}), a profile derived "
+            "from this host's kvm backend for development.\n"
+            "It is not pinned: a microcode, firmware, hypervisor, or OS update can "
+            "change it.\n"
+        )
+        self.assertEqual(time_abi.parse_cpu_profile_fallback(warning), "intel.host.v1")
+        self.assertEqual(
+            time_abi.parse_cpu_profile_fallback(
+                warning.replace("intel.host.v1", "amd.host.v1")
+            ),
+            "amd.host.v1",
+        )
+        self.assertIsNone(time_abi.parse_cpu_profile_fallback("no warning\n"))
+        for output, message in (
+            (warning + warning, "logged 2 NVX-CPU-PROFILE-FALLBACK: warnings"),
+            (warning.replace("intel.host.v1", "intel.icelake-sp.v1"), "malformed"),
+            (warning.replace(f"sha256:{digest}", "sha256:ab"), "malformed"),
+            (warning.replace("fell back to", "selected"), "malformed"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    time_abi.parse_cpu_profile_fallback(output)
+
+    def test_benchmark_refuses_cpus_that_no_built_in_profile_serves(self):
+        granite_rapids = time_abi.HostCpu(
+            "GenuineIntel", 6, 173, 1, "Intel(R) Xeon(R) 6973P-C"
+        )
+        refusal = time_abi.benchmark_cpu_profile_refusal(
+            granite_rapids, "openvmm", "kvm"
+        )
+        assert refusal is not None
+        self.assertTrue(
+            refusal.startswith(
+                "benchmark refuses this host: no built-in CPU profile serves its CPU, "
+                "GenuineIntel 6/173/1 (Intel(R) Xeon(R) 6973P-C), so --cpu-profile "
+                "auto would fall back to a CPU profile derived from this host, whose "
+                "every cold boot fingerprints the hypervisor first"
+            ),
+            refusal,
+        )
+        self.assertIn(time_abi.describe_cpu_generations(), refusal)
+        self.assertIn(
+            "\n  openvmm --hypervisor kvm --cpu-fingerprint fingerprint.json\n", refusal
+        )
+        self.assertTrue(
+            refusal.endswith(time_abi.cpu_profile_request_url(granite_rapids)), refusal
+        )
+        # Another vendor's CPU cannot boot at all, and gets no request form.
+        hygon = time_abi.benchmark_cpu_profile_refusal(
+            time_abi.HostCpu("HygonGenuine", 24, 0, 1), "openvmm", "kvm"
+        )
+        assert hygon is not None
+        self.assertIn("host CPU profiles serve only Intel and AMD CPUs", hygon)
+        self.assertIn("E_PROFILE_HOST_UNKNOWN", hygon)
+        self.assertNotIn("github.com", hygon)
+        # A CPU that cannot be identified is refused too: OpenVMM, which reads
+        # the CPU itself, could fall back on it.
+        unknown = time_abi.benchmark_cpu_profile_refusal(None, "openvmm", "kvm")
+        assert unknown is not None
+        self.assertTrue(
+            unknown.startswith(
+                "benchmark refuses this host: it cannot identify the host's CPU"
+            ),
+            unknown,
+        )
+        # Its vendor is unknown too, so the refusal qualifies the fallback by
+        # vendor.
+        self.assertIn(
+            "On an Intel or AMD CPU that none serves, --cpu-profile auto falls "
+            "back to a CPU profile",
+            unknown,
+        )
+        self.assertIn(
+            "on another vendor's CPU, every cold boot fails with "
+            f"{time_abi.PROFILE_HOST_UNKNOWN}",
+            unknown,
+        )
+        # A CPU that a built-in profile serves is benchmarked.
+        for host in (
+            time_abi.HostCpu("GenuineIntel", 6, 106, 6),
+            time_abi.HostCpu("AuthenticAMD", 25, 1, 1),
+        ):
+            with self.subTest(host=host):
                 self.assertIsNone(
-                    time_abi.host_cpu_unsupported_guidance(cpu_profile, host)
+                    time_abi.benchmark_cpu_profile_refusal(host, "openvmm", "whp")
                 )
+        # The profiles that decide are those of the OpenVMM that benchmark
+        # builds: one that adds a profile for a CPU serves it, and one that
+        # lacks a profile refuses its CPU, listing its own profiles.
+        graniterapids = time_abi.CpuGeneration(
+            "graniterapids", "GenuineIntel", (time_abi.CpuModel(6, 173),)
+        )
+        self.assertIsNone(
+            time_abi.benchmark_cpu_profile_refusal(
+                granite_rapids,
+                "openvmm",
+                "kvm",
+                (*time_abi.CPU_GENERATIONS, graniterapids),
+            )
+        )
+        icelake = time_abi.HostCpu("GenuineIntel", 6, 106, 6)
+        refusal = time_abi.benchmark_cpu_profile_refusal(
+            icelake, "openvmm", "kvm", (graniterapids,)
+        )
+        assert refusal is not None
+        self.assertIn(
+            "no built-in CPU profile serves its CPU, GenuineIntel 6/106/6", refusal
+        )
+        self.assertIn("The built-in profiles cover graniterapids 6/173.\n", refusal)
+        # A CPU in more than one generation fails every cold boot, because
+        # auto rejects it as a catalog defect without falling back, as OpenVMM
+        # does; revisions of one generation's profile do not make it ambiguous.
+        icelake_x = time_abi.CpuGeneration(
+            "icelake-x", "GenuineIntel", (time_abi.CpuModel(6, 106),)
+        )
+        ambiguous = time_abi.benchmark_cpu_profile_refusal(
+            icelake, "openvmm", "kvm", (*time_abi.CPU_GENERATIONS, icelake_x)
+        )
+        assert ambiguous is not None
+        self.assertTrue(
+            ambiguous.startswith(
+                "benchmark refuses this host: its CPU, GenuineIntel 6/106/6, is in "
+                "more than one generation of the built-in CPU profiles (icelake-sp, "
+                "icelake-x), so every cold boot with --cpu-profile auto fails with "
+                f"{time_abi.PROFILE_HOST_UNKNOWN}."
+            ),
+            ambiguous,
+        )
+        self.assertNotIn("github.com", ambiguous)
+        revised = time_abi.CpuGeneration(
+            "icelake-sp",
+            "GenuineIntel",
+            (time_abi.CpuModel(6, 106), time_abi.CpuModel(6, 108)),
+        )
+        self.assertIsNone(
+            time_abi.benchmark_cpu_profile_refusal(
+                icelake, "openvmm", "kvm", (*time_abi.CPU_GENERATIONS, revised)
+            )
+        )
+
+    def test_cpu_profile_requests_match_openvmm_and_the_issue_form(self):
+        # OpenVMM's fallback warning and NVX link to the same form, which must
+        # define the text fields that the links prefill, and NVX matches the
+        # warning's marker. OpenVMM's constants are read from the gitlink's
+        # commit, as the catalog copy's comparison reads its profiles.
+        root = Path(__file__).resolve().parents[1]
+        form = (root / ".github" / "ISSUE_TEMPLATE" / "cpu-profile.yml").read_text(
+            encoding="utf-8"
+        )
+        fields = re.findall(r"^  - type: (\w+)\n    id: ([\w-]+)$", form, re.MULTILINE)
+        for prefilled in ("cpu", "signature"):
+            self.assertIn(("input", prefilled), fields)
+        self.assertRegex(form, r"(?m)^name: CPU profile request$")
+        self.assertEqual(
+            time_abi.CPU_PROFILE_REQUEST_URL.rpartition("template=")[2],
+            "cpu-profile.yml",
+        )
+
+        submodule = root / "openvmm"
+        if not (submodule / ".git").exists():
+            self.skipTest("the OpenVMM submodule is not initialized")
+        pin = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", ":openvmm"],
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+        ).stdout.strip()
+        source = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(submodule),
+                "show",
+                f"{pin}:openvmm/openvmm_core/src/worker/dispatch/time_abi.rs",
+            ],
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+        )
+        if not pin or source.returncode != 0:
+            self.skipTest(
+                f"the OpenVMM submodule lacks its pinned revision {pin or '(unknown)'}"
+            )
+        constants = dict(
+            re.findall(
+                r'const (FALLBACK_MARKER|CPU_PROFILE_REQUEST_URL): &str =\s*"([^"]*)";',
+                source.stdout,
+            )
+        )
+        self.assertEqual(
+            constants,
+            {
+                "FALLBACK_MARKER": time_abi.CPU_PROFILE_FALLBACK_MARKER,
+                "CPU_PROFILE_REQUEST_URL": time_abi.CPU_PROFILE_REQUEST_URL,
+            },
+        )
+        for key in ("&title=", "&signature=", "&cpu="):
+            self.assertIn(key, source.stdout)
 
     def test_computes_the_checks_cpu_time_budget(self):
         # The spec's final budgets: a base plus an increment per additional
@@ -1799,17 +2197,81 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(fields["model"], "85")
         self.assertIn("nonstop_tsc", fields["flags"])
 
+    def test_qualification_rejects_a_host_on_which_auto_falls_back(self):
+        """auto falls back to a host profile on a CPU that no built-in profile
+        serves, but qualification does not: H2's fingerprint check never falls
+        back, and H3 rejects the host profile that OpenVMM's preflight selects,
+        so CI's microVM jobs still require a built-in profile."""
+        granite_rapids = dict(
+            CPU, model="173", stepping="1", brand="Intel(R) Xeon(R) 6973P-C"
+        )
+        fingerprint = self.root / "fingerprint.json"
+        unknown = (
+            "NVX-CPU-PROFILE: status=fail backend=kvm generation=none profile=none "
+            "surface_digest=sha256:1 host_invariant_tsc=yes "
+            'code=E_PROFILE_HOST_UNKNOWN detail="no pinned CPU profile serves '
+            'the host CPU, GenuineIntel family 6 model 173 stepping 1"\n'
+        )
+        fallback = (
+            "NVX-TIME-ABI-VERIFY: v=1 status=ok backend=kvm cpu_profile=intel.host.v1 "
+            "tsc_hz=2793437000 native_tsc_hz=2793437000 lapic_hz=1000000000 "
+            "msr_route=ExitToVmm sync=CommonOffset\n"
+        )
+
+        def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            if "--cpu-fingerprint" in command:
+                return completed("", 1, unknown)
+            return completed(fallback)
+
+        context = doctor_context(self.root)
+        for path in (context.openvmm, context.kernel, context.initrd):
+            path.write_bytes(b"")
+        context.fingerprint = fingerprint
+        with (
+            patch.object(doctor, "host_cpu", return_value=granite_rapids),
+            patch.object(doctor.subprocess, "run", side_effect=run),
+            contextlib.redirect_stdout(io.StringIO()) as lines,
+        ):
+            cpu, preflight = doctor.run_checks(context, ("H2", "H3"))
+        self.assertIn("NVX-DOCTOR: check=H2 status=fail", lines.getvalue())
+        self.assertIn("NVX-DOCTOR: check=H3 status=fail", lines.getvalue())
+        self.assertEqual((cpu.check, cpu.passed), ("H2", False))
+        self.assertTrue(cpu.detail.startswith("[E_PROFILE_HOST_UNKNOWN] "), cpu.detail)
+        self.assertEqual((preflight.check, preflight.passed), ("H3", False))
+        self.assertIn(
+            "cpu_profile=intel.host.v1 (a host profile, to which --cpu-profile auto "
+            "falls back",
+            preflight.detail,
+        )
+        # Without OpenVMM, NVX's copy of the catalog fails the CPU too.
+        context.fingerprint = None
+        with patch.object(doctor, "host_cpu", return_value=granite_rapids):
+            result = doctor.check_cpu(context)
+        self.assertFalse(result.passed)
+        self.assertTrue(result.detail.startswith("[E_PROFILE_HOST_UNKNOWN] "))
+
     def test_identifies_the_host_cpu_signature(self):
         HostCpu = time_abi.HostCpu
-        with patch.object(doctor, "host_is_windows", return_value=True):
+        brand = "12th Gen Intel(R) Core(TM) i9-12900H"
+
+        def registry(key: str, name: str) -> object:
+            self.assertEqual(
+                (key, name), (doctor.WINDOWS_PROCESSOR_KEY, "ProcessorNameString")
+            )
+            return f"{brand}  "
+
+        with (
+            patch.object(doctor, "host_is_windows", return_value=True),
+            patch.object(doctor, "_windows_registry_value", side_effect=registry),
+        ):
             for processor, expected in (
                 (
                     "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
-                    HostCpu("GenuineIntel", 6, 154, 3),
+                    HostCpu("GenuineIntel", 6, 154, 3, brand),
                 ),
                 (
                     "AMD64 Family 25 Model 33 Stepping 0, AuthenticAMD",
-                    HostCpu("AuthenticAMD", 25, 33, 0),
+                    HostCpu("AuthenticAMD", 25, 33, 0, brand),
                 ),
                 ("", None),
             ):
@@ -1818,6 +2280,21 @@ class DoctorTests(unittest.TestCase):
                     patch.object(doctor.platform, "processor", return_value=processor),
                 ):
                     self.assertEqual(doctor.host_cpu_signature(), expected)
+        # A brand string that the registry lacks leaves the signature.
+        with (
+            patch.object(doctor, "host_is_windows", return_value=True),
+            patch.object(
+                doctor.platform,
+                "processor",
+                return_value="Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+            ),
+            patch.object(
+                doctor, "_windows_registry_value", side_effect=OSError("no value")
+            ),
+        ):
+            self.assertEqual(
+                doctor.host_cpu_signature(), HostCpu("GenuineIntel", 6, 154, 3)
+            )
         cpuinfo = {
             "vendor_id": "AuthenticAMD",
             "cpu family": "25",
@@ -1827,6 +2304,12 @@ class DoctorTests(unittest.TestCase):
         with patch.object(doctor, "host_is_windows", return_value=False):
             for fields, expected in (
                 (cpuinfo, HostCpu("AuthenticAMD", 25, 17, 1)),
+                (
+                    {**cpuinfo, "model name": "AMD EPYC 9V74 80-Core Processor"},
+                    HostCpu(
+                        "AuthenticAMD", 25, 17, 1, "AMD EPYC 9V74 80-Core Processor"
+                    ),
+                ),
                 ({**cpuinfo, "model": "?"}, None),
                 ({"vendor_id": "AuthenticAMD"}, None),
             ):
@@ -1916,11 +2399,13 @@ class DoctorTests(unittest.TestCase):
                 completed(line.replace("intel.icelake-sp.v1", "interim.host.kvm.v1")),
                 "verified no catalog CPU profile: cpu_profile=interim.host.kvm.v1",
             ),
-            # Qualification never accepts a host profile.
+            # Qualification never accepts a host profile, such as the one to
+            # which auto falls back on a CPU that no built-in profile serves.
             (
                 completed(line.replace("intel.icelake-sp.v1", "intel.host.v1")),
                 "verified no catalog CPU profile: cpu_profile=intel.host.v1 (a host "
-                "profile, which qualification never accepts)",
+                "profile, to which --cpu-profile auto falls back on a CPU that no "
+                "built-in profile serves, and which qualification never accepts)",
             ),
         )
         for result_value, message in cases:

@@ -88,6 +88,35 @@ def _restore_target(command: list[str]) -> int | None:
     return int(command[command.index("--restore-processors") + 1])
 
 
+# OpenVMM's warning of a cold boot whose --cpu-profile auto falls back to a
+# host profile (openvmm_core's time_abi host_profile_warning), on stderr.
+FALLBACK_WARNING = (
+    "   0.012345s  WARN openvmm_core::worker::dispatch::time_abi: "
+    "NVX-CPU-PROFILE-FALLBACK: no built-in CPU profile serves this host's CPU, "
+    "GenuineIntel 6/106/6 (Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz), so "
+    f"--cpu-profile auto fell back to intel.host.v1 (sha256:{'cd' * 32}), a "
+    "profile derived from this host's kvm backend for development.\n"
+    "It is not pinned: a microcode, firmware, hypervisor, or OS update can change "
+    "it. Each cold boot fingerprints the backend first, which took 14.2 ms here, "
+    "and its snapshots restore only on hosts of the same CPU model and stepping "
+    "whose hypervisor supports it.\n"
+    "Help NVX add a built-in profile for this CPU: run\n"
+    "  openvmm --hypervisor kvm --cpu-fingerprint fingerprint.json\n"
+    "and attach fingerprint.json to a CPU profile request:\n"
+    f"  {time_abi.CPU_PROFILE_REQUEST_URL}&signature=GenuineIntel%206%2F106%2F6\n"
+).encode()
+
+
+def _declared(cpu_profile: bytes) -> bytes:
+    """Return OpenVMM's record of the rates that a partition with
+    ``cpu_profile`` declares, on stderr."""
+    return (
+        b"   0.023456s  INFO openvmm_core::worker::dispatch::time_abi: time ABI "
+        b'rates declared hypervisor="kvm" cpu_profile="' + cpu_profile + b'" '
+        b"msr_route=ExitToVmm sync=CommonOffset native_tsc_hz=0xa680b7c8\n"
+    )
+
+
 def _warp_probe_output(cpus: int, *, offset_ns: int = 40) -> bytes:
     """Return the console output of the idle-inducing warp schedule."""
     pairs = cpus * (cpus - 1) // 2
@@ -4000,6 +4029,143 @@ class MicrovmTests(unittest.TestCase):
                             timeout=60,
                             output_dir=Path(temporary),
                         )
+
+    def _run_cpu_profile_fallback(
+        self, capture_log: bytes, restore_log: bytes
+    ) -> tuple[MagicMock, MagicMock]:
+        """Run the CPU profile fallback scenario on KVM, with a capture and a
+        restore whose OpenVMM logs are ``capture_log`` and ``restore_log``."""
+
+        def capture(_command: list[str], _snapshot: Path, **kwargs: object) -> None:
+            cast(Path, kwargs["log_path"]).write_bytes(capture_log)
+
+        def measure(_command: list[str], **kwargs: object) -> None:
+            cast(Path, kwargs["log_path"]).write_bytes(restore_log)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(
+                    microvm_tests,
+                    "workload_boot_command",
+                    return_value=["openvmm", "boot"],
+                ),
+                patch.object(
+                    microvm_tests, "capture_snapshot", side_effect=capture
+                ) as capture_snapshot,
+                patch.object(
+                    microvm_tests, "measure_once", side_effect=measure
+                ) as measure_once,
+            ):
+                microvm_tests.run_cpu_profile_fallback(
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initrd"),
+                    "kvm",
+                    memory_mib=128,
+                    timeout=60,
+                    output_dir=Path(temporary),
+                )
+        return capture_snapshot, measure_once
+
+    def test_cpu_profile_fallback_boots_and_restores_on_the_host_profile(self):
+        capture_snapshot, measure_once = self._run_cpu_profile_fallback(
+            FALLBACK_WARNING + _declared(b"intel.host.v1"),
+            _declared(b"intel.host.v1")
+            + _warp_probe_output(1)
+            + _restore_status_output("kvm", 1),
+        )
+        # The cold boot takes the test hook, and its log keeps the time ABI's
+        # warning and declared rates beside the capture's records.
+        capture = capture_snapshot.call_args
+        self.assertEqual(
+            capture.args[0],
+            [
+                "openvmm",
+                "boot",
+                "--x-time-abi-test-hook",
+                "host-cpu-unknown",
+                "--snapshot-destination",
+                str(capture.args[1]),
+            ],
+        )
+        self.assertEqual(capture.kwargs["processors"], 1)
+        self.assertEqual(
+            capture.kwargs["post_restore_script"],
+            time_abi.warp_probe_script() + time_abi.status_script(),
+        )
+        self.assertEqual(
+            capture.kwargs["log_filter"],
+            f"{benchmark.CAPTURE_LOG_FILTER},"
+            "openvmm_core::worker::dispatch::time_abi=info",
+        )
+        # The restore takes auto, without the hook.
+        restore = measure_once.call_args
+        self.assertNotIn("--x-time-abi-test-hook", restore.args[0])
+        self.assertNotIn("--cpu-profile", restore.args[0])
+        self.assertEqual(
+            restore.kwargs["environment"]["OPENVMM_LOG"],
+            microvm_tests.TIME_ABI_RESTORE_LOG_FILTER,
+        )
+        self.assertTrue(restore.kwargs["guest_exit_prequeued"])
+        self.assertEqual(
+            restore.kwargs["failure_marker"], time_abi.WARP_PROBE_FAILURE_MARKER
+        )
+
+    def test_cpu_profile_fallback_rejects_a_missing_or_wrong_fallback(self):
+        restored = (
+            _declared(b"intel.host.v1")
+            + _warp_probe_output(1)
+            + _restore_status_output("kvm", 1)
+        )
+        cases = (
+            (
+                _declared(b"intel.icelake-sp.v1"),
+                restored,
+                "CPU profile fallback cold boot: OpenVMM logged no "
+                "NVX-CPU-PROFILE-FALLBACK: warning",
+            ),
+            (
+                FALLBACK_WARNING + FALLBACK_WARNING + _declared(b"intel.host.v1"),
+                restored,
+                "logged 2 NVX-CPU-PROFILE-FALLBACK: warnings",
+            ),
+            (
+                FALLBACK_WARNING.replace(
+                    time_abi.CPU_PROFILE_REQUEST_URL.encode(), b"https://example.com"
+                )
+                + _declared(b"intel.host.v1"),
+                restored,
+                "the warning does not link to",
+            ),
+            (
+                FALLBACK_WARNING + _declared(b"intel.icelake-sp.v1"),
+                restored,
+                r"cold boot declared CPU profiles \['intel.icelake-sp.v1'\], not "
+                "intel.host.v1",
+            ),
+            (
+                FALLBACK_WARNING + _declared(b"intel.host.v1"),
+                FALLBACK_WARNING + restored,
+                "CPU profile fallback restore fell back to a host profile again",
+            ),
+            (
+                FALLBACK_WARNING + _declared(b"intel.host.v1"),
+                restored.replace(b"intel.host.v1", b"intel.icelake-sp.v1"),
+                r"restore declared CPU profiles \['intel.icelake-sp.v1'\], not the "
+                "snapshot's intel.host.v1",
+            ),
+            (
+                FALLBACK_WARNING + _declared(b"intel.host.v1"),
+                _warp_probe_output(1),
+                "CPU profile fallback restore: nvx-time status did not finish",
+            ),
+        )
+        for capture_log, restore_log, message in cases:
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                self._run_cpu_profile_fallback(capture_log, restore_log)
 
     def test_restore_processors_uses_capacity_eight_and_each_target(self):
         with tempfile.TemporaryDirectory() as temporary:

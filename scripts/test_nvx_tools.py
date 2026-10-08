@@ -66,7 +66,14 @@ from nvx_tools.build_constants import (  # noqa: E402
     UbuntuBuildConstants,
     ZstdBuildConstants,
 )
-from nvx_tools.time_abi import HostCpu  # noqa: E402
+from nvx_tools.time_abi import (  # noqa: E402
+    CPU_GENERATIONS,
+    OPENVMM_CPU_PROFILES,
+    CpuGeneration,
+    CpuModel,
+    HostCpu,
+    cpu_profile_request_url,
+)
 
 
 def _workflow_job(workflow: str, job_name: str) -> str:
@@ -542,7 +549,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.warmups, 1)
         self.assertEqual(args.runs, 5)
         self.assertEqual(args.output_dir, Path("results"))
-        self.assertIs(args.handler, benchmark.run)
+        self.assertIs(args.handler, nvx.command_benchmark)
 
     def test_benchmark_exposes_non_python_performance_suite(self):
         args = nvx.parse_args(
@@ -565,7 +572,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.network_memory_mib, 256)
         self.assertEqual(args.host_cpu_reserve, 2)
         self.assertEqual(args.output_dir, Path("results"))
-        self.assertIs(args.handler, benchmark.run)
+        self.assertIs(args.handler, nvx.command_benchmark)
 
     def test_device_io_uses_canonical_sampling_defaults(self):
         args = nvx.parse_args(["benchmark", "--suite", "device-io"])
@@ -602,7 +609,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.suite, "shell-snapshot-restore")
         self.assertEqual(args.shell_memories, [512])
         self.assertEqual(args.processors, 8)
-        self.assertIs(args.handler, benchmark.run)
+        self.assertIs(args.handler, nvx.command_benchmark)
 
     def test_benchmark_exposes_restore_vcpu_matrix(self):
         args = nvx.parse_args(
@@ -622,7 +629,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.suite, "snapshot-restore-vcpu")
         self.assertEqual(args.processors, 8)
         self.assertEqual(args.memory_mib, 512)
-        self.assertIs(args.handler, benchmark.run)
+        self.assertIs(args.handler, nvx.command_benchmark)
 
     def test_benchmark_exposes_snapshot_profile_matrix(self):
         args = nvx.parse_args(
@@ -643,7 +650,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.shell_memories, [128, 256, 512, 1024])
         self.assertEqual(args.cache_state, "cold")
         self.assertFalse(args.snapshot_profile)
-        self.assertIs(args.handler, benchmark.run)
+        self.assertIs(args.handler, nvx.command_benchmark)
 
     def test_benchmark_preserves_canonical_shell_memory_defaults(self):
         args = nvx.parse_args(["benchmark", "--suite", "performance"])
@@ -1741,8 +1748,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(restored[restored.index("--cpu-profile") + 1], "host")
 
     def test_run_explains_a_host_cpu_that_no_profile_serves(self):
-        tiger_lake = HostCpu("GenuineIntel", 6, 140, 1)
+        tiger_lake = HostCpu("GenuineIntel", 6, 140, 1, "Intel(R) Core(TM) i7-1185G7")
         zen3 = HostCpu("AuthenticAMD", 25, 33, 0)
+        openvmm = "/nvx/openvmm/target/release/openvmm"
 
         def run(
             returncode: int,
@@ -1751,48 +1759,61 @@ class CliTests(unittest.TestCase):
             host: HostCpu | None = tiger_lake,
         ) -> tuple[int, str]:
             stderr = io.StringIO()
-            completed = subprocess.CompletedProcess[bytes](["openvmm"], returncode)
+            completed = subprocess.CompletedProcess[bytes]([openvmm], returncode)
             with (
                 patch.object(nvx.sys, "stderr", stderr),
                 patch.object(nvx.subprocess, "run", return_value=completed) as launch,
                 patch.object(nvx, "host_cpu_signature", return_value=host),
             ):
                 status = nvx._run_openvmm(  # pyright: ignore[reportPrivateUsage]
-                    ["openvmm"], cpu_profile, cold_boot
+                    [openvmm, "--hypervisor", "kvm"], cpu_profile, cold_boot, "kvm"
                 )
             # OpenVMM keeps the terminal, its standard error included.
-            launch.assert_called_once_with(["openvmm"])
+            launch.assert_called_once_with([openvmm, "--hypervisor", "kvm"])
             return status, stderr.getvalue()
 
         status, output = run(1, None)
         self.assertEqual(status, 1)
+        # auto falls back on the CPU, so run says so, and asks for the CPU's
+        # fingerprint, which this OpenVMM writes for this backend, through the
+        # CPU profile request form.
         self.assertIn(
             "nvx: no built-in CPU profile serves this host's CPU, "
-            "GenuineIntel 6/140/1, so a cold boot with --cpu-profile auto, the "
-            "default, fails on it with E_PROFILE_HOST_UNKNOWN;",
+            "GenuineIntel 6/140/1 (Intel(R) Core(TM) i7-1185G7), so --cpu-profile "
+            "auto, the default, falls back on it to a CPU profile derived from "
+            "this host",
             output,
         )
         self.assertIn("alderlake 6/151 and 6/154", output)
-        self.assertIn("rerun with --cpu-profile host", output)
+        self.assertIn(
+            f"nvx:   {openvmm} --hypervisor kvm --cpu-fingerprint fingerprint.json\n",
+            output,
+        )
+        self.assertIn(cpu_profile_request_url(tiger_lake), output)
         self.assertIn("https://github.com/microsoft/nvx/issues/408", output)
+        self.assertNotIn("rerun with --cpu-profile host", output)
         self.assertEqual(run(1, "auto"), (1, output))
         # Host profiles serve AMD CPUs too, so an AMD host that no built-in
-        # profile serves gets the same suggestion, with the issue that tracks
-        # profiles for more AMD CPUs, and a host profile that fails on it
-        # fails for another reason, which OpenVMM explains.
+        # profile serves falls back too, with the issue that tracks profiles
+        # for more AMD CPUs, and a host profile that fails on it fails for
+        # another reason, which OpenVMM explains.
         status, output = run(1, None, host=zen3)
-        self.assertIn("AuthenticAMD 25/33/0", output)
-        self.assertIn("rerun with --cpu-profile host", output)
+        self.assertIn("AuthenticAMD 25/33/0, so --cpu-profile auto", output)
+        self.assertIn(cpu_profile_request_url(zen3), output)
         self.assertIn("https://github.com/microsoft/nvx/issues/409", output)
         self.assertNotIn("issues/408", output)
         self.assertEqual(run(1, "host", host=zen3), (1, ""))
         # Host profiles serve only Intel and AMD CPUs, so another vendor's
-        # host gets no such suggestion, with either request.
+        # host still fails, with either request.
         hygon = HostCpu("HygonGenuine", 24, 0, 1)
         status, output = run(1, None, host=hygon)
-        self.assertIn("HygonGenuine 24/0/1", output)
-        self.assertNotIn("rerun with --cpu-profile host", output)
+        self.assertIn(
+            "HygonGenuine 24/0/1, so a cold boot with --cpu-profile auto, the "
+            "default, fails on it with E_PROFILE_HOST_UNKNOWN",
+            output,
+        )
         self.assertIn("host CPU profiles serve only Intel and AMD CPUs", output)
+        self.assertNotIn("cpu-profile.yml", output)
         self.assertEqual(run(1, "host", host=hygon), (1, output))
         # Successful runs, restores, other requests and CPUs, and an unknown
         # CPU get no guidance.
@@ -1814,6 +1835,207 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(
                     run(returncode, cpu_profile, cold_boot, host), (returncode, "")
                 )
+
+    def test_run_quotes_the_openvmm_path_in_the_cpu_profile_guidance(self):
+        # The guidance's fingerprint command is for copying, so a path with a
+        # space is quoted as the shell of this platform reads it.
+        openvmm = str(Path("/nvx checkout") / "openvmm")
+        stderr = io.StringIO()
+        with (
+            patch.object(nvx.sys, "stderr", stderr),
+            patch.object(
+                nvx.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess[bytes]([openvmm], 1),
+            ),
+            patch.object(
+                nvx,
+                "host_cpu_signature",
+                return_value=HostCpu("GenuineIntel", 6, 140, 1),
+            ),
+        ):
+            nvx._run_openvmm(  # pyright: ignore[reportPrivateUsage]
+                [openvmm, "--hypervisor", "kvm"], None, True, "kvm"
+            )
+        quoted = (
+            subprocess.list2cmdline([openvmm])
+            if os.name == "nt"
+            else shlex.quote(openvmm)
+        )
+        self.assertNotEqual(quoted, openvmm)
+        self.assertIn(
+            f"nvx:   {quoted} --hypervisor kvm --cpu-fingerprint fingerprint.json\n",
+            stderr.getvalue(),
+        )
+
+    def test_run_passes_its_backend_to_the_cpu_profile_guidance(self):
+        args = nvx.parse_args(["run", "--hypervisor", "kvm"])
+        with (
+            patch.object(nvx, "require_file", return_value=Path("artifact")),
+            patch.object(nvx, "_run_openvmm", return_value=0) as run_openvmm,
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            nvx.command_run(args)
+        command, cpu_profile, cold_boot, hypervisor = run_openvmm.call_args.args
+        self.assertEqual(command[command.index("--hypervisor") + 1], "kvm")
+        self.assertEqual((cpu_profile, cold_boot, hypervisor), (None, True, "kvm"))
+
+    def test_benchmark_refuses_a_cpu_that_no_built_in_profile_serves(self):
+        # The command guards the benchmark coordinator, which it runs after.
+        self.assertIs(nvx.run_benchmark, benchmark.run)
+        granite_rapids = HostCpu("GenuineIntel", 6, 173, 1, "Intel(R) Xeon(R) 6973P-C")
+        icelake = HostCpu("GenuineIntel", 6, 106, 6)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+
+        def checkout(name: str, *generations: CpuGeneration) -> str:
+            # An OpenVMM checkout that pins profiles of these generations, with
+            # the fields that NVX reads.
+            directory = Path(temporary.name) / name
+            profiles = directory / OPENVMM_CPU_PROFILES
+            profiles.mkdir(parents=True)
+            for generation in generations:
+                document = {
+                    "vendor": generation.vendor,
+                    "generation": {
+                        "name": generation.name,
+                        "cpus": [
+                            {
+                                "family": cpu.family,
+                                "model": cpu.model,
+                                "steppings": [
+                                    cpu.steppings.start,
+                                    cpu.steppings.stop - 1,
+                                ],
+                            }
+                            for cpu in generation.cpus
+                        ],
+                    },
+                }
+                (profiles / f"{generation.name}.json").write_text(
+                    json.dumps(document), encoding="utf-8"
+                )
+            return str(directory)
+
+        pinned = checkout("pinned", *CPU_GENERATIONS)
+
+        def run_command(
+            host: HostCpu | None, *arguments: str, openvmm_dir: str = pinned
+        ) -> tuple[int, str, list[argparse.Namespace]]:
+            stderr = io.StringIO()
+            launched: list[argparse.Namespace] = []
+
+            def run(args: argparse.Namespace) -> int:
+                launched.append(args)
+                return 0
+
+            with (
+                patch.object(nvx, "host_cpu_signature", return_value=host),
+                patch.object(nvx, "run_benchmark", side_effect=run),
+                contextlib.redirect_stderr(stderr),
+            ):
+                status = nvx.main(
+                    ["benchmark", "--openvmm-dir", openvmm_dir, *arguments]
+                )
+            return status, stderr.getvalue(), launched
+
+        # The refusal comes before the coordinator builds or measures anything.
+        status, output, launched = run_command(
+            granite_rapids, "--suite", "e2e", "--backend", "kvm"
+        )
+        self.assertEqual((status, launched), (1, []))
+        self.assertTrue(
+            output.startswith(
+                "error: benchmark refuses this host: no built-in CPU profile serves "
+                "its CPU, GenuineIntel 6/173/1 (Intel(R) Xeon(R) 6973P-C)"
+            ),
+            output,
+        )
+        self.assertIn("openvmm --hypervisor kvm --cpu-fingerprint", output)
+        self.assertIn(cpu_profile_request_url(granite_rapids), output)
+        # On Windows, both backends name WHP's fingerprint.
+        status, output, launched = run_command(granite_rapids, "--backend", "both")
+        self.assertEqual((status, launched), (1, []))
+        self.assertIn("openvmm --hypervisor whp --cpu-fingerprint", output)
+        # A CPU that cannot be identified is refused too.
+        status, output, launched = run_command(None)
+        self.assertEqual((status, launched), (1, []))
+        self.assertIn("it cannot identify the host's CPU", output)
+        # The phase 2 suite boots no microVM, so it runs on any CPU, and a CPU
+        # that a built-in profile serves runs every suite.
+        for host, arguments in (
+            (granite_rapids, ("--suite", "phase2")),
+            (None, ("--suite", "phase2")),
+            (icelake, ("--suite", "e2e")),
+            (icelake, ()),
+        ):
+            with self.subTest(host=host, arguments=arguments):
+                status, output, launched = run_command(host, *arguments)
+                self.assertEqual((status, output), (0, ""))
+                self.assertEqual(len(launched), 1)
+        # The profiles that decide are those of the OpenVMM checkout that
+        # benchmark builds: one that adds a profile for a CPU benchmarks it, and
+        # one that lacks a CPU's profile refuses it.
+        graniterapids = CpuGeneration(
+            "graniterapids", "GenuineIntel", (CpuModel(6, 173),)
+        )
+        candidate = checkout("candidate", *CPU_GENERATIONS, graniterapids)
+        status, output, launched = run_command(
+            granite_rapids, "--suite", "e2e", openvmm_dir=candidate
+        )
+        self.assertEqual((status, output), (0, ""))
+        self.assertEqual([args.openvmm_dir for args in launched], [Path(candidate)])
+        lacking = checkout(
+            "lacking",
+            *(
+                generation
+                for generation in CPU_GENERATIONS
+                if generation.name != "icelake-sp"
+            ),
+        )
+        status, output, launched = run_command(icelake, openvmm_dir=lacking)
+        self.assertEqual((status, launched), (1, []))
+        self.assertIn(
+            "no built-in CPU profile serves its CPU, GenuineIntel 6/106/6", output
+        )
+        # A checkout whose generations overlap on a CPU is refused there, since
+        # every cold boot fails on it.
+        ambiguous = checkout(
+            "ambiguous",
+            *CPU_GENERATIONS,
+            CpuGeneration("icelake-x", "GenuineIntel", (CpuModel(6, 106),)),
+        )
+        status, output, launched = run_command(icelake, openvmm_dir=ambiguous)
+        self.assertEqual((status, launched), (1, []))
+        self.assertIn(
+            "is in more than one generation of the built-in CPU profiles "
+            "(icelake-sp, icelake-x)",
+            output,
+        )
+        # A checkout whose profiles cannot be read is refused, except for the
+        # phase 2 suite.
+        missing = str(Path(temporary.name) / "missing")
+        status, output, launched = run_command(icelake, openvmm_dir=missing)
+        self.assertEqual((status, launched), (1, []))
+        self.assertTrue(
+            output.startswith(
+                "error: benchmark cannot confirm that a built-in CPU profile serves "
+                f"this host's CPU: the OpenVMM checkout {missing} pins no CPU profile"
+            ),
+            output,
+        )
+        status, output, launched = run_command(
+            icelake, "--suite", "phase2", openvmm_dir=missing
+        )
+        self.assertEqual((status, output, len(launched)), (0, "", 1))
+        # A KVM worker, which the Windows coordinator reinvokes inside WSL
+        # without its --openvmm-dir, runs the binaries that the coordinator
+        # staged after the check, so it skips the check, whatever its checkout.
+        status, output, launched = run_command(
+            granite_rapids, "--_kvm-worker", openvmm_dir=missing
+        )
+        self.assertEqual((status, output, len(launched)), (0, "", 1))
 
     def test_run_leaves_openvmm_the_terminal_to_restore(self):
         """A guest-triggered shutdown can end OpenVMM while its console holds
@@ -1840,7 +2062,8 @@ class CliTests(unittest.TestCase):
             f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
             "import nvx\n"
             "sys.exit(nvx._run_openvmm("
-            f"[sys.executable, '-c', {openvmm!r}], None, cold_boot=False))\n"
+            f"[sys.executable, '-c', {openvmm!r}], None, cold_boot=False, "
+            "hypervisor='kvm'))\n"
         )
         primary, secondary = pty.openpty()
         try:

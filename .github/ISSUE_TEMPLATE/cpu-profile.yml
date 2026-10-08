@@ -1,0 +1,110 @@
+name: CPU profile request
+description: >-
+  Request a built-in CPU profile for a CPU that none serves, with its CPU
+  fingerprint.
+title: "CPU profile: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A microVM boots on the built-in CPU profile of its host's CPU generation. Where none serves an Intel or AMD CPU, `--cpu-profile auto` falls back to a host profile derived from the host, for development, and OpenVMM's `NVX-CPU-PROFILE-FALLBACK:` warning links here. A built-in profile derives from the fingerprints of its generation's hosts on every backend that it serves, and released profiles are immutable. A maintainer links each request to [#408](https://github.com/microsoft/nvx/issues/408) for Intel CPUs or [#409](https://github.com/microsoft/nvx/issues/409) for AMD CPUs, which explain how fingerprints become a pinned profile.
+
+        A fingerprint holds the CPU's identity and microcode, the OS kind and build, the hypervisor's interface, and the CPUID, XSAVE, MSR, and time surface that the backend supports. It holds no hostname, user name, or serial number.
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      description: >-
+        The CPU's name, its brand string, as OpenVMM's warning, `model name` in
+        `/proc/cpuinfo`, or Windows' System Information gives it.
+      placeholder: Intel(R) Xeon(R) 6973P-C
+    validations:
+      required: true
+  - type: input
+    id: signature
+    attributes:
+      label: Vendor, family, model, and stepping
+      description: >-
+        The CPU's vendor string and its display family, model, and stepping, as
+        OpenVMM's warning gives them.
+      placeholder: GenuineIntel 6/173/1
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      description: The hypervisor backend whose fingerprint you attach.
+      options:
+        - KVM
+        - MSHV
+        - WHP
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS build
+      description: >-
+        The host's kernel release (`uname -r`) or Windows build (`winver`).
+      placeholder: 6.8.0-1036-azure
+    validations:
+      required: true
+  - type: dropdown
+    id: host-type
+    attributes:
+      label: Host type
+      options:
+        - Bare metal
+        - Virtual machine
+    validations:
+      required: true
+  - type: input
+    id: sku
+    attributes:
+      label: Cloud and SKU
+      description: >-
+        For a virtual machine, its cloud and size, such as an Azure
+        Standard_D4ads_v6, or a GitHub-hosted Actions runner.
+      placeholder: Azure Standard_D4ads_v6
+  - type: textarea
+    id: fingerprint
+    attributes:
+      label: Fingerprint
+      description: |
+        Attach the `fingerprint.json` that OpenVMM writes on the host for the backend above:
+
+        ```
+        openvmm --hypervisor <kvm|mshv|whp> --cpu-fingerprint fingerprint.json
+        ```
+
+        On a CPU that no built-in profile serves, it reports `E_PROFILE_HOST_UNKNOWN` and exits with status 1, but still writes the fingerprint.
+      placeholder: Drag fingerprint.json here.
+    validations:
+      required: true
+  - type: textarea
+    id: other-fingerprints
+    attributes:
+      label: Fingerprints from other backends
+      description: >-
+        Where available, attach fingerprints of this CPU generation from the
+        other backends (KVM, MSHV, and WHP), naming each one's backend and host
+        type. A profile is the intersection of its backends' fingerprints, and
+        released profiles are immutable, so a profile derived without a
+        backend's fingerprint may not boot on that backend.
+  - type: dropdown
+    id: test-microvm
+    attributes:
+      label: test-microvm on the fallback
+      description: >-
+        Optionally, whether `nvx.py test-microvm --backend <backend>` passes on
+        this host, where `--cpu-profile auto` falls back to the host profile.
+      options:
+        - Not run
+        - Passes
+        - Fails
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else, such as the scenarios that fail and their errors.
