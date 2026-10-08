@@ -53,7 +53,7 @@ flowchart LR
    Low["Low RAM<br/>0x00000000 through 0xbfffffff<br/>up to 3 GiB"]
    Gap["Fixed MMIO gap<br/>0xc0000000 through 0xffffffff<br/>1 GiB"]
    High["High RAM<br/>0x100000000 and above"]
-   Slots["Reserved virtio-mmio slots<br/>0xd0000000 through 0xd0007fff"]
+   Slots["Reserved virtio-mmio slots<br/>0xd0000000 through 0xd0008fff"]
 
    Low --- Gap
    Gap --- High
@@ -95,12 +95,14 @@ tokens. A fresh boot then appends host-owned tokens in this order:
 2. the optional fixed workload identity (`nvx_workload_uid=` and
    `nvx_workload_gid=`) and workload lifecycle (`nvx_lifecycle=`);
 3. `nvx_snapshot_tier=<tier>` for a capture with sandbox blocks;
-4. device-discovery tokens in fixed address order: network, filesystem, boot
-   console, sandbox blocks, and the control console followed by
-   `nvx_control_tty=hvc2`; and
+4. device-discovery tokens in fixed address order: network, the first
+   filesystem slot, boot console, sandbox blocks, the control console followed
+   by `nvx_control_tty=hvc2`, and the second filesystem slot when a second
+   HostFs export is attached; and
 5. network bootstrap tokens, including gateway DNS only when the egress
-   policy permits it, followed by filesystem bootstrap tokens for an active
-   HostFs export.
+   policy permits it, followed by
+   [filesystem bootstrap tokens](machine-and-device-abi.md#filesystem) for
+   each attached HostFs export, in slot order.
 
 The command line carries no clock parameter: the guest reads its TSC and
 LAPIC rates from the [time ABI](time-abi.md#rates) MSRs, and a
@@ -117,3 +119,13 @@ Embedded NULs are rejected, and the complete NUL-terminated command line must
 fit in 64 KiB. The same effective string and its SHA-256 digest become part of
 the snapshot machine contract; a restore reuses that string verbatim and
 appends no tokens.
+
+The `nvx_overlay_upper` caller token changes the accepted block layout.
+Passing `nvx_overlay_upper=ramfs` exactly once declares that the guest keeps
+its overlay upper in RAM. The microVM then requires exactly one read-only
+`distro` [sandbox block](machine-and-device-abi.md#fixed-virtio-mmio-transport)
+and no other block, so the guest has no writable scratch. This layout supports
+neither snapshot capture nor restore. Any other `nvx_overlay_upper` token,
+including a bare or repeated one, is rejected. The NVX init agent does not use
+this layout; it
+[keeps its overlay upper on scratch](sandbox-filesystem-and-agent-architecture.md#implemented-filesystem-bootstrap).
