@@ -65,6 +65,9 @@ KVM_SNAPSHOT_RESULT_PREFIX = "OPENVMM_KVM_SNAPSHOT_RESULT="
 PHASE2_RESULT_PREFIX = "OPENVMM_PHASE2_RESULT="
 SNAPSHOT_PROFILE_ENV = "OPENVMM_STARTUP_PROFILE"
 SNAPSHOT_PROFILE_PREFIX = b"OPENVMM_SNAPSHOT_PROFILE_V1 "
+# A snapshot capture's OpenVMM log: the controller's records, which time the
+# capture.
+CAPTURE_LOG_FILTER = "off,openvmm_entry::vm_controller=info"
 NVX_SCRIPT = Path(__file__).resolve().parents[1] / "nvx.py"
 BENCHMARK_SCRIPTS_DIR = Path(__file__).with_name("benchmark_scripts")
 WORKLOAD_SUITES = frozenset(
@@ -4729,18 +4732,20 @@ def capture_snapshot(
     log_path: Path | None = None,
     boot_marker: bytes = BOOT_MARKER,
     time_abi_status: bool = False,
+    log_filter: str = CAPTURE_LOG_FILTER,
 ) -> tuple[float, float, float, int]:
     """Capture one guest-requested snapshot and time its generation.
 
     Guest markers match only the guest console, and the profile records that
     time generation come only from OpenVMM's stderr. With ``time_abi_status``,
     the source guest first answers a time ABI status query, and the capture
-    starts only after the query exits.
+    starts only after the query exits. ``log_filter`` is OpenVMM's log filter,
+    which must keep the records of :data:`CAPTURE_LOG_FILTER`.
     """
     if snapshot_path.exists():
         shutil.rmtree(snapshot_path)
     environment = os.environ.copy()
-    environment["OPENVMM_LOG"] = "off,openvmm_entry::vm_controller=info"
+    environment["OPENVMM_LOG"] = log_filter
     environment[SNAPSHOT_PROFILE_ENV] = "1"
     process_started_ns = time.perf_counter_ns()
     interaction = InteractiveProcess(command, environment, separate_stderr=True)

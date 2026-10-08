@@ -285,7 +285,12 @@ the Alpine-prompt-specific `console-snapshot` scenario. `--debug-kernel` boots
 the CI debug kernel, `build/vmlinux-debug`, whose soft-lockup and hung-task
 detectors the guest's time ABI watcher reports; without `--scenario`, it runs
 only the same-host restore scenarios `smp`, `smp-snapshot`,
-`restore-processors`, `restore-downtime`, and `snapshot-tiers`. The command
+`restore-processors`, `restore-downtime`, and `snapshot-tiers`. The
+`cpu-profile-fallback` scenario cold boots with OpenVMM's `host-cpu-unknown`
+test hook, which makes OpenVMM's default CPU profile selection, `auto`, fall
+back to a host profile on a host that a built-in profile serves, checks the
+fallback's warning, captures the guest, and restores it on the snapshot's host
+profile. The command
 requires `build/vmlinux` (with `--debug-kernel`, `build/vmlinux-debug` and its
 `build/vmlinux-debug.config`), the selected initramfs, and
 `openvmm/target/release/openvmm[.exe]`.

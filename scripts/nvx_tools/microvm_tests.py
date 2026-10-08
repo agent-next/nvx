@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import secrets
 import socket
 import struct
@@ -22,6 +23,7 @@ from stat import S_ISUID
 from typing import Any, cast
 
 from .benchmark import (
+    CAPTURE_LOG_FILTER,
     RESTORE_MARKER,
     SMP_PROBE_COMPLETION_MARKER,
     SNAPSHOT_PROFILE_ENV,
@@ -63,6 +65,8 @@ from .openvmm_process import OpenvmmProcess, TcpConsole
 from .time_abi import (
     ABI_VERSION,
     CHECK_CPU_BUDGET_US,
+    CPU_PROFILE_FALLBACK_MARKER,
+    CPU_PROFILE_REQUEST_URL,
     STATUS_TIMEOUT_SECONDS,
     WARP_PROBE_COMPLETION_MARKER,
     WARP_PROBE_FAILURE_MARKER,
@@ -72,6 +76,7 @@ from .time_abi import (
     check_cpu_budget_us,
     check_warp_probe,
     describe_exit_status,
+    parse_cpu_profile_fallback,
     parse_fields,
     parse_marker,
     status_script,
@@ -82,6 +87,7 @@ from .time_abi import (
 MICROVM_TEST_SCENARIOS = (
     "console-exit",
     "console-snapshot",
+    "cpu-profile-fallback",
     "directional-network-policy",
     "denied-filesystem-paths",
     "endpoint-policy-snapshot",
@@ -215,6 +221,19 @@ RESTORE_PROCESSORS_FAILURE_MARKER = b"NVX-RESTORE-PROCESSORS-FAIL"
 # console line; targets that log while the guest runs, such as virt_kvm's
 # hidden-MSR #GPs, could split a marker in the merged console stream.
 TIME_ABI_RESTORE_LOG_FILTER = "off,openvmm_core::worker::dispatch::time_abi=info"
+# The test hook that makes OpenVMM's --cpu-profile auto treat the host CPU as
+# one that no built-in CPU profile serves, so that it falls back to a host
+# profile on CI's runners, which built-in profiles serve.
+CPU_PROFILE_FALLBACK_HOOK = ("--x-time-abi-test-hook", "host-cpu-unknown")
+# The fallback capture's OpenVMM log: the capture's records, and the time ABI's
+# fallback warning and declared rates, which name the CPU profile.
+CPU_PROFILE_FALLBACK_LOG_FILTER = (
+    f"{CAPTURE_LOG_FILTER},openvmm_core::worker::dispatch::time_abi=info"
+)
+# The CPU profile of each partition, in the time ABI's declared rates record.
+DECLARED_CPU_PROFILE = re.compile(
+    rb'time ABI rates declared [^\r\n]*\bcpu_profile="([a-z0-9.-]+)"'
+)
 # The guest finishes a restore after the RCU grace-period release, which gives
 # up after rcu_cpu_stall_timeout (21 s), and the deferred C7 check.
 TIME_ABI_RESTORE_FINISH_SECONDS = 30.0
@@ -361,6 +380,7 @@ def capture_snapshot(
     profile_sink: list[dict[str, object]] | None = None,
     post_restore_script: str | None = None,
     log_path: Path | None = None,
+    log_filter: str = CAPTURE_LOG_FILTER,
 ) -> tuple[float, float, float, int]:
     return _capture_snapshot(
         command,
@@ -377,6 +397,7 @@ def capture_snapshot(
         log_path=log_path,
         boot_marker=BOOT_MARKER,
         time_abi_status=True,
+        log_filter=log_filter,
     )
 
 
@@ -3008,6 +3029,106 @@ def run_smp_snapshot(
                     raise RuntimeError(f"{context} modified snapshot artifacts")
 
 
+def _declared_cpu_profiles(output: bytes) -> list[str]:
+    """Return the CPU profile of each time ABI rates declaration in OpenVMM's
+    log, in order: one per partition."""
+    return [match.group(1).decode() for match in DECLARED_CPU_PROFILE.finditer(output)]
+
+
+def run_cpu_profile_fallback(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Exercise ``--cpu-profile auto``'s fallback to a host profile on a host
+    that a built-in profile serves, through the ``host-cpu-unknown`` test hook.
+
+    The cold boot falls back to the host's host profile, warns once with
+    OpenVMM's marker and a link to the CPU profile request form, and boots a
+    guest that passes its time ABI checks on that profile. The guest's snapshot
+    records the profile, which a restore with ``auto`` takes from the snapshot
+    without falling back again, and the restored guest passes the warp probe
+    and its restore checks."""
+    cold_boot = "CPU profile fallback cold boot"
+    context = "CPU profile fallback restore"
+    with tempfile.TemporaryDirectory(prefix="nvx-cpu-profile-fallback-") as temporary:
+        snapshot_path = Path(temporary) / "snapshot"
+        boot_command = workload_boot_command(
+            executable,
+            backend,
+            kernel,
+            initrd,
+            memory_mib,
+            "quiet loglevel=0",
+            processors=1,
+        )
+        capture_log = output_dir / "cpu-profile-fallback-capture.log"
+        capture_snapshot(
+            [
+                *boot_command,
+                *CPU_PROFILE_FALLBACK_HOOK,
+                "--snapshot-destination",
+                str(snapshot_path),
+            ],
+            snapshot_path,
+            timeout=timeout,
+            processors=1,
+            post_restore_script=post_restore_checks(),
+            log_path=capture_log,
+            log_filter=CPU_PROFILE_FALLBACK_LOG_FILTER,
+        )
+        capture = capture_log.read_bytes()
+        try:
+            profile = parse_cpu_profile_fallback(capture.decode("utf-8", "replace"))
+        except ValueError as error:
+            raise RuntimeError(f"{cold_boot}: {error}") from error
+        if profile is None:
+            raise RuntimeError(
+                f"{cold_boot}: OpenVMM logged no {CPU_PROFILE_FALLBACK_MARKER} warning"
+            )
+        if CPU_PROFILE_REQUEST_URL.encode() not in capture:
+            raise RuntimeError(
+                f"{cold_boot}: the warning does not link to {CPU_PROFILE_REQUEST_URL}"
+            )
+        declared = _declared_cpu_profiles(capture)
+        if declared != [profile]:
+            raise RuntimeError(
+                f"{cold_boot} declared CPU profiles {declared}, not {profile}"
+            )
+
+        restore_command = snapshot_restore_command(
+            executable,
+            backend,
+            snapshot_path,
+            processors=1,
+        )
+        environment = _restore_environment()
+        environment["OPENVMM_LOG"] = TIME_ABI_RESTORE_LOG_FILTER
+        output = _measure_restore(
+            restore_command,
+            context=context,
+            environment=environment,
+            timeout=timeout,
+            log_path=output_dir / "cpu-profile-fallback-restore.log",
+            failure_marker=WARP_PROBE_FAILURE_MARKER,
+        )
+        _check_restore_warp(output, processors=1, context=context)
+        _check_restore_status(output, restore_command, processors=1, context=context)
+        if CPU_PROFILE_FALLBACK_MARKER.encode() in output:
+            raise RuntimeError(f"{context} fell back to a host profile again")
+        declared = _declared_cpu_profiles(output)
+        if declared != [profile]:
+            raise RuntimeError(
+                f"{context} declared CPU profiles {declared}, not the snapshot's "
+                f"{profile}"
+            )
+
+
 def _restore_vp_bindings(output: bytes) -> list[int]:
     """Return the VP indices bound by one profiled OpenVMM process."""
     bound: list[int] = []
@@ -5456,6 +5577,20 @@ def run(args: argparse.Namespace) -> int:
     if "console-snapshot" in scenarios:
         print(f"Running microVM console snapshot correctness on OpenVMM/{args.backend}")
         run_console_snapshot(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "cpu-profile-fallback" in scenarios:
+        print(
+            "Running microVM CPU profile fallback correctness on "
+            f"OpenVMM/{args.backend}"
+        )
+        run_cpu_profile_fallback(
             executable,
             kernel,
             initrd,

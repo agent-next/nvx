@@ -114,6 +114,16 @@ every CPU, a summary with `status=ok`, the requested CPU count, and no
 failures, and exit status 0; a failure lists each failing check with the
 guest's detail. The guest command fits on one console line, so the console's
 echo of it ends before the check prints.
+The `cpu-profile-fallback` scenario covers `--cpu-profile auto`'s fallback to a
+host profile on a CPU that no built-in profile serves, on runners that
+built-in profiles serve. It cold boots one vCPU with OpenVMM's
+`host-cpu-unknown` test hook, which makes `auto` treat the host CPU as
+unknown, and requires exactly one `NVX-CPU-PROFILE-FALLBACK:` warning that
+names a host profile with its digest and links the CPU profile request form,
+a cold boot that declares that profile, and passing boot checks. It then
+captures the guest and restores it with `auto` and no hook: the restore must
+take the snapshot's host profile without another warning, and pass the warp
+probe and its restore checks.
 The `snapshot-core` scenario first sends a snapshot request to a guest that
 OpenVMM launched without a snapshot destination. OpenVMM releases the request,
 so it returns in the source, which must continue exactly once. Before the
