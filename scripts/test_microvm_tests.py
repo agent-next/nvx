@@ -3061,6 +3061,11 @@ class MicrovmTests(unittest.TestCase):
         self.assertIn("[ -e /run/nvx/workload-ran ]", workload)
         self.assertIn("/sbin/nvx-snapshot\n", checkpoint)
         self.assertIn("captured-workload-id", checkpoint)
+        self.assertIn(
+            "printf 'restored-direct-claimed\\n' "
+            ">/run/nvx/scratch/direct-claimed\nsync",
+            checkpoint,
+        )
         self.assertNotIn("@CAPTURE_ACTION@", checkpoint)
 
     def test_restored_tier_guests_report_their_restore_checks_before_exiting(self):
@@ -3121,6 +3126,26 @@ class MicrovmTests(unittest.TestCase):
             [entry.args[0] for entry in run_tier.call_args_list],
             ["platform", "workload-start", "instance-checkpoint"],
         )
+
+    def test_snapshot_storage_policy_selects_generation_and_materialization(self):
+        self.assertEqual(microvm_tests._snapshot_storage_policy("platform"), ())
+        workload = microvm_tests._snapshot_storage_policy("workload-start")
+        checkpoint = microvm_tests._snapshot_storage_policy("instance-checkpoint")
+
+        self.assertEqual(
+            workload,
+            (
+                "--snapshot-block-identity",
+                "generation",
+                "--snapshot-generation-id",
+                "00112233445566778899aabbccddee01",
+                "--snapshot-scratch-restore-mode",
+                "private-copy",
+            ),
+        )
+        self.assertEqual(checkpoint[-1], "direct-claimed")
+        with self.assertRaisesRegex(ValueError, "unsupported snapshot tier"):
+            microvm_tests._snapshot_storage_policy("other")
 
     def test_lifecycle_uses_one_vcpu_linux_guest(self):
         with (
