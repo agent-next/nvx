@@ -411,9 +411,36 @@ python3 scripts/nvx.py sandbox \
   --memory-mib 256
 ```
 
-CI uses `/sbin/nvx-sandbox-smoke` as the entrypoint to verify Ubuntu identity,
-the fixed non-root account, and a scratch-backed `/tmp` write before clean
-guest exit. With `--arg TARGET --arg ro|rw`, it also checks a live share at
+CI uses `/sbin/nvx-sandbox-smoke` as the entrypoint to verify the security
+profile that this section describes before clean guest exit. Before any other
+check, it requires:
+
+- the fixed `65534:65534` identity as the real, effective, saved, and
+  file-system IDs, no supplementary groups, and `HOME=/nonexistent`;
+- empty inheritable, permitted, effective, bounding, and ambient capability
+  sets and `NoNewPrivs: 1`;
+- mount, PID, and UTS namespaces other than the guest's initial ones, whose
+  inode numbers Linux 6.18 fixes in its UAPI, with the workload as PID 1 of its
+  PID namespace and the `--hostname` value as its host name;
+- exactly one mount at each of `/`, `/proc`, `/sys`, `/dev`, `/dev/pts`, and
+  `/dev/shm`, none of which propagates to another namespace: an overlay root
+  over the EROFS layers whose upper directory is on scratch, `nosuid,nodev,noexec`
+  procfs, read-only sysfs, and a private `/dev` tmpfs that holds only `fd`,
+  `full`, `null`, `ptmx`, `pts`, `random`, `shm`, `stderr`, `stdin`, `stdout`,
+  `tty`, `urandom`, and `zero`, with its own devpts instance;
+- the agent-owned `/container` cgroup; and
+- Ubuntu image files that the workload cannot modify, and a scratch-backed
+  `/tmp` write that lands in the overlay.
+
+A managed workload that mounted into the agent's namespace would stack its
+runtime mounts on those of earlier requests, so the single-mount check also
+covers repeated managed execs. With `--arg limits --arg MEMORY_MAX --arg
+PIDS_MAX`, for a sandbox started with the same `--memory-max` and
+`--pids-max`, it also requires the memory controller to kill an allocation of
+twice `MEMORY_MAX` with `SIGKILL` while a 1 MiB allocation succeeds, and the
+pids controller to stop the workload at `PIDS_MAX` processes, itself included;
+keep twice `MEMORY_MAX` within the guest's free memory. With
+`--arg TARGET --arg ro|rw`, it also checks a live share at
 `TARGET` as described below, including symbolic links in an `rw` share; the
 share needs a host-created, world-writable `nvx-links` directory for them.
 Repeat the pair to check several shares; with an `rw` and an `ro` share, it

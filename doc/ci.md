@@ -221,7 +221,16 @@ descriptor modules, converter implementation, and Dockerfile. Artifact upload
 retains the Alpine filenames and adds the distinct Ubuntu filenames. Each
 backend also boots the Ubuntu initramfs and runs
 `/sbin/nvx-sandbox-smoke` from the Ubuntu EROFS layer as UID/GID 65534 over a
-fresh ext4 scratch copy. The same entrypoint then verifies a live virtio-fs
+fresh ext4 scratch copy, with a 32 MiB `--memory-max` and an 8-process
+`--pids-max`. The probe verifies the
+[sandbox security profile](run.md#experimental-single-workload-sandbox): the
+fixed identity, empty capability sets and `no_new_privs`, private mount, PID,
+and UTS namespaces, the private device view and read-only sysfs, the
+container cgroup, the overlay root over read-only image layers with its upper
+directory on scratch, and that the memory controller kills an allocation of
+twice the limit and the pids controller stops the workload at eight
+processes. The live-share runs below repeat the profile checks. The same
+entrypoint then verifies a live virtio-fs
 share inside the container: a read-write `/workspace` share with a denied
 subdirectory must round-trip guest writes to the host, and a read-only
 `/opt/hostedtoolcache` share must reject writes and symbolic links. In the

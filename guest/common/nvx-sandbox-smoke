@@ -1,6 +1,279 @@
 #!/bin/sh
 set -eu
 
+# The fixed workload identity, as the four real, effective, saved, and
+# file-system IDs that /proc/self/status lists.
+workload_ids="65534 65534 65534 65534"
+# Linux 6.18 fixes the inode numbers of the initial namespaces in its UAPI
+# (enum init_ns_ino in linux/nsfs.h). The agent runs in the initial mount,
+# PID, and UTS namespaces, so a workload namespace with another number is
+# private.
+initial_namespaces="mnt:4026531832 pid:4026531836 uts:4026531838"
+# The private /dev that the container runtime creates, in byte order.
+device_view="fd full null ptmx pts random shm stderr stdin stdout tty urandom zero"
+
+fail() {
+    echo "NVX-UBUNTU-SANDBOX-FAIL: $*" >&2
+    exit 1
+}
+
+# Prints the values of field $2 of the process status file $1, separated by
+# single spaces.
+status_field() {
+    while IFS= read -r status_line; do
+        case "$status_line" in
+            "$2":*)
+                set -f
+                # The values are tab-separated words.
+                # shellcheck disable=SC2086
+                set -- ${status_line#*:}
+                set +f
+                printf '%s\n' "$*"
+                return 0
+                ;;
+        esac
+    done <"$1"
+    fail "$1 has no $2 field"
+}
+
+check_identity() {
+    [ "$(id -u):$(id -g)" = 65534:65534 ] ||
+        fail "the workload runs as $(id -u):$(id -g)"
+    uids=$(status_field /proc/self/status Uid)
+    [ "$uids" = "$workload_ids" ] || fail "the workload UIDs are $uids"
+    gids=$(status_field /proc/self/status Gid)
+    [ "$gids" = "$workload_ids" ] || fail "the workload GIDs are $gids"
+    groups=$(status_field /proc/self/status Groups)
+    [ -z "$groups" ] || fail "the workload has supplementary groups $groups"
+    [ "${HOME:-}" = /nonexistent ] || fail "the workload home is ${HOME:-unset}"
+}
+
+# The workload holds no capability in any set and cannot gain privileges
+# through execve.
+check_capabilities() {
+    for capability_set in CapInh CapPrm CapEff CapBnd CapAmb; do
+        capabilities=$(status_field /proc/self/status "$capability_set")
+        [ "$capabilities" = 0000000000000000 ] ||
+            fail "the workload $capability_set set is $capabilities"
+    done
+    no_new_privs=$(status_field /proc/self/status NoNewPrivs)
+    [ "$no_new_privs" = 1 ] || fail "the workload NoNewPrivs is $no_new_privs"
+}
+
+check_namespaces() {
+    for initial_namespace in $initial_namespaces; do
+        namespace_type=${initial_namespace%%:*}
+        initial_inode=${initial_namespace#*:}
+        namespace_link=$(readlink "/proc/self/ns/$namespace_type") ||
+            fail "cannot read the workload $namespace_type namespace"
+        namespace_inode=${namespace_link#"$namespace_type:["}
+        namespace_inode=${namespace_inode%"]"}
+        case "$namespace_link" in
+            "$namespace_type:[$namespace_inode]") ;;
+            *) fail "unexpected $namespace_type namespace link $namespace_link" ;;
+        esac
+        case "$namespace_inode" in
+            '' | *[!0-9]*)
+                fail "unexpected $namespace_type namespace link $namespace_link"
+                ;;
+        esac
+        [ "$namespace_inode" != "$initial_inode" ] ||
+            fail "the workload shares the initial $namespace_type namespace"
+    done
+    # PID 1 of the workload's PID namespace is the workload, not the guest's
+    # root-owned init.
+    init_uids=$(status_field /proc/1/status Uid)
+    [ "$init_uids" = "$workload_ids" ] ||
+        fail "PID 1 of the workload PID namespace runs as $init_uids"
+    expected_hostname=nvx-sandbox
+    read -r kernel_command_line </proc/cmdline
+    set -f
+    # Kernel command-line tokens are deliberately split on spaces.
+    # shellcheck disable=SC2086
+    for token in $kernel_command_line; do
+        case "$token" in
+            nvx_hostname=*) expected_hostname=${token#*=} ;;
+        esac
+    done
+    set +f
+    read -r workload_hostname </proc/sys/kernel/hostname
+    [ "$workload_hostname" = "$expected_hostname" ] ||
+        fail "the workload hostname is $workload_hostname, expected $expected_hostname"
+}
+
+# Prints the mount options, file-system type, source, and super options of
+# each mount at $1 in the workload's mount namespace, one mount per line.
+mount_records() {
+    while read -r _ _ _ _ mount_point mount_options mount_rest; do
+        [ "$mount_point" = "$1" ] || continue
+        while :; do
+            case "$mount_rest" in
+                "- "*)
+                    mount_rest=${mount_rest#- }
+                    break
+                    ;;
+                *" "*) mount_rest=${mount_rest#* } ;;
+                *) fail "malformed mount record for $1" ;;
+            esac
+        done
+        printf '%s %s\n' "$mount_options" "$mount_rest"
+    done </proc/self/mountinfo
+}
+
+# Requires exactly one mount at $1, of file-system type $2, with each of the
+# remaining mount options, and leaves its super options in mount_super.
+require_mount() {
+    mount_target=$1
+    mount_type=$2
+    shift 2
+    mount_record=$(mount_records "$mount_target")
+    [ -n "$mount_record" ] || fail "nothing is mounted at $mount_target"
+    case "$mount_record" in
+        *"
+"*) fail "several mounts are stacked at $mount_target" ;;
+    esac
+    mount_options=${mount_record%% *}
+    mount_rest=${mount_record#* }
+    [ "${mount_rest%% *}" = "$mount_type" ] ||
+        fail "$mount_target is ${mount_rest%% *}, expected $mount_type"
+    for mount_option in "$@"; do
+        case ",$mount_options," in
+            *",$mount_option,"*) ;;
+            *) fail "$mount_target is mounted $mount_options, without $mount_option" ;;
+        esac
+    done
+    mount_super=${mount_record##* }
+}
+
+# The workload sees its own overlay root over the image layers, with its
+# upper layer on scratch, and private proc, read-only sysfs, and device
+# mounts. Each container runtime mount appears once: a managed exec that
+# made its mounts in the agent's namespace would stack them on those of the
+# earlier execs. No mount propagates to or from another namespace.
+check_mounts() {
+    while read -r _ _ _ _ mount_point _ mount_rest; do
+        case "$mount_rest" in
+            "- "*) ;;
+            *) fail "the mount at $mount_point propagates: ${mount_rest%% - *}" ;;
+        esac
+    done </proc/self/mountinfo
+    require_mount / overlay rw
+    case ",$mount_super," in
+        *,lowerdir=/run/nvx/layers/*) ;;
+        *) fail "the root overlay does not use the image layers: $mount_super" ;;
+    esac
+    case ",$mount_super," in
+        *,upperdir=/run/nvx/scratch/upper,*) ;;
+        *) fail "the root overlay upper layer is not on scratch: $mount_super" ;;
+    esac
+    require_mount /proc proc nosuid nodev noexec
+    require_mount /sys sysfs ro nosuid nodev noexec
+    require_mount /dev tmpfs nosuid
+    require_mount /dev/pts devpts
+    require_mount /dev/shm tmpfs nosuid nodev
+}
+
+check_devices() {
+    devices=
+    for device in /dev/.* /dev/*; do
+        case "${device#/dev/}" in
+            . | ..) continue ;;
+        esac
+        [ -e "$device" ] || [ -L "$device" ] || continue
+        devices="${devices:+$devices }${device#/dev/}"
+    done
+    [ "$devices" = "$device_view" ] || fail "the workload device view is $devices"
+    for device in full null random tty urandom zero; do
+        [ -c "/dev/$device" ] && [ ! -L "/dev/$device" ] ||
+            fail "/dev/$device is not a character device"
+    done
+    [ "$(LC_ALL=C ls -A /dev/pts)" = ptmx ] ||
+        fail "the workload devpts instance is not private"
+}
+
+check_cgroup() {
+    workload_cgroup=
+    while IFS= read -r cgroup_line; do
+        case "$cgroup_line" in
+            0::*) workload_cgroup=${cgroup_line#0::} ;;
+        esac
+    done </proc/self/cgroup
+    [ "$workload_cgroup" = /container ] ||
+        fail "the workload runs in cgroup ${workload_cgroup:-unknown}"
+}
+
+# The workload cannot modify the image's files, and its writes land in the
+# scratch-backed overlay.
+check_image() {
+    grep -qx 'ID=ubuntu' /etc/os-release || fail "the image is not Ubuntu"
+    for image_file in /etc/passwd /usr/bin/env; do
+        if (: >>"$image_file") 2>/dev/null; then
+            fail "the workload can modify image file $image_file"
+        fi
+    done
+    if (: >/usr/nvx-sandbox-image-write) 2>/dev/null; then
+        fail "the workload can create files in image directory /usr"
+    fi
+    printf 'scratch-backed-write\n' >/tmp/nvx-ubuntu-sandbox-smoke
+    [ "$(cat /tmp/nvx-ubuntu-sandbox-smoke)" = scratch-backed-write ] ||
+        fail "the scratch-backed write did not persist"
+    [ "$(stat -f -c %T /tmp/nvx-ubuntu-sandbox-smoke)" = overlayfs ] ||
+        fail "the scratch-backed write did not land in the overlay"
+}
+
+# Starts sleepers until a fork fails or $2 have started, then stops and reaps
+# them and records how many started in $1. A refused fork ends the shell,
+# which still runs its exit trap.
+start_sleepers() {
+    sleepers_file=$1
+    sleepers=
+    sleepers_started=0
+    trap 'kill $sleepers 2>/dev/null || :; wait; echo "$sleepers_started" >"$sleepers_file"' EXIT
+    while [ "$sleepers_started" -lt "$2" ]; do
+        sleep 600 &
+        sleepers="$sleepers $!"
+        sleepers_started=$((sleepers_started + 1))
+    done
+}
+
+# The workload's memory.max is $1 bytes, and its pids.max lets it run $2
+# processes, itself included. Keep twice $1 within the guest's free memory,
+# so that an unenforced memory.max fails the check instead of the guest.
+check_limits() {
+    memory_max=$1
+    pids_max=$2
+    for limit in "$memory_max" "$pids_max"; do
+        case "$limit" in
+            '' | *[!0-9]*) fail "limits requires numeric MEMORY_MAX and PIDS_MAX" ;;
+        esac
+    done
+    [ "$pids_max" -ge 3 ] || fail "the process limit check requires PIDS_MAX of at least 3"
+    dd if=/dev/zero of=/dev/null bs=1M count=1 2>/dev/null ||
+        fail "a 1 MiB allocation failed under memory.max"
+    # The memory controller kills an allocation of twice the limit. The shell
+    # reports the kill on standard error, so silence it.
+    memory_status=0
+    { dd if=/dev/zero of=/dev/null bs="$((memory_max * 2))" count=1; } \
+        2>/dev/null || memory_status=$?
+    [ "$memory_status" -eq 137 ] ||
+        fail "memory.max did not kill an allocation of $((memory_max * 2)) bytes: status $memory_status"
+    # `--pids-max N` admits N workload processes: the CLI sets the container
+    # cgroup's pids.max to N + 1 for the launcher's `unshare` parent, which
+    # waits outside the workload's PID namespace. The probe and the subshell
+    # are two of the N, so the subshell can start $2 - 2 sleepers. The bound
+    # stops a subshell whose forks the controller does not refuse.
+    sleepers_record=/tmp/nvx-ubuntu-sandbox-sleepers
+    rm -f "$sleepers_record"
+    (start_sleepers "$sleepers_record" "$((pids_max * 4))") 2>/dev/null || :
+    read -r started <"$sleepers_record" ||
+        fail "the process limit check did not record its sleepers"
+    rm -f "$sleepers_record"
+    [ "$started" = "$((pids_max - 2))" ] ||
+        fail "pids.max let the workload start $started sleepers beside the probe and a subshell, expected $((pids_max - 2))"
+    /bin/true || fail "the workload cannot fork after its processes exit"
+    echo "NVX-UBUNTU-SANDBOX-LIMITS-OK memory_max=$memory_max pids_max=$pids_max"
+}
+
 check_share() {
     share=$1
     share_mode=$2
@@ -222,16 +495,25 @@ check_shares_isolated() {
     echo "NVX-UBUNTU-SANDBOX-SHARES-ISOLATED-OK rw=$rw_share ro=$ro_share"
 }
 
-[ "$(id -u)" = 65534 ]
-[ "$(id -g)" = 65534 ]
-[ "${HOME:-}" = /nonexistent ]
-grep -qx 'ID=ubuntu' /etc/os-release
-printf 'scratch-backed-write\n' >/tmp/nvx-ubuntu-sandbox-smoke
-[ "$(cat /tmp/nvx-ubuntu-sandbox-smoke)" = scratch-backed-write ]
+check_identity
+check_capabilities
+check_namespaces
+check_mounts
+check_devices
+check_cgroup
+check_image
+echo "NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534"
 # Each share is a TARGET MODE pair; a final TARGET alone is read-only.
+# `limits MEMORY_MAX PIDS_MAX` checks the workload's resource limits.
 rw_share=
 ro_share=
 while [ "$#" -gt 0 ]; do
+    if [ "$1" = limits ]; then
+        [ "$#" -ge 3 ] || fail "limits requires MEMORY_MAX and PIDS_MAX"
+        check_limits "$2" "$3"
+        shift 3
+        continue
+    fi
     share_mode=${2:-ro}
     check_share "$1" "$share_mode"
     case "$share_mode" in
