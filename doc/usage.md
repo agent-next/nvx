@@ -40,7 +40,7 @@ python3 scripts/nvx.py performance gate --help
 | `test-aci-edge-sandboxes` | Run the `aci_edge_sandboxes` Rust crate lifecycle test on a real hypervisor. |
 | `test-adversarial` | Run a brokered Copilot-driven adversarial campaign. |
 | `build` | Build the guest artifacts and OpenVMM. |
-| `download` | Download and install the latest matching GitHub release. |
+| `download` | Install the selected platform package built from this checkout or a released first-parent ancestor. |
 | `run` | Run an OpenVMM microVM. |
 | `sandbox` | Run or manage workloads over EROFS layers and private ext4 scratch. |
 | `benchmark` | Run the OpenVMM-native benchmark coordinator. |
@@ -401,8 +401,19 @@ python3 scripts/nvx.py download
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--repository OWNER/REPOSITORY` | `microsoft/nvx` | GitHub repository from which to download the latest release. |
+| `--repository OWNER/REPOSITORY` | `microsoft/nvx` | GitHub repository from which to download the release. |
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the release platform. `auto` chooses WHP on Windows and KVM on Linux. |
+
+`download` first looks for the selected platform's package in the release that
+CI built from the checked-out commit. When that package exists, the packaged
+artifacts match the checkout. CI publishes a development release tagged
+`v<VERSION>-dev.<first 12 characters of the commit>` for each `dev` commit whose
+checks pass. When `HEAD` has no release, as with CI's `[skip ci]` baseline
+commits, commits whose checks failed, and local commits, or its release has no
+package for the selected platform, `download` uses the nearest first-parent
+ancestor that has one. Those fallback artifacts match that ancestor, not
+`HEAD`. It checks at most 20 commits, at one GitHub API request each. Update the
+checkout to install a newer release.
 
 Installing a release replaces the packaged guest artifacts under `build/` and
 removes any known guest artifact that the release does not declare, such as the

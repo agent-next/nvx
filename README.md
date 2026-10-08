@@ -15,10 +15,11 @@ files, build tools, and benchmarks needed to use NVX.
 
 ## Quick Start
 
-Python 3.10 or newer is required. The commands below download the latest NVX release for the
-selected platform, so no local build is required. A successful boot prints
-`NVX-GUEST-BOOT-OK: alpine` and opens a root shell. Select Ubuntu userland
-with the same NVX kernel by passing `--guest ubuntu`.
+Python 3.10 or newer is required. The commands below download the prebuilt NVX package for the
+selected platform from the cloned revision's release when available, or from its nearest released
+first-parent ancestor otherwise, so no local build is required. A successful boot prints
+`NVX-GUEST-BOOT-OK: alpine` and opens a root shell. Select Ubuntu userland with the same NVX kernel
+by passing `--guest ubuntu`.
 
 Exit cleanly from the guest with `/sbin/nvx-exit 0`. See the [setup](doc/setup.md) and
 [run](doc/run.md) guides for detailed prerequisites and runtime options.

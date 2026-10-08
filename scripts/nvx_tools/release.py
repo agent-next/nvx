@@ -50,6 +50,7 @@ from .common import (
     artifact_path,
     credential_safe_opener,
     download,
+    git_output,
     openvmm_binary_path,
     openvmm_git_state,
     require_file,
@@ -57,9 +58,13 @@ from .common import (
     verify_sha256_sums,
     write_sha256_sums,
 )
+from .development_release import development_release_tag
 from .ubuntu import converter_input_sha256, customization_files, package_lock_sha256
 
 GITHUB_API_VERSION = "2022-11-28"
+# HEAD often has no release, as with CI's [skip ci] baseline commits. Each
+# commit searched costs one GitHub API request.
+_RELEASE_SEARCH_COMMITS = 20
 
 
 @dataclass(frozen=True)
@@ -158,26 +163,22 @@ def _github_error_hint(error: urllib.error.HTTPError, token: str | None) -> str:
     return ""
 
 
-def _latest_release_asset(
-    repository: str,
-    platform: str,
+def _github_json(
+    url: str,
     token: str | None,
-) -> _ReleaseAsset:
-    repository_parts = repository.split("/")
-    if len(repository_parts) != 2 or not all(repository_parts):
-        raise ScriptError("GitHub repository must be OWNER/REPOSITORY")
-    encoded_repository = "/".join(
-        urllib.parse.quote(part, safe="") for part in repository_parts
-    )
-    url = f"https://api.github.com/repos/{encoded_repository}/releases?per_page=100"
+    *,
+    missing_ok: bool = False,
+) -> object | None:
     request = urllib.request.Request(
         url,
         headers=_github_headers(token, "application/vnd.github+json"),
     )
     try:
         with credential_safe_opener().open(request) as response:
-            releases: object = json.load(response)
+            return json.load(response)
     except urllib.error.HTTPError as error:
+        if missing_ok and error.code == 404:
+            return None
         message = _github_error_message(error)
         hint = _github_error_hint(error, token)
         detail = f": {message.rstrip('.')}" if message else ""
@@ -188,20 +189,71 @@ def _latest_release_asset(
         ) from error
     except (OSError, urllib.error.URLError) as error:
         raise ScriptError(f"GitHub release query failed: {error}") from error
-    if not isinstance(releases, list):
-        raise ScriptError("GitHub release query returned an invalid response")
+
+
+def _first_parent_commits(limit: int) -> list[str]:
+    try:
+        output = git_output(
+            "rev-list", "--first-parent", f"--max-count={limit}", "HEAD"
+        )
+    except subprocess.CalledProcessError as error:
+        detail = str(error.stderr or "").strip() or str(error)
+        raise ScriptError(
+            f"download needs a Git checkout to find its release: {detail}"
+        ) from error
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ScriptError(
+            f"download needs a Git checkout to find its release: {error}"
+        ) from error
+    return output.split()
+
+
+def _version_at(commit: str) -> str | None:
+    try:
+        return git_output("show", f"{commit}:VERSION") or None
+    except subprocess.CalledProcessError:
+        return None
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ScriptError(
+            f"download failed to read VERSION at {commit}: {error}"
+        ) from error
+
+
+def _checkout_release_asset(
+    repository: str,
+    platform: str,
+    token: str | None,
+) -> _ReleaseAsset:
+    repository_parts = repository.split("/")
+    if len(repository_parts) != 2 or not all(repository_parts):
+        raise ScriptError("GitHub repository must be OWNER/REPOSITORY")
+    encoded_repository = "/".join(
+        urllib.parse.quote(part, safe="") for part in repository_parts
+    )
+    repository_url = f"https://api.github.com/repos/{encoded_repository}"
 
     extension = ".zip" if platform.startswith("windows-") else ".tar.gz"
     asset_pattern = re.compile(rf"^nvx-.+-{re.escape(platform)}{re.escape(extension)}$")
-    for release_value in cast(list[object], releases):
-        if not isinstance(release_value, dict):
+    commits = _first_parent_commits(_RELEASE_SEARCH_COMMITS)
+    for distance, commit in enumerate(commits):
+        version = _version_at(commit)
+        if version is None:
             continue
-        release = cast(dict[str, object], release_value)
-        if release.get("draft") is True:
+        tag = development_release_tag(version, commit)
+        release = _github_json(
+            f"{repository_url}/releases/tags/{urllib.parse.quote(tag, safe='')}",
+            token,
+            missing_ok=True,
+        )
+        if release is None:
             continue
-        tag = release.get("tag_name")
-        assets = release.get("assets")
-        if not isinstance(tag, str) or not isinstance(assets, list):
+        if not isinstance(release, dict):
+            raise ScriptError("GitHub release query returned an invalid response")
+        release_document = cast(dict[str, object], release)
+        if release_document.get("draft") is True:
+            continue
+        assets = release_document.get("assets")
+        if not isinstance(assets, list):
             continue
         for asset_value in cast(list[object], assets):
             if not isinstance(asset_value, dict):
@@ -217,20 +269,33 @@ def _latest_release_asset(
                 and isinstance(size, int)
                 and not isinstance(size, bool)
             ):
+                if distance:
+                    plural = "s" if distance > 1 else ""
+                    print(
+                        f">> no {platform} release for HEAD; using {tag}, "
+                        f"{distance} first-parent commit{plural} earlier"
+                    )
                 return _ReleaseAsset(tag, name, asset_url, size)
-    raise ScriptError(f"no GitHub release contains an NVX package for {platform}")
+    # GitHub also answers 404 for a repository that the caller cannot read, so
+    # query it to report that case with its usual hint.
+    _github_json(repository_url, token)
+    raise ScriptError(
+        f"no {repository} release with an NVX package for {platform} was built "
+        f"from HEAD or its first-parent ancestors ({len(commits)} commits "
+        "searched); check out a released commit or build the artifacts"
+    )
 
 
-def _latest_release_asset_with_fallback(
+def _checkout_release_asset_with_fallback(
     repository: str,
     platform: str,
     token: str | None,
 ) -> tuple[_ReleaseAsset, str | None]:
     if token is None:
-        return _latest_release_asset(repository, platform, None), None
+        return _checkout_release_asset(repository, platform, None), None
 
     try:
-        return _latest_release_asset(repository, platform, token), token
+        return _checkout_release_asset(repository, platform, token), token
     except _GitHubReleaseQueryError as authenticated_error:
         if authenticated_error.status not in (401, 403):
             raise
@@ -239,7 +304,7 @@ def _latest_release_asset_with_fallback(
             file=sys.stderr,
         )
         try:
-            return _latest_release_asset(repository, platform, None), None
+            return _checkout_release_asset(repository, platform, None), None
         except _GitHubReleaseQueryError as public_error:
             raise authenticated_error from public_error
 
@@ -621,9 +686,9 @@ def _install_release_archive(archive_path: Path) -> None:
             _replace_runtime_file(source, artifact_path(name))
 
 
-def download_latest_release(repository: str, platform: str) -> None:
+def download_checkout_release(repository: str, platform: str) -> None:
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    asset, download_token = _latest_release_asset_with_fallback(
+    asset, download_token = _checkout_release_asset_with_fallback(
         repository,
         platform,
         token,

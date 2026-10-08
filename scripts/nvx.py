@@ -79,7 +79,7 @@ from nvx_tools.performance import configure_parser as configure_performance_pars
 from nvx_tools.release import (
     collect_release_sources,
     create_release_archive,
-    download_latest_release,
+    download_checkout_release,
     package_release,
     verify_source_tree,
 )
@@ -343,7 +343,7 @@ def _release_platform(hypervisor: str) -> str:
 
 
 def command_download(args: argparse.Namespace) -> None:
-    download_latest_release(args.repository, _release_platform(args.hypervisor))
+    download_checkout_release(args.repository, _release_platform(args.hypervisor))
 
 
 def _format_command(command: list[str]) -> str:
@@ -936,7 +936,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     download = subparsers.add_parser(
         "download",
-        help="download and install the latest matching GitHub release",
+        help=(
+            "download and install the platform package for HEAD or its nearest "
+            "released first-parent ancestor"
+        ),
     )
     download.add_argument(
         "--repository",

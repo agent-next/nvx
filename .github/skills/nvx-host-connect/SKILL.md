@@ -168,7 +168,10 @@ as-is or create an isolated checkout. Never silently test a different revision.
 
 Choose artifact preparation according to the task:
 
-- For the latest packaged NVX release, use `download` with the explicit backend.
+- For packaged NVX artifacts, use `download` with the explicit backend. It
+  installs that backend's package from the release built from `HEAD` when
+  available, otherwise from the nearest released first-parent ancestor that has
+  the package. Report the selected release as the artifact provenance.
 - For guest, OpenVMM, or build changes, use the relevant `build-guest`,
   `build-openvmm`, or `build` command.
 - For coordinator-only changes, existing matching release artifacts may be reused
