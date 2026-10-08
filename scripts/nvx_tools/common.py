@@ -117,6 +117,10 @@ def require_success(result: CommandResult, label: str) -> None:
     raise ScriptError(f"{label} exited {result.returncode}{suffix}")
 
 
+def _command_start_error(command: Sequence[str], error: OSError) -> ScriptError:
+    return ScriptError(f"failed to run command {' '.join(command)}: {error}")
+
+
 def run_capture(
     args: Sequence[str | os.PathLike[str]],
     *,
@@ -124,12 +128,15 @@ def run_capture(
     env: Mapping[str, str] | None = None,
 ) -> CommandResult:
     command = tuple(os.fspath(arg) for arg in args)
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+        )
+    except OSError as error:
+        raise _command_start_error(command, error) from error
     return CommandResult(command, result.returncode, result.stdout, result.stderr)
 
 
@@ -320,6 +327,8 @@ def run_checked(
         raise ScriptError(
             f"command failed with exit {error.returncode}: {' '.join(command)}"
         ) from error
+    except OSError as error:
+        raise _command_start_error(command, error) from error
 
 
 class _CrossOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
