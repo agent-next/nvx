@@ -2,14 +2,17 @@
 
 The GitHub Actions workflow has two microVM test layers on Azure-hosted
 self-hosted KVM, MSHV, and WHP virtual machines. Each backend has a pool of
-three runners labeled by operating system, backend, and `virtual-machine`.
-Jobs target the shared backend labels so any available matching runner can
-execute them. This allows the backend lanes to execute concurrently without
+runners labeled by operating system, backend, and `virtual-machine`; see
+[Job graph and runner capacity](#job-graph-and-runner-capacity) for their
+sizes. Jobs target the shared backend labels so any available matching runner
+can execute them. This allows the backend lanes to execute concurrently without
 binding a workload to a specific host. `openvmm-vmm-tests` downloads the NVX
 guest artifacts and uses the Linux-direct kernel and Alpine initramfs to
-exercise OpenVMM's Linux MP-table lifecycle, TTRPC, and snapshot contracts.
-`openvmm-unit-tests` runs the OpenVMM unit and documentation tests independently
-on the same backend matrix.
+exercise OpenVMM's Linux MP-table lifecycle, TTRPC, and snapshot contracts on
+each backend. `openvmm-unit-tests` runs the OpenVMM unit and documentation
+tests once per operating system, on an MSHV runner and a WHP runner. The tests
+that need `/dev/kvm` or `/dev/mshv` are ignored, so the KVM and MSHV runners
+used to run the same 4,820 tests, and the MSHV pool has the most runners.
 Failed `openvmm-vmm-tests` jobs upload Petri's `test_results` directory,
 including guest and VMM logs, screenshots, and watchdog inspection data.
 These seven-day artifacts are named
@@ -339,6 +342,76 @@ pull requests run the GitHub-hosted validation jobs but do not execute code on
 the Azure runner fleet. A maintainer must stage an external contribution on a
 trusted repository branch before running the backend matrices.
 
+## Job graph and runner capacity
+
+A `dev` push or a pull request that is ready for review starts these jobs at
+once: `quality`, `aci-edge-sandboxes`, `nvx-cli-linux`, and `nvx-cli-windows`
+on GitHub-hosted runners, and `openvmm-changes`, which classifies the change
+(see [Change classification](#change-classification)). When it finishes,
+`artifacts` and `debug-kernel` restore or build the guest artifacts on
+GitHub-hosted runners, the three `build-openvmm-*` producers restore or build
+OpenVMM on a KVM, an MSHV, and a WHP runner, and `openvmm-unit-tests` starts on
+an MSHV and a WHP runner. `openvmm-vmm-tests` waits for `artifacts`. Each
+microVM test and platform job waits for `artifacts`, its OpenVMM producer, and
+the NVX CLI job of its operating system, and the debug-kernel jobs also wait
+for `debug-kernel`. `Performance regression gate`, `Publish development
+release`, `Persist performance baseline`, and `Required status check` wait for
+the jobs whose results they check. Required handoffs between these jobs use
+same-run workflow artifacts; caches only skip rebuilding their inputs.
+
+The NVX CLI tests do not depend on the backend, so they run once per operating
+system in `nvx-cli-linux` and `nvx-cli-windows` rather than in every
+hypervisor job. Each checks out OpenVMM, whose pinned CPU profiles a test
+reads, and uses Python 3.12, the release that the self-hosted runners provide;
+the Windows job also installs the pinned Rust release with the minimal profile
+for the curl shim test. Fork pull requests lack the OpenVMM deploy key, so the
+CLI jobs run, like the hypervisor jobs, only for pushes and same-repository
+pull requests. Because the microVM and platform jobs of each operating system
+wait for its CLI job, a broken CLI does not occupy the hypervisor runners.
+`Required status check`, the development release, and performance persistence
+require both CLI jobs.
+
+The WHP pool has five runners, the KVM pool six, and the MSHV pool nine. Jobs
+wait seconds for a runner when one run is in flight, but the WHP jobs are the
+longest: the OpenVMM VMM and unit tests compile OpenVMM on Windows for about 15
+and 13 minutes before testing. A full run occupies the WHP pool for most of its
+duration, so overlapping pull requests queue there first. A change that adds a
+job or a shard needs runners to run it in parallel; otherwise it only queues.
+
+## Change classification
+
+`openvmm-changes` lists the files that changed between the pull request's base
+and head, or between a push's previous and new commits, and
+`nvx.py classify-ci-changes` selects the suites from their paths:
+
+- `run-workloads` is false only when every changed file is documentation,
+  under `doc/` or ending in `.md`. It enables the guest artifacts, the OpenVMM
+  producers, and the platform benchmarks.
+- `run-tests` is true when a test input changed: the OpenVMM pin, the guests
+  and their package locks, the CLI and its modules, the workflows and actions
+  that build and run the tests, the runner setup scripts, the Rust pin, or the
+  `aci_edge_sandboxes` crate. It enables the NVX microVM tests.
+- `run-openvmm-unit-tests` and `run-openvmm-vmm-tests` enable the OpenVMM
+  suites. A push sets both to `run-tests`. A pull request sets each only when
+  one of that suite's own inputs changed. The unit tests depend on the OpenVMM
+  pin, the Rust pin, the runner setup scripts, `ci.yml`, the actions that their
+  job uses, `nvx.py`, and the modules that `ci.py` imports. The VMM tests also
+  boot the kernel and Alpine initramfs, so they add every input of those
+  artifacts' cache keys and the `build-guest-artifacts` action.
+
+A pull request that changes neither OpenVMM suite's inputs, such as one that
+changes only the microVM tests, the benchmarks, or the Ubuntu or Azure Linux
+guests, therefore skips the two jobs that occupy the WHP runners longest,
+while the `dev` push that merges it still runs them. The detector runs the
+full matrix instead when the comparison base or a commit is unavailable, when
+the diff or the classifier fails, or when the classifier reports a suite
+twice or not at all, because a missing output would skip its jobs.
+`Required status check` passes the same outputs to `check-required-ci`, which
+expects every scheduled job to succeed and every other job to be skipped.
+Tests in `scripts/test_nvx_tools.py` derive each suite's inputs from the
+actions that its jobs use, the modules that `ci.py` imports, and the guest
+cache keys, and fail when a pattern misses one.
+
 ## Host qualification
 
 `python3 scripts/nvx.py doctor --backend <kvm|mshv|whp>` qualifies a host for
@@ -358,7 +431,7 @@ microcode and the invariant-TSC flags, may read `unknown`.
 | Check | Implementation |
 | --- | --- |
 | H1 | `/dev/kvm` or `/dev/mshv` is readable and writable, and a KVM host has no `/dev/mshv`; on Windows, `WHvGetCapability` reports a hypervisor |
-| H2 | Vendor, family, model, stepping, microcode, and OS build from `/proc/cpuinfo` or the Windows registry. Then `openvmm --hypervisor <backend> --cpu-fingerprint <path>` writes the host's CPU fingerprint (by default `nvx-cpu-fingerprint-<backend>.json` in the probe directory; `--cpu-fingerprint` overrides it), checks it against the profile that `auto` selects from OpenVMM's catalog, which shares one profile per generation across backends, and prints one `NVX-CPU-PROFILE:` line. H2 reports the generation and the profile from that line, so a profile that an OpenVMM pin adds qualifies its hosts without an NVX change. H2 requires exit status 0, `status=pass`, the same backend, and a catalog profile of the reported generation, reports the profile and surface digests, and otherwise fails with OpenVMM's code, for example `[E_PROFILE_HOST_UNKNOWN]` on a CPU that no profile serves or `[E_PROFILE_UNSUPPORTED]` naming every unsupported CPUID bit. On MSHV and WHP, OpenVMM checks the entries outside the profile on a probe partition configured from the profile, as a cold boot does. With `--no-openvmm`, H2 maps the host with NVX's copy of the catalog instead: `skylake-sp` (6/85, steppings 0 to 4, `intel.skylake-sp.v1`), `icelake-sp` (6/106, `intel.icelake-sp.v1`), `emeraldrapids` (6/207, `intel.emeraldrapids.v1`), `alderlake` (6/151 and 6/154, `intel.alderlake.v1`), `milan` (AMD 25/1, `amd.milan.v1`), `genoa` (AMD 25/17, `amd.genoa.v1`), or `turin` (AMD 26/2, `amd.turin.v1`). Any other CPU, including Cascade Lake and Cooper Lake, fails with `E_PROFILE_HOST_UNKNOWN`. A unit test keeps the copy equal to the profiles of the OpenVMM submodule's pinned revision, which it reads from the gitlink's commit, so the CI jobs validate the NVX CLI after they check out OpenVMM. The host OS's invariant-TSC flags (`constant_tsc nonstop_tsc`, or the CPUID bit on Windows) are recorded as evidence and never fail the check, because they don't decide what a guest observes: Azure WHP hosts show the CPUID bit but cannot offer invariant TSC to partitions, and their guests measure tens of nanoseconds of skew |
+| H2 | Vendor, family, model, stepping, microcode, and OS build from `/proc/cpuinfo` or the Windows registry. Then `openvmm --hypervisor <backend> --cpu-fingerprint <path>` writes the host's CPU fingerprint (by default `nvx-cpu-fingerprint-<backend>.json` in the probe directory; `--cpu-fingerprint` overrides it), checks it against the profile that `auto` selects from OpenVMM's catalog, which shares one profile per generation across backends, and prints one `NVX-CPU-PROFILE:` line. H2 reports the generation and the profile from that line, so a profile that an OpenVMM pin adds qualifies its hosts without an NVX change. H2 requires exit status 0, `status=pass`, the same backend, and a catalog profile of the reported generation, reports the profile and surface digests, and otherwise fails with OpenVMM's code, for example `[E_PROFILE_HOST_UNKNOWN]` on a CPU that no profile serves or `[E_PROFILE_UNSUPPORTED]` naming every unsupported CPUID bit. On MSHV and WHP, OpenVMM checks the entries outside the profile on a probe partition configured from the profile, as a cold boot does. With `--no-openvmm`, H2 maps the host with NVX's copy of the catalog instead: `skylake-sp` (6/85, steppings 0 to 4, `intel.skylake-sp.v1`), `icelake-sp` (6/106, `intel.icelake-sp.v1`), `emeraldrapids` (6/207, `intel.emeraldrapids.v1`), `alderlake` (6/151 and 6/154, `intel.alderlake.v1`), `milan` (AMD 25/1, `amd.milan.v1`), `genoa` (AMD 25/17, `amd.genoa.v1`), or `turin` (AMD 26/2, `amd.turin.v1`). Any other CPU, including Cascade Lake and Cooper Lake, fails with `E_PROFILE_HOST_UNKNOWN`. A unit test keeps the copy equal to the profiles of the OpenVMM submodule's pinned revision, which it reads from the gitlink's commit, so the NVX CLI jobs validate the CLI after they check out OpenVMM. The host OS's invariant-TSC flags (`constant_tsc nonstop_tsc`, or the CPUID bit on Windows) are recorded as evidence and never fail the check, because they don't decide what a guest observes: Azure WHP hosts show the CPUID bit but cannot offer invariant TSC to partitions, and their guests measure tens of nanoseconds of skew |
 | H3 | `openvmm --x-time-abi-verify` builds the partition and runs the time ABI preflight without running the guest. Its `NVX-TIME-ABI-VERIFY:` line must report `status=ok` for the backend, plausible declared and native TSC rates, the backend's LAPIC rate, and a `cpu_profile` that is a catalog profile, `<vendor>.<generation>.v<revision>` of any generation but a host profile's `host`, and, when H2 runs too, a revision of the profile H2 names. A failed preflight reports OpenVMM's code, for example `[E_TSC_SYNC_UNSUPPORTED]` |
 | H4 | Samples of the TSC against the host's monotonic clocks, with sleeps between them so the host's CPUs idle: 13 samples 10 s apart, or 3 samples 1 s apart with `--ci-schedule`. Each sample reads the TSC between two reads of a clock, keeping the tightest of 64 brackets; its uncertainty is half the bracket plus half the clock's resolution. A clock that returns the same value to consecutive reads is coarser than one read, so the probe takes its smallest step as its resolution: Hyper-V's reference TSC page advances the Linux clocks in 100 ns steps although `clock_getres` reports 1 ns. The interval stability is judged against a clock that time synchronization never steers, `CLOCK_MONOTONIC_RAW` on Linux and `QueryPerformanceCounter` on Windows: every interval between consecutive samples must be conclusive within 0.25 ppm, and the interval rates must agree within 1 ppm. chrony's frequency updates move `CLOCK_MONOTONIC`'s rate by up to several ppm between seconds on the Azure runners, which says nothing about the TSC. The rate over the whole window is measured against the disciplined clock, `CLOCK_MONOTONIC` on Linux, and must lie within 100 ppm of the rate H3 reports when H3 runs in the same invocation. A Linux host's clocksource is recorded as evidence |
 | H5 | Pinned-thread ping-pong rounds over every pair of host CPUs; `max_abs_offset_ns` is at most 1,000, the measurement is conclusive, and no pair stalls |
@@ -450,7 +523,7 @@ interrupted earlier start, host path mappings, egress rules, and per-execution
 environments and working directories. On failure
 it keeps the OpenVMM log under `build/test-results/aci-edge-sandboxes-<backend>`, which is
 uploaded with the other microVM logs. Changes under `aci_edge_sandboxes/` therefore trigger
-the backend matrices.
+the NVX microVM test matrix.
 
 ## Adversarial campaigns
 

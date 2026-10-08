@@ -48,6 +48,9 @@ from nvx_tools.build_constants import (
 from nvx_tools.ci import (
     OPENVMM_TEST_BACKENDS,
     REQUIRED_CI_RESULT_ENVIRONMENTS,
+    CiChanges,
+    classify_ci_changes,
+    describe_ci_changes,
     required_ci_failures,
     run_openvmm_tests,
     run_openvmm_unit_tests,
@@ -291,6 +294,16 @@ def command_setup_cross_os_cache(_: argparse.Namespace) -> None:
     setup_cross_os_cache()
 
 
+def command_classify_ci_changes(args: argparse.Namespace) -> None:
+    changed_files = args.changed_files.read_text(encoding="utf-8").splitlines()
+    changes = classify_ci_changes(args.event_name, changed_files)
+    if args.summary is not None:
+        with args.summary.open("a", encoding="utf-8") as summary:
+            summary.write(describe_ci_changes(args.event_name, changed_files, changes))
+    for name, selected in changes.outputs().items():
+        print(f"{name}={str(selected).lower()}")
+
+
 def command_check_required_ci(args: argparse.Namespace) -> None:
     results = {
         job: os.environ.get(environment, "")
@@ -299,8 +312,12 @@ def command_check_required_ci(args: argparse.Namespace) -> None:
     failures = required_ci_failures(
         args.event_name,
         same_repository=args.same_repository == "true",
-        run_tests=args.run_tests == "true",
-        run_workloads=args.run_workloads == "true",
+        changes=CiChanges(
+            run_tests=args.run_tests == "true",
+            run_workloads=args.run_workloads == "true",
+            run_openvmm_unit_tests=args.run_openvmm_unit_tests == "true",
+            run_openvmm_vmm_tests=args.run_openvmm_vmm_tests == "true",
+        ),
         results=results,
     )
     if failures:
@@ -870,6 +887,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     cache.set_defaults(handler=command_setup_cross_os_cache)
 
+    classify_changes = subparsers.add_parser(
+        "classify-ci-changes",
+        help="select the CI suites that a list of changed files runs",
+    )
+    classify_changes.add_argument(
+        "--event-name",
+        choices=("pull_request", "push"),
+        required=True,
+    )
+    classify_changes.add_argument(
+        "--changed-files",
+        type=Path,
+        required=True,
+        help="file listing one changed repository path per line",
+    )
+    classify_changes.add_argument(
+        "--summary",
+        type=Path,
+        help="Markdown file to append the reasons for each decision to",
+    )
+    classify_changes.set_defaults(handler=command_classify_ci_changes)
+
     required_ci = subparsers.add_parser(
         "check-required-ci",
         help="validate required GitHub Actions job results",
@@ -886,6 +925,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     required_ci.add_argument("--run-tests", required=True)
     required_ci.add_argument("--run-workloads", required=True)
+    required_ci.add_argument("--run-openvmm-unit-tests", required=True)
+    required_ci.add_argument("--run-openvmm-vmm-tests", required=True)
     required_ci.set_defaults(handler=command_check_required_ci)
 
     openvmm_unit_tests = subparsers.add_parser(

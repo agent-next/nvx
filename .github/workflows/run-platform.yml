@@ -71,10 +71,6 @@ jobs:
         with:
           ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
 
-      # After the OpenVMM checkout: the CLI tests read the pinned revision.
-      - name: Validate NVX CLI
-        uses: ./.github/actions/validate-nvx
-
       - name: Verify source pins on Linux
         if: runner.os != 'Windows'
         shell: bash

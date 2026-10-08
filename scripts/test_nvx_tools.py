@@ -2659,6 +2659,8 @@ class CiConfigurationTests(unittest.TestCase):
 
     def test_required_ci_result_policy(self):
         always_successful = {"quality", "aci-edge-sandboxes", "openvmm-changes"}
+        # Jobs that succeed whenever the repository's jobs run.
+        repository = always_successful | set(ci.REQUIRED_CI_CLI_JOBS)
         builds = set(ci.REQUIRED_CI_BUILD_JOBS)
         openvmm_tests = set(ci.REQUIRED_CI_OPENVMM_TEST_JOBS)
         openvmm_artifact_tests = set(ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS)
@@ -2667,108 +2669,102 @@ class CiConfigurationTests(unittest.TestCase):
         debug_kernel_push = set(ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS)
         artifacts = {ci.REQUIRED_CI_ARTIFACT_JOB, ci.REQUIRED_CI_DEBUG_KERNEL_JOB}
         platforms = set(ci.REQUIRED_CI_PLATFORM_JOBS)
+        workloads = artifacts | builds | platforms
+        microvm = microvm_tests | debug_kernel
+        # Event, same repository, the change detector's outputs (tests,
+        # workloads, OpenVMM unit tests, OpenVMM VMM tests), and the jobs that
+        # must succeed; every other required job must be skipped.
         cases = (
-            ("pull_request", True, False, False, always_successful),
+            ("pull_request", True, (False, False, False, False), repository),
             (
                 "pull_request",
                 True,
-                False,
-                True,
-                always_successful
-                | artifacts
-                | builds
-                | platforms
-                | {"performance-gate"},
+                (False, True, False, False),
+                repository | workloads | {"performance-gate"},
             ),
             (
                 "pull_request",
                 True,
-                True,
-                False,
-                always_successful | builds | openvmm_tests,
+                (True, False, True, True),
+                repository | builds | openvmm_tests,
             ),
             (
                 "pull_request",
                 True,
-                True,
-                True,
-                always_successful
-                | builds
+                (True, True, True, True),
+                repository
+                | workloads
                 | openvmm_tests
                 | openvmm_artifact_tests
-                | microvm_tests
-                | debug_kernel
-                | artifacts
-                | platforms
+                | microvm
                 | {"performance-gate"},
             ),
-            ("pull_request", False, False, False, always_successful),
+            # A pull request that changes no input of either OpenVMM suite.
+            (
+                "pull_request",
+                True,
+                (True, True, False, False),
+                repository | workloads | microvm | {"performance-gate"},
+            ),
+            # Guest inputs reach the VMM tests but not the unit tests.
+            (
+                "pull_request",
+                True,
+                (True, True, False, True),
+                repository
+                | workloads
+                | openvmm_artifact_tests
+                | microvm
+                | {"performance-gate"},
+            ),
+            ("pull_request", False, (False, False, False, False), always_successful),
             (
                 "pull_request",
                 False,
-                False,
-                True,
+                (False, True, False, False),
                 always_successful | artifacts,
             ),
-            ("pull_request", False, True, False, always_successful),
+            ("pull_request", False, (True, False, True, True), always_successful),
             (
                 "pull_request",
                 False,
-                True,
-                True,
+                (True, True, True, True),
                 always_successful | artifacts,
             ),
-            ("push", True, False, False, always_successful),
+            ("push", True, (False, False, False, False), repository),
+            ("push", True, (False, True, False, False), repository | workloads),
             (
                 "push",
                 True,
-                False,
-                True,
-                always_successful | artifacts | builds | platforms,
+                (True, False, True, True),
+                repository | builds | openvmm_tests,
             ),
             (
                 "push",
                 True,
-                True,
-                False,
-                always_successful | builds | openvmm_tests,
-            ),
-            (
-                "push",
-                True,
-                True,
-                True,
-                always_successful
-                | artifacts
-                | builds
+                (True, True, True, True),
+                repository
+                | workloads
                 | openvmm_tests
                 | openvmm_artifact_tests
-                | microvm_tests
-                | debug_kernel
-                | debug_kernel_push
-                | platforms,
+                | microvm
+                | debug_kernel_push,
             ),
         )
 
-        for (
-            event_name,
-            same_repository,
-            run_tests,
-            run_workloads,
-            successful_jobs,
-        ) in cases:
+        for event_name, same_repository, flags, successful_jobs in cases:
+            changes = ci.CiChanges(*flags)
             with self.subTest(
                 event_name=event_name,
                 same_repository=same_repository,
-                run_tests=run_tests,
-                run_workloads=run_workloads,
+                changes=changes,
             ):
                 expected = ci.required_ci_expected_results(
                     event_name,
                     same_repository=same_repository,
-                    run_tests=run_tests,
-                    run_workloads=run_workloads,
+                    changes=changes,
                 )
+                self.assertEqual(set(expected), set(ci.REQUIRED_CI_RESULT_ENVIRONMENTS))
                 self.assertEqual(
                     {job for job, result in expected.items() if result == "success"},
                     successful_jobs,
@@ -2777,8 +2773,7 @@ class CiConfigurationTests(unittest.TestCase):
                     ci.required_ci_failures(
                         event_name,
                         same_repository=same_repository,
-                        run_tests=run_tests,
-                        run_workloads=run_workloads,
+                        changes=changes,
                         results=expected,
                     ),
                     [],
@@ -2794,8 +2789,7 @@ class CiConfigurationTests(unittest.TestCase):
                             ci.required_ci_failures(
                                 event_name,
                                 same_repository=same_repository,
-                                run_tests=run_tests,
-                                run_workloads=run_workloads,
+                                changes=changes,
                                 results=unexpected,
                             ),
                             [
@@ -2812,8 +2806,7 @@ class CiConfigurationTests(unittest.TestCase):
                             ci.required_ci_failures(
                                 event_name,
                                 same_repository=same_repository,
-                                run_tests=run_tests,
-                                run_workloads=run_workloads,
+                                changes=changes,
                                 results=failed,
                             ),
                             [f"{job}: expected {expected[job]}, got failure"],
@@ -2839,6 +2832,385 @@ class CiConfigurationTests(unittest.TestCase):
         for environment in ci.REQUIRED_CI_RESULT_ENVIRONMENTS.values():
             with self.subTest(environment=environment):
                 self.assertIn(f"          {environment}:", job)
+        # Every suite flag reaches the policy as the detector reported it.
+        detector = _workflow_job(workflow, "openvmm-changes")
+        for output in ci.CI_CHANGE_OUTPUTS:
+            environment = output.upper().replace("-", "_")
+            with self.subTest(output=output):
+                self.assertIn(
+                    f"      {output}: ${{{{ steps.changes.outputs.{output} }}}}",
+                    detector,
+                )
+                self.assertIn(
+                    f"          {environment}: "
+                    f"${{{{ needs.openvmm-changes.outputs.{output} }}}}",
+                    job,
+                )
+                self.assertIn(f'--{output} "${{{environment}}}"', job)
+
+    def test_ci_change_classification_selects_suites_by_input(self):
+        # The pull-request outputs (tests, workloads, OpenVMM unit tests,
+        # OpenVMM VMM tests) for each class of changed path.
+        cases = (
+            ((), (False, True, False, False)),
+            (("doc/ci.md", "README.md", "DOC/Guide.MD"), (False, False, False, False)),
+            (("openvmm",), (True, True, True, True)),
+            (("rust-toolchain.toml",), (True, True, True, True)),
+            (("scripts/setup/setup-windows-whp.ps1",), (True, True, True, True)),
+            (("scripts/setup/README.md",), (True, False, True, True)),
+            ((".github/workflows/ci.yml",), (True, True, True, True)),
+            ((".github/actions/validate-runner/action.yml",), (True, True, True, True)),
+            ((".github/actions/sccache/action.yml",), (True, True, True, True)),
+            ((".github/actions/setup-curl/curl-shim.rs",), (True, True, True, True)),
+            (("scripts/nvx.py",), (True, True, True, True)),
+            (("scripts/nvx_tools/ci.py",), (True, True, True, True)),
+            (("scripts/nvx_tools/common.py",), (True, True, True, True)),
+            (("scripts/nvx_tools/build.py",), (True, True, False, True)),
+            (("scripts/nvx_tools/guests.py",), (True, True, False, True)),
+            (("kernel/config-microvm",), (True, True, False, True)),
+            (("kernel/patches/0001-example.patch",), (True, True, False, True)),
+            (("guest/common/init",), (True, True, False, True)),
+            (("guest/alpine/nvx-container-enter",), (True, True, False, True)),
+            (("SOURCE-MANIFEST.json",), (True, True, False, True)),
+            (("docker/Dockerfile",), (True, True, False, True)),
+            (
+                (".github/actions/build-guest-artifacts/action.yml",),
+                (True, True, False, True),
+            ),
+            (("guest/ubuntu/nvx-bashrc",), (True, True, False, False)),
+            (("ubuntu/packages.lock.json",), (True, True, False, False)),
+            (("azurelinux/packages.lock.json",), (True, True, False, False)),
+            (("aci_edge_sandboxes/src/lib.rs",), (True, True, False, False)),
+            (("scripts/nvx_tools/microvm_tests.py",), (True, True, False, False)),
+            (
+                (".github/workflows/run-nvx-microvm-tests.yml",),
+                (True, True, False, False),
+            ),
+            ((".github/actions/build-openvmm/action.yml",), (True, True, False, False)),
+            ((".github/actions/validate-nvx/action.yml",), (False, True, False, False)),
+            (
+                (".github/actions/run-benchmark/action.yml",),
+                (False, True, False, False),
+            ),
+            (("scripts/test_nvx_tools.py",), (False, True, False, False)),
+            (("data/linux-kvm-virtual-machine.csv",), (False, True, False, False)),
+            (
+                ("scripts/nvx_tools/microvm_tests.py", "kernel/config-microvm"),
+                (True, True, False, True),
+            ),
+        )
+        for changed_files, flags in cases:
+            with self.subTest(changed_files=changed_files):
+                pull_request = ci.classify_ci_changes("pull_request", changed_files)
+                self.assertEqual(pull_request, ci.CiChanges(*flags))
+                # Pushes keep running both OpenVMM suites with the tests.
+                run_tests, run_workloads = flags[:2]
+                self.assertEqual(
+                    ci.classify_ci_changes("push", changed_files),
+                    ci.CiChanges(run_tests, run_workloads, run_tests, run_tests),
+                )
+        self.assertEqual(
+            ci.classify_ci_changes("pull_request", ["openvmm", ""]),
+            ci.classify_ci_changes("pull_request", ["openvmm"]),
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported CI event"):
+            ci.classify_ci_changes("workflow_dispatch", ["openvmm"])
+
+    def test_ci_change_classification_covers_each_suite_input(self):
+        github = BuildConstants.REPO_ROOT / ".github"
+        tools = BuildConstants.REPO_ROOT / "scripts" / "nvx_tools"
+        workflow = (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+        def local_actions(configuration: str) -> set[str]:
+            names = set(
+                re.findall(r"uses: \./\.github/actions/([a-z0-9-]+)", configuration)
+            )
+            pending = list(names)
+            while pending:
+                action = (github / "actions" / pending.pop() / "action.yml").read_text(
+                    encoding="utf-8"
+                )
+                for name in local_actions(action) - names:
+                    names.add(name)
+                    pending.append(name)
+            return names
+
+        def imported_modules(module: str) -> set[str]:
+            modules = {module}
+            pending = [module]
+            while pending:
+                tree = ast.parse(
+                    (tools / f"{pending.pop()}.py").read_text(encoding="utf-8")
+                )
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.ImportFrom) or node.level != 1:
+                        continue
+                    names = (
+                        [node.module.split(".")[0]]
+                        if node.module
+                        else [alias.name for alias in node.names]
+                    )
+                    for name in set(names) - modules:
+                        modules.add(name)
+                        pending.append(name)
+            return modules
+
+        command_inputs = {
+            "scripts/nvx.py",
+            "scripts/nvx_tools/__init__.py",
+            ".github/workflows/ci.yml",
+            *(f"scripts/nvx_tools/{name}.py" for name in imported_modules("ci")),
+        }
+        self.assertLessEqual(
+            {"ci", "common", "build_constants"}, imported_modules("ci")
+        )
+        unit_inputs = command_inputs | {
+            f".github/actions/{name}/action.yml"
+            for name in local_actions(_workflow_job(workflow, "openvmm-unit-tests"))
+        }
+        vmm_inputs = command_inputs | {
+            f".github/actions/{name}/action.yml"
+            for job in ("openvmm-vmm-tests", "artifacts")
+            for name in local_actions(_workflow_job(workflow, job))
+        }
+        # Every cache key input of the kernel and Alpine initramfs that the
+        # VMM tests boot, and of every guest that the microVM tests boot.
+        guest_action = (
+            github / "actions" / "build-guest-artifacts" / "action.yml"
+        ).read_text(encoding="utf-8")
+        guest_inputs = {
+            match.group(1): {
+                path.replace("**", "example").replace("*", "example")
+                for path in re.findall(r"'([^']+)'", match.group(2))
+            }
+            for match in re.finditer(
+                r"^\s+([A-Z_]+)_INPUT_HASH: \$\{\{ hashFiles\((.+)\) \}\}$",
+                guest_action,
+                re.MULTILINE,
+            )
+        }
+        self.assertEqual(
+            set(guest_inputs),
+            {"KERNEL", "DEBUG_KERNEL", "ALPINE", "UBUNTU", "AZURELINUX"},
+        )
+        vmm_inputs |= guest_inputs["KERNEL"] | guest_inputs["ALPINE"]
+        test_inputs = vmm_inputs.union(*guest_inputs.values()) | {
+            ".github/workflows/run-nvx-microvm-tests.yml",
+            ".github/workflows/build-openvmm-binary.yml",
+            *(
+                f".github/actions/{name}/action.yml"
+                for configuration in (
+                    (github / "workflows" / "run-nvx-microvm-tests.yml").read_text(
+                        encoding="utf-8"
+                    ),
+                    (github / "workflows" / "build-openvmm-binary.yml").read_text(
+                        encoding="utf-8"
+                    ),
+                    _workflow_job(workflow, "debug-kernel"),
+                )
+                for name in local_actions(configuration)
+            ),
+        }
+        self.assertNotIn(".github/actions/validate-nvx/action.yml", test_inputs)
+        for pattern, inputs in (
+            (ci.OPENVMM_UNIT_TEST_INPUT_PATHS, unit_inputs),
+            (ci.OPENVMM_VMM_TEST_INPUT_PATHS, vmm_inputs),
+            (ci.CI_TEST_INPUT_PATHS, test_inputs),
+        ):
+            for path in sorted(inputs):
+                with self.subTest(pattern=pattern.pattern, path=path):
+                    self.assertIsNotNone(pattern.match(path))
+
+    def test_ci_change_summary_explains_each_decision(self):
+        changed_files = [
+            "scripts/nvx_tools/microvm_tests.py",
+            "guest/common/init",
+            "guest/common/nvx-hostmount",
+            "guest/common/nvx-snapshot",
+            "guest/common/nvx-identity-probe",
+        ]
+        changes = ci.classify_ci_changes("pull_request", changed_files)
+        summary = ci.describe_ci_changes("pull_request", changed_files, changes)
+        self.assertIn("### Artifact-backed tests and benchmarks: run\n", summary)
+        self.assertIn("### NVX microVM tests: run\n", summary)
+        self.assertIn(
+            "### OpenVMM unit tests: skip\nNo input of this suite changed.\n",
+            summary,
+        )
+        self.assertIn(
+            "### OpenVMM VMM tests: run\nSuite inputs changed: "
+            "`guest/common/init`, `guest/common/nvx-hostmount`, "
+            "`guest/common/nvx-snapshot`, and 1 more.\n",
+            summary,
+        )
+        push = ci.describe_ci_changes(
+            "push", changed_files, ci.classify_ci_changes("push", changed_files)
+        )
+        self.assertIn(
+            "### OpenVMM unit tests: run\n"
+            "Pushes run every OpenVMM suite whenever the tests run.\n",
+            push,
+        )
+        documentation = ci.describe_ci_changes(
+            "pull_request",
+            ["doc/ci.md"],
+            ci.classify_ci_changes("pull_request", ["doc/ci.md"]),
+        )
+        self.assertIn(
+            "### Artifact-backed tests and benchmarks: skip\n"
+            "Only documentation files changed.\n",
+            documentation,
+        )
+        self.assertIn(
+            "### OpenVMM VMM tests: skip\nNo test input changed.\n", documentation
+        )
+
+    def test_classify_ci_changes_command_prints_every_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            changed_files = Path(temporary) / "changed-files"
+            changed_files.write_text("guest/common/init\n", encoding="utf-8")
+            summary = Path(temporary) / "summary.md"
+            summary.write_text("before\n", encoding="utf-8")
+            args = nvx.parse_args(
+                [
+                    "classify-ci-changes",
+                    "--event-name",
+                    "pull_request",
+                    "--changed-files",
+                    os.fspath(changed_files),
+                    "--summary",
+                    os.fspath(summary),
+                ]
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                args.handler(args)
+            self.assertEqual(
+                stdout.getvalue().splitlines(),
+                [
+                    "run-tests=true",
+                    "run-workloads=true",
+                    "run-openvmm-unit-tests=false",
+                    "run-openvmm-vmm-tests=true",
+                ],
+            )
+            text = summary.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("before\n### "))
+            self.assertIn("### OpenVMM VMM tests: run\n", text)
+
+    @unittest.skipUnless(os.name == "posix", "requires bash")
+    def test_ci_change_detector_runs_the_full_matrix_unless_classified(self):
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        step = _workflow_step(workflow, "openvmm-changes", "Detect relevant changes")
+        lines = step.splitlines()
+        start = lines.index("        run: |") + 1
+        script = "\n".join(line[10:] for line in lines[start:])
+        stub = """
+git() {
+    case "$1" in
+    cat-file) return "${GIT_CAT_FILE_STATUS}" ;;
+    diff)
+        printf '%s' "${CHANGED_FILES}"
+        return "${GIT_DIFF_STATUS}"
+        ;;
+    esac
+    echo "unexpected git command: $*" >&2
+    return 1
+}
+python3() {
+    if [[ -n "${CLASSIFIER:-}" ]]; then
+        "${CLASSIFIER}" "$@"
+        return
+    fi
+    printf '%b' "${CLASSIFICATION}"
+    return "${CLASSIFIER_STATUS}"
+}
+"""
+        complete = (
+            "run-tests=true\\nrun-workloads=true\\n"
+            "run-openvmm-unit-tests=false\\nrun-openvmm-vmm-tests=false\\n"
+        )
+        everything = dict.fromkeys(ci.CI_CHANGE_OUTPUTS, "true")
+        classified = {
+            "run-tests": "true",
+            "run-workloads": "true",
+            "run-openvmm-unit-tests": "false",
+            "run-openvmm-vmm-tests": "false",
+        }
+        cases = (
+            ("missing base", {"BASE_SHA": ""}, everything),
+            ("zero base", {"BASE_SHA": "0" * 40}, everything),
+            ("missing commit", {"GIT_CAT_FILE_STATUS": "1"}, everything),
+            ("failed diff", {"GIT_DIFF_STATUS": "128"}, everything),
+            ("failed classifier", {"CLASSIFIER_STATUS": "1"}, everything),
+            (
+                "missing output",
+                {"CLASSIFICATION": complete.rsplit("run-openvmm-vmm", 1)[0]},
+                everything,
+            ),
+            (
+                "duplicate output",
+                {"CLASSIFICATION": complete + "run-tests=false\\n"},
+                everything,
+            ),
+            (
+                "malformed output",
+                {"CLASSIFICATION": complete.replace("=true", "=yes", 1)},
+                everything,
+            ),
+            (
+                "classified",
+                {"CLASSIFICATION": "notice: ignored\\n" + complete},
+                classified,
+            ),
+            (
+                "real classifier",
+                {
+                    "CLASSIFIER": sys.executable,
+                    "CHANGED_FILES": "scripts/nvx_tools/microvm_tests.py\n",
+                },
+                classified,
+            ),
+        )
+        for name, overrides, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "EVENT_NAME": "pull_request",
+                        "BASE_SHA": "1" * 40,
+                        "HEAD_SHA": "2" * 40,
+                        "GITHUB_OUTPUT": os.fspath(root / "output"),
+                        "GITHUB_STEP_SUMMARY": os.fspath(root / "summary"),
+                        "RUNNER_TEMP": temporary,
+                        "GIT_CAT_FILE_STATUS": "0",
+                        "GIT_DIFF_STATUS": "0",
+                        "CHANGED_FILES": "openvmm\n",
+                        "CLASSIFICATION": complete,
+                        "CLASSIFIER_STATUS": "0",
+                    }
+                )
+                environment.update(overrides)
+                result = subprocess.run(
+                    ["bash", "-c", stub + script],
+                    cwd=BuildConstants.REPO_ROOT,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = (root / "output").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(output), len(expected), output)
+                self.assertEqual(dict(line.split("=", 1) for line in output), expected)
+                summary = (root / "summary").read_text(encoding="utf-8")
+                if expected is everything:
+                    self.assertIn("### Full matrix: run\n", summary)
+                else:
+                    self.assertNotIn("Full matrix", summary)
 
     def test_flowey_downloads_use_retrying_curl(self):
         action = (
@@ -3110,11 +3482,18 @@ class CiConfigurationTests(unittest.TestCase):
                     if job_name.startswith("nvx-microvm-debug-")
                     else ""
                 )
+                cli = (
+                    "nvx-cli-windows"
+                    if producer == "build-openvmm-windows-msvc"
+                    else "nvx-cli-linux"
+                )
                 self.assertIn(
-                    f"needs: [artifacts, {debug_kernel}{producer}, openvmm-changes]",
+                    f"needs: [artifacts, {debug_kernel}{producer}, {cli}, "
+                    "openvmm-changes]",
                     job,
                 )
                 self.assertIn(f"needs.{producer}.result == 'success'", job)
+                self.assertIn(f"needs.{cli}.result == 'success'", job)
                 self.assertIn(f"uses: ./.github/workflows/{reusable_workflow}", job)
                 self.assertIn(f"openvmm-artifact: {artifact}", job)
                 for unrelated_producer in producers.keys() - {producer}:
@@ -3514,13 +3893,59 @@ class CiConfigurationTests(unittest.TestCase):
                         job,
                     )
 
-    def test_ci_runs_openvmm_tests_and_unit_tests_on_each_backend(self):
+    def test_ci_runs_openvmm_vmm_tests_per_backend_and_unit_tests_per_os(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
         vmm_tests_job = _workflow_job(workflow, "openvmm-vmm-tests")
         unit_tests_job = _workflow_job(workflow, "openvmm-unit-tests")
 
+        def legs(job: str) -> list[tuple[str, str, str]]:
+            return re.findall(
+                r"^          - name: (.+)\n"
+                r"            backend: (\S+)\n"
+                r"            runner: '(.+)'$",
+                job,
+                re.MULTILINE,
+            )
+
+        self.assertEqual(
+            legs(vmm_tests_job),
+            [
+                (
+                    "Linux / KVM",
+                    "kvm",
+                    '["self-hosted", "linux", "kvm", "virtual-machine"]',
+                ),
+                (
+                    "Linux / MSHV",
+                    "mshv",
+                    '["self-hosted", "linux", "mshv", "virtual-machine"]',
+                ),
+                (
+                    "Windows / WHP",
+                    "whp",
+                    '["self-hosted", "windows", "whp", "virtual-machine"]',
+                ),
+            ],
+        )
+        # The unit tests that need /dev/kvm or /dev/mshv are ignored, so one
+        # Linux runner covers both Linux backends.
+        self.assertEqual(
+            legs(unit_tests_job),
+            [
+                (
+                    "Linux",
+                    "mshv",
+                    '["self-hosted", "linux", "mshv", "virtual-machine"]',
+                ),
+                (
+                    "Windows",
+                    "whp",
+                    '["self-hosted", "windows", "whp", "virtual-machine"]',
+                ),
+            ],
+        )
         self.assertIn(
             """      - name: Run OpenVMM unit tests on Linux
         if: runner.os != 'Windows'
@@ -3555,26 +3980,91 @@ class CiConfigurationTests(unittest.TestCase):
         )
         self.assertNotIn("test-openvmm --backend", unit_tests_job)
 
-    def test_ci_validates_the_cli_after_checking_out_openvmm(self):
+    def test_ci_validates_the_cli_once_per_os_after_checking_out_openvmm(self):
         # The CLI tests read OpenVMM's pinned CPU profiles from the submodule,
-        # which a self-hosted runner's workspace holds at the pinned revision
-        # only after the job checks it out.
+        # which a runner's workspace holds at the pinned revision only after
+        # the job checks it out. The tests do not depend on the backend, so
+        # one GitHub-hosted job per OS runs them instead of every hypervisor
+        # job, and the microVM and platform jobs of each OS wait for it.
         workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
-        for workflow_name, job_name in (
-            ("ci.yml", "openvmm-vmm-tests"),
-            ("ci.yml", "openvmm-unit-tests"),
-            ("run-nvx-microvm-tests.yml", "test"),
-            ("run-platform.yml", "run"),
+        workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(ci.REQUIRED_CI_CLI_JOBS, ("nvx-cli-linux", "nvx-cli-windows"))
+        for job_name, runner in (
+            ("nvx-cli-linux", "ubuntu-latest"),
+            ("nvx-cli-windows", "windows-latest"),
         ):
-            with self.subTest(workflow=workflow_name, job=job_name):
-                job = _workflow_job(
-                    (workflows / workflow_name).read_text(encoding="utf-8"), job_name
+            with self.subTest(job=job_name):
+                job = _workflow_job(workflow, job_name)
+                self.assertIn(f"    runs-on: {runner}\n", job)
+                self.assertNotIn("    needs:", job)
+                self.assertIn(
+                    "github.event.pull_request.head.repo.full_name "
+                    "== github.repository",
+                    job,
                 )
                 self.assertEqual(job.count("uses: ./.github/actions/validate-nvx"), 1)
-                self.assertLess(
-                    job.index("uses: ./.github/actions/checkout-openvmm"),
-                    job.index("uses: ./.github/actions/validate-nvx"),
-                )
+                for prerequisite in (
+                    "uses: ./.github/actions/checkout-openvmm",
+                    "uses: actions/setup-python@v6",
+                ):
+                    self.assertLess(
+                        job.index(prerequisite),
+                        job.index("uses: ./.github/actions/validate-nvx"),
+                    )
+                # The release that the self-hosted runners provide.
+                self.assertIn('python-version: "3.12"', job)
+                self.assertIn(job_name, ci.REQUIRED_CI_RESULT_ENVIRONMENTS)
+        windows = _workflow_job(workflow, "nvx-cli-windows")
+        self.assertIn("rust-toolchain.toml", windows)
+        self.assertIn("--profile minimal --no-self-update", windows)
+        self.assertLess(
+            windows.index("rustup toolchain install"),
+            windows.index("uses: ./.github/actions/validate-nvx"),
+        )
+
+        configurations = {
+            name: (workflows / name).read_text(encoding="utf-8")
+            for name in (
+                "ci.yml",
+                "build-openvmm-binary.yml",
+                "run-nvx-microvm-tests.yml",
+                "run-platform.yml",
+            )
+        }
+        self.assertEqual(
+            sum(
+                configuration.count("uses: ./.github/actions/validate-nvx")
+                for configuration in configurations.values()
+            ),
+            len(ci.REQUIRED_CI_CLI_JOBS),
+        )
+        for job_name in (
+            *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
+            *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
+            *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,
+            *ci.REQUIRED_CI_PLATFORM_JOBS,
+        ):
+            cli = "nvx-cli-windows" if job_name.endswith("-whp") else "nvx-cli-linux"
+            with self.subTest(consumer=job_name):
+                job = _workflow_job(workflow, job_name)
+                needs = re.search(r"^    needs: \[(.+)\]$", job, re.MULTILINE)
+                assert needs is not None
+                self.assertIn(cli, needs.group(1).split(", "))
+                self.assertIn(f"        needs.{cli}.result == 'success' &&\n", job)
+                for other in set(ci.REQUIRED_CI_CLI_JOBS) - {cli}:
+                    self.assertNotIn(other, job)
+        for job_name in ("openvmm-vmm-tests", "openvmm-unit-tests"):
+            with self.subTest(job=job_name):
+                self.assertNotIn("nvx-cli", _workflow_job(workflow, job_name))
+        for consumer in ("release", "performance-persist", "required-status-check"):
+            job = _workflow_job(workflow, consumer)
+            for cli in ci.REQUIRED_CI_CLI_JOBS:
+                with self.subTest(consumer=consumer, cli=cli):
+                    self.assertIn(f"      - {cli}\n", job)
+                    if consumer != "required-status-check":
+                        self.assertIn(
+                            f"        needs.{cli}.result == 'success' &&\n", job
+                        )
 
     def test_ci_preserves_failed_openvmm_test_diagnostics(self):
         workflow = (
@@ -4048,11 +4538,13 @@ class CiConfigurationTests(unittest.TestCase):
             4,
         )
 
-        ci_workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
-        [relevant_paths] = [
-            line for line in ci_workflow.splitlines() if "relevant_paths='" in line
-        ]
-        self.assertIn(r"|rust-toolchain\.toml$", relevant_paths)
+        # A new release reruns every suite that it builds.
+        for pattern in (
+            ci.CI_TEST_INPUT_PATHS,
+            ci.OPENVMM_UNIT_TEST_INPUT_PATHS,
+            ci.OPENVMM_VMM_TEST_INPUT_PATHS,
+        ):
+            self.assertIsNotNone(pattern.match("rust-toolchain.toml"))
 
     def test_release_actions_use_deterministic_immutable_tooling(self):
         package_action = (
