@@ -2478,9 +2478,12 @@ class DoctorTests(unittest.TestCase):
 
         with patch.object(
             doctor, "require_tool", side_effect=doctor.ScriptError("rustc is required")
-        ):
+        ) as require_tool:
             with self.assertRaisesRegex(doctor.ScriptError, "rustc is required"):
                 doctor.build_probe(self.root)
+        require_tool.assert_called_once_with(
+            "rustc", "rustc is required to build the host time probe"
+        )
         with (
             patch.object(doctor, "require_tool", return_value="rustc"),
             patch.object(doctor.subprocess, "run", side_effect=rustc) as run,
