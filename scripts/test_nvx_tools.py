@@ -2659,7 +2659,7 @@ class CiConfigurationTests(unittest.TestCase):
     def test_required_ci_result_policy(self):
         always_successful = {"quality", "aci-edge-sandboxes", "openvmm-changes"}
         # Jobs that succeed whenever the repository's jobs run.
-        repository = always_successful
+        repository = always_successful | set(ci.REQUIRED_CI_CLI_JOBS)
         builds = set(ci.REQUIRED_CI_BUILD_JOBS)
         openvmm_tests = set(ci.REQUIRED_CI_OPENVMM_TEST_JOBS)
         openvmm_artifact_tests = set(ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS)
@@ -2886,7 +2886,7 @@ class CiConfigurationTests(unittest.TestCase):
                 (True, True, False, False),
             ),
             ((".github/actions/build-openvmm/action.yml",), (True, True, False, False)),
-            ((".github/actions/validate-nvx/action.yml",), (True, True, True, True)),
+            ((".github/actions/validate-nvx/action.yml",), (False, True, False, False)),
             (
                 (".github/actions/run-benchmark/action.yml",),
                 (False, True, False, False),
@@ -3010,6 +3010,7 @@ class CiConfigurationTests(unittest.TestCase):
                 for name in local_actions(configuration)
             ),
         }
+        self.assertNotIn(".github/actions/validate-nvx/action.yml", test_inputs)
         for pattern, inputs in (
             (ci.OPENVMM_UNIT_TEST_INPUT_PATHS, unit_inputs),
             (ci.OPENVMM_VMM_TEST_INPUT_PATHS, vmm_inputs),
@@ -3480,11 +3481,18 @@ python3() {
                     if job_name.startswith("nvx-microvm-debug-")
                     else ""
                 )
+                cli = (
+                    "nvx-cli-windows"
+                    if producer == "build-openvmm-windows-msvc"
+                    else "nvx-cli-linux"
+                )
                 self.assertIn(
-                    f"needs: [artifacts, {debug_kernel}{producer}, openvmm-changes]",
+                    f"needs: [artifacts, {debug_kernel}{producer}, {cli}, "
+                    "openvmm-changes]",
                     job,
                 )
                 self.assertIn(f"needs.{producer}.result == 'success'", job)
+                self.assertIn(f"needs.{cli}.result == 'success'", job)
                 self.assertIn(f"uses: ./.github/workflows/{reusable_workflow}", job)
                 self.assertIn(f"openvmm-artifact: {artifact}", job)
                 for unrelated_producer in producers.keys() - {producer}:
@@ -3971,26 +3979,91 @@ python3() {
         )
         self.assertNotIn("test-openvmm --backend", unit_tests_job)
 
-    def test_ci_validates_the_cli_after_checking_out_openvmm(self):
+    def test_ci_validates_the_cli_once_per_os_after_checking_out_openvmm(self):
         # The CLI tests read OpenVMM's pinned CPU profiles from the submodule,
-        # which a self-hosted runner's workspace holds at the pinned revision
-        # only after the job checks it out.
+        # which a runner's workspace holds at the pinned revision only after
+        # the job checks it out. The tests do not depend on the backend, so
+        # one GitHub-hosted job per OS runs them instead of every hypervisor
+        # job, and the microVM and platform jobs of each OS wait for it.
         workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
-        for workflow_name, job_name in (
-            ("ci.yml", "openvmm-vmm-tests"),
-            ("ci.yml", "openvmm-unit-tests"),
-            ("run-nvx-microvm-tests.yml", "test"),
-            ("run-platform.yml", "run"),
+        workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(ci.REQUIRED_CI_CLI_JOBS, ("nvx-cli-linux", "nvx-cli-windows"))
+        for job_name, runner in (
+            ("nvx-cli-linux", "ubuntu-latest"),
+            ("nvx-cli-windows", "windows-latest"),
         ):
-            with self.subTest(workflow=workflow_name, job=job_name):
-                job = _workflow_job(
-                    (workflows / workflow_name).read_text(encoding="utf-8"), job_name
+            with self.subTest(job=job_name):
+                job = _workflow_job(workflow, job_name)
+                self.assertIn(f"    runs-on: {runner}\n", job)
+                self.assertNotIn("    needs:", job)
+                self.assertIn(
+                    "github.event.pull_request.head.repo.full_name "
+                    "== github.repository",
+                    job,
                 )
                 self.assertEqual(job.count("uses: ./.github/actions/validate-nvx"), 1)
-                self.assertLess(
-                    job.index("uses: ./.github/actions/checkout-openvmm"),
-                    job.index("uses: ./.github/actions/validate-nvx"),
-                )
+                for prerequisite in (
+                    "uses: ./.github/actions/checkout-openvmm",
+                    "uses: actions/setup-python@v6",
+                ):
+                    self.assertLess(
+                        job.index(prerequisite),
+                        job.index("uses: ./.github/actions/validate-nvx"),
+                    )
+                # The release that the self-hosted runners provide.
+                self.assertIn('python-version: "3.12"', job)
+                self.assertIn(job_name, ci.REQUIRED_CI_RESULT_ENVIRONMENTS)
+        windows = _workflow_job(workflow, "nvx-cli-windows")
+        self.assertIn("rust-toolchain.toml", windows)
+        self.assertIn("--profile minimal --no-self-update", windows)
+        self.assertLess(
+            windows.index("rustup toolchain install"),
+            windows.index("uses: ./.github/actions/validate-nvx"),
+        )
+
+        configurations = {
+            name: (workflows / name).read_text(encoding="utf-8")
+            for name in (
+                "ci.yml",
+                "build-openvmm-binary.yml",
+                "run-nvx-microvm-tests.yml",
+                "run-platform.yml",
+            )
+        }
+        self.assertEqual(
+            sum(
+                configuration.count("uses: ./.github/actions/validate-nvx")
+                for configuration in configurations.values()
+            ),
+            len(ci.REQUIRED_CI_CLI_JOBS),
+        )
+        for job_name in (
+            *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
+            *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
+            *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,
+            *ci.REQUIRED_CI_PLATFORM_JOBS,
+        ):
+            cli = "nvx-cli-windows" if job_name.endswith("-whp") else "nvx-cli-linux"
+            with self.subTest(consumer=job_name):
+                job = _workflow_job(workflow, job_name)
+                needs = re.search(r"^    needs: \[(.+)\]$", job, re.MULTILINE)
+                assert needs is not None
+                self.assertIn(cli, needs.group(1).split(", "))
+                self.assertIn(f"        needs.{cli}.result == 'success' &&\n", job)
+                for other in set(ci.REQUIRED_CI_CLI_JOBS) - {cli}:
+                    self.assertNotIn(other, job)
+        for job_name in ("openvmm-vmm-tests", "openvmm-unit-tests"):
+            with self.subTest(job=job_name):
+                self.assertNotIn("nvx-cli", _workflow_job(workflow, job_name))
+        for consumer in ("release", "performance-persist", "required-status-check"):
+            job = _workflow_job(workflow, consumer)
+            for cli in ci.REQUIRED_CI_CLI_JOBS:
+                with self.subTest(consumer=consumer, cli=cli):
+                    self.assertIn(f"      - {cli}\n", job)
+                    if consumer != "required-status-check":
+                        self.assertIn(
+                            f"        needs.{cli}.result == 'success' &&\n", job
+                        )
 
     def test_ci_preserves_failed_openvmm_test_diagnostics(self):
         workflow = (

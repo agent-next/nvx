@@ -31,6 +31,8 @@ OPENVMM_TEST_BACKENDS = ("kvm", "mshv", "whp")
 REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "quality": "QUALITY_RESULT",
     "aci-edge-sandboxes": "ACI_EDGE_SANDBOXES_RESULT",
+    "nvx-cli-linux": "NVX_CLI_LINUX_RESULT",
+    "nvx-cli-windows": "NVX_CLI_WINDOWS_RESULT",
     "openvmm-changes": "CHANGES_RESULT",
     "artifacts": "ARTIFACTS_RESULT",
     "debug-kernel": "DEBUG_KERNEL_RESULT",
@@ -55,6 +57,9 @@ REQUIRED_CI_BUILD_JOBS = (
     "build-openvmm-linux-musl",
     "build-openvmm-windows-msvc",
 )
+# GitHub-hosted, once per OS; the microVM and platform jobs of each OS wait for
+# its result.
+REQUIRED_CI_CLI_JOBS = ("nvx-cli-linux", "nvx-cli-windows")
 REQUIRED_CI_OPENVMM_TEST_JOBS = ("openvmm-unit-tests",)
 # OpenVMM VMM tests boot the NVX guest artifacts, which only workload runs build.
 REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS = ("openvmm-vmm-tests",)
@@ -107,7 +112,7 @@ CI_TEST_INPUT_PATHS = re.compile(
     r"\.github/workflows/"
     r"(ci|build-openvmm-binary|run-nvx-microvm-tests|run-platform)\.yml$|"
     r"\.github/actions/(build-guest-artifacts|build-openvmm|checkout-openvmm|"
-    r"sccache|setup-curl|validate-nvx|validate-runner)/|"
+    r"sccache|setup-curl|validate-runner)/|"
     r"scripts/nvx\.py$|scripts/nvx_tools/|scripts/setup/|"
     r"kernel/|alpine/|guest/|ubuntu/|"
     r"docker/Dockerfile$|SOURCE-MANIFEST\.json$|rust-toolchain\.toml$)"
@@ -117,8 +122,7 @@ CI_TEST_INPUT_PATHS = re.compile(
 OPENVMM_UNIT_TEST_INPUT_PATHS = re.compile(
     r"^(openvmm($|/)|rust-toolchain\.toml$|scripts/setup/|"
     r"\.github/workflows/ci\.yml$|"
-    r"\.github/actions/(checkout-openvmm|sccache|setup-curl|validate-nvx|"
-    r"validate-runner)/|"
+    r"\.github/actions/(checkout-openvmm|sccache|setup-curl|validate-runner)/|"
     r"scripts/nvx\.py$|scripts/nvx_tools/(__init__|build_constants|ci|common)\.py$)"
 )
 # The OpenVMM VMM tests also boot the NVX kernel and Alpine initramfs, so they
@@ -127,7 +131,7 @@ OPENVMM_VMM_TEST_INPUT_PATHS = re.compile(
     r"^(openvmm($|/)|rust-toolchain\.toml$|scripts/setup/|"
     r"\.github/workflows/ci\.yml$|"
     r"\.github/actions/(build-guest-artifacts|checkout-openvmm|sccache|"
-    r"setup-curl|validate-nvx|validate-runner)/|"
+    r"setup-curl|validate-runner)/|"
     r"scripts/nvx\.py$|"
     r"scripts/nvx_tools/"
     r"(__init__|build|build_config|build_constants|ci|common|guests)\.py$|"
@@ -273,6 +277,12 @@ def required_ci_expected_results(
             else "skipped"
         ),
     }
+    expected.update(
+        {
+            job: "success" if repository_jobs_enabled else "skipped"
+            for job in REQUIRED_CI_CLI_JOBS
+        }
+    )
     expected.update(
         {
             job: (

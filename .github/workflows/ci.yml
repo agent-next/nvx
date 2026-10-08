@@ -59,6 +59,97 @@ jobs:
       - name: Check aci_edge_sandboxes
         uses: ./.github/actions/check-aci-edge-sandboxes
 
+  # The NVX CLI tests do not depend on the backend, so they run once per OS on
+  # GitHub-hosted runners rather than in every hypervisor job. They read
+  # OpenVMM's pinned CPU profiles from the submodule, so they follow its
+  # checkout, which needs the deploy key that fork pull requests lack. The
+  # microVM and platform jobs of each OS wait for its result.
+  nvx-cli-linux:
+    name: NVX CLI / Linux
+    if: >-
+      ${{
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.draft == false
+        ) &&
+        (
+          github.event_name == 'push' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Checkout OpenVMM
+        uses: ./.github/actions/checkout-openvmm
+        with:
+          ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
+
+      # The release that the self-hosted runners provide.
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate NVX CLI
+        uses: ./.github/actions/validate-nvx
+
+  nvx-cli-windows:
+    name: NVX CLI / Windows
+    if: >-
+      ${{
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.draft == false
+        ) &&
+        (
+          github.event_name == 'push' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Checkout OpenVMM
+        uses: ./.github/actions/checkout-openvmm
+        with:
+          ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
+
+      # The release that the self-hosted runners provide.
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # The curl shim test compiles the shim with the release that
+      # rust-toolchain.toml pins, which rustup would otherwise install with
+      # its default profile.
+      - name: Install the pinned Rust release
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $channel = Select-String -LiteralPath "rust-toolchain.toml" `
+            -Pattern '^channel = "([^"]+)"' | Select-Object -First 1
+          if ($null -eq $channel) {
+            throw "rust-toolchain.toml does not pin a Rust release"
+          }
+          rustup toolchain install $channel.Matches[0].Groups[1].Value `
+            --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Validate NVX CLI
+        uses: ./.github/actions/validate-nvx
+
   openvmm-changes:
     name: Detect CI workload inputs
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
@@ -374,10 +465,6 @@ jobs:
         with:
           ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
 
-      # After the OpenVMM checkout: the CLI tests read the pinned revision.
-      - name: Validate NVX CLI
-        uses: ./.github/actions/validate-nvx
-
       - name: Set up retrying curl
         uses: ./.github/actions/setup-curl
 
@@ -609,10 +696,6 @@ jobs:
         with:
           ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
 
-      # After the OpenVMM checkout: the CLI tests read the pinned revision.
-      - name: Validate NVX CLI
-        uses: ./.github/actions/validate-nvx
-
       - name: Set up retrying curl
         uses: ./.github/actions/setup-curl
 
@@ -768,7 +851,7 @@ jobs:
 
   nvx-microvm-tests-kvm:
     name: NVX microVM tests / Linux / KVM
-    needs: [artifacts, build-openvmm-linux-gnu, openvmm-changes]
+    needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -783,6 +866,7 @@ jobs:
         ) &&
         needs.artifacts.result == 'success' &&
         needs.build-openvmm-linux-gnu.result == 'success' &&
+        needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
           needs.openvmm-changes.outputs.run-tests == 'true'
@@ -799,7 +883,7 @@ jobs:
 
   nvx-microvm-tests-mshv:
     name: NVX microVM tests / Linux / MSHV
-    needs: [artifacts, build-openvmm-linux-gnu, openvmm-changes]
+    needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -814,6 +898,7 @@ jobs:
         ) &&
         needs.artifacts.result == 'success' &&
         needs.build-openvmm-linux-gnu.result == 'success' &&
+        needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
           needs.openvmm-changes.outputs.run-tests == 'true'
@@ -830,7 +915,7 @@ jobs:
 
   nvx-microvm-tests-whp:
     name: NVX microVM tests / Windows / WHP
-    needs: [artifacts, build-openvmm-windows-msvc, openvmm-changes]
+    needs: [artifacts, build-openvmm-windows-msvc, nvx-cli-windows, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -845,6 +930,7 @@ jobs:
         ) &&
         needs.artifacts.result == 'success' &&
         needs.build-openvmm-windows-msvc.result == 'success' &&
+        needs.nvx-cli-windows.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
           needs.openvmm-changes.outputs.run-tests == 'true'
@@ -863,7 +949,7 @@ jobs:
   # backend.
   nvx-microvm-debug-kvm:
     name: NVX microVM tests / Linux / KVM / Debug kernel
-    needs: [artifacts, debug-kernel, build-openvmm-linux-gnu, openvmm-changes]
+    needs: [artifacts, debug-kernel, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -879,6 +965,7 @@ jobs:
         needs.artifacts.result == 'success' &&
         needs.debug-kernel.result == 'success' &&
         needs.build-openvmm-linux-gnu.result == 'success' &&
+        needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
           needs.openvmm-changes.outputs.run-tests == 'true'
@@ -896,7 +983,7 @@ jobs:
 
   nvx-microvm-debug-mshv:
     name: NVX microVM tests / Linux / MSHV / Debug kernel
-    needs: [artifacts, debug-kernel, build-openvmm-linux-gnu, openvmm-changes]
+    needs: [artifacts, debug-kernel, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -905,6 +992,7 @@ jobs:
         needs.artifacts.result == 'success' &&
         needs.debug-kernel.result == 'success' &&
         needs.build-openvmm-linux-gnu.result == 'success' &&
+        needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
           needs.openvmm-changes.outputs.run-tests == 'true'
@@ -922,7 +1010,7 @@ jobs:
 
   nvx-microvm-debug-whp:
     name: NVX microVM tests / Windows / WHP / Debug kernel
-    needs: [artifacts, debug-kernel, build-openvmm-windows-msvc, openvmm-changes]
+    needs: [artifacts, debug-kernel, build-openvmm-windows-msvc, nvx-cli-windows, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -931,6 +1019,7 @@ jobs:
         needs.artifacts.result == 'success' &&
         needs.debug-kernel.result == 'success' &&
         needs.build-openvmm-windows-msvc.result == 'success' &&
+        needs.nvx-cli-windows.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
           needs.openvmm-changes.outputs.run-tests == 'true'
@@ -948,7 +1037,7 @@ jobs:
 
   platform-kvm:
     name: Platform / Linux / KVM / Virtual machine
-    needs: [artifacts, build-openvmm-linux-gnu, openvmm-changes]
+    needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -963,6 +1052,7 @@ jobs:
         ) &&
         needs.artifacts.result == 'success' &&
         needs.build-openvmm-linux-gnu.result == 'success' &&
+        needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
           needs.openvmm-changes.outputs.run-workloads == 'true'
@@ -986,7 +1076,7 @@ jobs:
 
   platform-mshv:
     name: Platform / Linux / MSHV / Virtual machine
-    needs: [artifacts, build-openvmm-linux-musl, openvmm-changes]
+    needs: [artifacts, build-openvmm-linux-musl, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -1001,6 +1091,7 @@ jobs:
         ) &&
         needs.artifacts.result == 'success' &&
         needs.build-openvmm-linux-musl.result == 'success' &&
+        needs.nvx-cli-linux.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
           needs.openvmm-changes.outputs.run-workloads == 'true'
@@ -1024,7 +1115,7 @@ jobs:
 
   platform-whp:
     name: Platform / Windows / WHP / Virtual machine
-    needs: [artifacts, build-openvmm-windows-msvc, openvmm-changes]
+    needs: [artifacts, build-openvmm-windows-msvc, nvx-cli-windows, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -1039,6 +1130,7 @@ jobs:
         ) &&
         needs.artifacts.result == 'success' &&
         needs.build-openvmm-windows-msvc.result == 'success' &&
+        needs.nvx-cli-windows.result == 'success' &&
         (
           needs.openvmm-changes.result != 'success' ||
           needs.openvmm-changes.outputs.run-workloads == 'true'
@@ -1066,6 +1158,8 @@ jobs:
       - debug-kernel
       - quality
       - aci-edge-sandboxes
+      - nvx-cli-linux
+      - nvx-cli-windows
       - openvmm-vmm-tests
       - openvmm-unit-tests
       - nvx-microvm-tests-kvm
@@ -1086,6 +1180,8 @@ jobs:
         needs.debug-kernel.result == 'success' &&
         needs.quality.result == 'success' &&
         needs.aci-edge-sandboxes.result == 'success' &&
+        needs.nvx-cli-linux.result == 'success' &&
+        needs.nvx-cli-windows.result == 'success' &&
         (
           needs.openvmm-vmm-tests.result == 'success' ||
           needs.openvmm-vmm-tests.result == 'skipped'
@@ -1170,6 +1266,8 @@ jobs:
     needs:
       - quality
       - aci-edge-sandboxes
+      - nvx-cli-linux
+      - nvx-cli-windows
       - openvmm-changes
       - artifacts
       - debug-kernel
@@ -1212,6 +1310,8 @@ jobs:
           RUN_OPENVMM_VMM_TESTS: ${{ needs.openvmm-changes.outputs.run-openvmm-vmm-tests }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           ACI_EDGE_SANDBOXES_RESULT: ${{ needs.aci-edge-sandboxes.result }}
+          NVX_CLI_LINUX_RESULT: ${{ needs.nvx-cli-linux.result }}
+          NVX_CLI_WINDOWS_RESULT: ${{ needs.nvx-cli-windows.result }}
           CHANGES_RESULT: ${{ needs.openvmm-changes.result }}
           ARTIFACTS_RESULT: ${{ needs.artifacts.result }}
           DEBUG_KERNEL_RESULT: ${{ needs.debug-kernel.result }}
@@ -1243,6 +1343,8 @@ jobs:
     name: Persist performance baseline
     needs:
       - debug-kernel
+      - nvx-cli-linux
+      - nvx-cli-windows
       - openvmm-vmm-tests
       - openvmm-unit-tests
       - nvx-microvm-tests-kvm
@@ -1261,6 +1363,8 @@ jobs:
         github.ref == 'refs/heads/dev' &&
         !cancelled() &&
         needs.debug-kernel.result == 'success' &&
+        needs.nvx-cli-linux.result == 'success' &&
+        needs.nvx-cli-windows.result == 'success' &&
         (
           needs.openvmm-vmm-tests.result == 'success' ||
           needs.openvmm-vmm-tests.result == 'skipped'
