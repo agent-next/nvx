@@ -77,13 +77,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install gh-aw extension
-        id: gh-aw
-        continue-on-error: true
-        uses: github/gh-aw-actions/setup-cli@5e508589e03a7757a7e05b26e834292f5445bfb6 # v0.88.7
-        with:
-          version: v0.88.7
-
       # The OpenVMM submodule is public, so it needs no deploy key here.
       - name: Initialize the OpenVMM submodule
         id: openvmm
