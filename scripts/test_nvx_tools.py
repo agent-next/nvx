@@ -5197,6 +5197,74 @@ Write-Output (Get-BenchmarkScratchDirectory)
             ],
         )
 
+    def test_cli_validation_runs_every_script_test_module(self):
+        # Each scripts/test_*.py module must run in both CLI validation jobs;
+        # test_control_session.py once ran in neither (#229).
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "validate-nvx"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        modules = {
+            path.name
+            for path in (BuildConstants.REPO_ROOT / "scripts").glob("test_*.py")
+        }
+        self.assertIn("test_control_session.py", modules)
+        for step in ("Validate NVX CLI on Linux", "Validate NVX CLI on Windows"):
+            with self.subTest(step=step):
+                script = _composite_action_script(action, step)
+                invoked = re.findall(r"(?:^|\s)scripts[/\\](test_\w+\.py)", script)
+                self.assertEqual(sorted(invoked), sorted(modules))
+
+    def test_ci_runs_the_public_sandbox_acceptance_on_every_backend(self):
+        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
+        workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
+        microvm_workflow = (workflows / "run-nvx-microvm-tests.yml").read_text(
+            encoding="utf-8"
+        )
+        for backend in ("kvm", "mshv", "whp"):
+            with self.subTest(backend=backend):
+                job = _workflow_job(workflow, f"nvx-microvm-tests-{backend}")
+                self.assertIn(
+                    "uses: ./.github/workflows/run-nvx-microvm-tests.yml", job
+                )
+                self.assertIn(f"backend: {backend}", job)
+                self.assertNotIn("debug-kernel: true", job)
+        for system in ("Linux", "Windows"):
+            with self.subTest(system=system):
+                acceptance = _workflow_step(
+                    microvm_workflow,
+                    "test",
+                    f"Run public managed sandbox acceptance on {system}",
+                )
+                self.assertIn("!inputs.debug-kernel", acceptance)
+                self.assertIn("--scenario managed-exec-config", acceptance)
+                self.assertIn("--scenario sandbox-lifecycle", acceptance)
+                self.assertIn(
+                    '--output-dir "build/test-results/public-exec-${{ inputs.backend }}"',
+                    acceptance,
+                )
+                smoke = _workflow_step(
+                    microvm_workflow,
+                    "test",
+                    f"Run Ubuntu sandbox layer smoke test on {system}",
+                )
+                for option in (
+                    "--entrypoint /sbin/nvx-sandbox-smoke",
+                    "--arg limits",
+                    "--arg 33554432",
+                    "--arg 8",
+                    "--memory-max 33554432",
+                    "--pids-max 8",
+                ):
+                    self.assertIn(option, smoke)
+        upload = _workflow_step(
+            microvm_workflow, "test", "Upload NVX microVM failure logs"
+        )
+        self.assertIn("build/test-results/public-exec-${{ inputs.backend }}", upload)
+
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell")
     def test_windows_cli_validation_stops_at_each_failed_command(self):
         action = (
@@ -9320,6 +9388,340 @@ class SandboxSmokeShareTests(unittest.TestCase):
         self.assertNotIn("NVX-UBUNTU-SANDBOX-SHARE-OK", result.stdout)
 
 
+_SANDBOX_MOUNTINFO = (
+    "20 1 0:20 / / rw,relatime - overlay overlay rw,"
+    "lowerdir=/run/nvx/layers/distro,upperdir=/run/nvx/scratch/upper,"
+    "workdir=/run/nvx/scratch/work,metacopy=on,xino=on\n"
+    "21 20 0:21 / /.nvx-agent ro,nosuid,nodev,relatime - tmpfs tmpfs ro,mode=755\n"
+    "22 20 0:22 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+    "23 20 0:23 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro\n"
+    "24 20 0:24 / /dev rw,nosuid,relatime - tmpfs tmpfs rw,mode=755\n"
+    "25 24 0:25 / /dev/pts rw,relatime - devpts devpts rw,mode=620,ptmxmode=666\n"
+    "26 24 0:26 / /dev/shm rw,nosuid,nodev,relatime - tmpfs tmpfs rw\n"
+)
+_SANDBOX_STATUS = (
+    "Name:\tsh\nUid:\t65534\t65534\t65534\t65534\n"
+    "Gid:\t65534\t65534\t65534\t65534\nGroups:\t\nNoNewPrivs:\t1\n"
+    + "".join(
+        f"{name}:\t0000000000000000\n"
+        for name in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+    )
+)
+
+
+@unittest.skipIf(os.name == "nt", "requires a POSIX shell and process tools")
+class SandboxSmokeProfileTests(unittest.TestCase):
+    SMOKE = Path(__file__).parents[1] / "guest" / "common" / "nvx-sandbox-smoke"
+
+    def setUp(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        self.shell = shell
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source = self.SMOKE.read_text(encoding="utf-8")
+
+    def _fixture(self, name: str, content: str) -> str:
+        path = self.root / name
+        path.write_text(content, encoding="utf-8")
+        return path.as_posix()
+
+    def _run(
+        self,
+        names: tuple[str, ...],
+        call: str,
+        replacements: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        # The globals before fail() configure the checks.
+        script = self.source[: self.source.index("\nfail() {\n") + 1] + "".join(
+            _shell_function(self.source, name) for name in ("fail", *names)
+        )
+        for old, new in (replacements or {}).items():
+            script = script.replace(old, new)
+        return subprocess.run(
+            [self.shell, "-s"],
+            input=f"{script}{call}\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_status_fields_join_their_values(self):
+        status = self._fixture("status", _SANDBOX_STATUS)
+        result = self._run(
+            ("status_field",),
+            f"status_field {status} Uid\nstatus_field {status} Groups\n"
+            f"status_field {status} Missing",
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "65534 65534 65534 65534\n\n")
+        self.assertIn(f"{status} has no Missing field", result.stderr)
+
+    def test_identity_and_capability_checks_read_the_process_status(self):
+        identity = (
+            'id() { case "$1" in -u | -g) echo 65534 ;; esac; }\nHOME=/nonexistent\n'
+        )
+        mutations = {
+            "valid": ("", ""),
+            "saved-uid": (
+                "Uid:\t65534\t65534\t65534\t65534",
+                "Uid:\t65534\t65534\t0\t65534",
+            ),
+            "groups": ("Groups:\t", "Groups:\t27 "),
+            "bounding": (
+                "CapBnd:\t0000000000000000",
+                "CapBnd:\t000001ffffffffff",
+            ),
+            "no-new-privs": ("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
+        }
+        for mutation, (old, new) in mutations.items():
+            with self.subTest(mutation=mutation):
+                status = self._fixture("status", _SANDBOX_STATUS.replace(old, new))
+                result = self._run(
+                    ("status_field", "check_identity", "check_capabilities"),
+                    f"{identity}check_identity\ncheck_capabilities\necho checked",
+                    {"/proc/self/status": status},
+                )
+                if mutation == "valid":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "checked\n")
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn("NVX-UBUNTU-SANDBOX-FAIL", result.stderr)
+
+    def test_namespace_check_rejects_the_initial_namespaces(self):
+        def run(
+            links: dict[str, str],
+            *,
+            init_status: str = _SANDBOX_STATUS,
+            command_line: str = "console=hvc0 nvx_hostname=nvx-lifecycle",
+            hostname: str = "nvx-lifecycle",
+        ) -> subprocess.CompletedProcess[str]:
+            readlink = (
+                'readlink() { case "$1" in '
+                + " ".join(
+                    f"*/{name}) echo '{link}' ;;" for name, link in links.items()
+                )
+                + " esac; }\n"
+            )
+            return self._run(
+                ("status_field", "check_namespaces"),
+                f"{readlink}check_namespaces\necho checked",
+                {
+                    "/proc/1/status": self._fixture("init-status", init_status),
+                    "/proc/cmdline": self._fixture("cmdline", command_line + "\n"),
+                    "/proc/sys/kernel/hostname": self._fixture(
+                        "hostname", hostname + "\n"
+                    ),
+                },
+            )
+
+        private = {
+            "mnt": "mnt:[4026532200]",
+            "pid": "pid:[4026532201]",
+            "uts": "uts:[4026532202]",
+        }
+        result = run(private)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "checked\n")
+        result = run(private, command_line="console=hvc0", hostname="nvx-sandbox")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        for name, initial in (
+            ("mnt", "mnt:[4026531832]"),
+            ("pid", "pid:[4026531836]"),
+            ("uts", "uts:[4026531838]"),
+        ):
+            with self.subTest(namespace=name):
+                result = run({**private, name: initial})
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"shares the initial {name} namespace", result.stderr)
+        for link in ("pid:[]", "pid:[42a]", "mnt:[42]", "pid:42"):
+            with self.subTest(link=link):
+                result = run({**private, "pid": link})
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("unexpected pid namespace link", result.stderr)
+        result = run(
+            private,
+            init_status=_SANDBOX_STATUS.replace(
+                "Uid:\t65534\t65534\t65534\t65534", "Uid:\t0\t0\t0\t0"
+            ),
+        )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("PID 1 of the workload PID namespace runs as 0", result.stderr)
+        result = run(private, hostname="nvx-sandbox")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("expected nvx-lifecycle", result.stderr)
+
+    def test_mount_check_requires_private_runtime_mounts_once(self):
+        functions = ("mount_records", "require_mount", "check_mounts")
+        mountinfo = self._fixture("mountinfo", _SANDBOX_MOUNTINFO)
+        result = self._run(
+            functions,
+            "check_mounts\necho checked",
+            {"/proc/self/mountinfo": mountinfo},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "checked\n")
+
+        proc = "22 20 0:22 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+        mutations = {
+            "stacked": (
+                proc,
+                proc + proc.replace("22 20 0:22", "27 22 0:27"),
+                "several mounts are stacked at /proc",
+            ),
+            "propagation": (
+                proc,
+                proc.replace("relatime - proc", "relatime shared:5 - proc"),
+                "the mount at /proc propagates: shared:5",
+            ),
+            "writable-sysfs": (
+                "/sys ro,nosuid",
+                "/sys rw,nosuid",
+                "/sys is mounted rw,nosuid,nodev,noexec,relatime, without ro",
+            ),
+            "upper": (
+                "upperdir=/run/nvx/scratch/upper",
+                "upperdir=/run/nvx/upper",
+                "upper layer is not on scratch",
+            ),
+            "lower": (
+                "lowerdir=/run/nvx/layers/distro",
+                "lowerdir=/srv/distro",
+                "does not use the image layers",
+            ),
+            "missing-shm": (
+                "26 24 0:26 / /dev/shm rw,nosuid,nodev,relatime - tmpfs tmpfs rw\n",
+                "",
+                "nothing is mounted at /dev/shm",
+            ),
+            "host-devices": (
+                "- tmpfs tmpfs rw,mode=755\n",
+                "- devtmpfs devtmpfs rw,mode=755\n",
+                "/dev is devtmpfs, expected tmpfs",
+            ),
+        }
+        for mutation, (old, new, message) in mutations.items():
+            with self.subTest(mutation=mutation):
+                self.assertIn(old, _SANDBOX_MOUNTINFO)
+                mountinfo = self._fixture(
+                    "mountinfo", _SANDBOX_MOUNTINFO.replace(old, new, 1)
+                )
+                result = self._run(
+                    functions, "check_mounts", {"/proc/self/mountinfo": mountinfo}
+                )
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(message, result.stderr)
+
+    def test_cgroup_check_requires_the_container_cgroup(self):
+        for content, returncode in (
+            ("0::/container\n", 0),
+            ("0::/agent\n", 1),
+            ("12:pids:/container\n", 1),
+        ):
+            with self.subTest(content=content):
+                cgroup = self._fixture("cgroup", content)
+                result = self._run(
+                    ("check_cgroup",), "check_cgroup", {"/proc/self/cgroup": cgroup}
+                )
+                self.assertEqual(result.returncode, returncode, result.stderr)
+
+    def test_limits_check_validates_its_arguments(self):
+        for arguments, message in (
+            ("abc 8", "limits requires numeric MEMORY_MAX and PIDS_MAX"),
+            ("33554432 ''", "limits requires numeric MEMORY_MAX and PIDS_MAX"),
+            ("33554432 2", "requires PIDS_MAX of at least 3"),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self._run(
+                    ("start_sleepers", "check_limits"), f"check_limits {arguments}"
+                )
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(message, result.stderr)
+
+    @unittest.skipUnless(sys.platform == "linux", "inspects the Linux process table")
+    def test_sleeper_subshell_records_and_reaps_its_sleepers(self):
+        record = self.root / "sleepers"
+        result = self._run(
+            ("start_sleepers",),
+            f'(start_sleepers "{record.as_posix()}" 3)\necho done',
+            # A distinct duration identifies this test's sleepers.
+            {"sleep 600": "sleep 611.25"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(record.read_text(encoding="utf-8"), "3\n")
+        for process in Path("/proc").iterdir():
+            if process.name.isdigit():
+                try:
+                    command = (process / "cmdline").read_bytes()
+                except OSError:
+                    continue
+                self.assertNotEqual(command, b"sleep\x00611.25\x00")
+
+    def test_main_body_runs_the_profile_then_limits_and_shares(self):
+        body = self.source[self.source.index("\ncheck_identity\n") + 1 :]
+        stubs = "".join(
+            f'{name}() {{ echo "{name} $*"; }}\n'
+            for name in (
+                "check_identity",
+                "check_capabilities",
+                "check_namespaces",
+                "check_mounts",
+                "check_devices",
+                "check_cgroup",
+                "check_image",
+                "check_limits",
+                "check_share",
+                "check_shares_isolated",
+            )
+        )
+        script = (
+            self.source[: self.source.index("\nfail() {\n") + 1]
+            + _shell_function(self.source, "fail")
+            + stubs
+            + body
+        )
+
+        def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [self.shell, "-s", "--", *arguments],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        result = run("limits", "33554432", "8", "/workspace", "rw", "/tools")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "check_identity ",
+                "check_capabilities ",
+                "check_namespaces ",
+                "check_mounts ",
+                "check_devices ",
+                "check_cgroup ",
+                "check_image ",
+                "NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534",
+                "check_limits 33554432 8",
+                "check_share /workspace rw",
+                "check_share /tools ro",
+                "check_shares_isolated /workspace /tools",
+                "NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534",
+            ],
+        )
+        result = run("limits", "33554432")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("limits requires MEMORY_MAX and PIDS_MAX", result.stderr)
+        self.assertNotIn("NVX-UBUNTU-SANDBOX-OK", result.stdout)
+
+
 class ManagedAgentCgroupTests(unittest.TestCase):
     SOURCE = Path(__file__).parents[1] / "guest" / "common" / "nvx-managed-agent.c"
 
@@ -12344,6 +12746,28 @@ class SandboxTests(unittest.TestCase):
         self.assertFalse(sandbox_lifecycle._process_running(pid, start_time + 1))
         # Records from earlier NVX versions identify OpenVMM by process ID alone.
         self.assertTrue(sandbox_lifecycle._process_running(pid, None))
+
+    def test_runtime_records_report_whether_their_process_runs(self):
+        if os.name != "nt" and sys.platform != "linux":
+            self.skipTest("process identity requires a Linux or Windows host")
+        pid = os.getpid()
+        start_time = sandbox_lifecycle._process_start_time(pid)
+        assert isinstance(start_time, int)
+
+        self.assertTrue(
+            sandbox_lifecycle.runtime_process_running(
+                {"pid": pid, "start_time": start_time}
+            )
+        )
+        self.assertFalse(
+            sandbox_lifecycle.runtime_process_running(
+                {"pid": pid, "start_time": start_time + 1}
+            )
+        )
+        with self.assertRaisesRegex(common.ScriptError, "invalid process ID"):
+            sandbox_lifecycle.runtime_process_running({"pid": "openvmm"})
+        with self.assertRaisesRegex(common.ScriptError, "invalid process start"):
+            sandbox_lifecycle.runtime_process_running({"pid": pid, "start_time": -1})
 
     def test_process_identity_counts_an_exited_process_as_stopped(self):
         if os.name != "nt" and sys.platform != "linux":

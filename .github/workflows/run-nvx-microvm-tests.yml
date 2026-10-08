@@ -109,22 +109,24 @@ jobs:
           ${{ inputs.debug-kernel && '--debug-kernel' || '' }}
           --output-dir "build/test-results/microvm-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}"
 
-      - name: Run public managed execution configuration on Linux
+      - name: Run public managed sandbox acceptance on Linux
         if: runner.os != 'Windows' && !inputs.debug-kernel
         shell: bash
         run: >-
           python3 scripts/nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           --scenario managed-exec-config
+          --scenario sandbox-lifecycle
           --output-dir "build/test-results/public-exec-${{ inputs.backend }}"
 
-      - name: Run public managed execution configuration on Windows
+      - name: Run public managed sandbox acceptance on Windows
         if: runner.os == 'Windows' && !inputs.debug-kernel
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           --scenario managed-exec-config
+          --scenario sandbox-lifecycle
           --output-dir "build/test-results/public-exec-${{ inputs.backend }}"
 
       - name: Run Ubuntu guest smoke tests on Linux
@@ -217,12 +219,19 @@ jobs:
           )
           scratch="build/ubuntu-smoke-${{ inputs.backend }}.ext4"
           cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
+          # The probe checks the security profile and that the 32 MiB memory
+          # and 8-process limits hold.
           python3 scripts/nvx.py sandbox \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
             --scratch "${scratch}" \
             --entrypoint /sbin/nvx-sandbox-smoke \
+            --arg limits \
+            --arg 33554432 \
+            --arg 8 \
             --workload-user 65534:65534 \
+            --memory-max 33554432 \
+            --pids-max 8 \
             --memory-mib 256
 
       - name: Run Ubuntu sandbox live-share smoke test on Linux
@@ -687,12 +696,19 @@ jobs:
               ConvertFrom-Json
           $scratch = "build\ubuntu-smoke-${{ inputs.backend }}.ext4"
           Copy-Item build\ubuntu-smoke-scratch.ext4 $scratch
+          # The probe checks the security profile and that the 32 MiB memory
+          # and 8-process limits hold.
           python scripts\nvx.py sandbox `
             --hypervisor "${{ inputs.backend }}" `
             --layer "distro,build\ubuntu-distro.erofs,$($manifest.uuid)" `
             --scratch $scratch `
             --entrypoint /sbin/nvx-sandbox-smoke `
+            --arg limits `
+            --arg 33554432 `
+            --arg 8 `
             --workload-user 65534:65534 `
+            --memory-max 33554432 `
+            --pids-max 8 `
             --memory-mib 256
 
       - name: Run Ubuntu sandbox live-share smoke test on Windows

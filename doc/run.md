@@ -411,9 +411,36 @@ python3 scripts/nvx.py sandbox \
   --memory-mib 256
 ```
 
-CI uses `/sbin/nvx-sandbox-smoke` as the entrypoint to verify Ubuntu identity,
-the fixed non-root account, and a scratch-backed `/tmp` write before clean
-guest exit. With `--arg TARGET --arg ro|rw`, it also checks a live share at
+CI uses `/sbin/nvx-sandbox-smoke` as the entrypoint to verify the security
+profile that this section describes before clean guest exit. Before any other
+check, it requires:
+
+- the fixed `65534:65534` identity as the real, effective, saved, and
+  file-system IDs, no supplementary groups, and `HOME=/nonexistent`;
+- empty inheritable, permitted, effective, bounding, and ambient capability
+  sets and `NoNewPrivs: 1`;
+- mount, PID, and UTS namespaces other than the guest's initial ones, whose
+  inode numbers Linux 6.18 fixes in its UAPI, with the workload as PID 1 of its
+  PID namespace and the `--hostname` value as its host name;
+- exactly one mount at each of `/`, `/proc`, `/sys`, `/dev`, `/dev/pts`, and
+  `/dev/shm`, none of which propagates to another namespace: an overlay root
+  over the EROFS layers whose upper directory is on scratch, `nosuid,nodev,noexec`
+  procfs, read-only sysfs, and a private `/dev` tmpfs that holds only `fd`,
+  `full`, `null`, `ptmx`, `pts`, `random`, `shm`, `stderr`, `stdin`, `stdout`,
+  `tty`, `urandom`, and `zero`, with its own devpts instance;
+- the agent-owned `/container` cgroup; and
+- Ubuntu image files that the workload cannot modify, and a scratch-backed
+  `/tmp` write that lands in the overlay.
+
+A managed workload that mounted into the agent's namespace would stack its
+runtime mounts on those of earlier requests, so the single-mount check also
+covers repeated managed execs. With `--arg limits --arg MEMORY_MAX --arg
+PIDS_MAX`, for a sandbox started with the same `--memory-max` and
+`--pids-max`, it also requires the memory controller to kill an allocation of
+twice `MEMORY_MAX` with `SIGKILL` while a 1 MiB allocation succeeds, and the
+pids controller to stop the workload at `PIDS_MAX` processes, itself included;
+keep twice `MEMORY_MAX` within the guest's free memory. With
+`--arg TARGET --arg ro|rw`, it also checks a live share at
 `TARGET` as described below, including symbolic links in an `rw` share; the
 share needs a host-created, world-writable `nvx-links` directory for them.
 Repeat the pair to check several shares; with an `rw` and an `ro` share, it
@@ -692,7 +719,10 @@ request to retain VM state.
 Environment files are limited to 1 MiB of UTF-8 JSON. Environments contain at
 most 256 unique, nonempty names. Each `KEY=VALUE` entry and working-directory
 path is limited to 4096 UTF-8 bytes; the combined execution request must also
-fit the existing 64 KiB control-payload bound.
+fit the existing 64 KiB control-payload bound. A managed `exec` forwards at
+most 1 MiB of combined standard output and standard error; the guest agent
+kills a workload that writes more, and `exec` exits with status 125 and reports
+the `output-limit` category.
 
 The explicit `test-microvm --scenario managed-exec-config --backend BACKEND`
 scenario is the authoritative acceptance for these public options. It invokes
@@ -717,6 +747,56 @@ Empty environments are measured with `/usr/bin/env`, not a shell that can
 synthesize its own variables. The scenario retains bounded subprocess argument
 and status observations, typed exec outcomes, and OpenVMM logs. Inline
 environment values are redacted from the retained command observations.
+
+The explicit `test-microvm --scenario sandbox-lifecycle --backend BACKEND`
+scenario is the authoritative acceptance for the managed lifecycle itself. It
+also runs the public commands as subprocesses against the real kernel, Alpine
+control initramfs, Ubuntu EROFS layer, and fresh copies of the same scratch
+template, so it has the same artifact requirements and also runs only when
+named. It checks that:
+
+- `provision` rejects a root `--workload-user` before it creates any state, and
+  the guest refuses an identity that the Ubuntu image lacks before a one-shot
+  workload starts, and in a managed `start`, which then fails without leaving
+  a runtime record, capability, control socket, or OpenVMM process;
+- every operation fails on a state directory that was never provisioned, a
+  repeated `provision` leaves the configuration unchanged, and `exec` and
+  `stop` fail before `start`;
+- a repeated `start` and a `deprovision` of a running sandbox fail without
+  changing its runtime record, capability, or OpenVMM process, and the
+  sandbox keeps serving requests;
+- managed arguments keep leading, trailing, and embedded spaces, tabs, and
+  newlines, a later request reads the file that an earlier one wrote, and the
+  file survives `stop` and a new `start`, because the overlay's upper directory
+  is on scratch;
+- `/sbin/nvx-sandbox-smoke` passes its security profile and resource-limit
+  checks in a sandbox provisioned with `--hostname`, `--memory-max`, and
+  `--pids-max`, after earlier requests;
+- a request that writes more than the 1 MiB output bound exits with status
+  125 and an `output-limit` outcome report after the host has received more
+  than 1 MiB less one 32 KiB read chunk and at most 1 MiB, and a request whose
+  `--outcome-report` path exists fails before its workload runs and leaves the
+  file intact;
+- `stop` ends OpenVMM and its control socket or pipe, leaves only
+  `config.json`, `openvmm.log`, and a successful `outcome.json`, and leaves a
+  cleanly unmounted scratch file system, after which `exec` and `stop` fail;
+- after OpenVMM exits without a `stop`, `exec` and `stop` report the stale
+  runtime state and `start` refuses it; and
+- `deprovision` removes only NVX's files: it fails and keeps a foreign file in
+  the state directory, and once that file is gone, it removes the directory,
+  which a later `exec` does not recreate.
+
+Throughout, no OpenVMM process whose arguments name the scenario's fixture
+outlives its sandbox, and the EROFS layer keeps its digest and the scratch
+image its file. On failure, the scenario stops and deprovisions what it
+started, ends every OpenVMM process that names its fixture, and preserves the
+fixture for recovery only if that cleanup fails. Its evidence, written to the
+output directory with a `sandbox-lifecycle-` prefix, holds bounded command
+observations (arguments, statuses, output sizes, and state-directory entries),
+the runtime record, the OpenVMM logs, the VM-level and exec outcome reports, the
+guest probe's transcript, and the console of the refused one-shot run, each
+limited to its last 64 KiB. The command observations hold no workload output,
+and no evidence holds the control capability.
 
 Decoder, helper, and direct control-session tests remain useful supplemental
 coverage for protocol boundaries and guest implementation details. They do not

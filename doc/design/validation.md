@@ -39,7 +39,15 @@ localhost-to-guest forwarding under allow, and pre-boot rejection when both
 directions cannot be enforced. Managed lifecycle coverage authenticates the
 dedicated control channel, runs multiple workloads in one warm VM across
 reconnects, preserves guest state, reports execution timeout, and stops the VM
-cleanly. Sandbox coverage adds deterministic active block-I/O drain, paired
+cleanly. Public sandbox coverage drives `nvx.py sandbox` itself: request-scoped
+execution options, identity refusal, fail-closed lifecycle transitions,
+scratch-backed state across requests and restarts, bounded output and outcome
+reports, a crashed OpenVMM's stale runtime state, and teardown that leaves no
+OpenVMM process, control endpoint, capability, or runtime record while the
+supplied layer and scratch survive. Its guest probe verifies the sandbox's
+identity, capability, `no_new_privs`, namespace, device, sysfs, cgroup,
+resource-limit, image-layer, and scratch invariants. Sandbox coverage adds
+deterministic active block-I/O drain, paired
 scratch publication, two private restores, fresh scratch replacement, and
 pre-entry rejection of missing, corrupt, mismatched, or wrong-geometry media.
 Denied-filesystem coverage verifies listing suppression, allowed writes,

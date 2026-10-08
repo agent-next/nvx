@@ -443,6 +443,11 @@ def _runtime_process(runtime: dict[str, Any]) -> tuple[int, int | None]:
     return pid, start_time
 
 
+def runtime_process_running(runtime: dict[str, Any]) -> bool:
+    """Returns whether the OpenVMM process of a runtime record still runs."""
+    return _process_running(*_runtime_process(runtime))
+
+
 def _load_running(state_dir: Path) -> tuple[dict[str, Any], bytes]:
     runtime_path = state_dir / RUNTIME_NAME
     if not runtime_path.is_file():

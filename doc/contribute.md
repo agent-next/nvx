@@ -22,3 +22,7 @@ guest helpers, SMP behavior, or virtio devices. Add those scenarios to
 `scripts/nvx_tools/microvm_tests.py` and run them with
 `scripts/nvx.py test-microvm --backend BACKEND`. Keep guest workloads in
 `scripts/nvx_tools/microvm_test_scripts` and retain complete failure logs.
+The scenarios that drive the public `nvx.py sandbox` commands live in
+`scripts/nvx_tools/managed_exec_tests.py` and
+`scripts/nvx_tools/sandbox_lifecycle_tests.py`, and `microvm_tests.py`
+registers them.

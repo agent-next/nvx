@@ -85,6 +85,8 @@ The initial workload catalog exercises the same managed control and isolation
 mechanisms through `test-microvm`; it does not yet drive the public persistent
 `sandbox provision -> start -> exec -> stop` command sequence. That lifecycle
 remains required before the workload-adversary mode is considered complete.
+The deterministic `sandbox-lifecycle` scenario already drives that sequence,
+so it is the regression baseline for such a primitive.
 
 Model-generated scripts are intentionally unsupported. A future generator
 must place its output inside the disposable guest or a separate disposable

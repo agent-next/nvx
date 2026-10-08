@@ -62,6 +62,7 @@ from .egress_policy import CompiledEgressPolicy, compile_policy_file
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .managed_exec_tests import run_managed_exec_configuration
 from .openvmm_process import OpenvmmProcess, TcpConsole
+from .sandbox_lifecycle_tests import run_sandbox_lifecycle
 from .time_abi import (
     ABI_VERSION,
     CHECK_CPU_BUDGET_US,
@@ -107,6 +108,7 @@ MICROVM_TEST_SCENARIOS = (
     "restore-memory",
     "restore-processors",
     "sandbox-blocks",
+    "sandbox-lifecycle",
     "scratch-snapshot",
     "smp",
     "smp-snapshot",
@@ -122,10 +124,15 @@ SANDBOX_CONTROL_SCENARIOS = frozenset(
     (
         "managed-exec-config",
         "sandbox-blocks",
+        "sandbox-lifecycle",
         "scratch-snapshot",
         "snapshot-tiers",
     )
 )
+# The public `nvx.py sandbox` scenarios need the Ubuntu scratch template that
+# the guest-artifact build produces and packages omit, so they run only when
+# named.
+PUBLIC_SANDBOX_SCENARIOS = frozenset(("managed-exec-config", "sandbox-lifecycle"))
 # The spec runs the same-host restore cases on the CI debug kernel, whose
 # soft-lockup and hung-task detectors the guest's time ABI watcher reports.
 DEBUG_KERNEL_SCENARIOS = (
@@ -300,7 +307,8 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         choices=(*MICROVM_TEST_SCENARIOS, *MICROVM_EXPLICIT_SCENARIOS),
         help=(
             "scenario to run; repeat to select multiple (default: all except "
-            "smp-lapic, which runs only when named)"
+            "smp-lapic, managed-exec-config, and sandbox-lifecycle, which run "
+            "only when named)"
         ),
     )
     parser.add_argument(
@@ -5514,7 +5522,7 @@ def run(args: argparse.Namespace) -> int:
             scenario
             for scenario in defaults
             if scenario not in unsupported_scenarios
-            and scenario != "managed-exec-config"
+            and scenario not in PUBLIC_SANDBOX_SCENARIOS
         )
     else:
         scenarios = tuple(dict.fromkeys(args.scenario))
@@ -5685,6 +5693,9 @@ def run(args: argparse.Namespace) -> int:
         run_managed_exec_configuration(
             args.backend, timeout=args.timeout, output_dir=output_dir
         )
+    if "sandbox-lifecycle" in scenarios:
+        print(f"Running public managed sandbox lifecycle on OpenVMM/{args.backend}")
+        run_sandbox_lifecycle(args.backend, timeout=args.timeout, output_dir=output_dir)
     if "managed-lifecycle" in scenarios:
         print(f"Running managed microVM lifecycle on OpenVMM/{args.backend}")
         run_managed_lifecycle(
