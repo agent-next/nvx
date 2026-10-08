@@ -13201,6 +13201,66 @@ class SandboxTests(unittest.TestCase):
                     [sandbox_lifecycle.CONFIG_NAME, sandbox_lifecycle.LOG_NAME],
                 )
 
+    def test_managed_start_spawns_openvmm_with_a_prepared_capability_pipe(self):
+        # OpenVMM reads its capability as soon as it starts, so start hands it a
+        # pipe that already holds the capability and the end of file (#440).
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        capability = bytes(range(1, 33))
+        prepared: list[int] = []
+        spawned: list[object] = []
+
+        def prepare(value: bytes) -> int:
+            self.assertEqual(value, capability)
+            descriptor = control_session.capability_pipe(value)
+            prepared.append(descriptor)
+            return descriptor
+
+        process = MagicMock()
+        process.pid = 123
+        process.stdin = None
+
+        def launch(_command: list[str], *, stdin: object, **_options: object) -> Any:
+            # The pipe stays open until OpenVMM has started with it.
+            self.assertIsInstance(stdin, int)
+            os.fstat(cast(int, stdin))
+            spawned.append(stdin)
+            return process
+
+        session = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = session
+        context.__exit__.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            state = _provision_managed_sandbox(Path(temporary).resolve())
+            with (
+                patch.object(sandbox_lifecycle, "require_file", side_effect=require),
+                patch.object(
+                    sandbox_lifecycle.secrets, "token_bytes", return_value=capability
+                ),
+                patch.object(sandbox_lifecycle, "capability_pipe", side_effect=prepare),
+                patch.object(sandbox_lifecycle.subprocess, "Popen", side_effect=launch),
+                patch.object(
+                    sandbox_lifecycle, "_process_start_time", return_value=456
+                ),
+                patch.object(
+                    sandbox_lifecycle.ControlSession, "connect", return_value=context
+                ) as connect,
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(
+                (state / sandbox_lifecycle.CAPABILITY_NAME).read_bytes(), capability
+            )
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(spawned, prepared)
+        # start closes its copy of the pipe once OpenVMM has it.
+        with self.assertRaises(OSError):
+            os.fstat(prepared[0])
+        self.assertEqual(connect.call_args.args[1], capability)
+        session.ping.assert_called_once_with(10)
+
     def test_launch_contract_rejects_disk_option_delimiters(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
