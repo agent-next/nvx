@@ -32,7 +32,7 @@ import uuid
 import zipfile
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -48,6 +48,7 @@ from nvx_tools import (  # noqa: E402
     collect_alpine_sources,
     collect_ubuntu_sources,
     common,
+    control_session,
     guests,
     release,
     sandbox,
@@ -10875,6 +10876,111 @@ def _exit_unreaped(child: subprocess.Popen[bytes]) -> None:
     os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
 
 
+def _end_child(child: subprocess.Popen[bytes]) -> None:
+    if child.poll() is None:
+        child.kill()
+        child.wait(timeout=30)
+
+
+def _openvmm_mock(status: int | None) -> MagicMock:
+    """Mocks an OpenVMM process that exits on its own with `status`.
+
+    With None, it runs until it is terminated and then exits with status 1.
+    """
+    process = MagicMock()
+    process.pid = 123
+    process.stdin = io.BytesIO()
+    process.poll.return_value = status
+
+    def wait(timeout: float) -> int:
+        if process.terminate.called:
+            return 1
+        if status is None:
+            raise subprocess.TimeoutExpired("openvmm", timeout)
+        return status
+
+    process.wait.side_effect = wait
+    return process
+
+
+# Stands in for OpenVMM when the managed guest exits during startup. Like OpenVMM,
+# it closes the control endpoint before it publishes its outcome report through a
+# staging file, and a slow flush keeps that file in place for a second. It takes
+# the size of the attach request and then OpenVMM's arguments.
+_EXITING_OPENVMM = r"""
+import json
+import os
+import socket
+import sys
+import tempfile
+import time
+
+attach_size = int(sys.argv[1])
+arguments = sys.argv[2:]
+endpoint = arguments[arguments.index("--microvm-control-console") + 1]
+endpoint = endpoint.removeprefix("listen=")
+report = arguments[arguments.index("--microvm-report") + 1]
+sys.stdin.buffer.read()
+received = 0
+if os.name == "nt":
+    import _winapi
+
+    pipe = _winapi.CreateNamedPipe(
+        endpoint.replace("/", "\\"),
+        _winapi.PIPE_ACCESS_DUPLEX,
+        _winapi.PIPE_WAIT,
+        1,
+        65536,
+        65536,
+        0,
+        _winapi.NULL,
+    )
+    try:
+        _winapi.ConnectNamedPipe(pipe, False)
+    except OSError as error:
+        if error.winerror != _winapi.ERROR_PIPE_CONNECTED:
+            raise
+    while received < attach_size:
+        data, _ = _winapi.ReadFile(pipe, attach_size - received)
+        received += len(data)
+    _winapi.CloseHandle(pipe)
+else:
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(endpoint)
+    listener.listen(1)
+    connection, _ = listener.accept()
+    while received < attach_size:
+        chunk = connection.recv(attach_size - received)
+        if not chunk:
+            sys.exit("the control client closed before it attached")
+        received += len(chunk)
+    connection.close()
+    listener.close()
+report_document = json.dumps(
+    {
+        "schema_version": 1,
+        "outcome": {
+            "operation": "managed",
+            "category": "guest-exit",
+            "status_code": 125,
+        },
+        "network_policy": {"status": "not-requested"},
+        "teardown": {"vm_stopped": True},
+    }
+).encode()
+staging = tempfile.NamedTemporaryFile(
+    dir=os.path.dirname(report), prefix=".tmp", delete=False
+)
+staging.write(report_document[: len(report_document) // 2])
+staging.flush()
+time.sleep(1)
+staging.write(report_document[len(report_document) // 2 :])
+staging.close()
+os.rename(staging.name, report)
+sys.exit(125)
+"""
+
+
 class SandboxTests(unittest.TestCase):
     def test_launch_contract_orders_roles_and_builds_agent_command_line(self):
         custom = sandbox.SandboxLayer.parse(
@@ -12949,6 +13055,151 @@ class SandboxTests(unittest.TestCase):
                 self.assertFalse((state / sandbox_lifecycle.RUNTIME_NAME).exists())
                 self.assertFalse((state / sandbox_lifecycle.CAPABILITY_NAME).exists())
                 self.assertTrue((state / sandbox_lifecycle.CONFIG_NAME).exists())
+
+    def test_managed_start_lets_exiting_openvmm_publish_its_outcome(self):
+        # A guest that exits during startup, such as one that refuses the workload
+        # identity, makes OpenVMM close the control endpoint before it publishes
+        # its outcome report. Terminating OpenVMM then left the report's staging
+        # file, which deprovision refuses to remove (issue #438).
+        if os.name != "nt" and sys.platform != "linux":
+            self.skipTest("managed sandboxes require a Linux or Windows host")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        state = _provision_managed_sandbox(Path(temporary.name).resolve())
+        popen = subprocess.Popen
+        launched: list[subprocess.Popen[bytes]] = []
+
+        def launch(command: list[str], **options: Any) -> subprocess.Popen[bytes]:
+            attach_size = control_session.OUTER_HEADER.size + 32
+            # With unknown options, the type checker cannot tell that start
+            # requests binary streams.
+            process = cast(
+                "subprocess.Popen[bytes]",
+                popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        _EXITING_OPENVMM,
+                        str(attach_size),
+                        *command[1:],
+                    ],
+                    **options,
+                ),
+            )
+            self.addCleanup(_end_child, process)
+            launched.append(process)
+            return process
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            patch.object(sandbox_lifecycle, "require_file", side_effect=require),
+            patch.object(sandbox_lifecycle.subprocess, "Popen", side_effect=launch),
+            self.assertRaisesRegex(
+                common.ScriptError,
+                "^OpenVMM exited during startup: guest-exit status 125$",
+            ),
+        ):
+            sandbox_lifecycle.start(state, 30)
+
+        log = (state / sandbox_lifecycle.LOG_NAME).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        # OpenVMM exited on its own, after it published the report.
+        self.assertEqual([process.returncode for process in launched], [125], log)
+        self.assertEqual(
+            sorted(path.name for path in state.iterdir()),
+            [
+                sandbox_lifecycle.CONFIG_NAME,
+                sandbox_lifecycle.LOG_NAME,
+                sandbox_lifecycle.OUTCOME_NAME,
+            ],
+            log,
+        )
+        sandbox_lifecycle.deprovision(state)
+        self.assertFalse(state.exists())
+
+    def test_managed_start_waits_only_for_openvmm_that_closed_its_endpoint(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        closed = control_session.ControlEndpointClosed()
+        # Each case holds the control failure, the status with which OpenVMM exits
+        # on its own or None if it runs until terminated, the waits for it, and the
+        # error that start raises.
+        for failure, status, waits, raised, message in (
+            # OpenVMM closed the endpoint and exits within the grace period.
+            (
+                closed,
+                7,
+                [call(timeout=10)],
+                common.ScriptError,
+                "^OpenVMM exited during startup with status 7$",
+            ),
+            # It closed the endpoint but outlives the grace period.
+            (
+                closed,
+                None,
+                [call(timeout=10), call(timeout=5)],
+                control_session.ControlEndpointClosed,
+                "^managed control endpoint closed$",
+            ),
+            # It still serves the endpoint, so it gets no grace period.
+            (
+                TimeoutError("managed control response timed out"),
+                None,
+                [call(timeout=5)],
+                TimeoutError,
+                "^managed control response timed out$",
+            ),
+            # A session reset also comes from an OpenVMM that serves the endpoint.
+            (
+                ConnectionError("managed control session was reset"),
+                None,
+                [call(timeout=5)],
+                ConnectionError,
+                "^managed control session was reset$",
+            ),
+            # An interrupt propagates even if OpenVMM exited.
+            (KeyboardInterrupt(), 0, [], KeyboardInterrupt, ""),
+        ):
+            with (
+                self.subTest(failure=failure, status=status),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                state = _provision_managed_sandbox(Path(temporary).resolve())
+                process = _openvmm_mock(status)
+                session = MagicMock()
+                session.ping.side_effect = failure
+                context = MagicMock()
+                context.__enter__.return_value = session
+                context.__exit__.return_value = False
+                with (
+                    patch.object(
+                        sandbox_lifecycle, "require_file", side_effect=require
+                    ),
+                    patch.object(
+                        sandbox_lifecycle.subprocess, "Popen", return_value=process
+                    ),
+                    patch.object(
+                        sandbox_lifecycle, "_process_start_time", return_value=456
+                    ),
+                    patch.object(
+                        sandbox_lifecycle.ControlSession,
+                        "connect",
+                        return_value=context,
+                    ),
+                    self.assertRaisesRegex(raised, message),
+                ):
+                    sandbox_lifecycle.start(state, 10)
+
+                self.assertEqual(process.wait.call_args_list, waits)
+                self.assertEqual(process.terminate.called, status is None)
+                self.assertEqual(
+                    sorted(path.name for path in state.iterdir()),
+                    [sandbox_lifecycle.CONFIG_NAME, sandbox_lifecycle.LOG_NAME],
+                )
 
     def test_launch_contract_rejects_disk_option_delimiters(self):
         with tempfile.TemporaryDirectory() as temporary:

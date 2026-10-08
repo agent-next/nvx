@@ -24,6 +24,7 @@ from .common import (
 )
 from .control_session import (
     MANAGED_EXIT_CATEGORIES,
+    ControlEndpointClosed,
     ControlSession,
     ManagedExecResult,
 )
@@ -472,6 +473,48 @@ def _endpoint(runtime: dict[str, Any]) -> Path:
         raise ScriptError("sandbox runtime state has no control endpoint") from error
 
 
+def _end_failed_start(process: subprocess.Popen[bytes], grace: float) -> int | None:
+    """Ends the OpenVMM process of a failed start.
+
+    Returns OpenVMM's exit status if it exits on its own within `grace` seconds,
+    or terminates it and returns None. Terminating OpenVMM while it publishes its
+    outcome report would leave the report's staging file in the state directory,
+    which `deprovision` refuses to remove.
+    """
+    try:
+        if grace > 0:
+            process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        status = process.poll()
+        if status is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+    return status
+
+
+def _startup_exit_message(outcome_path: Path, status: int) -> str:
+    """Describes how OpenVMM ended a start, preferring its outcome report.
+
+    The report keeps the guest's own status, such as the one with which it
+    refuses an unavailable workload identity.
+    """
+    try:
+        outcome: dict[str, Any] = _read_openvmm_outcome(outcome_path)["outcome"]
+    except ScriptError:
+        outcome = {}
+    category = outcome.get("category")
+    status_code = outcome.get("status_code")
+    if isinstance(category, str) and type(status_code) is int:
+        return f"OpenVMM exited during startup: {category} status {status_code}"
+    return f"OpenVMM exited during startup with status {status}"
+
+
 def provision(
     state_path: Path,
     launch: SandboxLaunch,
@@ -636,17 +679,22 @@ def start(state_path: Path, timeout: float) -> None:
             Path(endpoint_value), capability, timeout
         ) as session:
             session.ping(timeout)
-    except BaseException:
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-        (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
-        capability_path.unlink(missing_ok=True)
-        (state_dir / CONTROL_SOCKET_NAME).unlink(missing_ok=True)
+    except BaseException as error:
+        status: int | None = None
+        try:
+            if process is not None:
+                # OpenVMM closes the control endpoint as it tears the VM down,
+                # before it publishes its outcome report and exits, so only a
+                # closed endpoint warrants waiting for it.
+                status = _end_failed_start(
+                    process, timeout if isinstance(error, ControlEndpointClosed) else 0
+                )
+        finally:
+            (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
+            capability_path.unlink(missing_ok=True)
+            (state_dir / CONTROL_SOCKET_NAME).unlink(missing_ok=True)
+        if status is not None and isinstance(error, Exception):
+            raise ScriptError(_startup_exit_message(outcome_path, status)) from error
         raise
     finally:
         log.close()

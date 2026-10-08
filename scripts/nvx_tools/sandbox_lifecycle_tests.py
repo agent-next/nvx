@@ -61,6 +61,10 @@ EVIDENCE_LIMIT = 64 * 1024
 # ext4 sets this incompatible feature while its journal needs recovery.
 EXT4_INCOMPAT_RECOVER = 0x4
 MANAGED_SUCCESS = {"operation": "managed", "category": "success", "status_code": 0}
+# The guest powers off with status 125 when it refuses the workload identity,
+# and a managed start reports the status from OpenVMM's outcome report.
+MANAGED_REFUSAL = {"operation": "managed", "category": "guest-exit", "status_code": 125}
+REFUSED_START = b"error: OpenVMM exited during startup: guest-exit status 125"
 
 CONFIG = sandbox_lifecycle.CONFIG_NAME
 RUNTIME = sandbox_lifecycle.RUNTIME_NAME
@@ -158,6 +162,14 @@ def state_entries(state: Path) -> list[str] | None:
     if not state.is_dir():
         return None
     return sorted(path.name for path in state.iterdir())
+
+
+def managed_outcome(state: Path) -> object:
+    """Returns the outcome section of the OpenVMM report in a state directory."""
+    report: object = json.loads((state / OUTCOME).read_text(encoding="utf-8"))
+    if not isinstance(report, dict):
+        return None
+    return cast(dict[str, object], report).get("outcome")
 
 
 def bounded_evidence(data: bytes, omitted: int = 0) -> bytes:
@@ -396,7 +408,9 @@ class LifecycleAcceptance:
         ):
             raise RuntimeError("an unavailable one-shot identity was not refused")
 
-        # A managed start with that identity fails closed.
+        # A managed start with that identity fails closed. OpenVMM exits on its
+        # own and publishes the guest's status, which the start reports, and
+        # nothing else remains.
         identity_scratch = self.root / "identity-scratch.ext4"
         shutil.copyfile(self.artifacts.scratch_template, identity_scratch)
         self.invoke(
@@ -407,14 +421,16 @@ class LifecycleAcceptance:
             state=self.identity_state,
         )
         self.invoke(
-            "start", state=self.identity_state, expected=1, diagnostic=b"error:"
+            "start", state=self.identity_state, expected=1, diagnostic=REFUSED_START
         )
         self.copy_evidence(self.identity_state / LOG, "identity-openvmm.log")
-        entries = set(state_entries(self.identity_state) or ())
-        if entries - {OUTCOME} != {CONFIG, LOG}:
-            raise RuntimeError(
-                f"a failed start left lifecycle state behind: {sorted(entries)}"
-            )
+        self.copy_evidence(self.identity_state / OUTCOME, "identity-outcome.json")
+        self.require_entries(
+            self.identity_state, STOPPED_ENTRIES, "after a refused managed start"
+        )
+        outcome = managed_outcome(self.identity_state)
+        if outcome != MANAGED_REFUSAL:
+            raise RuntimeError(f"the refused managed start's outcome is {outcome!r}")
         self.require_processes((), "after a refused managed identity")
         self.invoke("deprovision", state=self.identity_state)
         if self.identity_state.exists():
@@ -605,12 +621,7 @@ class LifecycleAcceptance:
             raise RuntimeError("stop left the control endpoint behind")
         self.require_processes((), "after stop")
         self.copy_evidence(self.state / OUTCOME, "outcome.json")
-        report: object = json.loads((self.state / OUTCOME).read_text(encoding="utf-8"))
-        outcome = (
-            cast(dict[str, object], report).get("outcome")
-            if isinstance(report, dict)
-            else None
-        )
+        outcome = managed_outcome(self.state)
         if outcome != MANAGED_SUCCESS:
             raise RuntimeError(f"the managed outcome is {outcome!r}")
         # A clean journal shows that stop unmounted the overlay and scratch
