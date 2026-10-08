@@ -341,6 +341,40 @@ pull requests run the GitHub-hosted validation jobs but do not execute code on
 the Azure runner fleet. A maintainer must stage an external contribution on a
 trusted repository branch before running the backend matrices.
 
+## Change classification
+
+`openvmm-changes` lists the files that changed between the pull request's base
+and head, or between a push's previous and new commits, and
+`nvx.py classify-ci-changes` selects the suites from their paths:
+
+- `run-workloads` is false only when every changed file is documentation,
+  under `doc/` or ending in `.md`. It enables the guest artifacts, the OpenVMM
+  producers, and the platform benchmarks.
+- `run-tests` is true when a test input changed: the OpenVMM pin, the guests
+  and their package locks, the CLI and its modules, the workflows and actions
+  that build and run the tests, the runner setup scripts, the Rust pin, or the
+  `aci_edge_sandboxes` crate. It enables the NVX microVM tests.
+- `run-openvmm-unit-tests` and `run-openvmm-vmm-tests` enable the OpenVMM
+  suites. A push sets both to `run-tests`. A pull request sets each only when
+  one of that suite's own inputs changed. The unit tests depend on the OpenVMM
+  pin, the Rust pin, the runner setup scripts, `ci.yml`, the actions that their
+  job uses, `nvx.py`, and the modules that `ci.py` imports. The VMM tests also
+  boot the kernel and Alpine initramfs, so they add every input of those
+  artifacts' cache keys and the `build-guest-artifacts` action.
+
+A pull request that changes neither OpenVMM suite's inputs, such as one that
+changes only the microVM tests, the benchmarks, or the Ubuntu or Azure Linux
+guests, therefore skips the two jobs that occupy the WHP runners longest,
+while the `dev` push that merges it still runs them. The detector runs the
+full matrix instead when the comparison base or a commit is unavailable, when
+the diff or the classifier fails, or when the classifier reports a suite
+twice or not at all, because a missing output would skip its jobs.
+`Required status check` passes the same outputs to `check-required-ci`, which
+expects every scheduled job to succeed and every other job to be skipped.
+Tests in `scripts/test_nvx_tools.py` derive each suite's inputs from the
+actions that its jobs use, the modules that `ci.py` imports, and the guest
+cache keys, and fail when a pattern misses one.
+
 ## Host qualification
 
 `python3 scripts/nvx.py doctor --backend <kvm|mshv|whp>` qualifies a host for
@@ -452,7 +486,7 @@ interrupted earlier start, host path mappings, egress rules, and per-execution
 environments and working directories. On failure
 it keeps the OpenVMM log under `build/test-results/aci-edge-sandboxes-<backend>`, which is
 uploaded with the other microVM logs. Changes under `aci_edge_sandboxes/` therefore trigger
-the backend matrices.
+the NVX microVM test matrix.
 
 ## Adversarial campaigns
 

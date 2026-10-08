@@ -6,7 +6,8 @@ import os
 import re
 import shutil
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from .build_constants import (
@@ -90,17 +91,173 @@ OPENVMM_UNIT_TEST_EXCLUDED_PACKAGES = (
     "flowey_core",
 )
 
+# The workflow's change detector emits one output per entry, and runs the full
+# matrix when it cannot classify a change.
+CI_CHANGE_OUTPUTS = (
+    "run-tests",
+    "run-workloads",
+    "run-openvmm-unit-tests",
+    "run-openvmm-vmm-tests",
+)
+CI_DOCUMENTATION_PATHS = re.compile(r"^(doc/|.*\.md$)", re.IGNORECASE)
+# Inputs of the hypervisor test suites: OpenVMM, the guests that the microVM
+# tests boot, the CLI and workflows that drive the suites, and the runners.
+CI_TEST_INPUT_PATHS = re.compile(
+    r"^(openvmm($|/)|aci_edge_sandboxes/|azurelinux/|"
+    r"\.github/workflows/"
+    r"(ci|build-openvmm-binary|run-nvx-microvm-tests|run-platform)\.yml$|"
+    r"\.github/actions/(build-guest-artifacts|build-openvmm|checkout-openvmm|"
+    r"sccache|setup-curl|validate-nvx|validate-runner)/|"
+    r"scripts/nvx\.py$|scripts/nvx_tools/|scripts/setup/|"
+    r"kernel/|alpine/|guest/|ubuntu/|"
+    r"docker/Dockerfile$|SOURCE-MANIFEST\.json$|rust-toolchain\.toml$)"
+)
+# Inputs of the OpenVMM unit and documentation tests: the pinned revision, the
+# Rust release, the runner setup, and the code and workflow that run them.
+OPENVMM_UNIT_TEST_INPUT_PATHS = re.compile(
+    r"^(openvmm($|/)|rust-toolchain\.toml$|scripts/setup/|"
+    r"\.github/workflows/ci\.yml$|"
+    r"\.github/actions/(checkout-openvmm|sccache|setup-curl|validate-nvx|"
+    r"validate-runner)/|"
+    r"scripts/nvx\.py$|scripts/nvx_tools/(__init__|build_constants|ci|common)\.py$)"
+)
+# The OpenVMM VMM tests also boot the NVX kernel and Alpine initramfs, so they
+# add the inputs of those artifacts' cache keys and of the job that builds them.
+OPENVMM_VMM_TEST_INPUT_PATHS = re.compile(
+    r"^(openvmm($|/)|rust-toolchain\.toml$|scripts/setup/|"
+    r"\.github/workflows/ci\.yml$|"
+    r"\.github/actions/(build-guest-artifacts|checkout-openvmm|sccache|"
+    r"setup-curl|validate-nvx|validate-runner)/|"
+    r"scripts/nvx\.py$|"
+    r"scripts/nvx_tools/"
+    r"(__init__|build|build_config|build_constants|ci|common|guests)\.py$|"
+    r"SOURCE-MANIFEST\.json$|docker/Dockerfile$|kernel/|guest/(alpine|common)/)"
+)
+
+
+@dataclass(frozen=True)
+class CiChanges:
+    """The suites that a change runs, as the change detector reports them."""
+
+    run_tests: bool
+    run_workloads: bool
+    run_openvmm_unit_tests: bool
+    run_openvmm_vmm_tests: bool
+
+    def outputs(self) -> dict[str, bool]:
+        return dict(
+            zip(
+                CI_CHANGE_OUTPUTS,
+                (
+                    self.run_tests,
+                    self.run_workloads,
+                    self.run_openvmm_unit_tests,
+                    self.run_openvmm_vmm_tests,
+                ),
+                strict=True,
+            )
+        )
+
+
+def classify_ci_changes(event_name: str, changed_files: Sequence[str]) -> CiChanges:
+    """Select the suites that a change between two commits runs.
+
+    Pull requests run each OpenVMM suite only when one of its own inputs
+    changed. Pushes keep running both whenever any test input changed.
+    """
+    if event_name not in ("pull_request", "push"):
+        raise ValueError(f"unsupported CI event {event_name!r}")
+
+    files = [path for path in changed_files if path]
+    run_workloads = not files or not all(
+        CI_DOCUMENTATION_PATHS.match(path) for path in files
+    )
+    run_tests = any(CI_TEST_INPUT_PATHS.match(path) for path in files)
+    if event_name == "push":
+        return CiChanges(run_tests, run_workloads, run_tests, run_tests)
+    return CiChanges(
+        run_tests=run_tests,
+        run_workloads=run_workloads,
+        run_openvmm_unit_tests=run_tests
+        and any(OPENVMM_UNIT_TEST_INPUT_PATHS.match(path) for path in files),
+        run_openvmm_vmm_tests=run_tests
+        and any(OPENVMM_VMM_TEST_INPUT_PATHS.match(path) for path in files),
+    )
+
+
+def describe_ci_changes(
+    event_name: str,
+    changed_files: Sequence[str],
+    changes: CiChanges,
+) -> str:
+    """Return the Markdown job summary that explains each decision."""
+    files = [path for path in changed_files if path]
+
+    def evidence(pattern: re.Pattern[str]) -> str:
+        matches = [path for path in files if pattern.match(path)]
+        shown = ", ".join(f"`{path}`" for path in matches[:3])
+        if len(matches) > 3:
+            shown += f", and {len(matches) - 3} more"
+        return shown
+
+    def section(title: str, selected: bool, reason: str) -> str:
+        return f"### {title}: {'run' if selected else 'skip'}\n{reason}\n"
+
+    if not files:
+        workloads_reason = "No file changed, so the workloads run."
+    elif changes.run_workloads:
+        workloads_reason = "At least one non-documentation file changed."
+    else:
+        workloads_reason = "Only documentation files changed."
+    sections = [
+        section(
+            "Artifact-backed tests and benchmarks",
+            changes.run_workloads,
+            workloads_reason,
+        ),
+        section(
+            "NVX microVM tests",
+            changes.run_tests,
+            f"Test inputs changed: {evidence(CI_TEST_INPUT_PATHS)}."
+            if changes.run_tests
+            else "No test input changed.",
+        ),
+    ]
+    for title, selected, pattern in (
+        (
+            "OpenVMM unit tests",
+            changes.run_openvmm_unit_tests,
+            OPENVMM_UNIT_TEST_INPUT_PATHS,
+        ),
+        (
+            "OpenVMM VMM tests",
+            changes.run_openvmm_vmm_tests,
+            OPENVMM_VMM_TEST_INPUT_PATHS,
+        ),
+    ):
+        if event_name == "push":
+            reason = "Pushes run every OpenVMM suite whenever the tests run."
+        elif selected:
+            reason = f"Suite inputs changed: {evidence(pattern)}."
+        elif changes.run_tests:
+            reason = "No input of this suite changed."
+        else:
+            reason = "No test input changed."
+        sections.append(section(title, selected, reason))
+    return "".join(sections)
+
 
 def required_ci_expected_results(
     event_name: str,
     *,
     same_repository: bool,
-    run_tests: bool,
-    run_workloads: bool,
+    changes: CiChanges,
 ) -> dict[str, str]:
     if event_name not in ("pull_request", "push"):
         raise ValueError(f"unsupported CI event {event_name!r}")
 
+    run_tests = changes.run_tests
+    run_workloads = changes.run_workloads
     repository_jobs_enabled = event_name == "push" or same_repository
     expected = {
         "quality": "success",
@@ -128,8 +285,24 @@ def required_ci_expected_results(
     )
     expected.update(
         {
-            job: ("success" if repository_jobs_enabled and run_tests else "skipped")
+            job: (
+                "success"
+                if repository_jobs_enabled and changes.run_openvmm_unit_tests
+                else "skipped"
+            )
             for job in REQUIRED_CI_OPENVMM_TEST_JOBS
+        }
+    )
+    expected.update(
+        {
+            job: (
+                "success"
+                if repository_jobs_enabled
+                and changes.run_openvmm_vmm_tests
+                and run_workloads
+                else "skipped"
+            )
+            for job in REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS
         }
     )
     expected.update(
@@ -140,7 +313,6 @@ def required_ci_expected_results(
                 else "skipped"
             )
             for job in (
-                *REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
                 *REQUIRED_CI_MICROVM_TEST_JOBS,
                 *REQUIRED_CI_MICROVM_DEBUG_JOBS,
             )
@@ -169,15 +341,13 @@ def required_ci_failures(
     event_name: str,
     *,
     same_repository: bool,
-    run_tests: bool,
-    run_workloads: bool,
+    changes: CiChanges,
     results: Mapping[str, str],
 ) -> list[str]:
     expected = required_ci_expected_results(
         event_name,
         same_repository=same_repository,
-        run_tests=run_tests,
-        run_workloads=run_workloads,
+        changes=changes,
     )
     failures: list[str] = []
     for job, expected_result in expected.items():

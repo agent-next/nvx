@@ -32,6 +32,7 @@ python3 scripts/nvx.py performance gate --help
 | `record-openvmm-provenance` | Bind an existing OpenVMM binary to the pinned source revision. |
 | `materialize-kernel-provenance-inputs` | Write kernel provenance inputs from raw run-head blobs. |
 | `setup-cross-os-cache` | Install GNU tar and zstd for GitHub Actions cross-OS caches. |
+| `classify-ci-changes` | Select the CI suites that a list of changed files runs. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
 | `test-openvmm` | Run OpenVMM Petri VMM tests. |
@@ -79,6 +80,25 @@ python3 scripts/nvx.py setup-cross-os-cache
 
 Installs the GNU tar and zstd tools used by GitHub Actions cross-OS caches.
 
+### `classify-ci-changes`
+
+```text
+python3 scripts/nvx.py classify-ci-changes
+    --event-name {pull_request,push}
+    --changed-files PATH
+    [--summary PATH]
+```
+
+Reads one changed repository path per line and prints the change detector's
+`run-tests`, `run-workloads`, `run-openvmm-unit-tests`, and
+`run-openvmm-vmm-tests` outputs as `name=true` or `name=false` lines. Only
+documentation changes skip the workloads, and only test inputs run the NVX
+microVM tests. A pull request runs each OpenVMM suite only when one of that
+suite's own inputs changed, while a push runs both whenever the tests run. The
+summary file receives a Markdown explanation of each decision. CI runs the
+full matrix instead when the command fails or omits an output; see
+[Change classification](ci.md#change-classification).
+
 ### `check-required-ci`
 
 ```text
@@ -87,14 +107,16 @@ python3 scripts/nvx.py check-required-ci
     --same-repository {false,true}
     --run-tests VALUE
     --run-workloads VALUE
+    --run-openvmm-unit-tests VALUE
+    --run-openvmm-vmm-tests VALUE
 ```
 
 Validates the GitHub Actions result values supplied through the
 `QUALITY_RESULT`, `CHANGES_RESULT`, and job-specific `*_RESULT` environment
-variables. CI supplies `true` or `false` for the two workload flags. The
-command expects successful results for jobs enabled by the event, repository,
-and workload flags, and `skipped` for jobs that are not enabled; mismatches
-are reported as errors and cause a nonzero exit.
+variables. CI supplies the `true` or `false` suite flags that
+`classify-ci-changes` reports. The command expects successful results for jobs
+enabled by the event, repository, and suite flags, and `skipped` for jobs that
+are not enabled; mismatches are reported as errors and cause a nonzero exit.
 
 See [Setup](setup.md) for host prerequisites.
 
