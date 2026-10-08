@@ -33,8 +33,11 @@ Goals:
   identity, synthetic MSRs, CPU time bits, clocksource, tick, timers, and
   restore semantics.
 - No guest kernel patches and no clock command-line tokens.
-- No implicit fallbacks. A host or snapshot that cannot meet the contract is
-  rejected with a stable error code.
+- No silent fallbacks. A host or snapshot that cannot meet the contract is
+  rejected with a stable error code. The one fallback, from
+  `--cpu-profile auto` to a host profile on an Intel or AMD CPU that no pinned
+  profile serves, warns at every cold boot that takes it (see
+  [CPU profiles](#cpu-profiles)).
 - Restore within one backend across hosts of the same CPU generation and CPU
   profile, including restores after a host reboot.
 - Guest monotonic time advances by the snapshot downtime. Wall clock is set
@@ -546,19 +549,43 @@ and executable (boot check `K1`).
 `--cpu-profile <id>`, `auto` (the default), or `host`. `auto` selects the
 highest revision of the single pinned profile whose generation covers the
 host's vendor, family, model, and stepping as the VMM's host OS sees them (the
-L1 view on Azure). No match, or matches in more than one generation, is
-`E_PROFILE_HOST_UNKNOWN`, naming the host's signature and the available IDs,
-and, on an Intel or AMD CPU, pointing to `--cpu-profile host`; `auto` never
-falls back to a host profile, and host CPUID passthrough does not exist. A
-cold boot with `auto` whose profile the backend does not support fails with
-`E_PROFILE_UNSUPPORTED` (verification step 3), which on an Intel or AMD CPU
-points to `--cpu-profile host` too, because a host profile derives from what
-the backend supports. A restore always uses the profile recorded in the
-snapshot; an explicit `--cpu-profile` must name the same profile, or be
-`host` for a host profile (`E_PROFILE_UNKNOWN`).
+L1 view on Azure). With no match on an Intel or AMD CPU, `auto` falls back to
+the host profile that `host` selects (see **Host profiles**); host CPUID
+passthrough does not exist. With no match on a CPU of another vendor, such as
+Hygon's, or with matches in more than one generation, a catalog defect,
+`auto` fails with `E_PROFILE_HOST_UNKNOWN`, naming the host's signature and
+the available IDs, and, for the catalog defect on an Intel or AMD CPU,
+pointing to `--cpu-profile host`. A cold boot with `auto` whose pinned
+profile the backend does not support fails with `E_PROFILE_UNSUPPORTED`
+(verification step 3) instead of falling back, because that reveals a
+profile or hypervisor problem on a served generation; on an Intel or AMD CPU
+its error points to `--cpu-profile host`, because a host profile derives
+from what the backend supports. A restore always uses the profile recorded
+in the snapshot, and never falls back; an explicit `--cpu-profile` must name
+the same profile, or be `host` for a host profile (`E_PROFILE_UNKNOWN`).
 
-**Host profiles.** `--cpu-profile host` is an
-opt-in for development hosts that no pinned profile serves. Before it creates
+The fallback is never silent. The VM worker logs one warning at the default
+log level at every cold boot that falls back, wherever `auto` is selected,
+the management endpoint included. It starts with the stable marker
+`NVX-CPU-PROFILE-FALLBACK:`, which NVX's tools and log scrapers match, names
+the host CPU (vendor, display family, model, and stepping, and brand
+string), the host profile and its digest, and the limits of a host profile,
+including what that cold boot's fingerprint took, and asks the user to
+attach the CPU's fingerprint
+(`openvmm --hypervisor <backend> --cpu-fingerprint fingerprint.json`) to a
+CPU profile request, NVX's issue form `.github/ISSUE_TEMPLATE/cpu-profile.yml`,
+through a link that prefills the CPU. Maintainers link each request to #408
+or #409, which explain how fingerprints become a pinned profile. An explicit
+`--cpu-profile host` warns too, and with the same request where no pinned
+profile serves the CPU. Where the host profile that `auto` fell back to
+cannot boot, for example because the backend lacks a CPU feature that the
+time ABI requires (`E_PROFILE_UNSUPPORTED`), the error keeps its code and
+says that `auto` fell back.
+
+**Host profiles.** A host profile serves a development host that no pinned
+profile serves: `--cpu-profile host` selects one on any Intel or AMD host,
+and `auto` falls back to one on such a host that no pinned profile serves.
+Before it creates
 the partition, the VM worker fingerprints the backend on this host, as
 `--cpu-fingerprint` does, and derives `<vendor>.host.v1` from that one
 fingerprint under the pinned profiles' derivation policy
@@ -570,14 +597,23 @@ covers only the host's family, model, and stepping. Every verification step
 below applies to it unchanged. The VM worker hands it to the backend with the
 partition's configuration (`cpu_profile::PartitionProfile`), so each VM of a
 process holds its own host profile. A host profile is neither reviewed nor
-immutable: a microcode, firmware, or hypervisor update can change it. Its
-fingerprint costs a probe partition, 2.6 to 5.5 ms on WHP, and the host
-identity at every cold boot. Only Intel and AMD CPUs have host profiles,
+immutable: a microcode, firmware, hypervisor, or OS update can change it. Its
+fingerprint costs a probe partition and the host identity at every cold boot,
+which #394 measured at 2.6 to 5.5 ms on WHP, 11 to 23 ms on KVM, and 52 ms on
+MSHV; the cost varies with the host, and the fallback's warning reports what
+each cold boot's fingerprint took.
+Its snapshots restore only on a host of the same CPU model and stepping whose
+hypervisor supports the profile. Only Intel and AMD CPUs have host profiles,
 `intel.host.v1` and `amd.host.v1`; another vendor, such as Hygon, fails
 with `E_PROFILE_HOST_UNKNOWN`, and a backend that lacks a CPU
 feature that the time ABI requires fails with `E_PROFILE_UNSUPPORTED`. Host
-qualification never accepts a host profile, so CI and benchmark hosts need a
-pinned one.
+qualification never accepts a host profile, including the one that `auto`
+falls back to, so CI and benchmark hosts need a pinned one, and `benchmark`
+refuses a CPU that no pinned profile serves, or that it cannot identify.
+
+The `host-cpu-unknown` test hook makes `auto` treat the host CPU as one that
+no pinned profile serves, so that CI's runners, which pinned profiles serve,
+exercise the fallback (`test-microvm`'s `cpu-profile-fallback` scenario).
 
 **Verification.** At partition creation, for cold boot and restore, OpenVMM
 reports every violation at once, naming the leaf, subleaf, register, and bit:
@@ -1169,7 +1205,7 @@ Flags:
 | 0 | `DOWNTIME_UTC` | `D` came from the UTC delta; clear means same-boot host monotonic time |
 | 1 | `MEMORY_TARGET` | An explicit RAM target was requested; `memory_range_count` is valid and may be 0 |
 | 2 | `ACK_REQUIRED` | Host input is gated; the guest must acknowledge through `0x605` after repair |
-| 3 | `TEST_HOOKS` | A test hook altered the downtime source, `D`, UTC, or the rate deviation |
+| 3 | `TEST_HOOKS` | A test hook is active: it can alter the downtime source, `D`, UTC, the rate deviation, the handling of time samples, or the CPU profile |
 | 4–7 | | Zero; the guest rejects a packet with any of them set |
 
 `utc_ns` is latched when the guest first writes selector `0xa5` after the
@@ -1736,7 +1772,7 @@ code.
 | `E_BACKEND_MISMATCH` | Snapshot taken on another backend | Restore |
 | `E_PROFILE_UNKNOWN` | Profile ID neither pinned in this OpenVMM nor a host profile, or a restore's explicit `--cpu-profile` names another profile than the snapshot's | Cold boot, restore |
 | `E_PROFILE_DIGEST` | The recorded profile digest or embedded document is not the pinned profile's of the same ID, or a host profile's embedded document is not a canonical host profile of the recorded ID and digest | Restore |
-| `E_PROFILE_HOST_UNKNOWN` | `--cpu-profile auto` maps the host to no profile, or to profiles of more than one generation, or `--cpu-profile host` runs on a CPU of another vendor than Intel and AMD | Cold boot |
+| `E_PROFILE_HOST_UNKNOWN` | `--cpu-profile auto` maps a CPU of another vendor than Intel and AMD to no profile, where no host profile can serve it either, or maps the host to profiles of more than one generation; `--cpu-profile host` runs on a CPU of another vendor than Intel and AMD; or `--cpu-fingerprint`'s check, which never falls back to a host profile, maps the host to no pinned profile | Cold boot, `--cpu-fingerprint` |
 | `E_PROFILE_TIME_BITS` | The profile is invalid or violates the CPU time bits | Cold boot, restore |
 | `E_CPU_GENERATION` | Host CPU vendor, family, model, or stepping not in the profile | Cold boot, restore |
 | `E_PROFILE_UNSUPPORTED` | Backend lacks a feature, limit, XSAVE layout, MSR value, or feature-bank bit of the profile, or the host is not qualified | Cold boot, restore |
@@ -1804,8 +1840,8 @@ skew bound.
 | ID | Check |
 | --- | --- |
 | `H1` | The backend device or API is present and usable |
-| `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, the generation name, and the profile that `auto` selects; an unmapped generation fails (`E_PROFILE_HOST_UNKNOWN`). `openvmm --hypervisor <backend> --cpu-fingerprint <path>` writes the fingerprint (`openvmm-cpu-fingerprint/v1`), checks it against the generation's profile, and prints one `NVX-CPU-PROFILE:` line (`E_PROFILE_HOST_UNKNOWN`, `E_PROFILE_UNSUPPORTED`, `E_CPU_UNLISTED`), whose generation and profile `H2` reports, so that OpenVMM's catalog alone decides which hosts qualify; NVX's copy of the generation table maps the host only when qualification runs without OpenVMM. The host's invariant TSC (`constant_tsc` and `nonstop_tsc` on Linux, the CPUID bit on Windows) is reported as evidence only |
-| `H3` | OpenVMM preflight in verification mode: profile support, identity routing, synchronized TSC set, no scaling, and both rates, without booting a guest. The verified profile must be a pinned one: a host profile fails |
+| `H2` | CPU fingerprint: vendor, family, model, stepping, microcode, host kernel or OS build, the generation name, and the pinned profile that `auto` selects; an unmapped generation fails (`E_PROFILE_HOST_UNKNOWN`), although `auto` falls back to a host profile on such an Intel or AMD CPU. `openvmm --hypervisor <backend> --cpu-fingerprint <path>` writes the fingerprint (`openvmm-cpu-fingerprint/v1`), checks it against the generation's profile, which never falls back to a host profile, and prints one `NVX-CPU-PROFILE:` line (`E_PROFILE_HOST_UNKNOWN`, `E_PROFILE_UNSUPPORTED`, `E_CPU_UNLISTED`), whose generation and profile `H2` reports, so that OpenVMM's catalog alone decides which hosts qualify; NVX's copy of the generation table maps the host only when qualification runs without OpenVMM. The host's invariant TSC (`constant_tsc` and `nonstop_tsc` on Linux, the CPUID bit on Windows) is reported as evidence only |
+| `H3` | OpenVMM preflight in verification mode: profile support, identity routing, synchronized TSC set, no scaling, and both rates, without booting a guest. The verified profile must be a pinned one: a host profile fails, including the one that `auto` falls back to on a CPU that no pinned profile serves |
 | `H4` | TSC rate stability against the host's clocks: interval agreement against an undisciplined clock (`CLOCK_MONOTONIC_RAW` or `QueryPerformanceCounter`) and the whole-window rate against `F_d` on the disciplined one (see [Rate stability](#rate-stability-h4)). On a Linux host the detail also reports the host clocksource, as evidence only |
 | `H5` | Host cross-CPU TSC skew: a pinned-thread probe over all host CPU pairs, `max_abs_offset_ns <= 1000` |
 | `H6` | Guest warp probe on the qualification schedule (see [Warp schedules](#warp-schedules-h6-and-ci)) |
@@ -2213,7 +2249,8 @@ every backend. Production paths print no marker, so the matrix driver runs
 `/sbin/nvx-time status` over the console after shell-ready and after every
 restore. CI runs it after every cold boot whose shell is on a console the
 harness reads, and after every restore in the `smp-snapshot`,
-`restore-processors`, `restore-downtime`, and `snapshot-tiers` scenarios,
+`restore-processors`, `restore-downtime`, `snapshot-tiers`, and
+`cpu-profile-fallback` scenarios,
 except `snapshot-tiers`' gate-timeout check, whose guest OpenVMM stops at the
 restore gate on purpose. CI's other restores and its guests without a shell,
 the managed lifecycle and one-shot workloads, are only scanned for violation
@@ -2260,6 +2297,7 @@ can use as the fleet restore matrix.
 | Failed capture: in one VM, a request whose destination's parent the host made unwritable to the OpenVMM process after launch, so that creating the staging directory fails after quiesce and OpenVMM rolls back (root's `CAP_DAC_OVERRIDE` and an administrator's backup and restore privileges bypass file permissions, so drop them first and probe with the same credentials, or use an immutable or read-only mount); then, with the parent writable again and after 30 s idle, a second request. Companion: a request whose destination already exists, which preflight rejects before quiesce. Scratch variant: the failed request in a VM with a paired scratch device mounted at `/run/nvx/scratch` and a workload in the `container` cgroup, so that the snapshot agent's freezer and scratch barriers engage | Each bare-metal host at 1 and 8 vCPUs, 3 times each, and the scratch variant on one bare-metal host at 1 vCPU, 3 times; [CI's `snapshot-core`](../ci.md) exercises a request without a destination, which OpenVMM releases before preflight, and asserts that the guest continues once, that `nvx-time status` passes at `generation=0` with no restore, and that `rcu_cpu_stall_suppress` reads 0 | OpenVMM logs the rollback (`microVM snapshot failed before commit; attempting rollback`, then `microVM snapshot rollback succeeded; guest resumed`), with no time ABI code, and each failed request returns in the same VM: status bit 1 clear, `nvx-time status` passing at `generation=0` with `discontinuities` unchanged (from the capture's checks; `cancel-capture` records nothing), the saved values back at their values before the request (`rcu_cpu_stall_suppress`, and on the debug kernel `soft_watchdog` and `hung_task_timeout_secs`) with no saved-values file left, and no 193, 194, or 195 and no clock message; the second request captures, which step 2 of the snapshot agent refuses while the first request's saved values remain, and its snapshot restores; that capture's `cpu_us` is reported but not budgeted (see [`cpu_us` budgets](#performance-expectations-and-acceptance-gate)). The companion logs `microVM snapshot preflight failed; guest continues` with no capture anchor and no rollback, and its guest side is the same. In the scratch variant, the failed request also leaves the workload cgroup thawed (`cgroup.freeze` reads 0), the scratch filesystem taking a write with `fsync` within 1 s, and the workload running, and the real capture and restore with the scratch device pass |
 | Processor activation from one boot-online CPU to 2, 4, and 8 | All backends | Restored; warp probe passes |
 | Every tier and an untiered snapshot, restored more than once | All backends | Restored; each restore of a snapshot captured at `g = 0` carries `g = 1` and a new generation ID. OpenVMM cannot capture a restored process, so unit tests cover the generation arithmetic beyond one restore, including `E_GENERATION_EXHAUSTED` |
+| CPU profile fallback: a cold boot with `auto` and the `host-cpu-unknown` hook, captured, then restored with `auto` and no hook | All backends, in CI's `cpu-profile-fallback` scenario | The cold boot falls back to the host's host profile with one `NVX-CPU-PROFILE-FALLBACK:` warning that links the CPU profile request form, and passes its boot checks on it; the restore takes the snapshot's host profile without a warning, and passes the warp probe and its restore checks |
 
 No test reboots a host. The orchestrator asks the user before any real
 reboot.
@@ -2284,6 +2322,7 @@ repeatable):
 | `downtime-add-s=<n>` | Add `n` seconds to the measured `D` before the bounds check |
 | `utc-offset-ms=<n>` | Add `n` milliseconds to every destination UTC reading: the downtime sample, the packet, and time samples |
 | `sample-delay-us=<n>` | Delay the handling of the first `0xa5` write and of every `0xa7` write by `n` µs, which widens the guest's bracket |
+| `host-cpu-unknown` | On a cold boot with `--cpu-profile auto`, treat the host CPU as one that no pinned profile serves, so that `auto` falls back to a host profile, and warns, as on such a CPU |
 
 Every active hook is logged at warning level and sets `TEST_HOOKS` in the
 packet and in every time sample.
@@ -2359,9 +2398,10 @@ Migration impact:
 - CPUID becomes profile-defined, so guests can lose host features that no
   profile of their generation pins.
 - Hosts that fail qualification cannot run microVMs on a pinned profile until
-  replaced; an Intel development host can boot on a host profile
-  (`--cpu-profile host`) instead. A host without an invariant TSC, such as
-  the 8370C MSHV runner, qualifies when its guests stay within the skew
+  replaced; an Intel or AMD development host boots on a host profile instead,
+  which `--cpu-profile auto` falls back to where no pinned profile serves its
+  CPU, and `--cpu-profile host` selects. A host without an invariant TSC, such
+  as the 8370C MSHV runner, qualifies when its guests stay within the skew
   bound (see [Qualification gates](#qualification-gates)).
 - Per-PR CI captures and restores on the same runner. Same-generation
   cross-VM restore is validated by the fleet restore matrix on WHP only; no
@@ -2385,10 +2425,14 @@ The OpenVMM Guide documents the user-facing contract in
 - **Restoring a snapshot:** restore packet v4, the time sample at `0xeb`, the
   generation ID, and the synchronized TSC set with its read-back.
 - **Time and CPU compatibility:** the identity, the CPU profile and
-  `--cpu-profile`, including host profiles, the 250 ppm rate rule, the exact
-  LAPIC rule, the downtime sources and bounds, and the error codes.
-- **Limitations:** the same backend, CPU generation, and profile, and the
-  recapture of older snapshots.
+  `--cpu-profile`, including host profiles and `auto`'s fallback to them with
+  its warning, the 250 ppm rate rule, the exact LAPIC rule, the downtime
+  sources and bounds, and the error codes.
+- **Limitations:** the same backend, CPU generation, and profile, a host
+  profile's snapshot restoring only on the capture host's CPU model and
+  stepping, and the recapture of older snapshots.
 
-The CLI reference documents `--cpu-profile` and `--x-time-abi-verify`. The
-test hooks stay undocumented in the Guide; this document describes them.
+The CLI reference documents `--cpu-profile`, with `auto`'s fallback and its
+warning, `--cpu-fingerprint`, whose check never falls back, and
+`--x-time-abi-verify`. The test hooks stay undocumented in the Guide; this
+document describes them.
