@@ -719,7 +719,10 @@ request to retain VM state.
 Environment files are limited to 1 MiB of UTF-8 JSON. Environments contain at
 most 256 unique, nonempty names. Each `KEY=VALUE` entry and working-directory
 path is limited to 4096 UTF-8 bytes; the combined execution request must also
-fit the existing 64 KiB control-payload bound.
+fit the existing 64 KiB control-payload bound. A managed `exec` forwards at
+most 1 MiB of combined standard output and standard error; the guest agent
+kills a workload that writes more, and `exec` exits with status 125 and reports
+the `output-limit` category.
 
 The explicit `test-microvm --scenario managed-exec-config --backend BACKEND`
 scenario is the authoritative acceptance for these public options. It invokes
@@ -744,6 +747,56 @@ Empty environments are measured with `/usr/bin/env`, not a shell that can
 synthesize its own variables. The scenario retains bounded subprocess argument
 and status observations, typed exec outcomes, and OpenVMM logs. Inline
 environment values are redacted from the retained command observations.
+
+The explicit `test-microvm --scenario sandbox-lifecycle --backend BACKEND`
+scenario is the authoritative acceptance for the managed lifecycle itself. It
+also runs the public commands as subprocesses against the real kernel, Alpine
+control initramfs, Ubuntu EROFS layer, and fresh copies of the same scratch
+template, so it has the same artifact requirements and also runs only when
+named. It checks that:
+
+- `provision` rejects a root `--workload-user` before it creates any state, and
+  the guest refuses an identity that the Ubuntu image lacks before a one-shot
+  workload starts, and in a managed `start`, which then fails without leaving
+  a runtime record, capability, control socket, or OpenVMM process;
+- every operation fails on a state directory that was never provisioned, a
+  repeated `provision` leaves the configuration unchanged, and `exec` and
+  `stop` fail before `start`;
+- a repeated `start` and a `deprovision` of a running sandbox fail without
+  changing its runtime record, capability, or OpenVMM process, and the
+  sandbox keeps serving requests;
+- managed arguments keep leading, trailing, and embedded spaces, tabs, and
+  newlines, a later request reads the file that an earlier one wrote, and the
+  file survives `stop` and a new `start`, because the overlay's upper directory
+  is on scratch;
+- `/sbin/nvx-sandbox-smoke` passes its security profile and resource-limit
+  checks in a sandbox provisioned with `--hostname`, `--memory-max`, and
+  `--pids-max`, after earlier requests;
+- a request that writes more than the 1 MiB output bound exits with status
+  125 and an `output-limit` outcome report after the host has received more
+  than 1 MiB less one 32 KiB read chunk and at most 1 MiB, and a request whose
+  `--outcome-report` path exists fails before its workload runs and leaves the
+  file intact;
+- `stop` ends OpenVMM and its control socket or pipe, leaves only
+  `config.json`, `openvmm.log`, and a successful `outcome.json`, and leaves a
+  cleanly unmounted scratch file system, after which `exec` and `stop` fail;
+- after OpenVMM exits without a `stop`, `exec` and `stop` report the stale
+  runtime state and `start` refuses it; and
+- `deprovision` removes only NVX's files: it fails and keeps a foreign file in
+  the state directory, and once that file is gone, it removes the directory,
+  which a later `exec` does not recreate.
+
+Throughout, no OpenVMM process whose arguments name the scenario's fixture
+outlives its sandbox, and the EROFS layer keeps its digest and the scratch
+image its file. On failure, the scenario stops and deprovisions what it
+started, ends every OpenVMM process that names its fixture, and preserves the
+fixture for recovery only if that cleanup fails. Its evidence, written to the
+output directory with a `sandbox-lifecycle-` prefix, holds bounded command
+observations (arguments, statuses, output sizes, and state-directory entries),
+the runtime record, the OpenVMM logs, the VM-level and exec outcome reports, the
+guest probe's transcript, and the console of the refused one-shot run, each
+limited to its last 64 KiB. The command observations hold no workload output,
+and no evidence holds the control capability.
 
 Decoder, helper, and direct control-session tests remain useful supplemental
 coverage for protocol boundaries and guest implementation details. They do not

@@ -4974,6 +4974,53 @@ Write-Output (Get-BenchmarkScratchDirectory)
             ],
         )
 
+    def test_ci_runs_the_public_sandbox_acceptance_on_every_backend(self):
+        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
+        workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
+        microvm_workflow = (workflows / "run-nvx-microvm-tests.yml").read_text(
+            encoding="utf-8"
+        )
+        for backend in ("kvm", "mshv", "whp"):
+            with self.subTest(backend=backend):
+                job = _workflow_job(workflow, f"nvx-microvm-tests-{backend}")
+                self.assertIn(
+                    "uses: ./.github/workflows/run-nvx-microvm-tests.yml", job
+                )
+                self.assertIn(f"backend: {backend}", job)
+                self.assertNotIn("debug-kernel: true", job)
+        for system in ("Linux", "Windows"):
+            with self.subTest(system=system):
+                acceptance = _workflow_step(
+                    microvm_workflow,
+                    "test",
+                    f"Run public managed sandbox acceptance on {system}",
+                )
+                self.assertIn("!inputs.debug-kernel", acceptance)
+                self.assertIn("--scenario managed-exec-config", acceptance)
+                self.assertIn("--scenario sandbox-lifecycle", acceptance)
+                self.assertIn(
+                    '--output-dir "build/test-results/public-exec-${{ inputs.backend }}"',
+                    acceptance,
+                )
+                smoke = _workflow_step(
+                    microvm_workflow,
+                    "test",
+                    f"Run Ubuntu sandbox layer smoke test on {system}",
+                )
+                for option in (
+                    "--entrypoint /sbin/nvx-sandbox-smoke",
+                    "--arg limits",
+                    "--arg 33554432",
+                    "--arg 8",
+                    "--memory-max 33554432",
+                    "--pids-max 8",
+                ):
+                    self.assertIn(option, smoke)
+        upload = _workflow_step(
+            microvm_workflow, "test", "Upload NVX microVM failure logs"
+        )
+        self.assertIn("build/test-results/public-exec-${{ inputs.backend }}", upload)
+
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell")
     def test_windows_cli_validation_stops_at_each_failed_command(self):
         action = (
@@ -12455,6 +12502,28 @@ class SandboxTests(unittest.TestCase):
         self.assertFalse(sandbox_lifecycle._process_running(pid, start_time + 1))
         # Records from earlier NVX versions identify OpenVMM by process ID alone.
         self.assertTrue(sandbox_lifecycle._process_running(pid, None))
+
+    def test_runtime_records_report_whether_their_process_runs(self):
+        if os.name != "nt" and sys.platform != "linux":
+            self.skipTest("process identity requires a Linux or Windows host")
+        pid = os.getpid()
+        start_time = sandbox_lifecycle._process_start_time(pid)
+        assert isinstance(start_time, int)
+
+        self.assertTrue(
+            sandbox_lifecycle.runtime_process_running(
+                {"pid": pid, "start_time": start_time}
+            )
+        )
+        self.assertFalse(
+            sandbox_lifecycle.runtime_process_running(
+                {"pid": pid, "start_time": start_time + 1}
+            )
+        )
+        with self.assertRaisesRegex(common.ScriptError, "invalid process ID"):
+            sandbox_lifecycle.runtime_process_running({"pid": "openvmm"})
+        with self.assertRaisesRegex(common.ScriptError, "invalid process start"):
+            sandbox_lifecycle.runtime_process_running({"pid": pid, "start_time": -1})
 
     def test_process_identity_counts_an_exited_process_as_stopped(self):
         if os.name != "nt" and sys.platform != "linux":

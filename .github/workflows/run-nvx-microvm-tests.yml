@@ -109,22 +109,24 @@ jobs:
           ${{ inputs.debug-kernel && '--debug-kernel' || '' }}
           --output-dir "build/test-results/microvm-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}"
 
-      - name: Run public managed execution configuration on Linux
+      - name: Run public managed sandbox acceptance on Linux
         if: runner.os != 'Windows' && !inputs.debug-kernel
         shell: bash
         run: >-
           python3 scripts/nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           --scenario managed-exec-config
+          --scenario sandbox-lifecycle
           --output-dir "build/test-results/public-exec-${{ inputs.backend }}"
 
-      - name: Run public managed execution configuration on Windows
+      - name: Run public managed sandbox acceptance on Windows
         if: runner.os == 'Windows' && !inputs.debug-kernel
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           --scenario managed-exec-config
+          --scenario sandbox-lifecycle
           --output-dir "build/test-results/public-exec-${{ inputs.backend }}"
 
       - name: Run Ubuntu guest smoke tests on Linux

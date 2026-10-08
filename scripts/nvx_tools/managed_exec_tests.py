@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,14 +27,46 @@ FORBIDDEN_DEFAULT_ENVIRONMENT_NAMES = {
 }
 
 
-def _bounded_text(value: bytes) -> str:
+@dataclass(frozen=True)
+class WorkloadArtifacts:
+    """The Ubuntu workload layer and scratch template of the public scenarios."""
+
+    distro: Path
+    layer_uuid: str
+    scratch_template: Path
+
+
+def load_workload_artifacts() -> WorkloadArtifacts:
+    distro = require_file(
+        artifact_path(UbuntuBuildConstants.DISTRO_NAME), "Ubuntu workload layer"
+    )
+    manifest_path = require_file(
+        distro.with_name(UbuntuBuildConstants.DISTRO_MANIFEST_NAME),
+        "Ubuntu layer manifest",
+    )
+    scratch_template = require_file(
+        artifact_path("ubuntu-smoke-scratch.ext4"), "sandbox scratch template"
+    )
+    try:
+        manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ScriptError(f"invalid Ubuntu layer manifest: {manifest_path}") from error
+    if not isinstance(manifest, dict):
+        raise ScriptError("Ubuntu layer manifest must contain a UUID string")
+    layer_uuid = cast(dict[str, object], manifest).get("uuid")
+    if not isinstance(layer_uuid, str):
+        raise ScriptError("Ubuntu layer manifest must contain a UUID string")
+    return WorkloadArtifacts(distro, layer_uuid, scratch_template)
+
+
+def bounded_text(value: bytes) -> str:
     text = value[:DIAGNOSTIC_LIMIT].decode(errors="replace")
     if len(value) > DIAGNOSTIC_LIMIT:
         text += f"... ({len(value) - DIAGNOSTIC_LIMIT} bytes omitted)"
     return text
 
 
-def _evidence_argv(command: list[str]) -> list[str]:
+def evidence_argv(command: list[str]) -> list[str]:
     recorded = command.copy()
     for index, value in enumerate(recorded[:-1]):
         if value == "--environment":
@@ -41,9 +74,7 @@ def _evidence_argv(command: list[str]) -> list[str]:
     return recorded
 
 
-def _read_exec_outcome(
-    path: Path, *, category: str, status_code: int
-) -> dict[str, Any]:
+def read_exec_outcome(path: Path, *, category: str, status_code: int) -> dict[str, Any]:
     try:
         value: object = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -125,34 +156,19 @@ def _default_environment_matches(
     )
 
 
-def _format_errors(errors: list[Exception]) -> str:
+def format_errors(errors: list[Exception]) -> str:
     text = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
     encoded = text.encode("utf-8", errors="replace")
-    return _bounded_text(encoded)
+    return bounded_text(encoded)
 
 
 def run_managed_exec_configuration(
     backend: str, *, timeout: float, output_dir: Path
 ) -> None:
-    distro = require_file(
-        artifact_path(UbuntuBuildConstants.DISTRO_NAME), "Ubuntu workload layer"
-    )
-    manifest_path = require_file(
-        distro.with_name(UbuntuBuildConstants.DISTRO_MANIFEST_NAME),
-        "Ubuntu layer manifest",
-    )
-    scratch_template = require_file(
-        artifact_path("ubuntu-smoke-scratch.ext4"), "sandbox scratch template"
-    )
-    try:
-        manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ScriptError(f"invalid Ubuntu layer manifest: {manifest_path}") from error
-    if not isinstance(manifest, dict):
-        raise ScriptError("Ubuntu layer manifest must contain a UUID string")
-    layer_uuid = cast(dict[str, object], manifest).get("uuid")
-    if not isinstance(layer_uuid, str):
-        raise ScriptError("Ubuntu layer manifest must contain a UUID string")
+    artifacts = load_workload_artifacts()
+    distro = artifacts.distro
+    layer_uuid = artifacts.layer_uuid
+    scratch_template = artifacts.scratch_template
     output_dir.mkdir(parents=True, exist_ok=True)
     checks: list[dict[str, object]] = []
     root = Path(tempfile.mkdtemp(prefix="nvx-public-exec-"))
@@ -187,7 +203,7 @@ def run_managed_exec_configuration(
             checks.append(
                 {
                     "operation": operation,
-                    "argv": _evidence_argv([str(value) for value in result.args]),
+                    "argv": evidence_argv([str(value) for value in result.args]),
                     "expected_returncode": expected,
                     "returncode": result.returncode,
                     "stdout_bytes": len(result.stdout),
@@ -198,8 +214,8 @@ def run_managed_exec_configuration(
             if result.returncode != expected:
                 raise RuntimeError(
                     f"public sandbox {operation} returned {result.returncode}, "
-                    f"expected {expected}; stdout={_bounded_text(result.stdout)!r}; "
-                    f"stderr={_bounded_text(result.stderr)!r}"
+                    f"expected {expected}; stdout={bounded_text(result.stdout)!r}; "
+                    f"stderr={bounded_text(result.stderr)!r}"
                 )
             return result
 
@@ -216,8 +232,8 @@ def run_managed_exec_configuration(
             if result.stdout != expected or result.stderr:
                 raise RuntimeError(
                     "public managed workload returned unexpected output: "
-                    f"stdout={_bounded_text(result.stdout)!r}, "
-                    f"stderr={_bounded_text(result.stderr)!r}"
+                    f"stdout={bounded_text(result.stdout)!r}, "
+                    f"stderr={bounded_text(result.stderr)!r}"
                 )
 
         def expect_rejection(
@@ -226,8 +242,8 @@ def run_managed_exec_configuration(
             if result.stdout or message not in result.stderr:
                 raise RuntimeError(
                     "public managed validation returned unexpected diagnostics: "
-                    f"stdout={_bounded_text(result.stdout)!r}, "
-                    f"stderr={_bounded_text(result.stderr)!r}"
+                    f"stdout={bounded_text(result.stdout)!r}, "
+                    f"stderr={bounded_text(result.stderr)!r}"
                 )
 
         def persist_evidence() -> None:
@@ -255,7 +271,7 @@ def run_managed_exec_configuration(
             if errors:
                 raise RuntimeError(
                     "public managed evidence persistence failed: "
-                    f"{_format_errors(errors)}"
+                    f"{format_errors(errors)}"
                 ) from errors[0]
 
         invoke(
@@ -309,7 +325,7 @@ def run_managed_exec_configuration(
             if identity.stderr:
                 raise RuntimeError(
                     "public workload identity probe returned diagnostics: "
-                    f"{_bounded_text(identity.stderr)!r}"
+                    f"{bounded_text(identity.stderr)!r}"
                 )
             workload_name, workload_home = _read_workload_identity(identity.stdout)
             expected_defaults = {
@@ -411,7 +427,7 @@ def run_managed_exec_configuration(
             )
             if result.stdout != b"public stdout" or result.stderr != b"public stderr":
                 raise RuntimeError("public managed stdout/stderr were not preserved")
-            _read_exec_outcome(exit_outcome, category="exit", status_code=7)
+            read_exec_outcome(exit_outcome, category="exit", status_code=7)
 
             for limit in (0, 3_600_001, 86_400_000, 0xFFFFFFFF):
                 expect_output(
@@ -431,7 +447,7 @@ def run_managed_exec_configuration(
                 raise RuntimeError(
                     "public timed-out workload returned unexpected output"
                 )
-            _read_exec_outcome(timeout_outcome, category="timeout", status_code=124)
+            read_exec_outcome(timeout_outcome, category="timeout", status_code=124)
             expect_output(workload("/bin/pwd"), b"/\n")
         except Exception as error:
             acceptance_error = error
@@ -460,7 +476,7 @@ def run_managed_exec_configuration(
                 except Exception as error:
                     cleanup_errors.append(error)
             else:
-                preserved_path = _bounded_text(
+                preserved_path = bounded_text(
                     str(root).encode("utf-8", errors="replace")
                 )
                 preservation_reported = True
@@ -473,18 +489,18 @@ def run_managed_exec_configuration(
             if cleanup_errors:
                 raise RuntimeError(
                     f"{acceptance_error}; cleanup failed: "
-                    f"{_format_errors(cleanup_errors)}"
+                    f"{format_errors(cleanup_errors)}"
                 ) from acceptance_error
             raise acceptance_error.with_traceback(acceptance_error.__traceback__)
         if cleanup_errors:
             raise RuntimeError(
-                f"public managed cleanup failed: {_format_errors(cleanup_errors)}"
+                f"public managed cleanup failed: {format_errors(cleanup_errors)}"
             ) from cleanup_errors[0]
         if not scratch_template.is_file() or not distro.is_file():
             raise RuntimeError("managed cleanup removed a supplied workload artifact")
     except Exception as error:
         if root.exists() and not preservation_reported:
-            preserved_path = _bounded_text(str(root).encode("utf-8", errors="replace"))
+            preserved_path = bounded_text(str(root).encode("utf-8", errors="replace"))
             raise RuntimeError(
                 f"{error}; managed fixture preserved for recovery: {preserved_path}"
             ) from error

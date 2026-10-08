@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Callable
 from contextlib import ExitStack, redirect_stdout
@@ -30,6 +31,8 @@ from nvx_tools import (  # noqa: E402
     managed_exec_tests,
     microvm_tests,
     openvmm_process,
+    sandbox_lifecycle,
+    sandbox_lifecycle_tests,
     time_abi,
 )
 from nvx_tools.build_constants import (  # noqa: E402
@@ -773,6 +776,627 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         self.assertTrue((fixture_root / "scratch.ext4").is_file())
         shutil.rmtree(fixture_root)
         self.assertFalse(fixture_root.exists())
+
+
+_LIFECYCLE_STATE_SCRIPT = 'printf \'%s\\n\' "$@" >"$0"'
+_CliResult = tuple[int, bytes, bytes]
+
+
+class _FakeSandboxCli:
+    """Emulates `nvx.py sandbox` and the OpenVMM processes that it starts.
+
+    Each fault names one regression of the public lifecycle that the
+    acceptance must detect.
+    """
+
+    def __init__(self, *faults: str) -> None:
+        self.faults = set(faults)
+        self.running: dict[int, bool] = {}
+        self.endpoints: dict[int, str] = {}
+        self.guest_files: dict[Path, dict[str, bytes]] = {}
+        self.operations: list[str] = []
+        self.capabilities: list[bytes] = []
+        self.probed = False
+        self.next_pid = 4000
+
+    def __call__(
+        self, command: list[str], **_: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        operation = command[3]
+        self.operations.append(operation)
+        values: dict[str, str] = {}
+        arguments: list[str] = []
+        index = 4
+        while index < len(command):
+            if command[index].startswith("--arg="):
+                arguments.append(command[index].removeprefix("--arg="))
+                index += 1
+            else:
+                values[command[index]] = command[index + 1]
+                index += 2
+        state = Path(values["--state-dir"]) if "--state-dir" in values else None
+        handlers: dict[
+            str,
+            Callable[[Path | None, dict[str, str], list[str]], _CliResult],
+        ] = {
+            "run": self._run,
+            "provision": self._provision,
+            "start": self._start,
+            "exec": self._exec,
+            "stop": self._stop,
+            "deprovision": self._deprovision,
+        }
+        returncode, stdout, stderr = handlers[operation](state, values, arguments)
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+    @staticmethod
+    def _error(message: str) -> _CliResult:
+        return 1, b"", f"error: {message}\n".encode()
+
+    def _missing(self, state: Path) -> _CliResult | None:
+        if not state.is_dir():
+            return self._error(f"sandbox state path is not a plain directory: {state}")
+        return None
+
+    def _running(self, state: Path) -> tuple[dict[str, object], _CliResult | None]:
+        refusal = self._missing(state)
+        if refusal is not None:
+            return {}, refusal
+        if not (state / "runtime.json").is_file():
+            return {}, self._error("sandbox is not running")
+        runtime = json.loads((state / "runtime.json").read_text(encoding="utf-8"))
+        if not self.running.get(runtime["pid"], False):
+            return {}, self._error(
+                "sandbox runtime state is stale because the OpenVMM process is "
+                "not running"
+            )
+        return runtime, None
+
+    def _run(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
+        assert state is None
+        assert values["--workload-user"] == sandbox_lifecycle_tests.UNAVAILABLE_IDENTITY
+        if "run-starts-workload" in self.faults:
+            return 0, b"NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534\n", b""
+        return (
+            125,
+            b">> openvmm\nNVX-SANDBOX-ERROR: configured workload UID is unavailable\n",
+            b"",
+        )
+
+    def _provision(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
+        assert state is not None
+        if values.get("--workload-user") == "0:0":
+            return (
+                2,
+                b"",
+                b"nvx.py sandbox: error: argument --workload-user: "
+                b"--workload-user UID must be between 1 and 4294967295\n",
+            )
+        if (state / "config.json").exists():
+            return self._error("sandbox is already provisioned")
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "config.json").write_text(
+            json.dumps({"user": values.get("--workload-user", "65534:65534")}),
+            encoding="utf-8",
+        )
+        return 0, b"", b""
+
+    def _start(
+        self, state: Path | None, _: dict[str, str], __: list[str]
+    ) -> _CliResult:
+        assert state is not None
+        refusal = self._missing(state)
+        if refusal is not None:
+            return refusal
+        if (state / "runtime.json").exists() and "duplicate-start" not in self.faults:
+            return self._error("sandbox is already running or has stale runtime state")
+        (state / "outcome.json").unlink(missing_ok=True)
+        with (state / "openvmm.log").open("a", encoding="utf-8", newline="\n") as log:
+            if "noisy-log" in self.faults:
+                log.write("noise\n" * 40_000)
+            log.write("OpenVMM started\n")
+        config = json.loads((state / "config.json").read_text(encoding="utf-8"))
+        if config["user"] != "65534:65534":
+            # The guest refuses the identity and powers off.
+            (state / "outcome.json").write_text("{}", encoding="utf-8")
+            if "failed-start-keeps-runtime" in self.faults:
+                (state / "runtime.json").write_text("{}", encoding="utf-8")
+            return self._error("managed control endpoint closed")
+        pid = self.next_pid
+        self.next_pid += 1
+        self.running[pid] = True
+        endpoint = (
+            f"//./pipe/openvmm-microvm-{pid}"
+            if os.name == "nt"
+            else str(state / "control.sock")
+        )
+        self.endpoints[pid] = endpoint
+        if os.name != "nt":
+            (state / "control.sock").touch()
+        capability = os.urandom(32)
+        self.capabilities.append(capability)
+        (state / "control.capability").write_bytes(capability)
+        (state / "runtime.json").write_text(
+            json.dumps(
+                {
+                    "format": 1,
+                    "pid": pid,
+                    "start_time": pid * 7,
+                    "control_endpoint": endpoint,
+                }
+            ),
+            encoding="utf-8",
+        )
+        if "restart-loses-state" in self.faults:
+            self.guest_files.pop(state, None)
+        return 0, b"", b""
+
+    def _exec(
+        self, state: Path | None, values: dict[str, str], arguments: list[str]
+    ) -> _CliResult:
+        assert state is not None
+        _, refusal = self._running(state)
+        if refusal is not None:
+            return refusal
+        report = (
+            Path(values["--outcome-report"]) if "--outcome-report" in values else None
+        )
+        if (
+            report is not None
+            and report.exists()
+            and "overwrite-report" not in self.faults
+        ):
+            return self._error(f"outcome report already exists: {report}")
+        files = self.guest_files.setdefault(state, {})
+        entrypoint = values["--entrypoint"]
+        returncode, category, stdout, stderr = 0, "exit", b"", b""
+        if entrypoint == "/bin/sh" and arguments[:2] == ["-c", _LIFECYCLE_STATE_SCRIPT]:
+            if "exec-loses-state" not in self.faults:
+                files[arguments[2]] = "".join(
+                    f"{argument}\n" for argument in arguments[3:]
+                ).encode()
+        elif entrypoint == "/bin/sh" and arguments[1].startswith("test ! -e "):
+            returncode = int(arguments[1].removeprefix("test ! -e ") in files)
+        elif entrypoint == "/bin/cat":
+            if arguments[0] in files:
+                stdout = files[arguments[0]]
+            else:
+                returncode, stderr = 1, b"cat: No such file or directory\n"
+        elif entrypoint == "/bin/touch":
+            files[arguments[0]] = b""
+        elif entrypoint == sandbox_lifecycle_tests.PROBE:
+            self.probed = True
+            if "probe-fails" in self.faults:
+                returncode = 1
+                stderr = b"NVX-UBUNTU-SANDBOX-FAIL: the workload shares a namespace\n"
+            else:
+                stdout = (
+                    b"NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534\n"
+                    + f"NVX-UBUNTU-SANDBOX-LIMITS-OK memory_max={arguments[1]} "
+                    f"pids_max={arguments[2]}\n".encode()
+                    + b"NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534\n"
+                )
+        elif entrypoint == "/usr/bin/head":
+            size = sandbox_lifecycle_tests.OUTPUT_LIMIT_BYTES
+            if "unbounded-output" in self.faults:
+                size = int(arguments[1])
+            elif "short-output" in self.faults:
+                size -= sandbox_lifecycle_tests.OUTPUT_CHUNK_BYTES
+            returncode, category, stdout = 125, "output-limit", bytes(size)
+        elif entrypoint != "/bin/true":
+            raise AssertionError(f"unexpected workload {entrypoint}")
+        if report is not None:
+            report.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "operation_id": "a" * 32,
+                        "outcome": {
+                            "operation": "exec",
+                            "category": category,
+                            "status_code": returncode,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return returncode, stdout, stderr
+
+    def _stop(self, state: Path | None, _: dict[str, str], __: list[str]) -> _CliResult:
+        assert state is not None
+        runtime, refusal = self._running(state)
+        if refusal is not None:
+            return refusal
+        pid = cast(int, runtime["pid"])
+        if "stop-leaks-process" not in self.faults:
+            self.terminate(pid)
+        (state / "runtime.json").unlink()
+        if "stop-leaks-capability" not in self.faults:
+            (state / "control.capability").unlink()
+        (state / "control.sock").unlink(missing_ok=True)
+        (state / "outcome.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "outcome": sandbox_lifecycle_tests.MANAGED_SUCCESS,
+                    "network_policy": {},
+                    "teardown": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 0, b"", b""
+
+    def _deprovision(
+        self, state: Path | None, _: dict[str, str], __: list[str]
+    ) -> _CliResult:
+        assert state is not None
+        refusal = self._missing(state)
+        if refusal is not None:
+            return refusal
+        runtime_path = state / "runtime.json"
+        if runtime_path.is_file():
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+            if self.running.get(runtime.get("pid"), False):
+                return self._error("sandbox must be stopped before deprovision")
+        if "cleanup-deprovision-fails" in self.faults and self.probed:
+            return self._error("injected deprovision failure")
+        for name in (
+            "runtime.json",
+            "control.capability",
+            "control.sock",
+            "outcome.json",
+            "openvmm.log",
+            "config.json",
+        ):
+            (state / name).unlink(missing_ok=True)
+        unknown = sorted(path.name for path in state.iterdir())
+        if unknown and "deprovision-removes-foreign" not in self.faults:
+            return self._error(
+                "sandbox state directory contains files not owned by NVX: "
+                + ", ".join(unknown)
+            )
+        shutil.rmtree(state)
+        self.guest_files.pop(state, None)
+        return 0, b"", b""
+
+    def processes(self, _: str) -> tuple[int, ...]:
+        return tuple(sorted(pid for pid, running in self.running.items() if running))
+
+    def process_running(self, runtime: dict[str, object]) -> bool:
+        return self.running.get(cast(int, runtime["pid"]), False)
+
+    def endpoint_present(self, runtime: dict[str, object]) -> bool:
+        return runtime["control_endpoint"] in self.endpoints.values()
+
+    def terminate(self, pid: int) -> None:
+        self.running[pid] = False
+        self.endpoints.pop(pid, None)
+
+
+class PublicSandboxLifecycleTests(unittest.TestCase):
+    EXPECTED_OPERATIONS = [
+        # Identity admission.
+        "provision",
+        "run",
+        "provision",
+        "start",
+        "deprovision",
+        # Every operation fails before provision.
+        "start",
+        "exec",
+        "stop",
+        "deprovision",
+        # Provision, and the operations that need a running sandbox.
+        "provision",
+        "provision",
+        "exec",
+        "stop",
+        # A running sandbox.
+        "start",
+        "start",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "deprovision",
+        "exec",
+        # Stop, and the operations that need a running sandbox.
+        "stop",
+        "exec",
+        "stop",
+        # Restart, crash, and stale runtime state.
+        "start",
+        "exec",
+        "exec",
+        "stop",
+        "start",
+        # Deprovision.
+        "deprovision",
+        "deprovision",
+        "exec",
+    ]
+
+    def _run(self, root: Path, fake: _FakeSandboxCli) -> Path:
+        distro = root / "ubuntu-distro.erofs"
+        distro.write_bytes(b"distro")
+        template = root / "ubuntu-smoke-scratch.ext4"
+        template.write_bytes(bytes(4096))
+        artifacts = managed_exec_tests.WorkloadArtifacts(
+            distro, "12345678-1234-1234-1234-123456789abc", template
+        )
+        output_dir = root / "results"
+        mkdtemp = tempfile.mkdtemp
+
+        def fixture(prefix: str) -> str:
+            return mkdtemp(prefix=prefix, dir=root)
+
+        with (
+            patch.object(
+                sandbox_lifecycle_tests,
+                "load_workload_artifacts",
+                return_value=artifacts,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests.tempfile, "mkdtemp", side_effect=fixture
+            ),
+            patch.object(sandbox_lifecycle_tests.subprocess, "run", side_effect=fake),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "openvmm_processes",
+                side_effect=fake.processes,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "control_endpoint_present",
+                side_effect=fake.endpoint_present,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "terminate_process",
+                side_effect=fake.terminate,
+            ),
+            patch.object(
+                sandbox_lifecycle,
+                "runtime_process_running",
+                side_effect=fake.process_running,
+            ),
+        ):
+            sandbox_lifecycle_tests.run_sandbox_lifecycle(
+                "whp", timeout=2, output_dir=output_dir
+            )
+        return output_dir
+
+    def test_acceptance_drives_the_complete_public_lifecycle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = _FakeSandboxCli()
+            output_dir = self._run(root, fake)
+            checks = json.loads(
+                (output_dir / "sandbox-lifecycle-checks.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            evidence = {path.name: path.read_bytes() for path in output_dir.iterdir()}
+            fixtures = list(root.glob("nvx-public-lifecycle-*"))
+
+        self.assertEqual(fake.operations, self.EXPECTED_OPERATIONS)
+        self.assertEqual(fixtures, [])
+        self.assertFalse(any(fake.running.values()))
+        self.assertEqual(
+            set(evidence),
+            {
+                "sandbox-lifecycle-checks.json",
+                "sandbox-lifecycle-identity-run.log",
+                "sandbox-lifecycle-identity-openvmm.log",
+                "sandbox-lifecycle-runtime.json",
+                "sandbox-lifecycle-probe.log",
+                "sandbox-lifecycle-output-limit-outcome.json",
+                "sandbox-lifecycle-outcome.json",
+                "sandbox-lifecycle-openvmm.log",
+            },
+        )
+        self.assertEqual(
+            [record["operation"] for record in checks], self.EXPECTED_OPERATIONS
+        )
+        for record in checks:
+            self.assertEqual(
+                set(record),
+                {
+                    "operation",
+                    "argv",
+                    "expected_returncode",
+                    "returncode",
+                    "stdout_bytes",
+                    "stderr_bytes",
+                    "state_entries",
+                },
+            )
+        # Managed arguments keep their whitespace.
+        self.assertTrue(
+            any(
+                [
+                    f"--arg={argument}"
+                    for argument in sandbox_lifecycle_tests.STATE_ARGUMENTS
+                ]
+                == record["argv"][-3:]
+                for record in checks
+            )
+        )
+        # The bounded reports hold neither workload output nor the capability.
+        self.assertNotIn(
+            b"NVX-UBUNTU-SANDBOX", evidence["sandbox-lifecycle-checks.json"]
+        )
+        for capability in fake.capabilities:
+            for content in evidence.values():
+                self.assertNotIn(capability, content)
+                self.assertNotIn(capability.hex().encode(), content)
+        self.assertIn(
+            b"NVX-UBUNTU-SANDBOX-LIMITS-OK", evidence["sandbox-lifecycle-probe.log"]
+        )
+
+    def test_acceptance_detects_lifecycle_regressions(self):
+        regressions = {
+            "run-starts-workload": "run returned 0, expected 125",
+            "failed-start-keeps-runtime": "a failed start left lifecycle state behind",
+            "duplicate-start": "start returned 0, expected 1",
+            "exec-loses-state": "the state-reading request returned status 1",
+            "probe-fails": "exec returned 1, expected 0",
+            "unbounded-output": "the output limit forwarded 2097152 stdout",
+            "short-output": "the output limit forwarded 1015808 stdout",
+            "overwrite-report": "exec returned 0, expected 1",
+            "stop-leaks-capability": "after stop: the state directory holds",
+            "stop-leaks-process": "OpenVMM still runs after stop",
+            "restart-loses-state": "the restarted sandbox's state returned status 1",
+            "deprovision-removes-foreign": "deprovision returned 0, expected 1",
+        }
+        for fault, message in regressions.items():
+            with (
+                self.subTest(fault=fault),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                fake = _FakeSandboxCli(fault)
+                with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                    self._run(root, fake)
+                # Cleanup ends every OpenVMM process and removes the fixture.
+                self.assertFalse(any(fake.running.values()))
+                self.assertEqual(list(root.glob("nvx-public-lifecycle-*")), [])
+                self.assertTrue(
+                    (root / "results" / "sandbox-lifecycle-checks.json").is_file()
+                )
+
+    def test_evidence_keeps_the_end_of_long_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = self._run(Path(temporary), _FakeSandboxCli("noisy-log"))
+            log = (output_dir / "sandbox-lifecycle-openvmm.log").read_bytes()
+
+        limit = sandbox_lifecycle_tests.EVIDENCE_LIMIT
+        header, separator, tail = log.partition(b"\n")
+        self.assertRegex(header, rb"^\.\.\. \(\d+ earlier bytes omitted\)$")
+        self.assertEqual(separator, b"\n")
+        self.assertEqual(len(tail), limit)
+        self.assertTrue(tail.endswith(b"noise\nOpenVMM started\n"))
+
+    def test_bounded_evidence_keeps_the_end_of_its_data(self):
+        bounded = sandbox_lifecycle_tests.bounded_evidence
+        limit = sandbox_lifecycle_tests.EVIDENCE_LIMIT
+        self.assertEqual(bounded(b"short"), b"short")
+        self.assertEqual(
+            bounded(b"a" * 10 + b"b" * limit),
+            b"... (10 earlier bytes omitted)\n" + b"b" * limit,
+        )
+        self.assertEqual(bounded(b"tail", 7), b"... (7 earlier bytes omitted)\ntail")
+
+    def test_failed_cleanup_preserves_the_fixture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = _FakeSandboxCli("probe-fails", "cleanup-deprovision-fails")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "(?s)exec returned 1, expected 0.*fixture preserved for recovery",
+            ) as raised:
+                self._run(root, fake)
+            fixtures = list(root.glob("nvx-public-lifecycle-*"))
+
+            self.assertEqual(len(fixtures), 1)
+            self.assertIn(str(fixtures[0]), str(raised.exception))
+            self.assertTrue((fixtures[0] / "state" / "config.json").is_file())
+            self.assertFalse(any(fake.running.values()))
+            self.assertTrue(
+                (root / "results" / "sandbox-lifecycle-openvmm.log").is_file()
+            )
+
+    def test_scratch_journal_check_reads_the_ext4_recovery_flag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            image = Path(temporary) / "scratch.ext4"
+            superblock = bytearray(2048)
+            image.write_bytes(superblock)
+            self.assertTrue(sandbox_lifecycle_tests.scratch_journal_clean(image))
+            superblock[1024 + 0x60] = sandbox_lifecycle_tests.EXT4_INCOMPAT_RECOVER
+            image.write_bytes(superblock)
+            self.assertFalse(sandbox_lifecycle_tests.scratch_journal_clean(image))
+            image.write_bytes(bytes(1030))
+            with self.assertRaisesRegex(RuntimeError, "truncated"):
+                sandbox_lifecycle_tests.scratch_journal_clean(image)
+
+    def test_kill_ends_the_recorded_process(self):
+        if os.name != "nt" and sys.platform != "linux":
+            self.skipTest("process identity requires a Linux or Windows host")
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            runtime: dict[str, object] = {
+                "format": 1,
+                "pid": child.pid,
+                "start_time": sandbox_lifecycle._process_start_time(child.pid),
+                "control_endpoint": "unused",
+            }
+            self.assertTrue(sandbox_lifecycle.runtime_process_running(runtime))
+            sandbox_lifecycle_tests.kill_openvmm(runtime, 30)
+            self.assertFalse(sandbox_lifecycle.runtime_process_running(runtime))
+            self.assertNotEqual(child.wait(timeout=30), 0)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=30)
+
+    def test_control_endpoint_presence_follows_the_endpoint(self):
+        if sys.platform == "win32":
+            from multiprocessing.connection import Listener
+
+            name = f"openvmm-microvm-test-{os.getpid()}"
+            runtime: dict[str, object] = {"control_endpoint": f"//./pipe/{name}"}
+            listener = Listener(rf"\\.\pipe\{name}", family="AF_PIPE")
+            try:
+                self.assertTrue(
+                    sandbox_lifecycle_tests.control_endpoint_present(runtime)
+                )
+            finally:
+                listener.close()
+            self.assertFalse(sandbox_lifecycle_tests.control_endpoint_present(runtime))
+            return
+        with tempfile.TemporaryDirectory() as temporary:
+            endpoint = Path(temporary) / "control.sock"
+            runtime = {"control_endpoint": str(endpoint)}
+            self.assertFalse(sandbox_lifecycle_tests.control_endpoint_present(runtime))
+            endpoint.touch()
+            self.assertTrue(sandbox_lifecycle_tests.control_endpoint_present(runtime))
+
+    @unittest.skipUnless(sys.platform == "linux", "scans the Linux process table")
+    def test_process_scan_finds_openvmm_processes_naming_the_fixture(self):
+        shell = shutil.which("sh")
+        assert shell is not None
+        with tempfile.TemporaryDirectory() as temporary:
+            openvmm = Path(temporary) / "openvmm"
+            shutil.copyfile(shell, openvmm)
+            openvmm.chmod(0o755)
+            # The shell blocks in its read builtin, so it starts no other
+            # process and keeps its arguments.
+            child = subprocess.Popen(
+                [str(openvmm), "-c", "read -r line", "nvx-public-lifecycle-scan"],
+                stdin=subprocess.PIPE,
+            )
+            try:
+                deadline = time.monotonic() + 30
+                while child.pid not in sandbox_lifecycle_tests.openvmm_processes(
+                    "nvx-public-lifecycle-scan"
+                ):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.05)
+                self.assertEqual(
+                    sandbox_lifecycle_tests.openvmm_processes("nvx-other-fixture"), ()
+                )
+            finally:
+                child.kill()
+                child.wait(timeout=30)
+                if child.stdin is not None:
+                    child.stdin.close()
 
 
 class GuestIdentityScriptTests(unittest.TestCase):
@@ -4993,6 +5617,67 @@ class MicrovmTests(unittest.TestCase):
             run.assert_called_once_with(
                 "whp", timeout=args.timeout, output_dir=output_dir
             )
+
+    def test_runner_dispatches_public_sandbox_lifecycle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "mshv",
+                    "--scenario",
+                    "sandbox-lifecycle",
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_sandbox_lifecycle") as run,
+                patch.object(
+                    microvm_tests, "run_managed_exec_configuration"
+                ) as managed_exec,
+            ):
+                self.assertEqual(microvm_tests.run(args), 0)
+            run.assert_called_once_with(
+                "mshv", timeout=args.timeout, output_dir=output_dir
+            )
+            managed_exec.assert_not_called()
+
+    def test_runner_runs_public_sandbox_scenarios_only_when_named(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            args = nvx.parse_args(
+                ["test-microvm", "--backend", "kvm", "--output-dir", temporary]
+            )
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(
+                    microvm_tests,
+                    "MICROVM_TEST_SCENARIOS",
+                    ("managed-exec-config", "sandbox-lifecycle", "guest-boot"),
+                ),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_guest_boot") as guest_boot,
+                patch.object(microvm_tests, "run_sandbox_lifecycle") as lifecycle,
+                patch.object(
+                    microvm_tests, "run_managed_exec_configuration"
+                ) as managed_exec,
+            ):
+                self.assertEqual(microvm_tests.run(args), 0)
+
+        guest_boot.assert_called_once()
+        lifecycle.assert_not_called()
+        managed_exec.assert_not_called()
+        self.assertIn("sandbox-lifecycle", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
 
     def test_managed_container_launch_prepares_identity_and_static_helper(self):
         root = Path(__file__).resolve().parent.parent
