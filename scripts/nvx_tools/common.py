@@ -226,6 +226,13 @@ def _checksummed_tree_files(directory: Path) -> list[Path]:
     return files
 
 
+def normalized_sha256_file(path: Path) -> str:
+    contents = path.read_bytes().replace(b"\r\n", b"\n")
+    if b"\r" in contents:
+        raise ScriptError(f"{path} contains unsupported carriage returns")
+    return hashlib.sha256(contents).hexdigest()
+
+
 def write_sha256_sums(directory: Path) -> None:
     lines = [
         f"{sha256_file(path)}  {path.relative_to(directory).as_posix()}"

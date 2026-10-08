@@ -28,6 +28,7 @@ from .common import (
     ScriptError,
     cache_root,
     download_verified,
+    normalized_sha256_file,
     path_exists,
     require_tool,
     sha256_file,
@@ -198,10 +199,7 @@ def load_package_lock(
 
 
 def package_lock_sha256(path: Path = UbuntuBuildConstants.PACKAGE_LOCK) -> str:
-    contents = path.read_bytes().replace(b"\r\n", b"\n")
-    if b"\r" in contents:
-        raise ScriptError(f"{path} contains unsupported carriage returns")
-    return hashlib.sha256(contents).hexdigest()
+    return normalized_sha256_file(path)
 
 
 def _normalize_archive_path(raw_name: str, label: str) -> PurePosixPath:
