@@ -47,7 +47,8 @@ coordinator fills the `.sh.in` templates before use.
 The series names carry no CPU vendor: every CI microVM runner is an Azure virtual machine with an
 Intel Xeon CPU (Ice Lake-SP or Emerald Rapids), so each series has one vendor's samples. No CI
 microVM runner has an AMD CPU, so no AMD series exists yet. An AMD runner needs a built-in AMD
-[CPU profile](usage.md#cpu-profiles), because CI never uses host profiles, and only Milan, Genoa,
+[CPU profile](usage.md#cpu-profiles), because CI never uses host profiles and `benchmark` refuses a
+CPU that no built-in profile serves, and only Milan, Genoa,
 and Turin CPUs have one so far. Such a runner boots its guests on that profile through AMD-V, so its
 timings would skew an Intel series' baseline. [#410](https://github.com/microsoft/nvx/issues/410)
 tracks AMD runners. Before an AMD runner joins CI, give it series of its

@@ -33,15 +33,16 @@ the Rust release that [`rust-toolchain.toml`](../rust-toolchain.toml) pins on
 first use.
 
 By default, a microVM boots on the built-in
-[CPU profile](usage.md#cpu-profiles) of its host's CPU, so the host needs a CPU
-that one of OpenVMM's built-in profiles serves, four Intel generations and
-AMD's EPYC Milan, Genoa, and Turin, on a hypervisor that supports that
-profile. On another
-Intel or AMD CPU, or where the hypervisor does not support the built-in
-profile (`E_PROFILE_UNSUPPORTED`, whose message names this option),
-`nvx.py run --cpu-profile host` opts in to a development profile derived from
-the host, which OpenVMM verifies as it verifies a built-in profile: the cold
-boot still fails with `E_PROFILE_UNSUPPORTED` if the hypervisor lacks a CPU
+[CPU profile](usage.md#cpu-profiles) of its host's CPU: four Intel
+generations and AMD's EPYC Milan, Genoa, and Turin, on a hypervisor that
+supports that profile. On another Intel or AMD CPU, `--cpu-profile auto`, the
+default, falls back to a development profile derived from the host and warns
+at every cold boot, asking for the CPU's fingerprint so that a built-in
+profile can serve it; `nvx.py run --cpu-profile host` selects that profile
+explicitly, for example where the hypervisor does not support the built-in
+profile (`E_PROFILE_UNSUPPORTED`, whose message names this option). OpenVMM
+verifies a host profile as it verifies a built-in profile: the cold boot
+still fails with `E_PROFILE_UNSUPPORTED` if the hypervisor lacks a CPU
 feature that the time ABI requires. CPUs of other vendors have no CPU
 profiles.
 

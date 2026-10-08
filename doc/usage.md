@@ -491,7 +491,7 @@ python3 scripts/nvx.py run
 | `--memory-mib MIB` | guest-specific | Set guest memory in MiB. Defaults to 128 for Alpine, 512 for Ubuntu, and 512 for Azure Linux. |
 | `--memory-capacity-mib MIB` | none | Reserve an immutable, 128 MiB-aligned RAM capacity for a fresh microVM snapshot. |
 | `--processors {1,2,4,8}` | `1` | Select the microVM processor count. |
-| `--cpu-profile ID` | `auto` | Select the guest's [CPU profile](#cpu-profiles): `auto` for the built-in profile of the host's CPU, a built-in profile ID, or `host` for a development profile derived from this host. A restore uses the snapshot's profile, which `auto` and, for a host profile, `host` also name. |
+| `--cpu-profile ID` | `auto` | Select the guest's [CPU profile](#cpu-profiles): `auto` for the built-in profile of the host's CPU, which falls back with a warning to a development profile derived from this host on an Intel or AMD CPU that no built-in profile serves, a built-in profile ID, or `host` for that development profile. A restore uses the snapshot's profile, which `auto` and, for a host profile, `host` also name. |
 | `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Expose a host directory at the absolute guest target. Repeat once to expose a second directory with its own target and mode; targets and directories must not overlap. An `rw` mapping accepts guest-created symbolic links, which the host never follows. Active snapshot restore requires the same mappings in the same order, with the same canonical paths, targets, modes, and ownership mode; a dormant-slot restore may attach one new mapping that the resumed guest mounts explicitly. |
 | `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside a mounted host root; repeat to deny multiple paths. With two mappings, the path must be absolute. |
 | `--mount-allow HOST_PATH` | none | Expose one existing file or directory inside a `--mount-deny` path again; the hidden directories on the way list only the entries that lead to it. Repeat to allow multiple paths. With two mappings, the path must be absolute. See [Access policy](run.md#access-policy). |
@@ -520,15 +520,20 @@ selected `build/initramfs*.cpio.gz`. Ubuntu selection never falls back to
 Alpine. See [Run](run.md) for host setup, guest shutdown, networking, and
 virtio-fs examples.
 
-If no built-in CPU profile serves the host's CPU, OpenVMM exits with
-`E_PROFILE_HOST_UNKNOWN` before it creates the VM. After a failed cold boot on
-such a CPU, `run` names the CPU, lists the CPUs that the built-in profiles
-cover, and gives the next steps described in [CPU profiles](#cpu-profiles),
-suggesting `--cpu-profile host` only on an Intel or AMD CPU. OpenVMM's own
-error, above the guidance, names the cause of the failure. A host whose
-hypervisor does not support its built-in profile fails with
-`E_PROFILE_UNSUPPORTED` instead, and on an Intel or AMD CPU OpenVMM's error
-itself names `--cpu-profile host`.
+If no built-in CPU profile serves an Intel or AMD host's CPU, OpenVMM falls
+back to a host profile and warns with `NVX-CPU-PROFILE-FALLBACK:` at every
+cold boot, as [CPU profiles](#cpu-profiles) describes. After a failed cold
+boot on such a CPU, `run` names the CPU, lists the CPUs that the built-in
+profiles cover, says that `auto` falls back on it, and asks for the CPU's
+fingerprint through a [CPU profile request](#cpu-profiles), with the OpenVMM
+command that writes the fingerprint. OpenVMM's
+own error, above the guidance, names the cause of the failure, and says so
+where the host profile cannot boot. On a CPU of another vendor that no
+built-in profile serves, OpenVMM exits with `E_PROFILE_HOST_UNKNOWN` before it
+creates the VM, and `run` explains that host profiles cannot boot there
+either. A host whose hypervisor does not support its built-in profile fails
+with `E_PROFILE_UNSUPPORTED` instead, and on an Intel or AMD CPU OpenVMM's
+error itself names `--cpu-profile host`.
 
 ### `sandbox`
 
@@ -635,7 +640,9 @@ built-in profile of the host's CPU generation:
 | `amd.turin.v1` | `turin` | AMD EPYC, fifth generation (26/2) |
 
 Any other CPU, including Cascade Lake, Sapphire Rapids, Granite Rapids, Tiger
-Lake, Raptor Lake, and AMD's Ryzen CPUs, fails with `E_PROFILE_HOST_UNKNOWN`.
+Lake, Raptor Lake, and AMD's Ryzen CPUs, has no built-in profile: on an Intel
+or AMD CPU, `--cpu-profile auto` falls back to a host profile, described
+below, and on another vendor's CPU, it fails with `E_PROFILE_HOST_UNKNOWN`.
 A host of a listed generation can still fail with `E_PROFILE_UNSUPPORTED` if
 its SKU or hypervisor lacks a feature of the profile, and on an Intel or AMD
 CPU OpenVMM's error then names `--cpu-profile host`. `intel.alderlake.v1`
@@ -654,30 +661,55 @@ Linux guests therefore use retpolines and report SSB, SRSO, and TSA as
 vulnerable on every host. `amd.genoa.v1` pins the TSA immunities that Azure
 presents on Genoa, which a bare-metal Genoa host's KVM does not report.
 
-On an Intel or AMD development host that no built-in profile serves, or whose
-hypervisor does not support its built-in profile, `run --cpu-profile host`
-opts in to a host profile, `intel.host.v1` or `amd.host.v1`. OpenVMM
-fingerprints the hypervisor on this host and applies the built-in profiles'
-derivation policy to it, so the guest sees the same kind of filtered CPU
-surface, and verifies it as it verifies a built-in profile: a cold boot still
-fails with `E_PROFILE_UNSUPPORTED` if the hypervisor lacks a CPU feature that
-the time ABI requires. A host profile is for development only:
+On an Intel or AMD development host that no built-in profile serves,
+`--cpu-profile auto` falls back to a host profile, `intel.host.v1` or
+`amd.host.v1`, which `run --cpu-profile host` also selects, for example where
+the hypervisor does not support the built-in profile. OpenVMM fingerprints the
+hypervisor on this host and applies the built-in profiles' derivation policy
+to it, so the guest sees the same kind of filtered CPU surface, and verifies
+it as it verifies a built-in profile: a cold boot still fails with
+`E_PROFILE_UNSUPPORTED` if the hypervisor lacks a CPU feature that the time
+ABI requires. Where `auto` fell back, the error also says so; with an explicit
+`--cpu-profile host`, it reports the failure alone. A host profile is for
+development only:
 
 - It is not pinned: a microcode, firmware, hypervisor, or OS update can change
   it.
-- Each cold boot fingerprints the hypervisor first, which adds a few to tens
-  of milliseconds, depending on the hypervisor.
+- Each cold boot fingerprints the hypervisor first, which
+  [#394](https://github.com/microsoft/nvx/pull/394) measured at 2.6 to 5.5 ms
+  on WHP, 11 to 23 ms on KVM, and 52 ms on MSHV. The cost varies with the
+  host, and the fallback's warning reports what each cold boot's fingerprint
+  took.
 - A snapshot records its host profile, and restores only on a host with the
   same CPU model and stepping whose hypervisor supports the profile.
-- `doctor` never qualifies it, so benchmark and CI hosts need a built-in
-  profile.
+- `doctor` never qualifies it, so CI hosts need a built-in profile, and
+  `benchmark` refuses a CPU that no built-in profile serves.
+
+Every cold boot that falls back logs one OpenVMM warning, at the default log
+level, that starts with `NVX-CPU-PROFILE-FALLBACK:` and names the CPU, the
+host profile with its digest, and these limits, with what that cold boot's
+fingerprint took. It also asks you to help add
+a built-in profile for the CPU: run
+`openvmm --hypervisor <backend> --cpu-fingerprint fingerprint.json`, which
+reports `E_PROFILE_HOST_UNKNOWN` on such a CPU but still writes the
+fingerprint, and attach `fingerprint.json` to a
+[CPU profile request](https://github.com/microsoft/nvx/issues/new?template=cpu-profile.yml),
+whose link in the warning prefills the CPU. The fingerprint holds the CPU's
+identity and microcode, the OS kind and build, the hypervisor's interface, and
+the CPUID, XSAVE, MSR, and time surface that the backend supports; it holds no
+hostname, user name, or serial number. Fingerprints of the generation from
+other backends help too, because a profile is the intersection of its
+backends' fingerprints and released profiles are immutable. An explicit
+`--cpu-profile host` warns too, with the same request where no built-in
+profile serves the CPU.
 
 [#408](https://github.com/microsoft/nvx/issues/408) tracks built-in profiles
 for more Intel CPUs, such as Tiger Lake and Meteor Lake, and
-[#409](https://github.com/microsoft/nvx/issues/409) for more AMD CPUs; host
-profiles serve no CPU of another vendor than Intel and AMD. A profile derives
-from fingerprints of its generation's hosts on every backend that it serves;
-see `vmm_core/cpu_profile` in the OpenVMM submodule.
+[#409](https://github.com/microsoft/nvx/issues/409) for more AMD CPUs, and
+maintainers link each CPU profile request to one of them; host profiles serve
+no CPU of another vendor than Intel and AMD. A profile derives from
+fingerprints of its generation's hosts on every backend that it serves; see
+`vmm_core/cpu_profile` in the OpenVMM submodule.
 
 ## Benchmarking
 
@@ -723,6 +755,17 @@ python3 scripts/nvx.py benchmark [OPTIONS]
 | `--keep-kvm-stage` | off | Keep temporary staged KVM benchmark binaries. |
 
 Measured counts must be at least 1; warmups may be zero, and timeouts must be greater than zero.
+Every suite but `phase2`, which boots no microVM, refuses a host before it
+builds or measures anything if no built-in [CPU profile](#cpu-profiles) of the
+`--openvmm-dir` checkout serves its CPU, or if it cannot identify the CPU or
+read that checkout's profiles and so cannot confirm that one does.
+On such an Intel or AMD CPU, OpenVMM's default CPU profile selection, `auto`,
+falls back to a host profile, whose every cold boot fingerprints the
+hypervisor first and whose results no baseline shares, and the refusal names
+the CPU and links a CPU profile request. On another vendor's CPU, every cold
+boot fails with `E_PROFILE_HOST_UNKNOWN`, as it does on a CPU that profiles of
+more than one of the checkout's generations cover, which `benchmark` refuses
+too: `auto` rejects such a catalog without falling back.
 The `e2e` suite uses the general memory size and measures cold start, snapshot
 generation, snapshot restore, guest-exit teardown, and peak RSS against the
 shell-ready markers. CI uses the default 128 MiB baseline.

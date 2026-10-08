@@ -107,6 +107,8 @@ CPUINFO_PATH = Path("/proc/cpuinfo")
 # "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel": the display family,
 # model, and stepping, and the CPUID vendor.
 WINDOWS_PROCESSOR = re.compile(r"Family (\d+) Model (\d+) Stepping (\d+), (\S+)")
+# The registry key of the first processor's identity on Windows.
+WINDOWS_PROCESSOR_KEY = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
 ADJTIMEX_TIME_ERROR = 5
 ADJTIMEX_STA_UNSYNC = 0x0040
 # Every H7 failure to read the host's synchronization state starts with this
@@ -267,20 +269,30 @@ def _windows_registry_value(key: str, name: str) -> object:
 
 def host_cpu_signature() -> HostCpu | None:
     """Return the host CPU's vendor and display family, model, and stepping, as
-    the host OS reports them, or None where they cannot be read."""
+    the host OS reports them, with its brand string where the OS reports one,
+    or None where they cannot be read."""
     try:
         if host_is_windows():
             match = WINDOWS_PROCESSOR.search(platform.processor())
             if match is None:
                 return None
             family, model, stepping, vendor = match.groups()
+            try:
+                brand = str(
+                    _windows_registry_value(
+                        WINDOWS_PROCESSOR_KEY, "ProcessorNameString"
+                    )
+                ).strip()
+            except (OSError, ScriptError):
+                brand = ""
         else:
             cpuinfo = _linux_cpuinfo()
             vendor = cpuinfo["vendor_id"]
             family = cpuinfo["cpu family"]
             model = cpuinfo["model"]
             stepping = cpuinfo["stepping"]
-        return HostCpu(vendor, int(family), int(model), int(stepping))
+            brand = cpuinfo.get("model name", "")
+        return HostCpu(vendor, int(family), int(model), int(stepping), brand)
     except (OSError, KeyError, ValueError):
         return None
 
@@ -292,17 +304,16 @@ def host_cpu(context: DoctorContext) -> dict[str, str]:
         if match is None:
             raise ScriptError(f"cannot parse the processor {platform.processor()!r}")
         family, model, stepping, vendor = match.groups()
-        processor_key = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
         info = {
             "vendor": vendor,
             "family": family,
             "model": model,
             "stepping": stepping,
             "brand": str(
-                _windows_registry_value(processor_key, "ProcessorNameString")
+                _windows_registry_value(WINDOWS_PROCESSOR_KEY, "ProcessorNameString")
             ).strip(),
         }
-        revision = _windows_registry_value(processor_key, "Update Revision")
+        revision = _windows_registry_value(WINDOWS_PROCESSOR_KEY, "Update Revision")
         if isinstance(revision, bytes) and len(revision) in (4, 8):
             info["microcode"] = hex(int.from_bytes(revision[-4:], "little"))
         build = _windows_registry_value(
@@ -651,7 +662,9 @@ def check_openvmm_preflight(context: DoctorContext) -> CheckResult:
             "OpenVMM verified no catalog CPU profile: "
             f"cpu_profile={selected_profile}"
             + (
-                " (a host profile, which qualification never accepts)"
+                " (a host profile, to which --cpu-profile auto falls back on a "
+                "CPU that no built-in profile serves, and which qualification "
+                "never accepts)"
                 if is_host_profile_id(selected_profile)
                 else ""
             )

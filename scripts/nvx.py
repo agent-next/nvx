@@ -19,6 +19,7 @@ from nvx_tools.aci_edge_sandboxes_tests import (
 )
 from nvx_tools.adversarial import configure_parser as configure_adversarial_parser
 from nvx_tools.benchmark import configure_parser as configure_benchmark_parser
+from nvx_tools.benchmark import run as run_benchmark
 from nvx_tools.build import (
     build_all,
     build_distro_layer,
@@ -96,7 +97,11 @@ from nvx_tools.sandbox import (
     parse_workload_identity,
     require_mount_owner_supported,
 )
-from nvx_tools.time_abi import host_cpu_unsupported_guidance
+from nvx_tools.time_abi import (
+    benchmark_cpu_profile_refusal,
+    host_cpu_profile_guidance,
+    openvmm_cpu_generations,
+)
 
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
@@ -334,6 +339,30 @@ def command_test_openvmm_unit(_: argparse.Namespace) -> None:
     run_openvmm_unit_tests()
 
 
+def command_benchmark(args: argparse.Namespace) -> int:
+    """Run the benchmark coordinator, after refusing a host whose CPU no
+    built-in CPU profile of the selected OpenVMM checkout serves before it
+    builds or measures anything. Only the phase 2 suite, which boots no
+    microVM, runs on any host. A KVM worker, which the Windows coordinator
+    reinvokes inside WSL without its --openvmm-dir, runs the binaries that the
+    coordinator staged after this check, so it skips the check."""
+    if args.suite != "phase2" and not args._kvm_worker:
+        try:
+            generations = openvmm_cpu_generations(args.openvmm_dir)
+        except ValueError as error:
+            raise ScriptError(
+                "benchmark cannot confirm that a built-in CPU profile serves this "
+                f"host's CPU: {error}"
+            ) from error
+        hypervisor = "whp" if args.backend == "both" else args.backend
+        refusal = benchmark_cpu_profile_refusal(
+            host_cpu_signature(), "openvmm", hypervisor, generations
+        )
+        if refusal is not None:
+            raise ScriptError(refusal)
+    return run_benchmark(args)
+
+
 def command_build(args: argparse.Namespace) -> None:
     build_all(_build_config(args))
 
@@ -507,20 +536,30 @@ def command_run(args: argparse.Namespace) -> None:
     print(f">> {_format_command(command)}")
     if not args.dry_run:
         raise SystemExit(
-            _run_openvmm(command, args.cpu_profile, args.restore_snapshot is None)
+            _run_openvmm(
+                command,
+                args.cpu_profile,
+                args.restore_snapshot is None,
+                _hypervisor(args.hypervisor),
+            )
         )
 
 
-def _run_openvmm(command: list[str], cpu_profile: str | None, cold_boot: bool) -> int:
+def _run_openvmm(
+    command: list[str], cpu_profile: str | None, cold_boot: bool, hypervisor: str
+) -> int:
     """Run OpenVMM on the terminal, and explain the next steps when a cold boot
-    fails on a host whose CPU no built-in CPU profile serves.
+    fails on a host whose CPU no built-in CPU profile serves, with the
+    ``hypervisor`` backend.
 
     OpenVMM keeps all three standard streams: it restores the terminal settings
     that its console changes only when its standard error is a terminal, and
     writes its log for a terminal there."""
     returncode = subprocess.run(command).returncode
     if returncode != 0 and cold_boot:
-        guidance = host_cpu_unsupported_guidance(cpu_profile, host_cpu_signature())
+        guidance = host_cpu_profile_guidance(
+            cpu_profile, host_cpu_signature(), _format_command(command[:1]), hypervisor
+        )
         if guidance is not None:
             print(guidance, file=sys.stderr)
     return returncode
@@ -1253,6 +1292,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="run the OpenVMM-native benchmark coordinator",
     )
     configure_benchmark_parser(benchmark, BuildConstants.REPO_ROOT)
+    benchmark.set_defaults(handler=command_benchmark)
 
     performance = subparsers.add_parser(
         "performance",
