@@ -4629,6 +4629,410 @@ class MicrovmTests(unittest.TestCase):
                     guest=guest,
                 )
 
+    def test_egress_protocol_cases_cover_each_selector_as_allow_and_deny(self):
+        cases = {
+            case.name: case
+            for case in microvm_tests._egress_protocol_cases("192.0.2.1", 20000)
+        }
+        every_probe = frozenset(microvm_tests.L3_L4_EGRESS_PROBES)
+        expected = {
+            "tcp": ({"protocol": "tcp"}, {"tcp-named", "tcp-other"}),
+            "udp": ({"protocol": "udp"}, {"udp-named", "udp-other"}),
+            "icmp": ({"protocol": "icmp"}, {"icmp"}),
+            "any-port": (
+                {"protocol": "any", "port": 20000},
+                {"tcp-named", "udp-named"},
+            ),
+            "any": ({"protocol": "any"}, set(every_probe)),
+        }
+        self.assertEqual(
+            set(cases),
+            {f"{action}-{name}" for action in ("allow", "deny") for name in expected},
+        )
+        for name, (selector, matched) in expected.items():
+            rule = {"cidr": "192.0.2.1/32", **selector}
+            with self.subTest(selector=name):
+                allow = cases[f"allow-{name}"]
+                self.assertEqual((allow.allow, allow.deny), ((rule,), ()))
+                self.assertEqual(allow.reached, matched)
+                deny = cases[f"deny-{name}"]
+                self.assertEqual(
+                    (deny.allow, deny.deny), (({"cidr": "192.0.2.1/32"},), (rule,))
+                )
+                self.assertEqual(deny.reached, every_probe - matched)
+
+    def _run_egress_protocols(
+        self,
+        output_dir: Path,
+        *,
+        leaked: tuple[str, str] | None = None,
+        guest_report: tuple[str, str, str] | None = None,
+    ) -> tuple[MagicMock, MagicMock]:
+        tcp = [MagicMock(spec=socket.socket) for _ in range(2)]
+        udp = [MagicMock(spec=socket.socket) for _ in range(2)]
+        for index, endpoint in enumerate((*tcp, *udp)):
+            endpoint.getsockname.return_value = ("0.0.0.0", 20000 + index % 2)
+        cases = {
+            case.name: case
+            for case in microvm_tests._egress_protocol_cases(
+                microvm_tests.DIRECTIONAL_NETWORK_GATEWAY_IPV4, 20000
+            )
+        }
+        current: list[str] = []
+
+        def guest(
+            command: list[str], _script: str, _marker: bytes, **_kwargs: object
+        ) -> dict[str, str]:
+            policy = Path(command[command.index("--network-egress-policy-file") + 1])
+            name = policy.name.removeprefix("l3-l4-egress-").removesuffix(
+                "-policy.json"
+            )
+            current.append(name)
+            reports = {
+                probe: "sent"
+                if probe.startswith("udp")
+                else "reached"
+                if probe in cases[name].reached
+                else "blocked"
+                for probe in microvm_tests.L3_L4_EGRESS_PROBES
+            }
+            if guest_report is not None and guest_report[0] == name:
+                reports[guest_report[1]] = guest_report[2]
+            # The tty echoes script lines, which must not count as reports.
+            text = 'echo "NVX-L3-L4-PROBE icmp=echoed"\r\n' + "".join(
+                f"NVX-L3-L4-PROBE {probe}={value}\r\n"
+                for probe, value in reports.items()
+            )
+            return {"text": text + "NVX-L3-L4-EGRESS-PROTOCOLS-OK\r\n"}
+
+        class FakeServer:
+            def __init__(
+                self, endpoints: dict[str, socket.socket], _timeout: float
+            ) -> None:
+                assert list(endpoints.values()) == [*tcp, *udp]
+                assert list(endpoints) == list(microvm_tests.L3_L4_EGRESS_PROBES[:4])
+
+            def __enter__(self) -> "FakeServer":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                pass
+
+            def finish(self) -> frozenset[str]:
+                name = current[-1]
+                reached = set(cases[name].reached - {"icmp"})
+                if leaked is not None and leaked[0] == name:
+                    reached.add(leaked[1])
+                return frozenset(reached)
+
+        with (
+            patch.object(
+                microvm_tests, "_bind_dual_protocol_ports", return_value=(tcp, udp)
+            ),
+            patch.object(microvm_tests, "_EgressProbeServer", FakeServer),
+            patch.object(
+                microvm_tests, "run_guest_script", side_effect=guest
+            ) as run_guest_script,
+            patch.object(microvm_tests, "OpenvmmProcess") as openvmm_process,
+        ):
+            wait = openvmm_process.return_value.__enter__.return_value.wait
+            wait.side_effect = (
+                MagicMock(returncode=2, output=b"ICMP egress rules do not take a port"),
+                MagicMock(returncode=2, output=b"invalid egress transport 'any'"),
+            )
+            try:
+                microvm_tests.run_l3_l4_egress_protocols(
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initramfs"),
+                    "whp",
+                    memory_mib=128,
+                    timeout=1,
+                    output_dir=output_dir,
+                )
+            finally:
+                for endpoint in (*tcp, *udp):
+                    endpoint.close.assert_called_once_with()
+        return run_guest_script, openvmm_process
+
+    def test_l3_l4_egress_protocols_run_every_case_through_public_nvx_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            run_guest_script, openvmm_process = self._run_egress_protocols(output_dir)
+
+            names = [
+                case.name
+                for case in microvm_tests._egress_protocol_cases(
+                    microvm_tests.DIRECTIONAL_NETWORK_GATEWAY_IPV4, 20000
+                )
+            ]
+            self.assertEqual(run_guest_script.call_count, len(names))
+            nvx_path = str(Path(microvm_tests.__file__).parents[1] / "nvx.py")
+            for call, name in zip(run_guest_script.call_args_list, names, strict=True):
+                policy_path = output_dir / f"l3-l4-egress-{name}-policy.json"
+                self.assertEqual(
+                    call.args[0],
+                    [
+                        sys.executable,
+                        nvx_path,
+                        "run",
+                        "--guest",
+                        "alpine",
+                        "--hypervisor",
+                        "whp",
+                        "--memory-mib",
+                        "128",
+                        "--net",
+                        microvm_tests.DIRECTIONAL_NETWORK_CIDR,
+                        "--network-profile",
+                        "portable",
+                        "--network-egress",
+                        "deny",
+                        "--network-ingress",
+                        "deny",
+                        "--network-egress-policy-file",
+                        str(policy_path),
+                        "--cmdline",
+                        "quiet loglevel=0",
+                    ],
+                )
+                self.assertNotIn("@", call.args[1])
+                self.assertIn(" 20000 &\n", call.args[1])
+                self.assertIn(" 20001 &\n", call.args[1])
+                self.assertEqual(
+                    call.args[2], microvm_tests.L3_L4_EGRESS_PROTOCOLS_COMPLETION_MARKER
+                )
+                self.assertIs(call.kwargs["contain_process_tree"], True)
+
+            requested = json.loads(
+                (output_dir / "l3-l4-egress-allow-any-port-policy.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                requested,
+                {
+                    "allow": [
+                        {"cidr": "192.0.2.1/32", "protocol": "any", "port": 20000}
+                    ],
+                    "deny": [],
+                },
+            )
+            rejected = [call.args[0][-1] for call in openvmm_process.call_args_list]
+            self.assertEqual(rejected, ["192.0.2.1:icmp:443", "192.0.2.1:any"])
+
+            results = json.loads(
+                (output_dir / "l3-l4-egress-protocols-results.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(results["ports"], {"named": 20000, "other": 20001})
+            by_case = {case["case"]: case for case in results["cases"]}
+            self.assertEqual(list(by_case), names)
+            self.assertEqual(
+                by_case["deny-tcp"]["host_reached"], ["udp-named", "udp-other"]
+            )
+            self.assertEqual(by_case["deny-tcp"]["guest"]["icmp"], "reached")
+            self.assertEqual(by_case["allow-icmp"]["host_reached"], [])
+            self.assertEqual(by_case["allow-icmp"]["guest"]["icmp"], "reached")
+
+    def test_l3_l4_egress_protocols_reject_leaks_and_missed_traffic(self):
+        failures: tuple[
+            tuple[tuple[str, str] | None, tuple[str, str, str] | None, str], ...
+        ] = (
+            (("allow-tcp", "udp-named"), None, "allow-tcp: udp-named"),
+            (("deny-any-port", "tcp-named"), None, "deny-any-port: tcp-named"),
+            (
+                None,
+                ("deny-icmp", "icmp", "reached"),
+                "deny-icmp: icmp should be blocked",
+            ),
+            (
+                None,
+                ("allow-any", "tcp-other", "blocked"),
+                "allow-any: tcp-other should be reached",
+            ),
+            (None, ("allow-udp", "udp-named", "failed-2"), "allow-udp: udp-named"),
+            (None, ("allow-tcp", "tcp-named", "unexpected"), "allow-tcp: tcp-named"),
+        )
+        for leaked, guest_report, message in failures:
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                output_dir = Path(temporary)
+                with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                    self._run_egress_protocols(
+                        output_dir, leaked=leaked, guest_report=guest_report
+                    )
+                self.assertFalse(
+                    (output_dir / "l3-l4-egress-protocols-results.json").exists()
+                )
+
+    def test_l3_l4_egress_protocol_script_reports_each_probe(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+
+        script = microvm_tests._render_script(
+            "l3-l4-egress-protocols.sh.in",
+            GATEWAY_IPV4="192.0.2.1",
+            NAMED_PORT="20000",
+            OTHER_PORT="20001",
+        ).replace("nvx-exit", "record_exit")
+        stubs = (
+            "record_exit() { printf 'NVX-EXIT %s\\n' \"$1\"; }\n"
+            "wget() {\n"
+            "    for url; do :; done\n"
+            '    case "$url" in\n'
+            "    */tcp-named) printf NVX-EGRESS-PROBE-tcp-named ;;\n"
+            "    */tcp-other) printf WRONG ;;\n"
+            "    esac\n"
+            "}\n"
+            "nc() {\n"
+            "    cat >/dev/null\n"
+            "    for port; do :; done\n"
+            '    [ "$port" = 20000 ] || return 2\n'
+            "}\n"
+            "ping() { return 1; }\n"
+        )
+        result = subprocess.run(
+            [shell],
+            input=stubs + script,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "NVX-L3-L4-PROBE tcp-named=reached",
+                "NVX-L3-L4-PROBE tcp-other=unexpected",
+                "NVX-L3-L4-PROBE udp-named=sent",
+                "NVX-L3-L4-PROBE udp-other=failed-2",
+                "NVX-L3-L4-PROBE icmp=blocked",
+                "NVX-L3-L4-EGRESS-PROTOCOLS-OK",
+                "NVX-EXIT 0",
+            ],
+        )
+
+    def test_egress_probe_server_records_only_matching_probes(self):
+        tcp, udp = microvm_tests._bind_dual_protocol_ports(2, "127.0.0.1")
+        try:
+            named, other = (int(endpoint.getsockname()[1]) for endpoint in tcp)
+            self.assertEqual(other, named + 1)
+            self.assertEqual(
+                [int(endpoint.getsockname()[1]) for endpoint in udp], [named, other]
+            )
+            endpoints = {
+                "tcp-named": tcp[0],
+                "tcp-other": tcp[1],
+                "udp-named": udp[0],
+                "udp-other": udp[1],
+            }
+
+            with microvm_tests._EgressProbeServer(endpoints, 5) as server:
+                with socket.create_connection(
+                    ("127.0.0.1", named), timeout=5
+                ) as client:
+                    client.sendall(b"GET /tcp-named HTTP/1.1\r\nHost: test\r\n\r\n")
+                    response = b""
+                    while chunk := client.recv(4096):
+                        response += chunk
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                    client.sendto(b"NVX-EGRESS-PROBE-udp-other", ("127.0.0.1", other))
+                reached = server.finish()
+            self.assertTrue(response.startswith(b"HTTP/1.1 200 OK\r\n"))
+            self.assertTrue(response.endswith(b"\r\n\r\nNVX-EGRESS-PROBE-tcp-named"))
+            self.assertEqual(reached, {"tcp-named", "udp-other"})
+
+            with microvm_tests._EgressProbeServer(endpoints, 5) as server:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                    client.sendto(b"NVX-EGRESS-PROBE-udp-other", ("127.0.0.1", named))
+                with self.assertRaisesRegex(RuntimeError, "probe server failed"):
+                    server.finish()
+        finally:
+            for endpoint in (*tcp, *udp):
+                endpoint.close()
+
+    def test_dual_protocol_port_reservation_skips_partially_free_ports(self):
+        socket_type = socket.socket
+        created: list[MagicMock] = []
+
+        def endpoint(_family: int, kind: int) -> MagicMock:
+            reserved = MagicMock(spec=socket_type)
+
+            def bind(address: tuple[str, int]) -> None:
+                if kind == socket.SOCK_DGRAM and address[1] == 20001:
+                    raise OSError("address in use")
+
+            reserved.bind.side_effect = bind
+            created.append(reserved)
+            return reserved
+
+        with patch.object(microvm_tests.socket, "socket", side_effect=endpoint):
+            tcp, udp = microvm_tests._bind_dual_protocol_ports(2)
+        reserved_endpoints = cast(list[MagicMock], [*tcp, *udp])
+
+        self.assertEqual(
+            [
+                call.args[0][1]
+                for reserved in reserved_endpoints
+                for call in reserved.bind.call_args_list
+            ],
+            [20002, 20003, 20002, 20003],
+        )
+        for reserved in created:
+            if reserved in reserved_endpoints:
+                reserved.close.assert_not_called()
+            else:
+                reserved.close.assert_called_once_with()
+        self.assertEqual(len(created), 10)
+
+    def test_runner_dispatches_l3_l4_egress_protocols(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "validate_openvmm_test_backend"),
+            patch.object(microvm_tests, "require_file", side_effect=require),
+            patch.object(
+                microvm_tests, "run_l3_l4_egress_protocols"
+            ) as run_l3_l4_egress_protocols,
+        ):
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "whp",
+                    "--scenario",
+                    "l3-l4-egress-protocols",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            self.assertEqual(microvm_tests.run(args), 0)
+
+            run_l3_l4_egress_protocols.assert_called_once_with(
+                microvm_tests.openvmm_binary_path(),
+                microvm_tests.artifact_path(
+                    microvm_tests.KernelBuildConstants.BINARY_NAME
+                ),
+                microvm_tests.artifact_path(
+                    microvm_tests.guest_descriptor("alpine").initramfs_name
+                ),
+                "whp",
+                memory_mib=128,
+                timeout=60.0,
+                output_dir=Path(temporary),
+                guest="alpine",
+            )
+        self.assertIn("l3-l4-egress-protocols", microvm_tests.MICROVM_TEST_SCENARIOS)
+
     def test_sandbox_blocks_use_fixed_roles_and_access(self):
         with (
             patch.object(

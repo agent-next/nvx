@@ -106,6 +106,11 @@ from nvx_tools.time_abi import (
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
 NETWORK_PROFILES = ("portable",)
+NETWORK_EGRESS_RULE_METAVAR = "CIDR[:PROTOCOL[:PORT]]"
+NETWORK_EGRESS_RULE_HELP = (
+    "{action} guest egress to an IPv4 CIDR, optionally only for PROTOCOL tcp, "
+    "udp, or icmp, and for tcp or udp only on PORT; repeat to add rules"
+)
 MAX_ENVIRONMENT_FILE_BYTES = 1024 * 1024
 SYSTEMD_ENTRYPOINTS = frozenset(("/usr/lib/systemd/systemd", "/lib/systemd/systemd"))
 
@@ -1102,8 +1107,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--network-profile", choices=NETWORK_PROFILES)
     run.add_argument("--network-egress", choices=("allow", "deny"))
     run.add_argument("--network-ingress", choices=("allow", "deny"))
-    run.add_argument("--network-egress-allow", action="append", default=[])
-    run.add_argument("--network-egress-deny", action="append", default=[])
+    run.add_argument(
+        "--network-egress-allow",
+        action="append",
+        default=[],
+        metavar=NETWORK_EGRESS_RULE_METAVAR,
+        help=NETWORK_EGRESS_RULE_HELP.format(action="allow"),
+    )
+    run.add_argument(
+        "--network-egress-deny",
+        action="append",
+        default=[],
+        metavar=NETWORK_EGRESS_RULE_METAVAR,
+        help=NETWORK_EGRESS_RULE_HELP.format(action="deny"),
+    )
     run.add_argument(
         "--network-egress-policy-file",
         type=Path,
@@ -1263,8 +1280,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument("--network-profile", choices=NETWORK_PROFILES)
     sandbox.add_argument("--network-egress", choices=("allow", "deny"))
     sandbox.add_argument("--network-ingress", choices=("allow", "deny"))
-    sandbox.add_argument("--network-egress-allow", action="append", default=[])
-    sandbox.add_argument("--network-egress-deny", action="append", default=[])
+    sandbox.add_argument(
+        "--network-egress-allow",
+        action="append",
+        default=[],
+        metavar=NETWORK_EGRESS_RULE_METAVAR,
+        help=NETWORK_EGRESS_RULE_HELP.format(action="allow"),
+    )
+    sandbox.add_argument(
+        "--network-egress-deny",
+        action="append",
+        default=[],
+        metavar=NETWORK_EGRESS_RULE_METAVAR,
+        help=NETWORK_EGRESS_RULE_HELP.format(action="deny"),
+    )
     sandbox.add_argument(
         "--network-egress-policy-file",
         type=Path,

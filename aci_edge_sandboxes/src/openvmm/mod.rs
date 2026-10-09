@@ -49,8 +49,8 @@
 //! Host paths share OpenVMM's single virtio-fs export: the backend exports the deepest directory
 //! that contains every mapped path to a guest directory that only the guest's root can enter, and
 //! the guest agent bind-mounts each mapped path, read-only or read-write. Egress rules are expanded
-//! into OpenVMM's IPv4 rules exactly; IPv6, ICMP-only rules, and rules that would need more than
-//! 256 OpenVMM rules are rejected. Egress denied without allow rules, with ingress denied,
+//! into OpenVMM's IPv4 rules exactly; IPv6 and rules that would need more than 256 OpenVMM rules
+//! are rejected. Egress denied without allow rules, with ingress denied,
 //! attaches no network device. Workloads run as the fixed non-root identity of
 //! [`OpenVmmConfig::workload_uid`] and [`OpenVmmConfig::workload_gid`] (see
 //! [`OpenVmmConfig::map_host_identity`] for Linux hosts) with no capabilities, read end-of-file on

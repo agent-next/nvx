@@ -17,6 +17,10 @@ MAX_POLICY_FILE_SIZE = 1024 * 1024
 _MAX_JSON_INTEGER_DIGITS = 64
 _ROOT_FIELDS = frozenset(("allow", "deny"))
 _RULE_FIELDS = frozenset(("cidr", "except", "protocol", "port", "endPort"))
+_RULE_PROTOCOLS = ("tcp", "udp", "icmp", "any")
+# Protocols that a native rule can select on every port, and those with ports.
+_NATIVE_PROTOCOLS = ("icmp", "tcp", "udp")
+_PORT_PROTOCOLS = ("tcp", "udp")
 _AddressInterval = tuple[int, int]
 _AddressIntervals = tuple[_AddressInterval, ...]
 
@@ -30,7 +34,9 @@ class CompiledEgressPolicy:
 @dataclass(frozen=True)
 class _Rule:
     addresses: _AddressIntervals
+    # None matches every IPv4 protocol.
     protocol: str | None
+    # None matches every port of the protocol.
     start_port: int | None
     end_port: int | None
 
@@ -143,7 +149,7 @@ def _subtract_exclusions(
     return _subtract_intervals((parent_interval,), _merge_intervals(parsed))
 
 
-def _parse_rule(value: object, description: str) -> _Rule:
+def _parse_rule(value: object, description: str) -> tuple[_Rule, ...]:
     rule = _object(value, description)
     unknown = sorted(set(rule) - _RULE_FIELDS)
     if unknown:
@@ -154,20 +160,25 @@ def _parse_rule(value: object, description: str) -> _Rule:
     exclusions = _array(rule.get("except", []), f"{description}.except")
     addresses = _subtract_exclusions(parent, exclusions, description)
 
-    protocol_value = rule.get("protocol")
     if "protocol" not in rule:
         if "port" in rule or "endPort" in rule:
             raise ScriptError(f"{description}.port requires protocol")
-        return _Rule(addresses, None, None, None)
-    if not isinstance(protocol_value, str) or protocol_value not in ("tcp", "udp"):
-        raise ScriptError(f"{description}.protocol must be tcp or udp")
+        return (_Rule(addresses, None, None, None),)
+    protocol = rule["protocol"]
+    if not isinstance(protocol, str) or protocol not in _RULE_PROTOCOLS:
+        raise ScriptError(f"{description}.protocol must be tcp, udp, icmp, or any")
     if "port" not in rule:
-        raise ScriptError(f"{description}.port is required with protocol")
+        if "endPort" in rule:
+            raise ScriptError(f"{description}.endPort requires port")
+        return (_Rule(addresses, None if protocol == "any" else protocol, None, None),)
+    if protocol == "icmp":
+        raise ScriptError(f"{description}.port is not supported with icmp")
     start = _port(rule["port"], f"{description}.port")
     end = _port(rule.get("endPort", start), f"{description}.endPort")
     if end < start:
         raise ScriptError(f"{description}.endPort cannot be below port")
-    return _Rule(addresses, protocol_value, start, end)
+    protocols = _PORT_PROTOCOLS if protocol == "any" else (protocol,)
+    return tuple(_Rule(addresses, selected, start, end) for selected in protocols)
 
 
 def _intervals_to_networks(
@@ -192,11 +203,13 @@ def _intervals_to_networks(
 
 def _protocol_intervals_to_networks(
     protocol_intervals: _AddressIntervals,
-    address_only: _AddressIntervals,
+    covered: _AddressIntervals,
     maximum: int,
     category: str,
 ) -> tuple[ipaddress.IPv4Network, ...]:
-    combined = _merge_intervals((*protocol_intervals, *address_only))
+    # Rules over `covered` already match this selector, so widening prefixes
+    # into it keeps the output compact without changing what matches.
+    combined = _merge_intervals((*protocol_intervals, *covered))
     networks: list[ipaddress.IPv4Network] = []
     for start, end in combined:
         summarized = ipaddress.summarize_address_range(
@@ -208,7 +221,7 @@ def _protocol_intervals_to_networks(
                 int(network.network_address),
                 int(network.broadcast_address),
             )
-            if not _subtract_intervals((network_interval,), address_only):
+            if not _subtract_intervals((network_interval,), covered):
                 continue
             if len(networks) >= maximum:
                 raise ScriptError(
@@ -222,18 +235,21 @@ def _lower_protocol_rules(
     rules: list[_Rule],
     protocol: str,
     category: str,
-    address_only: _AddressIntervals,
+    covered: _AddressIntervals,
     remaining_budget: int,
 ) -> list[tuple[ipaddress.IPv4Network, str, int]]:
     events: dict[int, list[tuple[int, _AddressIntervals]]] = {}
     for rule in rules:
-        if rule.protocol != protocol or not rule.addresses:
+        if (
+            rule.protocol != protocol
+            or rule.start_port is None
+            or rule.end_port is None
+            or not rule.addresses
+        ):
             continue
-        uncovered_addresses = _subtract_intervals(rule.addresses, address_only)
+        uncovered_addresses = _subtract_intervals(rule.addresses, covered)
         if not uncovered_addresses:
             continue
-        assert rule.start_port is not None
-        assert rule.end_port is not None
         events.setdefault(rule.start_port, []).append((1, rule.addresses))
         events.setdefault(rule.end_port + 1, []).append((-1, rule.addresses))
 
@@ -249,7 +265,7 @@ def _lower_protocol_rules(
             network_budget = (remaining_budget - len(lowered)) // port_count
             networks = _protocol_intervals_to_networks(
                 addresses,
-                address_only,
+                covered,
                 network_budget,
                 category,
             )
@@ -266,10 +282,22 @@ def _lower_protocol_rules(
     return lowered
 
 
+def _native_rule(
+    network: ipaddress.IPv4Network, protocol: str | None, port: int | None
+) -> str:
+    if protocol is None:
+        return str(network)
+    if port is None:
+        return f"{network}:{protocol}"
+    return f"{network}:{protocol}:{port}"
+
+
 def _compile_category(value: object, category: str) -> tuple[str, ...]:
     values = _array(value, category)
     rules = [
-        _parse_rule(rule, f"{category}[{index}]") for index, rule in enumerate(values)
+        rule
+        for index, item in enumerate(values)
+        for rule in _parse_rule(item, f"{category}[{index}]")
     ]
     address_only = _merge_intervals(
         interval
@@ -285,13 +313,34 @@ def _compile_category(value: object, category: str) -> tuple[str, ...]:
     lowered: list[tuple[ipaddress.IPv4Network, str | None, int | None]] = [
         (network, None, None) for network in address_only_networks
     ]
-    for protocol in ("tcp", "udp"):
+    # Addresses that already match every port of each protocol.
+    covered = dict.fromkeys(_NATIVE_PROTOCOLS, address_only)
+    for protocol in _NATIVE_PROTOCOLS:
+        protocol_wide = _merge_intervals(
+            interval
+            for rule in rules
+            if rule.protocol == protocol and rule.start_port is None
+            for interval in rule.addresses
+        )
+        if not protocol_wide:
+            continue
+        lowered.extend(
+            (network, protocol, None)
+            for network in _protocol_intervals_to_networks(
+                protocol_wide,
+                address_only,
+                MAX_RULES_PER_ACTION - len(lowered),
+                category,
+            )
+        )
+        covered[protocol] = _merge_intervals((*address_only, *protocol_wide))
+    for protocol in _PORT_PROTOCOLS:
         lowered.extend(
             _lower_protocol_rules(
                 rules,
                 protocol,
                 category,
-                address_only,
+                covered[protocol],
                 MAX_RULES_PER_ACTION - len(lowered),
             )
         )
@@ -304,8 +353,7 @@ def _compile_category(value: object, category: str) -> tuple[str, ...]:
         )
     )
     return tuple(
-        str(network) if protocol is None else f"{network}:{protocol}:{port}"
-        for network, protocol, port in lowered
+        _native_rule(network, protocol, port) for network, protocol, port in lowered
     )
 
 

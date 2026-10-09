@@ -477,8 +477,8 @@ python3 scripts/nvx.py run
     [--network-profile {portable}]
     [--network-egress {allow,deny}]
     [--network-ingress {allow,deny}]
-    [--network-egress-allow CIDR[:PROTOCOL:PORT]]...
-    [--network-egress-deny CIDR[:PROTOCOL:PORT]]...
+    [--network-egress-allow CIDR[:PROTOCOL[:PORT]]]...
+    [--network-egress-deny CIDR[:PROTOCOL[:PORT]]]...
     [--network-egress-policy-file PATH]
     [--host-loopback {allow,deny}]
     [--network-proxy IPV4:TCP-PORT]
@@ -510,8 +510,8 @@ python3 scripts/nvx.py run
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy. |
 | `--network-ingress {allow,deny}` | `deny` | Set the default host ingress policy. The portable profile currently supports only `deny`; `allow` is rejected before launch. |
-| `--network-egress-allow CIDR[:PROTOCOL:PORT]` | none | Allow matching guest egress; repeat to add rules. |
-| `--network-egress-deny CIDR[:PROTOCOL:PORT]` | none | Deny matching guest egress; repeat to add rules. Deny rules take precedence. |
+| `--network-egress-allow CIDR[:PROTOCOL[:PORT]]` | none | Allow matching guest egress; repeat to add rules. `PROTOCOL` is `tcp`, `udp`, or `icmp` and matches every port when `PORT` is omitted; only `tcp` and `udp` take a `PORT`. |
+| `--network-egress-deny CIDR[:PROTOCOL[:PORT]]` | none | Deny matching guest egress; repeat to add rules. Deny rules take precedence. `PROTOCOL` and `PORT` select traffic as for `--network-egress-allow`. |
 | `--network-egress-policy-file PATH` | none | Load bounded IPv4 ranges and rule-local CIDR exclusions from JSON. Requires explicit `--network-egress`; cannot be mixed with explicit allow/deny rule flags. |
 | `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services. |
 | `--network-proxy IPV4:TCP-PORT` | none | Allow one explicit host TCP proxy endpoint. |
@@ -575,8 +575,8 @@ python3 scripts/nvx.py sandbox
     [--network-profile {portable}]
     [--network-egress {allow,deny}]
     [--network-ingress {allow,deny}]
-    [--network-egress-allow CIDR[:PROTOCOL:PORT]]...
-    [--network-egress-deny CIDR[:PROTOCOL:PORT]]...
+    [--network-egress-allow CIDR[:PROTOCOL[:PORT]]]...
+    [--network-egress-deny CIDR[:PROTOCOL[:PORT]]]...
     [--network-egress-policy-file PATH]
     [--host-loopback {allow,deny}]
     [--network-proxy IPV4:TCP-PORT]
@@ -618,8 +618,8 @@ launches.
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy for `run` or `provision`. |
 | `--network-ingress {allow,deny}` | `deny` | Set the host ingress policy for `run` or `provision`. The portable profile supports only `deny`. |
-| `--network-egress-allow CIDR[:PROTOCOL:PORT]` | none | Allow matching guest egress; repeat to add rules. Requires explicit `--network-egress`. |
-| `--network-egress-deny CIDR[:PROTOCOL:PORT]` | none | Deny matching guest egress; repeat to add rules. Requires explicit `--network-egress`; deny rules take precedence. |
+| `--network-egress-allow CIDR[:PROTOCOL[:PORT]]` | none | Allow matching guest egress; repeat to add rules. Requires explicit `--network-egress`. `PROTOCOL` is `tcp`, `udp`, or `icmp` and matches every port when `PORT` is omitted; only `tcp` and `udp` take a `PORT`. |
+| `--network-egress-deny CIDR[:PROTOCOL[:PORT]]` | none | Deny matching guest egress; repeat to add rules. Requires explicit `--network-egress`; deny rules take precedence. `PROTOCOL` and `PORT` select traffic as for `--network-egress-allow`. |
 | `--network-egress-policy-file PATH` | none | Load bounded IPv4 ranges and rule-local CIDR exclusions for `run` or `provision`. Managed provision persists lowered rules, not this path. Requires explicit `--network-egress`; cannot be mixed with explicit allow/deny rule flags. |
 | `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services for `run` or `provision`. |
 | `--network-proxy IPV4:TCP-PORT` | none | Allow one explicit host TCP proxy endpoint; the IPv4 address must match the guest gateway. |

@@ -15,6 +15,7 @@ import nvx_tools.egress_policy as egress_policy  # noqa: E402
 from nvx_tools.common import ScriptError  # noqa: E402
 from nvx_tools.egress_policy import (
     MAX_POLICY_FILE_SIZE,  # noqa: E402
+    MAX_RULES_PER_ACTION,  # noqa: E402
     compile_policy_file,  # noqa: E402
 )
 
@@ -61,7 +62,7 @@ class EgressPolicyTests(unittest.TestCase):
     def test_rejects_invalid_port_shapes_and_values(self):
         invalid_rules = (
             {"cidr": "192.0.2.0/24", "protocol": "tcp", "endPort": 80},
-            {"cidr": "192.0.2.0/24", "protocol": "tcp"},
+            {"cidr": "192.0.2.0/24", "protocol": "any", "endPort": 80},
             {
                 "cidr": "192.0.2.0/24",
                 "protocol": "tcp",
@@ -71,13 +72,124 @@ class EgressPolicyTests(unittest.TestCase):
             {"cidr": "192.0.2.0/24", "protocol": "tcp", "port": 0},
             {"cidr": "192.0.2.0/24", "protocol": "udp", "port": 65536},
             {"cidr": "192.0.2.0/24", "protocol": "tcp", "port": True},
+            {"cidr": "192.0.2.0/24", "protocol": "any", "port": 0},
             {"cidr": "192.0.2.0/24", "port": 80},
             {"cidr": "192.0.2.0/24", "protocol": "icmp", "port": 8},
+            {"cidr": "192.0.2.0/24", "protocol": "icmp", "endPort": 8},
+            {"cidr": "192.0.2.0/24", "protocol": "ICMP"},
+            {"cidr": "192.0.2.0/24", "protocol": "sctp"},
         )
 
         for rule in invalid_rules:
             with self.subTest(rule=rule), self.assertRaises(ScriptError):
                 self.compile({"allow": [rule]})
+
+    def test_compiles_protocol_selectors_with_and_without_ports(self):
+        selectors: tuple[tuple[dict[str, object], tuple[str, ...]], ...] = (
+            ({"protocol": "tcp"}, ("192.0.2.7/32:tcp",)),
+            ({"protocol": "udp"}, ("192.0.2.7/32:udp",)),
+            ({"protocol": "icmp"}, ("192.0.2.7/32:icmp",)),
+            ({"protocol": "any"}, ("192.0.2.7/32",)),
+            ({}, ("192.0.2.7/32",)),
+            (
+                {"protocol": "any", "port": 443},
+                ("192.0.2.7/32:tcp:443", "192.0.2.7/32:udp:443"),
+            ),
+            (
+                {"protocol": "any", "port": 443, "endPort": 444},
+                (
+                    "192.0.2.7/32:tcp:443",
+                    "192.0.2.7/32:tcp:444",
+                    "192.0.2.7/32:udp:443",
+                    "192.0.2.7/32:udp:444",
+                ),
+            ),
+        )
+
+        for category in ("allow", "deny"):
+            for selector, expected in selectors:
+                with self.subTest(category=category, selector=selector):
+                    compiled = self.compile(
+                        {category: [{"cidr": "192.0.2.7", **selector}]}
+                    )
+                    self.assertEqual(getattr(compiled, category), expected)
+
+    def test_protocol_wide_rules_cover_their_port_rules_only(self):
+        compiled = self.compile(
+            {
+                "allow": [
+                    {"cidr": "192.0.2.7", "protocol": "tcp", "port": 443},
+                    {"cidr": "192.0.2.0/24", "protocol": "tcp"},
+                    {"cidr": "192.0.2.7", "protocol": "udp", "port": 443},
+                    {"cidr": "192.0.2.0/24", "protocol": "icmp"},
+                ],
+                "deny": [
+                    {"cidr": "198.51.100.0/24", "protocol": "any", "port": 53},
+                    {"cidr": "198.51.100.0/24", "protocol": "udp"},
+                ],
+            }
+        )
+
+        self.assertEqual(
+            compiled.allow,
+            (
+                "192.0.2.0/24:icmp",
+                "192.0.2.0/24:tcp",
+                "192.0.2.7/32:udp:443",
+            ),
+        )
+        self.assertEqual(
+            compiled.deny,
+            ("198.51.100.0/24:tcp:53", "198.51.100.0/24:udp"),
+        )
+
+    def test_address_only_rules_cover_protocol_wide_rules(self):
+        compiled = self.compile(
+            {
+                "allow": [
+                    {"cidr": "192.0.2.0/24", "protocol": "udp"},
+                    {"cidr": "192.0.2.0/25"},
+                    {"cidr": "192.0.2.0/25", "protocol": "icmp"},
+                    {"cidr": "192.0.2.128/25", "protocol": "udp", "port": 53},
+                ]
+            }
+        )
+
+        # Widening the UDP rule into the address-only half keeps it to one prefix.
+        self.assertEqual(compiled.allow, ("192.0.2.0/24:udp", "192.0.2.0/25"))
+
+    def test_protocol_wide_rules_share_the_native_rule_budget(self):
+        address_only = [
+            {"cidr": f"10.0.{index}.1/32"} for index in range(MAX_RULES_PER_ACTION)
+        ]
+        accepted = self.compile(
+            {"allow": [*address_only[:-1], {"cidr": "192.0.2.0/24", "protocol": "tcp"}]}
+        )
+        self.assertEqual(len(accepted.allow), MAX_RULES_PER_ACTION)
+        self.assertIn("192.0.2.0/24:tcp", accepted.allow)
+
+        with self.assertRaisesRegex(ScriptError, "at most 256"):
+            self.compile(
+                {
+                    "allow": [
+                        *address_only,
+                        {"cidr": "192.0.2.0/24", "protocol": "icmp"},
+                    ]
+                }
+            )
+        with self.assertRaisesRegex(ScriptError, "at most 256"):
+            self.compile(
+                {
+                    "deny": [
+                        {
+                            "cidr": "192.0.2.1",
+                            "protocol": "any",
+                            "port": 1,
+                            "endPort": 129,
+                        }
+                    ]
+                }
+            )
 
     def test_normalizes_host_bits_like_the_native_cidr_parser(self):
         compiled = self.compile({"allow": [{"cidr": "10.0.0.5/24"}]})

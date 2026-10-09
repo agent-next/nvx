@@ -142,11 +142,14 @@ allow/deny options:
   --network-egress-deny 140.82.114.0/24:tcp:443
 ```
 
-Rules match IPv4 addresses or CIDRs and may add one TCP or UDP destination
-port. Deny matches take precedence over allow matches.
+Rules match IPv4 addresses or CIDRs and may select one protocol: `tcp`, `udp`,
+or `icmp`. A TCP or UDP rule may add one destination port; without a port, it
+matches every port of that protocol. ICMP rules take no port. For example,
+`192.0.2.0/24:udp` matches UDP on every port, and `192.0.2.1:icmp` matches ICMP
+but not TCP or UDP. Deny matches take precedence over allow matches.
 
-NVX can lower inclusive TCP/UDP port ranges and rule-local IPv4 exclusions to
-those native rules:
+NVX can lower protocol selectors, inclusive TCP/UDP port ranges, and rule-local
+IPv4 exclusions to those native rules:
 
 ```json
 {
@@ -160,6 +163,15 @@ those native rules:
     },
     {
       "cidr": "192.0.2.200/32"
+    },
+    {
+      "cidr": "198.51.100.0/24",
+      "protocol": "any",
+      "port": 443
+    },
+    {
+      "cidr": "198.51.100.7/32",
+      "protocol": "icmp"
     }
   ],
   "deny": [
@@ -183,11 +195,13 @@ Host bits are normalized like the native CIDR syntax: `10.0.0.5/24` means
 `10.0.0.0/24`, not one host. Use `/32` to select one IPv4 address.
 Duplicate JSON properties, unknown fields, and explicit `null` protocol values
 are rejected. Policy files are limited to 1 MiB of UTF-8 input.
-`protocol` is `tcp` or `udp` and requires `port` in `1..65535`. Optional
-`endPort` is inclusive, must be in `1..65535`, and cannot be below `port`.
-Omitting the protocol and ports matches every IPv4 transport supported by the
-native rule. Protocol-wide TCP/UDP rules without a port and IPv6 are not
-supported.
+`protocol` is `tcp`, `udp`, `icmp`, or `any`. Without `port`, `tcp` and `udp`
+match every port of that protocol, `icmp` matches ICMP alone, and `any` matches
+every IPv4 protocol, like a rule without `protocol`. A `port` in `1..65535`
+applies to `tcp`, `udp`, or `any`, which matches TCP and UDP on that port but
+not ICMP; `icmp` rejects ports, and a `port` without `protocol` is rejected.
+Optional `endPort` requires `port`, is inclusive, must be in `1..65535`, and
+cannot be below `port`. IPv6 is not supported.
 
 Exclusions affect only their containing rule: they never become global deny
 rules. A later allow rule may therefore match an address excluded from an
@@ -196,7 +210,8 @@ other rules and the explicit default. Explicit deny matches still take
 precedence over allow matches.
 
 NVX canonicalizes safely equivalent prefixes and rejects policies that lower to
-more than 256 allow rules or 256 deny rules. It rejects oversized expansions
+more than 256 allow rules or 256 deny rules; protocol `any` with a port range
+lowers to one TCP and one UDP rule per port. NVX rejects oversized expansions
 before launch rather than truncating or widening them. Managed provision stores
 the validated lowered rules in sandbox state, so later starts do not reread a
 mutable source policy file.

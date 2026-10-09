@@ -1,10 +1,11 @@
 //! Translation of the contract's network posture into OpenVMM options.
 //!
 //! OpenVMM's portable profile enforces an egress default plus IPv4 allow and deny rules that
-//! match a network and, optionally, one TCP or UDP port; deny rules take precedence. Contract
-//! rules are expanded into that form exactly: exceptions are subtracted from their networks,
-//! port ranges become one rule per port, and `any` protocol with a port becomes a TCP and a UDP
-//! rule. Rules that cannot be expressed exactly are rejected.
+//! match a network and, optionally, one protocol (TCP, UDP, or ICMP) and, for TCP or UDP, one
+//! port; deny rules take precedence. Contract rules are expanded into that form exactly:
+//! exceptions are subtracted from their networks, port ranges become one rule per port, and `any`
+//! protocol with a port becomes a TCP and a UDP rule. Rules that cannot be expressed exactly are
+//! rejected.
 
 use crate::cidr::{Cidr, Ipv4Cidr};
 use crate::error::{Error, Result};
@@ -108,7 +109,8 @@ fn expand_rule(rule: &NetworkRule, field: &str, output: &mut Vec<String>) -> Res
         networks.extend(remainder);
     }
 
-    let mut selectors: Vec<Option<(&str, u16)>> = Vec::new();
+    // `None` matches every protocol; a protocol without a port matches each of its ports.
+    let mut selectors: Vec<Option<(&str, Option<u16>)>> = Vec::new();
     if rule.ports.is_empty() {
         selectors.push(None);
     }
@@ -116,23 +118,20 @@ fn expand_rule(rule: &NetworkRule, field: &str, output: &mut Vec<String>) -> Res
         let protocols: &[&str] = match port.protocol {
             Protocol::Tcp => &["tcp"],
             Protocol::Udp => &["udp"],
+            Protocol::Icmp => &["icmp"],
             Protocol::Any => &["tcp", "udp"],
-            Protocol::Icmp => {
-                return unsupported(format!(
-                    ".ports[{index}]: the openvmm backend cannot select ICMP by itself"
-                ));
-            }
         };
         let Some(start) = port.port else {
             if port.protocol == Protocol::Any {
                 selectors.push(None);
-                continue;
+            } else {
+                selectors.extend(protocols.iter().map(|protocol| Some((*protocol, None))));
             }
-            return unsupported(format!(
-                ".ports[{index}]: the openvmm backend cannot match every port of one protocol; \
-                 name the ports"
-            ));
+            continue;
         };
+        if port.protocol == Protocol::Icmp {
+            return unsupported(format!(".ports[{index}]: ICMP has no ports"));
+        }
         let end = port.end_port.unwrap_or(start);
         if usize::from(end - start) >= MAX_RULES {
             return unsupported(format!(
@@ -142,7 +141,7 @@ fn expand_rule(rule: &NetworkRule, field: &str, output: &mut Vec<String>) -> Res
         }
         for protocol in protocols {
             for number in start..=end {
-                selectors.push(Some((protocol, number)));
+                selectors.push(Some((protocol, Some(number))));
             }
         }
     }
@@ -151,7 +150,8 @@ fn expand_rule(rule: &NetworkRule, field: &str, output: &mut Vec<String>) -> Res
         for selector in &selectors {
             output.push(match selector {
                 None => network.to_string(),
-                Some((protocol, port)) => format!("{network}:{protocol}:{port}"),
+                Some((protocol, None)) => format!("{network}:{protocol}"),
+                Some((protocol, Some(port))) => format!("{network}:{protocol}:{port}"),
             });
             if output.len() > MAX_RULES * 4 {
                 return unsupported(format!(" expands to more than {MAX_RULES} OpenVMM rules"));
@@ -271,6 +271,37 @@ mod tests {
     }
 
     #[test]
+    fn protocols_without_ports_expand_to_protocol_rules() {
+        let egress = EgressPolicy::new(Access::Deny)
+            .with_allow(NetworkRule::to("192.0.2.7").on_protocol(Protocol::Tcp))
+            .with_allow(NetworkRule::to("192.0.2.7").on_protocol(Protocol::Udp))
+            .with_allow(NetworkRule::to("192.0.2.7").on_protocol(Protocol::Icmp))
+            .with_allow(NetworkRule::to("198.51.100.0/24").on_protocol(Protocol::Any))
+            .with_allow(NetworkRule::to("203.0.113.9").on_port(Protocol::Any, 443))
+            .with_deny(
+                NetworkRule::to("192.0.2.7")
+                    .on_protocol(Protocol::Icmp)
+                    .on_port(Protocol::Tcp, 22),
+            );
+        let arguments = network_arguments(Some(&policy(egress)), "10.0.0.2/24").unwrap();
+        assert_eq!(
+            rules(&arguments, "--network-egress-allow"),
+            [
+                "192.0.2.7/32:icmp",
+                "192.0.2.7/32:tcp",
+                "192.0.2.7/32:udp",
+                "198.51.100.0/24",
+                "203.0.113.9/32:tcp:443",
+                "203.0.113.9/32:udp:443",
+            ]
+        );
+        assert_eq!(
+            rules(&arguments, "--network-egress-deny"),
+            ["192.0.2.7/32:icmp", "192.0.2.7/32:tcp:22"]
+        );
+    }
+
+    #[test]
     fn inexpressible_rules_are_rejected() {
         let port = |protocol, port, end_port| NetworkRule {
             to: vec![NetworkPeer::new("10.0.0.0/8")],
@@ -282,8 +313,7 @@ mod tests {
         };
         for rule in [
             NetworkRule::to("2001:db8::/32"),
-            port(Protocol::Tcp, None, None),
-            port(Protocol::Icmp, None, None),
+            port(Protocol::Icmp, Some(8), None),
             port(Protocol::Tcp, Some(1), Some(1024)),
             NetworkRule {
                 to: (0..300)
