@@ -34,7 +34,7 @@ pub use model::{
 pub use outcome::{ExecFailure, ExecOutcome};
 pub use setup::{
     BundleSource, CpuProfile, Diagnostics, ExecSettings, GuestSessionPolicy, Hypervisor,
-    ImageSettings, RuntimeDigests, RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
-    Timeouts,
+    ImageSettings, ReferenceSettings, RuntimeDigests, RuntimeFiles, RuntimeSource, SandboxDefaults,
+    SetupConfig, Timeouts,
 };
 pub use spec::{ImageSource, Resources, SandboxSpec};

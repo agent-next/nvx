@@ -27,8 +27,8 @@ use serde::Serialize;
 pub use aci_edge_sandboxes_model::wire::{HostInfo, SandboxDiagnostics};
 pub use aci_edge_sandboxes_model::{
     BundleSource, CpuProfile, Diagnostics, ExecSettings, GuestSessionPolicy, Hypervisor,
-    ImageDigest, ImageId, ImageSettings, RegisteredImage, RuntimeDigests, RuntimeFiles,
-    RuntimeSource, SandboxDefaults, SetupConfig, Timeouts,
+    ImageDigest, ImageId, ImageSettings, ReferenceSettings, RegisteredImage, RuntimeDigests,
+    RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig, Timeouts,
 };
 
 use self::library::{Event, Library};

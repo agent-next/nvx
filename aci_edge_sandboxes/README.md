@@ -141,6 +141,9 @@ approved, and a `SetupConfig`, which the library applies once per process:
     "resources": { "vcpus": 1, "memoryMib": 256 },
     "guestNetwork": "10.0.0.2/24"
   },
+  // How a library that pulls registry references materializes them; "tool" overrides the
+  // library's own converter.
+  "images": { "references": { "pullTimeoutMs": 1800000 } },
   "diagnostics": { "guestDebug": false, "contentVerification": false }
 }
 ```
@@ -151,12 +154,20 @@ Every field except `stateRoot` and `runtime` has a default. A bundle directory h
 ABI. Explicit files can be pinned with `RuntimeFiles::approved_sha256`.
 
 A `SandboxSpec`, passed to `AciEdgeSandbox::provision_with` beside the provision request, sets
-one sandbox's image (`ImageSource::Path` of a local GPT disk, or `ImageSource::Digest` of a
-registered image), its resources, its guest network, and its forwarded ports. Every guest has one
+one sandbox's image (`ImageSource::Path` of a local GPT disk, `ImageSource::Digest` of a
+registered image, or `ImageSource::Reference` of a registry image where the library supports it),
+its resources, its guest network, and its forwarded ports. Every guest has one
 virtual processor, so `resources.vcpus` may only be 1, and `resources.memoryMib` sets its memory.
-`Capabilities::spec` lists the fields that the library honors; image references and hostnames
-are not among them yet. A request may still set `microvm.provision.memoryMib`, but not together
+`Capabilities::spec` lists the fields that the library honors; hostnames are not among them yet.
+A request may still set `microvm.provision.memoryMib`, but not together
 with `spec.resources.memoryMib`.
+
+A library that honors `spec.imageReference` converts a reference into a local disk image with an
+external tool the first time a sandbox uses it, and caches the result by the reference's text.
+It does not check a tag again, so a moving tag such as `latest` keeps naming the content that was
+first pulled: use a version tag or a digest (`repository@sha256:…`) to control what a sandbox
+boots. The setup's `images.references` selects the tool (`tool`; the library's default
+otherwise) and limits each pull (`pullTimeoutMs`, 30 minutes by default).
 
 - **Loading.** `AgentBackend::new` checks the library's SHA-256 and sandbox ABI version and
   loads it once per process; it stays loaded until the process exits. It loads the bytes that it
