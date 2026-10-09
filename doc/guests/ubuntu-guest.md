@@ -178,7 +178,7 @@ same. The [microVM test workflow](../../.github/workflows/run-nvx-microvm-tests.
 runs Ubuntu boot, identity, console, lifecycle, network, and filesystem
 snapshot scenarios on every backend, broader lifecycle, network snapshot, SMP,
 snapshot, and workload-identity scenarios on Linux/KVM, and sandbox layer and
-live-share smoke tests on Linux backends. Ubuntu is not part of the
+live-share smoke tests on every backend. Ubuntu is not part of the
 performance gates.
 
 ## Full Ubuntu systemd guest (Proposed)
