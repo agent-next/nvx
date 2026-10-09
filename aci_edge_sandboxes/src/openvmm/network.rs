@@ -1,13 +1,13 @@
 //! Translation of the contract's network posture into OpenVMM options.
 //!
-//! OpenVMM's portable profile enforces an egress default plus IPv4 allow and deny rules that
-//! match a network and, optionally, one protocol (TCP, UDP, or ICMP) and, for TCP or UDP, one
-//! port or an inclusive range of ports; deny rules take precedence. Contract rules are expanded
-//! into that form exactly: exceptions are subtracted from their networks, and `any` protocol with
-//! a port or a port range becomes a TCP and a UDP rule. Rules that cannot be expressed exactly are
-//! rejected.
+//! OpenVMM's portable profile enforces an egress default plus IPv4 and IPv6 allow and deny rules
+//! that match a network of one family and, optionally, one protocol (TCP, UDP, or ICMP) and, for
+//! TCP or UDP, one port or an inclusive range of ports; deny rules take precedence. Contract rules
+//! are expanded into that form exactly: exceptions are subtracted from their networks, a rule
+//! without destinations matches `0.0.0.0/0` and `::/0`, and `any` protocol with a port or a port
+//! range becomes a TCP and a UDP rule. Rules that cannot be expressed exactly are rejected.
 
-use crate::cidr::{Cidr, Ipv4Cidr};
+use crate::cidr::Cidr;
 use crate::error::{Error, Result};
 use crate::model::{Access, NetworkPolicy, NetworkRule, Protocol};
 
@@ -82,21 +82,19 @@ fn expand_rule(rule: &NetworkRule, field: &str, output: &mut Vec<String>) -> Res
     let unsupported = |message: String| Err(Error::policy_validation(format!("{field}{message}")));
     let mut networks = Vec::new();
     if rule.to.is_empty() {
-        networks.push(ipv4(&Cidr::parse("0.0.0.0/0").expect("valid network")));
+        networks.extend([Cidr::everything(false), Cidr::everything(true)]);
     }
     for (index, peer) in rule.to.iter().enumerate() {
-        let Some(network) = Cidr::parse(&peer.cidr).ok().and_then(Cidr::ipv4) else {
-            return unsupported(format!(
-                ".to[{index}]: the openvmm backend supports only IPv4 destinations"
-            ));
+        let Ok(network) = Cidr::parse(&peer.cidr) else {
+            return unsupported(format!(".to[{index}]: the destination is not a network"));
         };
         let mut excluded = Vec::new();
         for value in &peer.except {
-            match Cidr::parse(value).ok().and_then(Cidr::ipv4) {
-                Some(exclusion) => excluded.push(exclusion),
-                None => {
+            match Cidr::parse(value) {
+                Ok(exclusion) if network.contains(exclusion) => excluded.push(exclusion),
+                _ => {
                     return unsupported(format!(
-                        ".to[{index}].except: the openvmm backend supports only IPv4 networks"
+                        ".to[{index}].except: an exception is not a network within the destination"
                     ));
                 }
             }
@@ -174,10 +172,6 @@ enum Selector {
     Protocol(&'static str),
     /// The TCP or UDP ports from the first through the last, both included.
     Ports(&'static str, u16, u16),
-}
-
-fn ipv4(cidr: &Cidr) -> Ipv4Cidr {
-    cidr.ipv4().expect("an IPv4 network")
 }
 
 #[cfg(test)]
@@ -271,9 +265,47 @@ mod tests {
             }],
         });
         let arguments = network_arguments(Some(&policy(egress)), "10.0.0.2/24").unwrap();
+        // A rule without destinations matches both address families.
         assert_eq!(
             rules(&arguments, "--network-egress-deny"),
-            ["0.0.0.0/0:udp:53"]
+            ["0.0.0.0/0:udp:53", "::/0:udp:53"]
+        );
+    }
+
+    #[test]
+    fn ipv6_rules_expand_exactly() {
+        let egress = EgressPolicy::new(Access::Deny)
+            .with_allow(NetworkRule::to("2001:db8:1::/64").on_port(Protocol::Tcp, 443))
+            .with_allow(NetworkRule {
+                to: vec![NetworkPeer {
+                    cidr: "2001:db8:2::/126".to_owned(),
+                    except: vec!["2001:db8:2::1".to_owned()],
+                }],
+                ports: vec![NetworkPort {
+                    protocol: Protocol::Any,
+                    port: Some(53),
+                    end_port: None,
+                }],
+            })
+            .with_allow(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Icmp))
+            .with_allow(NetworkRule::to("::/0").on_protocol(Protocol::Icmp))
+            .with_deny(NetworkRule::to("2001:db8:1::123"));
+        let arguments = network_arguments(Some(&policy(egress)), "10.0.0.2/24").unwrap();
+        assert_eq!(
+            rules(&arguments, "--network-egress-allow"),
+            [
+                "192.0.2.0/24:icmp",
+                "2001:db8:1::/64:tcp:443",
+                "2001:db8:2::/128:tcp:53",
+                "2001:db8:2::/128:udp:53",
+                "2001:db8:2::2/127:tcp:53",
+                "2001:db8:2::2/127:udp:53",
+                "::/0:icmp",
+            ]
+        );
+        assert_eq!(
+            rules(&arguments, "--network-egress-deny"),
+            ["2001:db8:1::123/128"]
         );
     }
 
@@ -376,7 +408,6 @@ mod tests {
             }],
         };
         for rule in [
-            NetworkRule::to("2001:db8::/32"),
             port(Protocol::Icmp, Some(8), None),
             // Structural validation rejects these first, unless the backend is called directly.
             port(Protocol::Tcp, Some(90), Some(80)),

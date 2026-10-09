@@ -236,7 +236,6 @@ fn provision_validation_rejects_backend_policies_before_probing() {
     let (directory, client) = client();
     let before = state_entries(&directory);
     for request in [
-        network_request(NetworkRule::to("::/0")),
         network_request(separate_port_ranges(Protocol::Tcp, 257)),
         network_request(separate_port_ranges(Protocol::Any, 129)),
     ] {
@@ -284,6 +283,9 @@ fn validation_is_side_effect_free_and_host_checks_remain_in_operations() {
         network_request(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Tcp)),
         network_request(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Udp)),
         network_request(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Icmp)),
+        network_request(NetworkRule::to("::/0")),
+        network_request(NetworkRule::to("2001:db8:1::/64").on_port(Protocol::Tcp, 443)),
+        network_request(NetworkRule::default().on_port(Protocol::Any, 53)),
         ProvisionRequest::new().with_filesystem(FilesystemPolicy {
             readonly_paths: vec![directory.path().join("missing-mapped-file")],
             ..FilesystemPolicy::default()
@@ -349,7 +351,7 @@ fn async_execution_uses_the_same_backend_validation_hooks() {
                 .unwrap_err();
             assert_eq!(error.code(), ErrorCode::PolicyValidation);
             let error = client
-                .provision(network_request(NetworkRule::to("::/0")))
+                .provision(network_request(separate_port_ranges(Protocol::Tcp, 257)))
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), ErrorCode::PolicyValidation);

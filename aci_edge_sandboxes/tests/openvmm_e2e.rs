@@ -861,6 +861,79 @@ fn network_protocol_selectors_are_enforced() {
     }
 }
 
+/// Reports, on one line each, whether TCP reaches the gateway's DNS service over IPv4 and over
+/// IPv6. OpenVMM derives the guest's IPv6 network from its IPv4 one, so the default
+/// `10.0.0.2/24` makes the IPv6 gateway `fd00::a00:1`.
+const GATEWAY_DUAL_STACK_PROBE: &str = "for gateway in 10.0.0.1 fd00::a00:1; do \
+     nc -w 3 $gateway 53 </dev/null && echo reached || echo blocked; done";
+
+#[test]
+#[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
+fn ipv6_network_policies_are_enforced() {
+    let (nvx, backend) = client("ipv6");
+    let egress = |egress: EgressPolicy| NetworkPolicy {
+        egress,
+        ..NetworkPolicy::deny_all()
+    };
+    let deny = || EgressPolicy::new(Access::Deny);
+    let cases: [(&str, NetworkPolicy, &[u8]); 8] = [
+        (
+            "allow",
+            NetworkPolicy::egress(Access::Allow),
+            b"reached\nreached\n",
+        ),
+        (
+            "ipv6 allow rule",
+            egress(deny().with_allow(NetworkRule::to("fd00::a00:1").on_port(Protocol::Tcp, 53))),
+            b"blocked\nreached\n",
+        ),
+        (
+            "ipv4 allow rule",
+            egress(deny().with_allow(NetworkRule::to("10.0.0.1").on_port(Protocol::Tcp, 53))),
+            b"reached\nblocked\n",
+        ),
+        (
+            "ipv6 wildcard",
+            egress(deny().with_allow(NetworkRule::to("::/0"))),
+            b"blocked\nreached\n",
+        ),
+        (
+            "rule without destinations",
+            egress(deny().with_allow(NetworkRule::default().on_port(Protocol::Any, 53))),
+            b"reached\nreached\n",
+        ),
+        (
+            "other ipv6 allow rule",
+            egress(deny().with_allow(NetworkRule::to("2001:db8::/32"))),
+            b"blocked\nblocked\n",
+        ),
+        (
+            "ipv6 deny precedence",
+            egress(
+                deny()
+                    .with_allow(NetworkRule::to("::/0"))
+                    .with_allow(NetworkRule::to("10.0.0.1"))
+                    .with_deny(NetworkRule::to("fd00::a00:1").on_protocol(Protocol::Tcp)),
+            ),
+            b"reached\nblocked\n",
+        ),
+        (
+            "ipv6 deny rule",
+            egress(EgressPolicy::new(Access::Allow).with_deny(NetworkRule::to("fd00::/8"))),
+            b"reached\nblocked\n",
+        ),
+    ];
+    for (name, policy, expected) in cases {
+        let sandbox = started(
+            &nvx,
+            &backend,
+            &ProvisionRequest::new().with_network(policy),
+        );
+        let output = shell(&nvx, id(&sandbox), GATEWAY_DUAL_STACK_PROBE);
+        assert_eq!(output.stdout, expected, "{name}: {output:?}");
+    }
+}
+
 #[test]
 #[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
 fn network_port_ranges_are_enforced() {

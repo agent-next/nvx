@@ -1,10 +1,12 @@
 //! IP networks in CIDR notation, as used by egress rules.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// An IPv4 or IPv6 network whose host bits are zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Networks order by address, IPv4 before IPv6, and then by prefix length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Cidr {
     address: IpAddr,
     prefix: u8,
@@ -37,101 +39,64 @@ impl Cidr {
         Ok(cidr)
     }
 
-    /// Returns the IPv4 network as an address and prefix length.
-    pub fn ipv4(self) -> Option<Ipv4Cidr> {
-        match self.address {
-            IpAddr::V4(address) => Some(Ipv4Cidr {
-                address: u32::from(address),
-                prefix: self.prefix,
-            }),
-            IpAddr::V6(_) => None,
-        }
+    /// Returns the network of every address of one family: `::/0` with `ipv6`, and `0.0.0.0/0`
+    /// without.
+    pub fn everything(ipv6: bool) -> Self {
+        let address = if ipv6 {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        };
+        Self { address, prefix: 0 }
     }
 
-    /// Returns whether `other` lies within this network.
+    /// Returns whether this is an IPv6 network.
+    pub fn is_ipv6(self) -> bool {
+        self.address.is_ipv6()
+    }
+
+    /// Returns whether `other` lies within this network. Networks of different families never
+    /// contain each other.
     pub fn contains(self, other: Self) -> bool {
-        match (self.address, other.address) {
-            (IpAddr::V4(_), IpAddr::V4(_)) => {
-                let (outer, inner) = (self.ipv4().unwrap(), other.ipv4().unwrap());
-                outer.contains(inner)
-            }
-            (IpAddr::V6(outer), IpAddr::V6(inner)) => {
-                self.prefix <= other.prefix
-                    && mask128(u128::from(inner), self.prefix) == u128::from(outer)
-            }
-            _ => false,
-        }
-    }
-
-    fn network(self) -> IpAddr {
-        match self.address {
-            IpAddr::V4(address) => {
-                IpAddr::V4(Ipv4Addr::from(mask32(u32::from(address), self.prefix)))
-            }
-            IpAddr::V6(address) => IpAddr::V6(mask128(u128::from(address), self.prefix).into()),
-        }
-    }
-}
-
-/// Parses a prefix length in canonical form: decimal digits without a sign or leading zeros.
-pub fn parse_prefix_length(text: &str) -> Option<u8> {
-    let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
-    // `u8::from_str` alone would also accept a leading `+`.
-    if digits && (text.len() == 1 || !text.starts_with('0')) {
-        text.parse().ok()
-    } else {
-        None
-    }
-}
-
-fn mask32(address: u32, prefix: u8) -> u32 {
-    if prefix == 0 {
-        0
-    } else {
-        address & (u32::MAX << (32 - u32::from(prefix)))
-    }
-}
-
-fn mask128(address: u128, prefix: u8) -> u128 {
-    if prefix == 0 {
-        0
-    } else {
-        address & (u128::MAX << (128 - u32::from(prefix)))
-    }
-}
-
-/// An IPv4 network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Ipv4Cidr {
-    address: u32,
-    prefix: u8,
-}
-
-impl Ipv4Cidr {
-    fn contains(self, other: Self) -> bool {
-        self.prefix <= other.prefix && mask32(other.address, self.prefix) == self.address
+        self.is_ipv6() == other.is_ipv6()
+            && self.prefix <= other.prefix
+            && mask(other.bits(), self.prefix, self.width()) == self.bits()
     }
 
     fn overlaps(self, other: Self) -> bool {
         self.contains(other) || other.contains(self)
     }
 
+    fn width(self) -> u8 {
+        if self.is_ipv6() { 128 } else { 32 }
+    }
+
+    fn bits(self) -> u128 {
+        match self.address {
+            IpAddr::V4(address) => u128::from(u32::from(address)),
+            IpAddr::V6(address) => u128::from(address),
+        }
+    }
+
+    /// Returns the network of this one's family at `bits` with `prefix`.
+    fn with_bits(self, bits: u128, prefix: u8) -> Self {
+        let address = match self.address {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(bits as u32)),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(bits)),
+        };
+        Self { address, prefix }
+    }
+
     fn halves(self) -> [Self; 2] {
         let prefix = self.prefix + 1;
         [
-            Self {
-                address: self.address,
-                prefix,
-            },
-            Self {
-                address: self.address | (1 << (32 - u32::from(prefix))),
-                prefix,
-            },
+            self.with_bits(self.bits(), prefix),
+            self.with_bits(self.bits() | (1 << (self.width() - prefix)), prefix),
         ]
     }
 
     /// Returns the smallest set of networks that cover this network except `excluded`, or `None`
-    /// if that set has more than `limit` networks.
+    /// if that set has more than `limit` networks. Exclusions of the other family exclude nothing.
     ///
     /// Each exclusion is followed only into the half of a network that contains it, and expansion
     /// stops as soon as the result exceeds `limit`, so the work grows linearly with the number of
@@ -166,16 +131,36 @@ impl Ipv4Cidr {
         low.subtract_sorted(&excluded[..split], limit, remainder)
             && high.subtract_sorted(&excluded[split..], limit, remainder)
     }
+
+    fn network(self) -> IpAddr {
+        self.with_bits(mask(self.bits(), self.prefix, self.width()), self.prefix)
+            .address
+    }
 }
 
-impl fmt::Display for Ipv4Cidr {
+impl fmt::Display for Cidr {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{}/{}",
-            Ipv4Addr::from(self.address),
-            self.prefix
-        )
+        write!(formatter, "{}/{}", self.address, self.prefix)
+    }
+}
+
+/// Parses a prefix length in canonical form: decimal digits without a sign or leading zeros.
+pub fn parse_prefix_length(text: &str) -> Option<u8> {
+    let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    // `u8::from_str` alone would also accept a leading `+`.
+    if digits && (text.len() == 1 || !text.starts_with('0')) {
+        text.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Clears the host bits of an address of `width` bits.
+fn mask(address: u128, prefix: u8, width: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        address & !((1u128 << (width - prefix)) - 1)
     }
 }
 
@@ -183,16 +168,28 @@ impl fmt::Display for Ipv4Cidr {
 mod tests {
     use super::*;
 
-    fn v4(value: &str) -> Ipv4Cidr {
-        Cidr::parse(value).unwrap().ipv4().unwrap()
+    fn cidr(value: &str) -> Cidr {
+        Cidr::parse(value).unwrap()
+    }
+
+    fn from_ipv4_bits(bits: u32, prefix: u8) -> Cidr {
+        Cidr {
+            address: IpAddr::V4(Ipv4Addr::from(bits)),
+            prefix,
+        }
     }
 
     #[test]
     fn parsing_requires_canonical_networks() {
-        assert_eq!(v4("192.0.2.1").to_string(), "192.0.2.1/32");
-        assert_eq!(v4("10.0.0.0/8").to_string(), "10.0.0.0/8");
-        assert_eq!(v4("0.0.0.0/0").to_string(), "0.0.0.0/0");
-        assert!(Cidr::parse("2001:db8::/32").unwrap().ipv4().is_none());
+        assert_eq!(cidr("192.0.2.1").to_string(), "192.0.2.1/32");
+        assert_eq!(cidr("10.0.0.0/8").to_string(), "10.0.0.0/8");
+        assert_eq!(cidr("0.0.0.0/0").to_string(), "0.0.0.0/0");
+        assert_eq!(cidr("2001:db8::/32").to_string(), "2001:db8::/32");
+        assert_eq!(cidr("2001:db8::1").to_string(), "2001:db8::1/128");
+        assert_eq!(cidr("::/0").to_string(), "::/0");
+        assert!(cidr("2001:db8::/32").is_ipv6() && !cidr("10.0.0.0/8").is_ipv6());
+        assert_eq!(Cidr::everything(false), cidr("0.0.0.0/0"));
+        assert_eq!(Cidr::everything(true), cidr("::/0"));
         for invalid in [
             "10.0.0.1/8",
             "10.0.0.0/33",
@@ -202,9 +199,11 @@ mod tests {
             "192.0.2.1/+32",
             "0.0.0.0/+0",
             "2001:db8::/+32",
+            "2001:db8::/129",
             "example.com",
             "10.0.0.0/",
             "2001:db8::1/32",
+            "fe80::1%eth0",
         ] {
             assert!(Cidr::parse(invalid).is_err(), "{invalid}");
         }
@@ -212,37 +211,45 @@ mod tests {
 
     #[test]
     fn containment_is_family_aware() {
-        let outer = Cidr::parse("10.0.0.0/8").unwrap();
-        assert!(outer.contains(Cidr::parse("10.1.0.0/16").unwrap()));
+        let outer = cidr("10.0.0.0/8");
+        assert!(outer.contains(cidr("10.1.0.0/16")));
         assert!(outer.contains(outer));
-        assert!(!outer.contains(Cidr::parse("11.0.0.0/16").unwrap()));
-        assert!(!outer.contains(Cidr::parse("::/0").unwrap()));
-        let v6 = Cidr::parse("2001:db8::/32").unwrap();
-        assert!(v6.contains(Cidr::parse("2001:db8:1::/48").unwrap()));
+        assert!(!outer.contains(cidr("11.0.0.0/16")));
+        assert!(!outer.contains(cidr("::/0")));
+        let v6 = cidr("2001:db8::/32");
+        assert!(v6.contains(cidr("2001:db8:1::/48")));
+        assert!(!v6.contains(cidr("2001:db9::/48")));
+        // ::/96 and 0.0.0.0/0 span the same integers but never contain each other.
+        assert!(!cidr("::/96").contains(cidr("0.0.0.0/0")));
+        assert!(!cidr("0.0.0.0/0").contains(cidr("::/96")));
     }
 
     #[test]
     fn subtraction_covers_exactly_the_remainder() {
-        let subtract = |network: &str, excluded: &[Ipv4Cidr]| {
-            v4(network).subtract(excluded, usize::MAX).unwrap()
+        let subtract = |network: &str, excluded: &[Cidr]| {
+            cidr(network).subtract(excluded, usize::MAX).unwrap()
         };
-        let remainder: Vec<String> = subtract("10.0.0.0/8", &[v4("10.0.0.0/9")])
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert_eq!(remainder, ["10.128.0.0/9"]);
-
-        let remainder = subtract("10.0.0.0/30", &[v4("10.0.0.1")]);
-        let rendered: Vec<String> = remainder.iter().map(ToString::to_string).collect();
-        assert_eq!(rendered, ["10.0.0.0/32", "10.0.0.2/31"]);
-
-        assert!(subtract("10.1.0.0/16", &[v4("10.0.0.0/8")]).is_empty());
+        let rendered = |networks: Vec<Cidr>| -> Vec<String> {
+            networks.iter().map(ToString::to_string).collect()
+        };
         assert_eq!(
-            subtract("10.0.0.0/8", &[v4("11.0.0.0/8")]),
-            [v4("10.0.0.0/8")]
+            rendered(subtract("10.0.0.0/8", &[cidr("10.0.0.0/9")])),
+            ["10.128.0.0/9"]
         );
+        assert_eq!(
+            rendered(subtract("10.0.0.0/30", &[cidr("10.0.0.1")])),
+            ["10.0.0.0/32", "10.0.0.2/31"]
+        );
+        assert!(subtract("10.1.0.0/16", &[cidr("10.0.0.0/8")]).is_empty());
+        assert_eq!(
+            subtract("10.0.0.0/8", &[cidr("11.0.0.0/8")]),
+            [cidr("10.0.0.0/8")]
+        );
+        // An exclusion of the other family excludes nothing.
+        assert_eq!(subtract("0.0.0.0/0", &[cidr("::/96")]), [cidr("0.0.0.0/0")]);
+        assert_eq!(subtract("::/96", &[cidr("0.0.0.0/0")]), [cidr("::/96")]);
         // Every remaining address is outside the exclusions, and the sizes add up.
-        let excluded = [v4("10.0.0.0/24"), v4("10.0.7.0/24")];
+        let excluded = [cidr("10.0.0.0/24"), cidr("10.0.7.0/24")];
         let remainder = subtract("10.0.0.0/16", &excluded);
         let covered: u64 = remainder
             .iter()
@@ -256,8 +263,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ipv6_subtraction_covers_exactly_the_remainder() {
+        let remainder = cidr("2001:db8::/32")
+            .subtract(
+                &[cidr("2001:db8:1::/48"), cidr("2001:db8:8000::/33")],
+                usize::MAX,
+            )
+            .unwrap();
+        let rendered: Vec<String> = remainder.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rendered,
+            [
+                "2001:db8::/48",
+                "2001:db8:2::/47",
+                "2001:db8:4::/46",
+                "2001:db8:8::/45",
+                "2001:db8:10::/44",
+                "2001:db8:20::/43",
+                "2001:db8:40::/42",
+                "2001:db8:80::/41",
+                "2001:db8:100::/40",
+                "2001:db8:200::/39",
+                "2001:db8:400::/38",
+                "2001:db8:800::/37",
+                "2001:db8:1000::/36",
+                "2001:db8:2000::/35",
+                "2001:db8:4000::/34",
+            ]
+        );
+        let host = cidr("2001:db8::1:123");
+        assert_eq!(
+            cidr("2001:db8::1:122/127")
+                .subtract(&[host], usize::MAX)
+                .unwrap(),
+            [cidr("2001:db8::1:122")]
+        );
+        assert_eq!(
+            cidr("::/0").subtract(&[cidr("::/1")], usize::MAX).unwrap(),
+            [cidr("8000::/1")]
+        );
+    }
+
     /// The direct recursion that rescans every exclusion at each split, as a reference.
-    fn reference_subtract(network: Ipv4Cidr, excluded: &[Ipv4Cidr]) -> Vec<Ipv4Cidr> {
+    fn reference_subtract(network: Cidr, excluded: &[Cidr]) -> Vec<Cidr> {
         if excluded.iter().any(|exclusion| exclusion.contains(network)) {
             return Vec::new();
         }
@@ -279,42 +328,46 @@ mod tests {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             state
         };
-        let network = v4("10.0.0.0/16");
-        for _ in 0..500 {
-            let count = next() % 32;
-            let excluded: Vec<Ipv4Cidr> = (0..count)
-                .map(|_| {
-                    let prefix = 12 + (next() % 21) as u8;
-                    // Most exclusions fall inside the network; some cover it or lie elsewhere.
-                    let address = if next() % 4 == 0 {
-                        next()
-                    } else {
-                        network.address | (next() & 0xffff)
-                    };
-                    Ipv4Cidr {
-                        address: mask32(address, prefix),
-                        prefix,
-                    }
-                })
-                .collect();
-            assert_eq!(
-                network.subtract(&excluded, usize::MAX).unwrap(),
-                reference_subtract(network, &excluded),
-                "{excluded:?}"
-            );
+        for network in [cidr("10.0.0.0/16"), cidr("2001:db8::/112")] {
+            let low_bits = network.bits() as u32;
+            for _ in 0..500 {
+                let count = next() % 32;
+                let excluded: Vec<Cidr> = (0..count)
+                    .map(|_| {
+                        let prefix = 12 + (next() % 21) as u8;
+                        // Most exclusions fall inside the network; some cover it or lie
+                        // elsewhere.
+                        let bits = if next() % 4 == 0 {
+                            next()
+                        } else {
+                            low_bits | (next() & 0xffff)
+                        };
+                        if network.is_ipv6() {
+                            let prefix = prefix + 96;
+                            let address =
+                                (network.bits() & !u128::from(u32::MAX)) | u128::from(bits);
+                            network.with_bits(mask(address, prefix, 128), prefix)
+                        } else {
+                            from_ipv4_bits(mask(u128::from(bits), prefix, 32) as u32, prefix)
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    network.subtract(&excluded, usize::MAX).unwrap(),
+                    reference_subtract(network, &excluded),
+                    "{excluded:?}"
+                );
+            }
         }
     }
 
     #[test]
     fn subtraction_stops_once_the_remainder_exceeds_its_limit() {
         // 512 evenly spaced addresses split the address space into 512 * 23 networks.
-        let excluded: Vec<Ipv4Cidr> = (0..512u32)
-            .map(|index| Ipv4Cidr {
-                address: index << 23,
-                prefix: 32,
-            })
+        let excluded: Vec<Cidr> = (0..512u32)
+            .map(|index| from_ipv4_bits(index << 23, 32))
             .collect();
-        let everything = v4("0.0.0.0/0");
+        let everything = Cidr::everything(false);
         let size = |limit| {
             everything
                 .subtract(&excluded, limit)
