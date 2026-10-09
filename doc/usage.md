@@ -510,7 +510,7 @@ python3 scripts/nvx.py run
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy. |
 | `--network-ingress {allow,deny}` | `deny` | Set the default host ingress policy. The portable profile currently supports only `deny`; `allow` is rejected before launch. |
-| `--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]` | none | Allow matching guest egress; repeat to add rules. `PROTOCOL` is `tcp`, `udp`, or `icmp` and matches every port when `PORT` is omitted; only `tcp` and `udp` take a `PORT` or an inclusive `PORT-PORT` range, such as `8000-8010`. |
+| `--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]` | none | Allow matching guest egress; repeat to add rules. `CIDR` is an IPv4 or IPv6 address or network, and a rule matches only its own family. `PROTOCOL` is `tcp`, `udp`, or `icmp` and matches every port when `PORT` is omitted; only `tcp` and `udp` take a `PORT` or an inclusive `PORT-PORT` range, such as `8000-8010`. |
 | `--network-egress-deny CIDR[:PROTOCOL[:PORT[-PORT]]]` | none | Deny matching guest egress; repeat to add rules. Deny rules take precedence. `PROTOCOL` and `PORT` select traffic as for `--network-egress-allow`. |
 | `--network-egress-policy-file PATH` | none | Load bounded IPv4 ranges and rule-local CIDR exclusions from JSON. Requires explicit `--network-egress`; cannot be mixed with explicit allow/deny rule flags. |
 | `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services. |
@@ -618,7 +618,7 @@ launches.
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy for `run` or `provision`. |
 | `--network-ingress {allow,deny}` | `deny` | Set the host ingress policy for `run` or `provision`. The portable profile supports only `deny`. |
-| `--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]` | none | Allow matching guest egress; repeat to add rules. Requires explicit `--network-egress`. `PROTOCOL` is `tcp`, `udp`, or `icmp` and matches every port when `PORT` is omitted; only `tcp` and `udp` take a `PORT` or an inclusive `PORT-PORT` range, such as `8000-8010`. |
+| `--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]` | none | Allow matching guest egress; repeat to add rules. Requires explicit `--network-egress`. `CIDR` is an IPv4 or IPv6 address or network, and a rule matches only its own family. `PROTOCOL` is `tcp`, `udp`, or `icmp` and matches every port when `PORT` is omitted; only `tcp` and `udp` take a `PORT` or an inclusive `PORT-PORT` range, such as `8000-8010`. |
 | `--network-egress-deny CIDR[:PROTOCOL[:PORT[-PORT]]]` | none | Deny matching guest egress; repeat to add rules. Requires explicit `--network-egress`; deny rules take precedence. `PROTOCOL` and `PORT` select traffic as for `--network-egress-allow`. |
 | `--network-egress-policy-file PATH` | none | Load bounded IPv4 ranges and rule-local CIDR exclusions for `run` or `provision`. Managed provision persists lowered rules, not this path. Requires explicit `--network-egress`; cannot be mixed with explicit allow/deny rule flags. |
 | `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services for `run` or `provision`. |

@@ -108,8 +108,8 @@ HYPERVISORS = ("auto", "whp", "kvm", "mshv")
 NETWORK_PROFILES = ("portable",)
 NETWORK_EGRESS_RULE_METAVAR = "CIDR[:PROTOCOL[:PORT[-PORT]]]"
 NETWORK_EGRESS_RULE_HELP = (
-    "{action} guest egress to an IPv4 CIDR, optionally only for PROTOCOL tcp, "
-    "udp, or icmp, and for tcp or udp only on PORT or on the inclusive range "
+    "{action} guest egress to an IPv4 or IPv6 CIDR, optionally only for PROTOCOL "
+    "tcp, udp, or icmp, and for tcp or udp only on PORT or on the inclusive range "
     "PORT-PORT; repeat to add rules"
 )
 MAX_ENVIRONMENT_FILE_BYTES = 1024 * 1024

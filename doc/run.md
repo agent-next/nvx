@@ -142,16 +142,27 @@ allow/deny options:
   --network-egress-deny 140.82.114.0/24:tcp:443
 ```
 
-Rules match IPv4 addresses or CIDRs and may select one protocol: `tcp`, `udp`,
-or `icmp`. A TCP or UDP rule may add one destination port, or an inclusive
-range of them written `FIRST-LAST`; without a port, it matches every port of
-that protocol. Ports are `1` through `65535`, and a range cannot end below its
-first port. ICMP rules take no port. For example, `192.0.2.0/24:udp` matches
-UDP on every port, `192.0.2.1:tcp:8000-8010` matches TCP ports 8000 through
-8010 but not UDP, and `192.0.2.1:icmp` matches ICMP but not TCP or UDP. Deny
-matches take precedence over allow matches, so adding
-`--network-egress-deny 192.0.2.1:tcp:8005` keeps port 8005 blocked inside that
-range.
+Rules match IPv4 or IPv6 addresses or CIDRs and may select one protocol: `tcp`,
+`udp`, or `icmp`. A TCP or UDP rule may add one destination port, or an
+inclusive range of them written `FIRST-LAST`; without a port, it matches every
+port of that protocol. Ports are `1` through `65535`, and a range cannot end
+below its first port. ICMP rules take no port, and an IPv6 ICMP rule matches
+ICMPv6. For example, `192.0.2.0/24:udp` matches UDP on every port,
+`192.0.2.1:tcp:8000-8010` matches TCP ports 8000 through 8010 but not UDP,
+`192.0.2.1:icmp` matches ICMP but not TCP or UDP, and `2001:db8::/32:tcp:443`
+matches TCP port 443 on that IPv6 network. Deny matches take precedence over
+allow matches, so adding `--network-egress-deny 192.0.2.1:tcp:8005` keeps port
+8005 blocked inside that range.
+
+A rule matches only destinations of its own address family, so IPv4 rules never
+admit IPv6 traffic, or the reverse, and a `deny` default blocks every IPv6
+destination that no IPv6 rule allows. Use `0.0.0.0/0` and `::/0` to match
+every destination of one family. Like ARP for the IPv4 gateway, Neighbor
+Discovery for the IPv6 gateway is allowed under an `allow` default or with any
+IPv6 allow rule. The gateway never forwards IPv6 packets that carry extension
+headers or that target IPv4-mapped addresses. The guest names the IPv4 gateway
+as its DNS server when the policy allows TCP or UDP port 53 to it, and
+otherwise the IPv6 gateway when the policy allows DNS to that one.
 
 NVX can lower protocol selectors, inclusive TCP/UDP port ranges, and rule-local
 IPv4 exclusions to those native rules:
