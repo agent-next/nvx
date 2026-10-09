@@ -129,10 +129,10 @@ the reviewed revision into NVX.
 
 A pin promotion moves the `openvmm` gitlink to a reviewed OpenVMM revision:
 
-- Make it one commit on the current `dev` that changes only the gitlink,
-  unless the revision needs coordinated NVX changes, with a subject such as
-  `openvmm: pin auto's fallback to host CPU profiles`. Never merge OpenVMM
-  history into NVX.
+- Make the promotion a one-commit topic branch based directly on the current
+  `dev`; that commit should change only the gitlink unless the revision needs
+  coordinated NVX changes, with a subject such as `openvmm: pin auto's fallback
+  to host CPU profiles`. Never merge OpenVMM history into NVX.
 - After committing, run `scripts/nvx.py verify`, which checks that the
   submodule checkout matches the recorded pin.
 - In the pull request, name the OpenVMM pull request and the exact pinned
