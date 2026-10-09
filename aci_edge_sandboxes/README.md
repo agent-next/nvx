@@ -164,8 +164,9 @@ virtual processor, so `resources.vcpus` may only be 1, and `resources.memoryMib`
 A request may still set `microvm.provision.memoryMib`, but not together
 with `spec.resources.memoryMib`.
 
-A library that honors `spec.imageReference` converts a reference into a local disk image with an
-external tool the first time a sandbox uses it, and caches the result by the reference's text.
+A library that honors `spec.image.reference` (`Capabilities::spec.image_reference`) converts a
+reference into a local disk image with an external tool the first time a sandbox uses it, and
+caches the result by the reference's text.
 The tool comes from the runtime bundle (`bin/direct-images[.exe]`), so a library given explicit
 runtime files does not materialize references. It does not check a tag again, so a moving tag
 such as `latest` keeps naming the content that was first pulled: use a version tag or a digest
