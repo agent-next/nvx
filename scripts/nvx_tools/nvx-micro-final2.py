@@ -2797,8 +2797,10 @@ def run_filesystem_owner(
         foreign = (foreign_uid, foreign_gid)
         cap_setuid, cap_setgid = openvmm_inherits_identity_capabilities()
         other_groups = openvmm_other_groups()
-        # Without CAP_SETGID, OpenVMM cannot drop its other supplementary
-        # groups, so it fails even requests from guest root.
+        # Guest root keeps its privileges only when OpenVMM can assume the
+        # export owner identity: CAP_SETUID when the export UID differs,
+        # CAP_SETGID when the export GID differs or supplementary groups
+        # must be dropped.
         root_allowed, foreign_allowed = filesystem_owner_expectations(
             export_uid=owner[0],
             export_gid=owner[1],
@@ -2808,11 +2810,20 @@ def run_filesystem_owner(
             cap_setgid=cap_setgid,
             supplementary_groups=other_groups,
         )
+        # Group dropping is only the blocker when there are supplementary
+        # groups to drop and CAP_SETGID is absent; otherwise the blocker is
+        # a mismatched export UID/GID.
+        groups_blocked = bool(other_groups) and not cap_setgid
+        identity_cause = (
+            "drop its supplementary groups"
+            if groups_blocked
+            else "assume the export's identity"
+        )
         print(
             "OpenVMM "
             + ("can" if (cap_setuid and cap_setgid) else "cannot")
             + " assume other host identities"
-            + ("" if root_allowed else " or drop its supplementary groups")
+            + ("" if root_allowed else f" or {identity_cause}")
             + "; guest root must "
             + ("own its files" if root_allowed else "fail with EPERM")
             + ", and foreign guest callers must "
@@ -2843,7 +2854,7 @@ def run_filesystem_owner(
             if any(root.iterdir()):
                 raise RuntimeError(
                     "a guest caller wrote to the share although OpenVMM cannot "
-                    "drop its supplementary groups"
+                    + identity_cause
                 )
         else:
             status = (root / "root-file").lstat()
