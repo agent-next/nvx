@@ -5,6 +5,7 @@ import argparse
 import ast
 import inspect
 import io
+import ipaddress
 import json
 import os
 import queue
@@ -5621,6 +5622,718 @@ class MicrovmTests(unittest.TestCase):
                 guest="alpine",
             )
         self.assertIn("l3-l4-egress-port-ranges", microvm_tests.MICROVM_TEST_SCENARIOS)
+
+    def test_ipv6_egress_identity_embeds_the_directional_network(self):
+        prefix = int(ipaddress.IPv6Address("fd00::"))
+        for ipv4, ipv6 in (
+            (
+                microvm_tests.DIRECTIONAL_NETWORK_GUEST_IPV4,
+                microvm_tests.DIRECTIONAL_NETWORK_GUEST_IPV6,
+            ),
+            (
+                microvm_tests.DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+                microvm_tests.DIRECTIONAL_NETWORK_GATEWAY_IPV6,
+            ),
+        ):
+            self.assertEqual(
+                ipaddress.IPv6Address(prefix | int(ipaddress.IPv4Address(ipv4))),
+                ipaddress.IPv6Address(ipv6),
+            )
+        ipv4_prefix_length = int(microvm_tests.DIRECTIONAL_NETWORK_CIDR.split("/")[1])
+        self.assertEqual(
+            microvm_tests.DIRECTIONAL_NETWORK_IPV6_PREFIX_LENGTH,
+            96 + ipv4_prefix_length,
+        )
+        self.assertEqual(
+            microvm_tests._ipv6_identity_values(),
+            {
+                "GUEST_IPV6": "fd00::c000:202",
+                "GATEWAY_IPV6": "fd00::c000:201",
+                "PREFIX_LENGTH": "120",
+                "GUEST_IPV6_HEX": "fd0000000000000000000000c0000202",
+                "GATEWAY_IPV6_HEX": "fd0000000000000000000000c0000201",
+                "PREFIX_LENGTH_HEX": "78",
+                "ANY_IPV6_HEX": "0" * 32,
+            },
+        )
+
+    def test_ipv6_egress_cases_cover_families_and_precedence(self):
+        cases = microvm_tests._ipv6_egress_cases(
+            "192.0.2.1", "fd00::c000:201", 20000, 20001
+        )
+        gateway = "fd00::c000:201/128"
+        named_tcp = f"{gateway}:tcp:20000"
+        every_probe = set(microvm_tests.IPV6_EGRESS_PROBES)
+        lowered = {}
+        for case in cases:
+            compiled = egress_policy.compile_policy(
+                {"allow": list(case.allow), "deny": list(case.deny)}
+            )
+            lowered[case.name] = (
+                case.default,
+                compiled.allow,
+                compiled.deny,
+                set(case.reached),
+                case.dns,
+            )
+        # The guest names the IPv4 gateway as its DNS server when the policy
+        # allows DNS to it, and otherwise the IPv6 gateway when it allows DNS
+        # to that one.
+        self.assertEqual(
+            lowered,
+            {
+                "allow-all": ("allow", (), (), every_probe, "192.0.2.1"),
+                "deny-all": ("deny", (), (), set(), None),
+                "allow-ipv6-tcp-port": (
+                    "deny",
+                    (named_tcp,),
+                    (),
+                    {"tcp6-named"},
+                    None,
+                ),
+                # The range lowers to one native range rule.
+                "allow-ipv6-tcp-range": (
+                    "deny",
+                    (f"{gateway}:tcp:20000-20001",),
+                    (),
+                    {"tcp6-named", "tcp6-other"},
+                    None,
+                ),
+                "allow-ipv6-udp-icmp": (
+                    "deny",
+                    (f"{gateway}:icmp", f"{gateway}:udp"),
+                    (),
+                    {"udp6-named", "icmp6"},
+                    "fd00::c000:201",
+                ),
+                "deny-ipv6-tcp-port": (
+                    "deny",
+                    ("::/0",),
+                    (named_tcp,),
+                    {"tcp6-other", "udp6-named", "icmp6"},
+                    "fd00::c000:201",
+                ),
+                "allow-tcp-port-without-to": (
+                    "deny",
+                    ("0.0.0.0/0:tcp:20000", "::/0:tcp:20000"),
+                    (),
+                    {"tcp6-named", "tcp4-named"},
+                    None,
+                ),
+                "allow-ipv4-only": (
+                    "deny",
+                    ("0.0.0.0/0",),
+                    (),
+                    {"tcp4-named"},
+                    "192.0.2.1",
+                ),
+                "deny-ipv6-only": (
+                    "allow",
+                    (),
+                    ("fd00::/8",),
+                    {"tcp4-named"},
+                    "192.0.2.1",
+                ),
+            },
+        )
+
+    def _run_ipv6_egress(
+        self,
+        output_dir: Path,
+        *,
+        leaked: tuple[str, str] | None = None,
+        guest_report: tuple[str, str, str] | None = None,
+        dns_report: tuple[str, str] | None = None,
+        changed_restore: bytes = b"restore-time egress policy does not match",
+        snapshot_reached: frozenset[str] = frozenset(("tcp6-named",)),
+    ) -> tuple[MagicMock, MagicMock]:
+        endpoints = {
+            name: MagicMock(spec=socket.socket)
+            for name in ("tcp6-named", "tcp6-other", "udp6-named", "tcp4-named")
+        }
+        for name, endpoint in endpoints.items():
+            endpoint.getsockname.return_value = (
+                "::1",
+                20001 if name == "tcp6-other" else 20000,
+            )
+        cases = {
+            case.name: case
+            for case in microvm_tests._ipv6_egress_cases(
+                microvm_tests.DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+                microvm_tests.DIRECTIONAL_NETWORK_GATEWAY_IPV6,
+                20000,
+                20001,
+            )
+        }
+        current: list[str] = []
+
+        def guest(
+            command: list[str], _script: str, _marker: bytes, **_kwargs: object
+        ) -> dict[str, str]:
+            policy = Path(command[command.index("--network-egress-policy-file") + 1])
+            name = policy.name.removeprefix("ipv6-egress-").removesuffix("-policy.json")
+            current.append(name)
+            reports = {
+                probe: "sent"
+                if probe.startswith("udp")
+                else "reached"
+                if probe in cases[name].reached
+                else "blocked"
+                for probe in microvm_tests.IPV6_EGRESS_PROBES
+            }
+            if guest_report is not None and guest_report[0] == name:
+                reports[guest_report[1]] = guest_report[2]
+            dns = cases[name].dns or "none"
+            if dns_report is not None and dns_report[0] == name:
+                dns = dns_report[1]
+            # The tty echoes script lines, which must not count as reports.
+            text = 'echo "NVX-IPV6-EGRESS-DNS ${dns:-none}"\r\n'
+            text += f"NVX-IPV6-EGRESS-DNS {dns}\r\n"
+            text += "".join(
+                f"NVX-L3-L4-PROBE {probe}={value}\r\n"
+                for probe, value in reports.items()
+            )
+            return {"text": text + "NVX-IPV6-EGRESS-OK\r\n"}
+
+        class FakeServer:
+            def __init__(
+                self, served: dict[str, socket.socket], _timeout: float
+            ) -> None:
+                self.snapshot = list(served) == ["tcp6-named"]
+                if self.snapshot:
+                    assert served["tcp6-named"] is endpoints["tcp6-named"]
+                else:
+                    assert served == endpoints
+
+            def __enter__(self) -> "FakeServer":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                pass
+
+            def finish(self) -> frozenset[str]:
+                if self.snapshot:
+                    return snapshot_reached
+                name = current[-1]
+                reached = set(cases[name].reached - {"icmp6"})
+                if leaked is not None and leaked[0] == name:
+                    reached.add(leaked[1])
+                return frozenset(reached)
+
+        with (
+            patch.object(
+                microvm_tests, "_bind_ipv6_egress_ports", return_value=endpoints
+            ),
+            patch.object(microvm_tests, "_EgressProbeServer", FakeServer),
+            patch.object(
+                microvm_tests, "run_guest_script", side_effect=guest
+            ) as run_guest_script,
+            patch.object(microvm_tests, "OpenvmmProcess") as openvmm_process,
+        ):
+            wait = openvmm_process.return_value.__enter__.return_value.wait
+            wait.side_effect = (
+                MagicMock(returncode=0, output=b"NVX-IPV6-EGRESS-BEFORE\r\n"),
+                MagicMock(returncode=1, output=changed_restore),
+                MagicMock(returncode=0, output=b"NVX-IPV6-EGRESS-AFTER\r\n"),
+                MagicMock(
+                    returncode=2,
+                    output=b"IPv6 prefix /129 is outside the supported range",
+                ),
+            )
+            try:
+                microvm_tests.run_ipv6_egress_policy(
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initramfs"),
+                    "whp",
+                    memory_mib=128,
+                    timeout=1,
+                    output_dir=output_dir,
+                )
+            finally:
+                for endpoint in endpoints.values():
+                    endpoint.close.assert_called_once_with()
+        return run_guest_script, openvmm_process
+
+    def test_ipv6_egress_policy_runs_every_case_through_public_nvx_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            run_guest_script, openvmm_process = self._run_ipv6_egress(output_dir)
+
+            cases = microvm_tests._ipv6_egress_cases(
+                microvm_tests.DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+                microvm_tests.DIRECTIONAL_NETWORK_GATEWAY_IPV6,
+                20000,
+                20001,
+            )
+            self.assertEqual(run_guest_script.call_count, len(cases))
+            nvx_path = str(Path(microvm_tests.__file__).parents[1] / "nvx.py")
+            for call, case in zip(run_guest_script.call_args_list, cases, strict=True):
+                policy_path = output_dir / f"ipv6-egress-{case.name}-policy.json"
+                self.assertEqual(
+                    call.args[0],
+                    [
+                        sys.executable,
+                        nvx_path,
+                        "run",
+                        "--guest",
+                        "alpine",
+                        "--hypervisor",
+                        "whp",
+                        "--memory-mib",
+                        "128",
+                        "--net",
+                        microvm_tests.DIRECTIONAL_NETWORK_CIDR,
+                        "--network-profile",
+                        "portable",
+                        "--network-egress",
+                        case.default,
+                        "--network-ingress",
+                        "deny",
+                        "--network-egress-policy-file",
+                        str(policy_path),
+                        "--cmdline",
+                        "quiet loglevel=0",
+                    ],
+                )
+                self.assertEqual(
+                    json.loads(policy_path.read_text(encoding="utf-8")),
+                    {"allow": list(case.allow), "deny": list(case.deny)},
+                )
+                script = call.args[1]
+                self.assertNotIn("@", script)
+                self.assertIn("'http://[fd00::c000:201]:20000/tcp6-named' &\n", script)
+                self.assertIn("'http://[fd00::c000:201]:20001/tcp6-other' &\n", script)
+                self.assertIn("'http://192.0.2.1:20000/tcp4-named' &\n", script)
+                self.assertEqual(
+                    call.args[2], microvm_tests.IPV6_EGRESS_COMPLETION_MARKER
+                )
+                self.assertIs(call.kwargs["contain_process_tree"], True)
+
+            launched = [call.args[0] for call in openvmm_process.call_args_list]
+            self.assertEqual(len(launched), 4)
+            capture, changed, restore, invalid = launched
+            ipv6_rule = "fd00::c000:201/128:tcp:20000"
+            self.assertEqual(
+                capture[capture.index("--snapshot-destination") + 2 :],
+                ["--network-egress", "deny", "--network-egress-allow", ipv6_rule],
+            )
+            self.assertEqual(
+                capture[capture.index("--net") + 1],
+                microvm_tests.DIRECTIONAL_NETWORK_CIDR,
+            )
+            for restored, rule in (
+                (changed, "192.0.2.1/32:tcp:20000"),
+                (restore, ipv6_rule),
+            ):
+                self.assertIn("--restore-snapshot", restored)
+                self.assertNotIn("--net", restored)
+                self.assertEqual(
+                    restored[restored.index("--network-profile") :],
+                    [
+                        "--network-profile",
+                        "portable",
+                        "--network-egress",
+                        "deny",
+                        "--network-egress-allow",
+                        rule,
+                    ],
+                )
+            self.assertEqual(
+                invalid[-4:],
+                [
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-allow",
+                    "fd00::c000:201/129",
+                ],
+            )
+            process = openvmm_process.return_value.__enter__.return_value
+            process.wait_for.assert_any_call(microvm_tests.BOOT_MARKER, 1)
+            process.wait_for.assert_any_call(microvm_tests.IPV6_EGRESS_AFTER_MARKER, 1)
+            staged = process.send_bytes.call_args.args[0].decode()
+            self.assertIn("http://[fd00::c000:201]:20000/tcp6-named", staged)
+            self.assertIn("nvx-snapshot\n", staged)
+
+            results = json.loads(
+                (output_dir / "ipv6-egress-policy-results.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(results["guest_ipv6"], "fd00::c000:202/120")
+            self.assertEqual(results["gateway_ipv6"], "fd00::c000:201")
+            self.assertEqual(results["ports"], {"named": 20000, "other": 20001})
+            by_case = {case["case"]: case for case in results["cases"]}
+            self.assertEqual(list(by_case), [case.name for case in cases])
+            self.assertEqual(
+                by_case["deny-ipv6-tcp-port"]["host_reached"],
+                ["tcp6-other", "udp6-named"],
+            )
+            self.assertEqual(by_case["deny-ipv6-tcp-port"]["guest"]["icmp6"], "reached")
+            self.assertEqual(by_case["allow-ipv4-only"]["host_reached"], ["tcp4-named"])
+            self.assertEqual(by_case["deny-all"]["host_reached"], [])
+            tcp_range = by_case["allow-ipv6-tcp-range"]
+            self.assertEqual(tcp_range["host_reached"], ["tcp6-named", "tcp6-other"])
+            self.assertEqual(
+                tcp_range["native_rules"],
+                {"allow": ["fd00::c000:201/128:tcp:20000-20001"], "deny": []},
+            )
+            # A rule without destinations reaches both families.
+            without_to = by_case["allow-tcp-port-without-to"]
+            self.assertEqual(without_to["host_reached"], ["tcp4-named", "tcp6-named"])
+            self.assertEqual(
+                without_to["native_rules"],
+                {"allow": ["0.0.0.0/0:tcp:20000", "::/0:tcp:20000"], "deny": []},
+            )
+            self.assertEqual(by_case["deny-ipv6-only"]["default"], "allow")
+            self.assertEqual(
+                {name: case["dns"] for name, case in by_case.items()},
+                {
+                    "allow-all": "192.0.2.1",
+                    "deny-all": "none",
+                    "allow-ipv6-tcp-port": "none",
+                    "allow-ipv6-tcp-range": "none",
+                    "allow-ipv6-udp-icmp": "fd00::c000:201",
+                    "deny-ipv6-tcp-port": "fd00::c000:201",
+                    "allow-tcp-port-without-to": "none",
+                    "allow-ipv4-only": "192.0.2.1",
+                    "deny-ipv6-only": "192.0.2.1",
+                },
+            )
+
+    def test_ipv6_egress_policy_requires_the_expected_dns_server(self):
+        for name, reported, expected in (
+            ("allow-ipv6-udp-icmp", "none", "fd00::c000:201"),
+            ("allow-ipv6-udp-icmp", "192.0.2.1", "fd00::c000:201"),
+            ("allow-ipv6-tcp-port", "fd00::c000:201", "none"),
+            ("allow-all", "fd00::c000:201", "192.0.2.1"),
+        ):
+            with (
+                self.subTest(name=name, reported=reported),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    re.escape(
+                        f"{name}: the guest named {reported!r} as its DNS server "
+                        f"instead of {expected!r}"
+                    ),
+                ):
+                    self._run_ipv6_egress(Path(temporary), dns_report=(name, reported))
+
+    def test_ipv6_egress_policy_rejects_leaks_and_missed_traffic(self):
+        failures: tuple[
+            tuple[tuple[str, str] | None, tuple[str, str, str] | None, str], ...
+        ] = (
+            (
+                ("allow-ipv6-tcp-port", "tcp6-other"),
+                None,
+                "L3/L4 IPv6 egress case allow-ipv6-tcp-port: tcp6-other",
+            ),
+            (("deny-all", "tcp6-named"), None, "deny-all: tcp6-named"),
+            (
+                ("allow-ipv6-tcp-range", "udp6-named"),
+                None,
+                "allow-ipv6-tcp-range: udp6-named",
+            ),
+            (
+                None,
+                ("allow-ipv6-tcp-range", "tcp6-other", "blocked"),
+                "allow-ipv6-tcp-range: tcp6-other should be reached",
+            ),
+            (("allow-ipv4-only", "udp6-named"), None, "allow-ipv4-only: udp6-named"),
+            (("deny-ipv6-only", "tcp6-named"), None, "deny-ipv6-only: tcp6-named"),
+            (
+                None,
+                ("allow-all", "icmp6", "blocked"),
+                "allow-all: icmp6 should be reached",
+            ),
+            (
+                None,
+                ("allow-ipv4-only", "tcp6-named", "reached"),
+                "allow-ipv4-only: tcp6-named should be blocked",
+            ),
+            (
+                None,
+                ("allow-tcp-port-without-to", "tcp4-named", "blocked"),
+                "allow-tcp-port-without-to: tcp4-named should be reached",
+            ),
+            (
+                None,
+                ("deny-ipv6-tcp-port", "tcp4-named", "unexpected"),
+                "deny-ipv6-tcp-port: tcp4-named",
+            ),
+        )
+        for leaked, guest_report, message in failures:
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                output_dir = Path(temporary)
+                with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                    self._run_ipv6_egress(
+                        output_dir, leaked=leaked, guest_report=guest_report
+                    )
+                self.assertFalse(
+                    (output_dir / "ipv6-egress-policy-results.json").exists()
+                )
+
+    def test_ipv6_egress_policy_requires_the_restored_policy_and_flow(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            self.assertRaisesRegex(
+                RuntimeError, "restore with a changed rule was not rejected"
+            ),
+        ):
+            self._run_ipv6_egress(Path(temporary), changed_restore=b"restored")
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            self.assertRaisesRegex(
+                RuntimeError, "snapshot probes did not reach the host"
+            ),
+        ):
+            self._run_ipv6_egress(Path(temporary), snapshot_reached=frozenset())
+
+    def _run_ipv6_guest_script(
+        self,
+        shell: str,
+        root: Path,
+        name: str,
+        stubs: str,
+        **values: str,
+    ) -> subprocess.CompletedProcess[str]:
+        script = (
+            microvm_tests._render_script(name, **values)
+            .replace("nvx-exit", "record_exit")
+            .replace("nvx-snapshot", "record_snapshot")
+            .replace("/proc/", f"{root.as_posix()}/proc/")
+            .replace("/etc/resolv.conf", f"{root.as_posix()}/etc/resolv.conf")
+        )
+        return subprocess.run(
+            [shell],
+            input="record_exit() { printf 'NVX-EXIT %s\\n' \"$1\"; }\n"
+            + stubs
+            + script,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+    def test_ipv6_egress_script_checks_the_identity_and_reports_each_probe(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        values = {
+            **microvm_tests._ipv6_identity_values(),
+            "GATEWAY_IPV4": "192.0.2.1",
+            "NAMED_PORT": "20000",
+            "OTHER_PORT": "20001",
+        }
+        any_ipv6 = "0" * 32
+        route = (
+            f"{any_ipv6} 00 {any_ipv6} 00 fd0000000000000000000000c0000201 "
+            "00000400 00000001 00000000 00000003     eth0\n"
+        )
+        address = "fd0000000000000000000000c0000202 02 78 00 80     eth0\n"
+        stubs = (
+            "wget() {\n"
+            "    for url; do :; done\n"
+            '    case "$url" in\n'
+            "    *]:20000/tcp6-named) printf NVX-EGRESS-PROBE-tcp6-named ;;\n"
+            "    */tcp6-other) return 1 ;;\n"
+            "    */tcp4-named) printf WRONG ;;\n"
+            "    esac\n"
+            "}\n"
+            "nc() {\n"
+            "    cat >/dev/null\n"
+            '    [ "$4" = fd00::c000:201 ] && [ "$5" = 20000 ] || return 2\n'
+            "}\n"
+            'ping() { [ "$5" = fd00::c000:201 ]; }\n'
+        )
+        ipv6_dns = " virtnet_dns=fd00::c000:201"
+        resolver = "nameserver fd00::c000:201\n"
+        # Each case: kernel tables, DNS token and resolver, and the exit status
+        # with the reported DNS server.
+        cases: tuple[tuple[str, str, str, str, str, int, str], ...] = (
+            ("complete", address, route, ipv6_dns, resolver, 0, "fd00::c000:201"),
+            ("no dns", address, route, "", "", 0, "none"),
+            (
+                "stale resolver",
+                address,
+                route,
+                ipv6_dns,
+                "nameserver 192.0.2.1\n",
+                64,
+                "",
+            ),
+            ("no address", "", route, "", "", 62, ""),
+            ("other prefix", address.replace(" 78 ", " 40 "), route, "", "", 62, ""),
+            ("no route", address, "", "", "", 63, ""),
+        )
+        for label, if_inet6, ipv6_route, dns, resolv, status, reported in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "proc" / "net").mkdir(parents=True)
+                (root / "etc").mkdir()
+                (root / "proc" / "cmdline").write_text(
+                    "quiet virtnet_ip=192.0.2.2 virtnet_mask=255.255.255.0 "
+                    f"virtnet_gw=192.0.2.1{dns} virtnet_ip6=fd00::c000:202/120 "
+                    "virtnet_gw6=fd00::c000:201\n",
+                    encoding="utf-8",
+                )
+                (root / "proc" / "net" / "if_inet6").write_text(
+                    if_inet6, encoding="utf-8"
+                )
+                (root / "proc" / "net" / "ipv6_route").write_text(
+                    ipv6_route, encoding="utf-8"
+                )
+                (root / "etc" / "resolv.conf").write_text(resolv, encoding="utf-8")
+                result = self._run_ipv6_guest_script(
+                    shell, root, "ipv6-egress-policy.sh.in", stubs, **values
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                if status:
+                    self.assertEqual(
+                        result.stdout.splitlines(),
+                        [f"NVX-IPV6-EGRESS-FAIL code={status}", f"NVX-EXIT {status}"],
+                    )
+                    continue
+                self.assertEqual(
+                    result.stdout.splitlines(),
+                    [
+                        f"NVX-IPV6-EGRESS-DNS {reported}",
+                        "NVX-L3-L4-PROBE tcp6-named=reached",
+                        "NVX-L3-L4-PROBE tcp6-other=blocked",
+                        "NVX-L3-L4-PROBE udp6-named=sent",
+                        "NVX-L3-L4-PROBE icmp6=reached",
+                        "NVX-L3-L4-PROBE tcp4-named=unexpected",
+                        "NVX-IPV6-EGRESS-OK",
+                        "NVX-EXIT 0",
+                    ],
+                )
+
+    def test_ipv6_egress_snapshot_script_probes_across_the_snapshot(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        for label, wget, expected in (
+            (
+                "reached",
+                "printf NVX-EGRESS-PROBE-tcp6-named",
+                [
+                    "NVX-IPV6-EGRESS-BEFORE",
+                    "SNAPSHOT",
+                    "NVX-IPV6-EGRESS-AFTER",
+                    "NVX-EXIT 0",
+                ],
+            ),
+            (
+                "blocked after restore",
+                '[ ! -e "$restored" ] && printf NVX-EGRESS-PROBE-tcp6-named',
+                [
+                    "NVX-IPV6-EGRESS-BEFORE",
+                    "SNAPSHOT",
+                    "NVX-IPV6-EGRESS-FAIL code=81",
+                    "NVX-EXIT 81",
+                ],
+            ),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
+                restored = (Path(temporary) / "restored").as_posix()
+                stubs = (
+                    f"restored={restored}\n"
+                    "wget() {\n"
+                    '    [ "$4" = "http://[fd00::c000:201]:20000/tcp6-named" ] ||'
+                    " return 9\n"
+                    f"    {wget}\n"
+                    "}\n"
+                    'record_snapshot() { echo SNAPSHOT; : >"$restored"; }\n'
+                )
+                result = self._run_ipv6_guest_script(
+                    shell,
+                    Path(temporary),
+                    "ipv6-egress-snapshot.sh.in",
+                    stubs,
+                    GATEWAY_IPV6="fd00::c000:201",
+                    NAMED_PORT="20000",
+                )
+                self.assertEqual(result.stdout.splitlines(), expected, result.stderr)
+
+    def test_ipv6_egress_ports_reserve_both_loopback_families(self):
+        try:
+            endpoints = microvm_tests._bind_ipv6_egress_ports()
+        except RuntimeError as error:
+            self.skipTest(str(error))
+        try:
+            ports = {
+                name: endpoint.getsockname()[:2] for name, endpoint in endpoints.items()
+            }
+            named = ports["tcp6-named"][1]
+            self.assertEqual(
+                ports,
+                {
+                    "tcp6-named": ("::1", named),
+                    "tcp6-other": ("::1", named + 1),
+                    "udp6-named": ("::1", named),
+                    "tcp4-named": ("127.0.0.1", named),
+                },
+            )
+            self.assertEqual(endpoints["udp6-named"].type, socket.SOCK_DGRAM)
+        finally:
+            for endpoint in endpoints.values():
+                endpoint.close()
+
+    def test_ipv6_egress_ports_require_host_ipv6_loopback(self):
+        unavailable = MagicMock(spec=socket.socket)
+        unavailable.__enter__.return_value = unavailable
+        unavailable.bind.side_effect = OSError("address family not supported")
+        with (
+            patch.object(microvm_tests.socket, "socket", return_value=unavailable),
+            self.assertRaisesRegex(RuntimeError, "no IPv6 loopback address"),
+        ):
+            microvm_tests._bind_ipv6_egress_ports()
+
+    def test_runner_dispatches_ipv6_egress_policy(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "validate_openvmm_test_backend"),
+            patch.object(microvm_tests, "require_file", side_effect=require),
+            patch.object(
+                microvm_tests, "run_ipv6_egress_policy"
+            ) as run_ipv6_egress_policy,
+        ):
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "kvm",
+                    "--scenario",
+                    "ipv6-egress-policy",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            self.assertEqual(microvm_tests.run(args), 0)
+
+            run_ipv6_egress_policy.assert_called_once_with(
+                microvm_tests.openvmm_binary_path(),
+                microvm_tests.artifact_path(
+                    microvm_tests.KernelBuildConstants.BINARY_NAME
+                ),
+                microvm_tests.artifact_path(
+                    microvm_tests.guest_descriptor("alpine").initramfs_name
+                ),
+                "kvm",
+                memory_mib=128,
+                timeout=60.0,
+                output_dir=Path(temporary),
+                guest="alpine",
+            )
+        self.assertIn("ipv6-egress-policy", microvm_tests.MICROVM_TEST_SCENARIOS)
 
     def test_sandbox_blocks_use_fixed_roles_and_access(self):
         with (

@@ -43,7 +43,17 @@ port below nor the port above them nor another protocol, both as allow rules
 and as deny rules that take precedence over an allow rule; that a deny rule for
 one port inside an allowed range blocks that port alone; that each range
 reaches OpenVMM as one native range rule; and that OpenVMM and `nvx.py run`
-reject reversed ranges and ranges without a first port before launch.
+reject reversed ranges and ranges without a first port before launch. IPv6
+coverage verifies, with MXC-shaped policy files, the guest's derived IPv6
+address and default route, TCP, UDP, and ICMPv6 to the IPv6 gateway, a `deny`
+default without rules that blocks both families, port and protocol rules, an
+IPv6 port range, deny precedence within `::/0`, a rule without destinations that
+admits both families, a `deny` default that IPv4 rules do not widen to IPv6, an
+IPv6 deny rule under an `allow` default that leaves IPv4 alone, the DNS server
+that each policy gives the guest, the IPv6 path across snapshot restore,
+rejection of a restore whose policy differs, and pre-boot rejection of an
+invalid IPv6 prefix. The Ubuntu and Azure Linux virtio-net smoke tests also
+verify the IPv6 identity.
 Host-loopback coverage verifies
 general guest-to-host denial, an exact proxy exception, explicit
 localhost-to-guest forwarding under allow, and pre-boot rejection when both

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import queue
@@ -101,6 +102,7 @@ MICROVM_TEST_SCENARIOS = (
     "guest-boot",
     "guest-identity",
     "host-loopback-policy",
+    "ipv6-egress-policy",
     "lifecycle",
     "l3-l4-egress-policy",
     "l3-l4-egress-port-ranges",
@@ -182,6 +184,19 @@ L3_L4_EGRESS_RANGE_PROBES = tuple(
     for protocol in ("tcp", "udp")
     for position in L3_L4_EGRESS_RANGE_POSITIONS
 )
+# The portable profile embeds the NIC's IPv4 addresses in fd00::/96, so the
+# directional network's guest is fd00::c000:202/120 behind fd00::c000:201.
+DIRECTIONAL_NETWORK_GUEST_IPV6 = "fd00::c000:202"
+DIRECTIONAL_NETWORK_GATEWAY_IPV6 = "fd00::c000:201"
+DIRECTIONAL_NETWORK_IPV6_PREFIX_LENGTH = 120
+IPV6_EGRESS_COMPLETION_MARKER = b"NVX-IPV6-EGRESS-OK"
+IPV6_EGRESS_BEFORE_MARKER = b"NVX-IPV6-EGRESS-BEFORE"
+IPV6_EGRESS_AFTER_MARKER = b"NVX-IPV6-EGRESS-AFTER"
+IPV6_EGRESS_DNS_PREFIX = "NVX-IPV6-EGRESS-DNS "
+# The IPv6 scenario's guest probes toward the gateway's IPv6 address: TCP to a
+# named port and to the next port, UDP to the named port, and ICMPv6 echo,
+# plus TCP to the named port over IPv4.
+IPV6_EGRESS_PROBES = ("tcp6-named", "tcp6-other", "udp6-named", "icmp6", "tcp4-named")
 HOST_LOOPBACK_DENY_MARKER = b"NVX-HOST-LOOPBACK-DENY-OK"
 HOST_LOOPBACK_UDP_CONTROL_MARKER = b"NVX-HOST-LOOPBACK-UDP-CONTROL-OK"
 HOST_LOOPBACK_ALLOW_MARKER = b"NVX-HOST-LOOPBACK-ALLOW-OK"
@@ -2172,6 +2187,7 @@ class _EgressCase:
     allow: tuple[dict[str, object], ...]
     deny: tuple[dict[str, object], ...]
     reached: frozenset[str]
+    default: str = "deny"
 
 
 def _egress_protocol_cases(gateway: str, named_port: int) -> tuple[_EgressCase, ...]:
@@ -2325,7 +2341,7 @@ def _check_egress_case(
         # Consomme answers echo requests to the gateway itself, so only the
         # guest observes ICMP.
         observed = probe in host_reached
-        if not guest_matches or (probe != "icmp" and observed != expected):
+        if not guest_matches or (not probe.startswith("icmp") and observed != expected):
             raise RuntimeError(
                 f"L3/L4 {kind} case {case.name}: {probe} should be "
                 f"{'reached' if expected else 'blocked'}, but the guest reported "
@@ -2718,6 +2734,415 @@ def run_l3_l4_egress_port_ranges(
         )
     finally:
         for endpoint in (*tcp, *udp):
+            endpoint.close()
+
+
+@dataclass(frozen=True)
+class _Ipv6EgressCase(_EgressCase):
+    # The gateway address that the guest names as its DNS server, if any.
+    dns: str | None = None
+
+
+def _ipv6_egress_cases(
+    gateway_ipv4: str, gateway_ipv6: str, named_port: int, other_port: int
+) -> tuple[_Ipv6EgressCase, ...]:
+    """Return the IPv6 scenario's MXC-shaped policies, the probes that each
+    admits, and the DNS server that each gives the guest: the IPv4 gateway when
+    the policy allows DNS to it, and otherwise the IPv6 gateway when it allows
+    DNS to that one. The other port follows the named port."""
+    gateway = [{"cidr": f"{gateway_ipv6}/128"}]
+    every_probe = frozenset(IPV6_EGRESS_PROBES)
+    named_tcp: dict[str, object] = {"protocol": "tcp", "port": named_port}
+    return (
+        # An unfiltered NIC carries every probe, so the IPv6 path itself works.
+        _Ipv6EgressCase(
+            "allow-all", (), (), every_probe, default="allow", dns=gateway_ipv4
+        ),
+        # A denied default without rules blocks IPv6 as well as IPv4.
+        _Ipv6EgressCase("deny-all", (), (), frozenset()),
+        _Ipv6EgressCase(
+            "allow-ipv6-tcp-port",
+            ({"to": gateway, "ports": [named_tcp]},),
+            (),
+            frozenset(("tcp6-named",)),
+        ),
+        # A port range reaches OpenVMM as one IPv6 range rule.
+        _Ipv6EgressCase(
+            "allow-ipv6-tcp-range",
+            (
+                {
+                    "to": gateway,
+                    "ports": [
+                        {"protocol": "tcp", "port": named_port, "endPort": other_port}
+                    ],
+                },
+            ),
+            (),
+            frozenset(("tcp6-named", "tcp6-other")),
+        ),
+        _Ipv6EgressCase(
+            "allow-ipv6-udp-icmp",
+            ({"to": gateway, "ports": [{"protocol": "udp"}, {"protocol": "icmp"}]},),
+            (),
+            frozenset(("udp6-named", "icmp6")),
+            dns=gateway_ipv6,
+        ),
+        # The IPv6 wildcard admits IPv6 alone, and the deny rule takes
+        # precedence over it.
+        _Ipv6EgressCase(
+            "deny-ipv6-tcp-port",
+            ({"to": [{"cidr": "::/0"}]},),
+            ({"to": gateway, "ports": [named_tcp]},),
+            every_probe - {"tcp6-named", "tcp4-named"},
+            dns=gateway_ipv6,
+        ),
+        # A rule without destinations matches both families.
+        _Ipv6EgressCase(
+            "allow-tcp-port-without-to",
+            ({"ports": [named_tcp]},),
+            (),
+            frozenset(("tcp6-named", "tcp4-named")),
+        ),
+        # Rules match only their own family, so IPv4 rules leave IPv6 to the
+        # denied default, and IPv6 rules leave IPv4 to the allowed one.
+        _Ipv6EgressCase(
+            "allow-ipv4-only",
+            ({"to": [{"cidr": "0.0.0.0/0"}]},),
+            (),
+            frozenset(("tcp4-named",)),
+            dns=gateway_ipv4,
+        ),
+        _Ipv6EgressCase(
+            "deny-ipv6-only",
+            (),
+            ({"to": [{"cidr": "fd00::/8"}]},),
+            frozenset(("tcp4-named",)),
+            default="allow",
+            dns=gateway_ipv4,
+        ),
+    )
+
+
+def _ipv6_egress_dns_report(output: str) -> str | None:
+    """Return the DNS server that the guest reported, or ``none``."""
+    reports = [
+        line.strip()[len(IPV6_EGRESS_DNS_PREFIX) :]
+        for line in output.splitlines()
+        if line.strip().startswith(IPV6_EGRESS_DNS_PREFIX)
+    ]
+    return reports[-1] if reports else None
+
+
+def _bind_ipv6_egress_ports() -> dict[str, socket.socket]:
+    """Reserve the IPv6 scenario's host endpoints on two consecutive ports.
+
+    The gateway maps guest flows onto host loopback, so the IPv6 probes reach
+    ``::1`` and the IPv4 probe reaches ``127.0.0.1``.
+    """
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as loopback:
+            loopback.bind(("::1", 0))
+    except OSError as error:
+        raise RuntimeError("the host has no IPv6 loopback address") from error
+    layout = (
+        ("tcp6-named", socket.AF_INET6, socket.SOCK_STREAM, "::1", 0),
+        ("tcp6-other", socket.AF_INET6, socket.SOCK_STREAM, "::1", 1),
+        ("udp6-named", socket.AF_INET6, socket.SOCK_DGRAM, "::1", 0),
+        ("tcp4-named", socket.AF_INET, socket.SOCK_STREAM, "127.0.0.1", 0),
+    )
+    for base in range(20000, 59999):
+        endpoints: dict[str, socket.socket] = {}
+        try:
+            for name, family, kind, host, offset in layout:
+                endpoint = socket.socket(family, kind)
+                endpoints[name] = endpoint
+                endpoint.bind((host, base + offset))
+                if kind == socket.SOCK_STREAM:
+                    endpoint.listen(8)
+            return endpoints
+        except OSError:
+            for endpoint in endpoints.values():
+                endpoint.close()
+    raise RuntimeError("could not reserve consecutive IPv6 and IPv4 loopback ports")
+
+
+def _ipv6_identity_values() -> dict[str, str]:
+    """Return the guest scripts' IPv6 identity, including the kernel's spelling
+    of addresses in ``/proc/net/if_inet6`` and ``/proc/net/ipv6_route``."""
+
+    def kernel(address: str) -> str:
+        return ipaddress.IPv6Address(address).exploded.replace(":", "")
+
+    return {
+        "GUEST_IPV6": DIRECTIONAL_NETWORK_GUEST_IPV6,
+        "GATEWAY_IPV6": DIRECTIONAL_NETWORK_GATEWAY_IPV6,
+        "PREFIX_LENGTH": str(DIRECTIONAL_NETWORK_IPV6_PREFIX_LENGTH),
+        "GUEST_IPV6_HEX": kernel(DIRECTIONAL_NETWORK_GUEST_IPV6),
+        "GATEWAY_IPV6_HEX": kernel(DIRECTIONAL_NETWORK_GATEWAY_IPV6),
+        "PREFIX_LENGTH_HEX": f"{DIRECTIONAL_NETWORK_IPV6_PREFIX_LENGTH:02x}",
+        "ANY_IPV6_HEX": kernel("::"),
+    }
+
+
+def _ipv6_egress_rule_arguments(*rules: str) -> list[str]:
+    arguments = ["--network-egress", "deny"]
+    for rule in rules:
+        arguments.extend(("--network-egress-allow", rule))
+    return arguments
+
+
+def _run_ipv6_egress_snapshot(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+    endpoint: socket.socket,
+    named_port: int,
+) -> None:
+    """Check that a restored NIC keeps its IPv6 identity and policy."""
+    ipv6_rule = f"{DIRECTIONAL_NETWORK_GATEWAY_IPV6}/128:tcp:{named_port}"
+    with (
+        tempfile.TemporaryDirectory(prefix="nvx-ipv6-egress-") as temporary,
+        _EgressProbeServer({"tcp6-named": endpoint}, timeout) as server,
+    ):
+        snapshot_path = Path(temporary) / "snapshot"
+        capture_command = [
+            *workload_boot_command(
+                executable,
+                backend,
+                kernel,
+                initrd,
+                memory_mib,
+                "quiet loglevel=0",
+                network=DIRECTIONAL_NETWORK_CIDR,
+            ),
+            "--snapshot-destination",
+            str(snapshot_path),
+            *_ipv6_egress_rule_arguments(ipv6_rule),
+        ]
+        with OpenvmmProcess(
+            capture_command,
+            output_dir / "ipv6-egress-capture.log",
+        ) as process:
+            process.wait_for(BOOT_MARKER, timeout)
+            _stage_script(
+                process,
+                "/tmp/nvx-ipv6-egress-snapshot",
+                "NVX_IPV6_EGRESS_SNAPSHOT",
+                _render_script(
+                    "ipv6-egress-snapshot.sh.in",
+                    GATEWAY_IPV6=DIRECTIONAL_NETWORK_GATEWAY_IPV6,
+                    NAMED_PORT=str(named_port),
+                ),
+            )
+            source = process.wait(timeout)
+        if source.returncode != 0:
+            raise RuntimeError(
+                f"IPv6 egress capture source exited with {source.returncode}"
+            )
+        source_lines = _output_lines(source.output)
+        if source_lines.count(IPV6_EGRESS_BEFORE_MARKER) != 1:
+            raise RuntimeError("IPv6 egress source did not reach capture exactly once")
+        if IPV6_EGRESS_AFTER_MARKER in source_lines:
+            raise RuntimeError("IPv6 egress source crossed the capture boundary")
+
+        # The policy digest binds the IPv6 rule, so an IPv4 rule for the same
+        # port does not satisfy it.
+        changed_command = [
+            *snapshot_restore_command(
+                executable, backend, snapshot_path, network_profile="portable"
+            ),
+            *_ipv6_egress_rule_arguments(
+                f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}/32:tcp:{named_port}"
+            ),
+        ]
+        with OpenvmmProcess(
+            changed_command,
+            output_dir / "ipv6-egress-restore-changed.log",
+        ) as process:
+            changed = process.wait(timeout)
+        if changed.returncode == 0 or (
+            b"restore-time egress policy does not match" not in changed.output
+        ):
+            raise RuntimeError(
+                "IPv6 egress restore with a changed rule was not rejected"
+            )
+
+        restore_command = [
+            *snapshot_restore_command(
+                executable, backend, snapshot_path, network_profile="portable"
+            ),
+            *_ipv6_egress_rule_arguments(ipv6_rule),
+        ]
+        with OpenvmmProcess(
+            restore_command,
+            output_dir / "ipv6-egress-restore.log",
+        ) as process:
+            process.wait_for(IPV6_EGRESS_AFTER_MARKER, timeout)
+            restored = process.wait(timeout)
+        if restored.returncode != 0:
+            raise RuntimeError(f"IPv6 egress restore exited with {restored.returncode}")
+        if _output_lines(restored.output).count(IPV6_EGRESS_AFTER_MARKER) != 1:
+            raise RuntimeError("IPv6 egress restore did not reach the host once")
+        if server.finish() != frozenset(("tcp6-named",)):
+            raise RuntimeError("IPv6 egress snapshot probes did not reach the host")
+
+
+def run_ipv6_egress_policy(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+    guest: str = "alpine",
+) -> None:
+    endpoints = _bind_ipv6_egress_ports()
+    try:
+        named_port = int(endpoints["tcp6-named"].getsockname()[1])
+        other_port = int(endpoints["tcp6-other"].getsockname()[1])
+        script = _render_script(
+            "ipv6-egress-policy.sh.in",
+            **_ipv6_identity_values(),
+            GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+            NAMED_PORT=str(named_port),
+            OTHER_PORT=str(other_port),
+        )
+        results: list[dict[str, object]] = []
+        for case in _ipv6_egress_cases(
+            DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+            DIRECTIONAL_NETWORK_GATEWAY_IPV6,
+            named_port,
+            other_port,
+        ):
+            policy_path = output_dir / f"ipv6-egress-{case.name}-policy.json"
+            policy_path.write_text(
+                json.dumps({"allow": case.allow, "deny": case.deny}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            native = compile_policy_file(policy_path)
+            command = [
+                sys.executable,
+                str(Path(__file__).parents[1] / "nvx.py"),
+                "run",
+                "--guest",
+                guest,
+                "--hypervisor",
+                backend,
+                "--memory-mib",
+                str(memory_mib),
+                "--net",
+                DIRECTIONAL_NETWORK_CIDR,
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                case.default,
+                "--network-ingress",
+                "deny",
+                "--network-egress-policy-file",
+                str(policy_path),
+                "--cmdline",
+                "quiet loglevel=0",
+            ]
+            with _EgressProbeServer(endpoints, timeout) as server:
+                result = run_guest_script(
+                    command,
+                    script,
+                    IPV6_EGRESS_COMPLETION_MARKER,
+                    timeout=timeout,
+                    log_path=output_dir / f"ipv6-egress-{case.name}.log",
+                    contain_process_tree=True,
+                )
+                host_reached = server.finish()
+            guest_reports = _egress_probe_reports(result["text"])
+            _check_egress_case(
+                "IPv6 egress", case, IPV6_EGRESS_PROBES, guest_reports, host_reached
+            )
+            dns = _ipv6_egress_dns_report(result["text"])
+            if dns != (case.dns or "none"):
+                raise RuntimeError(
+                    f"IPv6 egress case {case.name}: the guest named {dns!r} as its "
+                    f"DNS server instead of {case.dns or 'none'!r}"
+                )
+            results.append(
+                {
+                    "case": case.name,
+                    "default": case.default,
+                    "policy_file": policy_path.name,
+                    "native_rules": {
+                        "allow": list(native.allow),
+                        "deny": list(native.deny),
+                    },
+                    "expected_reached": sorted(case.reached),
+                    "guest": guest_reports,
+                    "host_reached": sorted(host_reached),
+                    "dns": dns,
+                }
+            )
+
+        _run_ipv6_egress_snapshot(
+            executable,
+            kernel,
+            initrd,
+            backend,
+            memory_mib=memory_mib,
+            timeout=timeout,
+            output_dir=output_dir,
+            endpoint=endpoints["tcp6-named"],
+            named_port=named_port,
+        )
+
+        invalid = workload_boot_command(
+            executable,
+            backend,
+            kernel,
+            initrd,
+            memory_mib,
+            "quiet loglevel=0",
+            network=DIRECTIONAL_NETWORK_CIDR,
+        )
+        invalid.extend(
+            _ipv6_egress_rule_arguments(f"{DIRECTIONAL_NETWORK_GATEWAY_IPV6}/129")
+        )
+        with OpenvmmProcess(
+            invalid,
+            output_dir / "ipv6-egress-invalid-prefix.log",
+        ) as process:
+            rejected = process.wait(timeout)
+        if (
+            rejected.returncode == 0
+            or b"IPv6 prefix /129 is outside the supported range" not in rejected.output
+            or BOOT_MARKER in rejected.output
+        ):
+            raise RuntimeError(
+                "an invalid IPv6 egress rule was not rejected before boot"
+            )
+
+        (output_dir / "ipv6-egress-policy-results.json").write_text(
+            json.dumps(
+                {
+                    "interface": "nvx.py run",
+                    "guest_ipv6": (
+                        f"{DIRECTIONAL_NETWORK_GUEST_IPV6}/"
+                        f"{DIRECTIONAL_NETWORK_IPV6_PREFIX_LENGTH}"
+                    ),
+                    "gateway_ipv6": DIRECTIONAL_NETWORK_GATEWAY_IPV6,
+                    "ports": {"named": named_port, "other": other_port},
+                    "cases": results,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    finally:
+        for endpoint in endpoints.values():
             endpoint.close()
 
 
@@ -6380,6 +6805,21 @@ def run(args: argparse.Namespace) -> int:
             f"on OpenVMM/{args.backend}"
         )
         run_l3_l4_egress_port_ranges(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+            guest=descriptor.name,
+        )
+    if "ipv6-egress-policy" in scenarios:
+        print(
+            "Running public nvx.py IPv6 egress policy acceptance "
+            f"on OpenVMM/{args.backend}"
+        )
+        run_ipv6_egress_policy(
             executable,
             kernel,
             initrd,
