@@ -145,8 +145,10 @@ start now report `ScriptError` (`87406b00`, #399); nvx-exit 32-bit wrap pinned
   caller, consumed by `guest/common/nvx-snapshot:288`. v1–v3 are no longer produced
   or accepted (`doc/design/time-abi.md:1181-1183`); v4 also replaces tier-based ACK
   gating with an `ACK_REQUIRED` flag. Repo side: `5a92c86f` removes the argument nvx
-  internally appended to the OpenVMM restore command built at `scripts/nvx.py:483`
-  (and from `scripts/nvx_tools/benchmark.py:5062`) — it was never an nvx CLI flag;
+  internally appended to the OpenVMM restore command built at `scripts/nvx.py:372` in
+  `5a92c86f`'s parent (and from `scripts/nvx_tools/benchmark.py:4982` there; the same
+  lines are `nvx.py:364`/`benchmark.py:4745` in this fork) — it was never an nvx CLI
+  flag;
   see §1.8 item 5; `d3d76646` rewrites
   the snapshot-core scenario (`scripts/nvx_tools/microvm_test_scripts/snapshot-core.sh:42`);
   `a3e250ce` specifies the 4-byte `inl` read (CPL-3 `rep insl` raises #GP on
@@ -222,7 +224,7 @@ and forwards each lifecycle op through the C ABI (JSON via the model crate).
   `Exited/Signaled/TimedOut/Cancelled/Failed` (`src/exec.rs:79`).
 - `src/agent/mod.rs:54` `AgentConfig {setup, library, library_sha256}`; `:119`
   `AgentBackend::new`; image-registry ops `register_image` :164, `verify_image` :184;
-  diagnostics `guest_logs` :197, `outcome_report_path` :208-223.
+  diagnostics `guest_logs` :197, `outcome_report_path` :223-225.
 - `src/async_api.rs:50` `AsyncAciEdgeSandbox` / `:288` `OutputStream` (Tokio, feature
   `async`).
 - `model/src/setup.rs:116` `SetupConfig` — `stateRoot`, `runtime` (format-1
@@ -279,8 +281,8 @@ sections; they are history, not pending work. Actually-open next work:
    callers that invoke `openvmm` directly are affected.
 6. `auto` CPU profile can now fall back to the host profile and surface
    `E_PROFILE_HOST_UNKNOWN` (`33aa16ae`/`c917dad1`, #394/#435; `doc/usage.md:541`) —
-   callers must handle the new error path; `run --mount` with >2 commas rejected
-   (`nvx.py:513-514`); `check-required-ci`'s two new flags are required (#436).
+   callers must handle the new error path; `run --mount` with a comma count outside
+   1–2 rejected (`nvx.py:515-516`); `check-required-ci`'s two new flags are required (#436).
 7. `smp-lapic` test scenario and its benchmark precheck removed (`263f9a48`, #325) —
    CI/oracle configs referencing it break.
 8. Commands that cannot start now return `ScriptError` (`87406b00`, #399) — message
@@ -297,7 +299,7 @@ Our 13 commits (fork → tip `07adc613`):
 
 | Commit | What it does | Upstream status of the same problem |
 |---|---|---|
-| `ec38aa01` fix(affinity) | Pin the nvx process tree to one CPU class (P-cores) on hybrid parts; `NVX_CPU_CLASS=efficiency|all` override; fixes OpenVMM destination-CPU-contract failures when a vCPU migrates between P and E cores between capture and restore (`scripts/nvx.py` `apply_hybrid_process_affinity`, ~line 967). | **Not fixed the same way.** Upstream's parallel answer is CPU *profiles*: Alder Lake profile pin `16237e29` (#394), host profiles (#404/#412), fingerprint checks `c2e166fb` (#411), `auto`→host fallback `00f8884d` (#435). Upstream stabilizes what CPUID the guest sees but has no process/class affinity pinning (`sched_setaffinity` appears only in `scripts/nvx_tools/host_time_probe.rs:45` for the probe itself). Whether profiles alone prevent the hybrid capture/restore mismatch on an i9-14900K is (unverified). |
+| `ec38aa01` fix(affinity) | Pin the nvx process tree to one CPU class (P-cores) on hybrid parts; `NVX_CPU_CLASS=efficiency\|all` override; fixes OpenVMM destination-CPU-contract failures when a vCPU migrates between P and E cores between capture and restore (`scripts/nvx.py:1004` `apply_hybrid_process_affinity`). | **Not fixed the same way.** Upstream's parallel answer is CPU *profiles*: Alder Lake profile pin `16237e29` (#394), host profiles (#404/#412), fingerprint checks `c2e166fb` (#411), `auto`→host fallback `00f8884d` (#435). Upstream stabilizes what CPUID the guest sees but has no process/class affinity pinning (`sched_setaffinity` appears only in `scripts/nvx_tools/host_time_probe.rs:45` for the probe itself). Whether profiles alone prevent the hybrid capture/restore mismatch on an i9-14900K is (unverified). |
 | `a4811e5e` test(provenance) | Isolate provenance fixture repos from host default-branch policy. | No direct equivalent found; upstream reworked provenance fixtures in #114 (`7407c3bd` aligns fixture with the current OpenVMM gitlink). (unverified) that it covers the same failure. |
 | `ac82a417` feat(setup) | `setup-submodule`: stage the installed release binary, `git submodule update --init openvmm`, restore — works around "download leaves `openvmm/` non-empty → submodule init fails" (PRODUCTION-NOTES §2). | **Still broken upstream as of `33bd2fe5`**: no commit touches the install-vs-submodule collision (searched `log -S'openvmm/target/release'`; nearest are #428 `2257313d` — release *selection order* — and `20fe103c` removing undeclared guest artifacts). Our workaround remains fork-only. |
 | `fa60c840` test(tree-kill) | Wait for async process-tree kills in contained-runner oracles (`scripts/test_adversarial.py`). | **Fixed upstream, more deeply**: PR #323 (`554fc45b`) `df532ce2` "wait for killed descendants in Linux process-tree cleanup" fixes the *oracle* (`scripts/nvx_tools/adversarial_oracles.py`) as well as the test. Upstream supersedes ours; drop ours on rebase. |
@@ -332,7 +334,7 @@ point). All citations are `upstream/dev` file:line.
 | `run --mount` repeatable (≤ `MAX_MOUNTS = 2`, optional mode) | `c2200425` #401 | `sandbox.py:31`; validation `nvx.py:513-514` | Two shares with independent modes; `--mount-deny/allow/write` bind to the preceding `--mount`. |
 | `--guest azurelinux` | `f85bb718` #110 | `scripts/nvx_tools/guests.py:87` | New guest OS enum value. |
 | `build-kernel --debug`, `build-initramfs --debug-kernel` | `b267c472` | `nvx.py:852`, `:815` | CI debug kernel with watchdogs. |
-| New subcommand `doctor` (host qualification H1–H3) | `8de77c62` #325 | `nvx.py:994-998`; `scripts/nvx_tools/doctor.py` | Fails closed on unreadable host facts. |
+| New subcommand `doctor` (host qualification H1–H7) | `8de77c62` #325 | `nvx.py:994-998`; `scripts/nvx_tools/doctor.py` | Fails closed on unreadable host facts. |
 | New subcommand `test-aci-edge-sandboxes` | PR #307/#418 area | `nvx.py:1000-1005` | Runs the Rust crate lifecycle test (§1.7). |
 | `classify-ci-changes`; `check-required-ci --run-openvmm-unit-tests/--run-openvmm-vmm-tests` (both `required=True`) | `8bf8a891` #436 | `nvx.py:930,939,945,967-968` | CI-helper surface only; invoking check-required-ci without the new flags now fails. |
 
@@ -369,7 +371,10 @@ point). All citations are `upstream/dev` file:line.
   *before* spawn — removes the `control authentication writer was not closed` race /
   full-`--timeout` hang — `8513233b` #441, `sandbox_lifecycle.py:644-657`; new
   on-disk `state_dir/control.capability` (mode 0600, `sandbox_lifecycle.py:36,634-636`).
-- No new env vars for CLI callers (the `scripts/` diff adds no `os.environ` reads).
+- No new env vars are required of CLI callers; the 17 `os.environ` reads the
+  `scripts/` diff does add are internal plumbing (env passthrough via
+  `os.environ.copy()`, CI runner vars like `RUNNER_TOOL_CACHE`/
+  `GITHUB_STEP_SUMMARY`, Azure Linux build inputs).
   `59b7c448` (nvx-exit 32-bit wrap) is test-only, not gateway-visible.
 
 ## 4. Performance: upstream baselines vs our 2026-10-02 numbers
