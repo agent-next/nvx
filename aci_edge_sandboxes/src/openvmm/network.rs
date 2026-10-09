@@ -264,6 +264,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exclusions_remain_local_to_their_rules() {
+        let excluding = |cidr: &str, excluded: &str| NetworkRule {
+            to: vec![NetworkPeer {
+                cidr: cidr.to_owned(),
+                except: vec![excluded.to_owned()],
+            }],
+            ports: Vec::new(),
+        };
+        let egress = EgressPolicy::new(Access::Deny)
+            .with_allow(excluding("192.0.2.0/24", "192.0.2.128/25"))
+            .with_allow(NetworkRule::to("192.0.2.200"))
+            .with_deny(excluding("198.51.100.0/24", "198.51.100.128/25"));
+        let arguments = network_arguments(Some(&policy(egress)), "10.0.0.2/24").unwrap();
+
+        assert_eq!(
+            rules(&arguments, "--network-egress-allow"),
+            ["192.0.2.0/25", "192.0.2.200/32"]
+        );
+        assert_eq!(
+            rules(&arguments, "--network-egress-deny"),
+            ["198.51.100.0/25"]
+        );
+    }
+
     fn has_pair(arguments: &[String], name: &str, value: &str) -> bool {
         arguments
             .windows(2)

@@ -22,7 +22,7 @@ use aci_edge_sandboxes::openvmm::{
 };
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
-    ExecRequest, FilesystemPolicy, NetworkPolicy, NetworkRule, ProcessSpec, Protocol,
+    ExecRequest, FilesystemPolicy, NetworkPeer, NetworkPolicy, NetworkRule, ProcessSpec, Protocol,
     ProvisionRequest, SandboxId, StdinMode,
 };
 
@@ -698,7 +698,14 @@ const GATEWAY_TCP_PROBE: &str = "nc -w 3 10.0.0.1 53 </dev/null && echo reached 
 #[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
 fn network_policies_are_enforced() {
     let (nvx, backend) = client("network");
-    let cases: [(&str, NetworkPolicy, &[u8]); 5] = [
+    let excluding_gateway = || NetworkRule {
+        to: vec![NetworkPeer {
+            cidr: "10.0.0.0/24".to_owned(),
+            except: vec!["10.0.0.1/32".to_owned()],
+        }],
+        ports: Vec::new(),
+    };
+    let cases: [(&str, NetworkPolicy, &[u8]); 8] = [
         ("no device", NetworkPolicy::deny_all(), b"lo\n"),
         ("allow", NetworkPolicy::egress(Access::Allow), b"reached\n"),
         (
@@ -715,6 +722,34 @@ fn network_policies_are_enforced() {
             NetworkPolicy {
                 egress: EgressPolicy::new(Access::Deny)
                     .with_allow(NetworkRule::to("192.0.2.1").on_port(Protocol::Tcp, 53)),
+                ..NetworkPolicy::deny_all()
+            },
+            b"blocked\n",
+        ),
+        (
+            "allow exclusion is rule local",
+            NetworkPolicy {
+                egress: EgressPolicy::new(Access::Deny)
+                    .with_allow(excluding_gateway())
+                    .with_allow(NetworkRule::to("10.0.0.1").on_port(Protocol::Tcp, 53)),
+                ..NetworkPolicy::deny_all()
+            },
+            b"reached\n",
+        ),
+        (
+            "deny exclusion follows default",
+            NetworkPolicy {
+                egress: EgressPolicy::new(Access::Allow).with_deny(excluding_gateway()),
+                ..NetworkPolicy::deny_all()
+            },
+            b"reached\n",
+        ),
+        (
+            "explicit deny takes precedence",
+            NetworkPolicy {
+                egress: EgressPolicy::new(Access::Deny)
+                    .with_allow(NetworkRule::to("10.0.0.1").on_port(Protocol::Tcp, 53))
+                    .with_deny(NetworkRule::to("10.0.0.1")),
                 ..NetworkPolicy::deny_all()
             },
             b"blocked\n",
