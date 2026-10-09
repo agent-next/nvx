@@ -1359,8 +1359,14 @@ fn filesystem_and_network_policies_reach_openvmm() {
         .with_network(NetworkPolicy {
             egress: EgressPolicy::new(Access::Deny)
                 .with_allow(NetworkRule::to("192.0.2.0/24").on_port(Protocol::Tcp, 443))
+                .with_allow(NetworkRule::to("192.0.2.0/24").on_port_range(
+                    Protocol::Tcp,
+                    8000,
+                    8010,
+                ))
                 .with_allow(NetworkRule::to("192.0.2.9").on_protocol(Protocol::Icmp))
-                .with_deny(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Udp)),
+                .with_deny(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Udp))
+                .with_deny(NetworkRule::to("192.0.2.7").on_port(Protocol::Tcp, 8005)),
             ..NetworkPolicy::deny_all()
         });
     let sandbox_id = nvx.provision(&request).unwrap().sandbox_id;
@@ -1381,9 +1387,16 @@ fn filesystem_and_network_policies_reach_openvmm() {
     assert_eq!(value("--network-egress"), ["deny"]);
     assert_eq!(
         value("--network-egress-allow"),
-        ["192.0.2.0/24:tcp:443", "192.0.2.9/32:icmp"]
+        [
+            "192.0.2.0/24:tcp:443",
+            "192.0.2.0/24:tcp:8000-8010",
+            "192.0.2.9/32:icmp"
+        ]
     );
-    assert_eq!(value("--network-egress-deny"), ["192.0.2.0/24:udp"]);
+    assert_eq!(
+        value("--network-egress-deny"),
+        ["192.0.2.0/24:udp", "192.0.2.7/32:tcp:8005"]
+    );
     let command_line = &value("--cmdline")[0];
     let maps: Vec<&str> = command_line
         .split(' ')

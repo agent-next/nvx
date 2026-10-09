@@ -28,6 +28,10 @@ _AddressInterval = tuple[int, int]
 _AddressIntervals = tuple[_AddressInterval, ...]
 _PortSelector = tuple[str | None, int | None, int | None]
 _ALL_IPV4: _AddressIntervals = ((0, (1 << 32) - 1),)
+# An inclusive range of destination ports.
+_PortRange = tuple[int, int]
+# A native rule: a network, and optionally a protocol and its port range.
+_NativeRule = tuple[ipaddress.IPv4Network, str | None, _PortRange | None]
 
 
 @dataclass(frozen=True)
@@ -176,23 +180,23 @@ def _parse_legacy_rule(rule: dict[str, object], description: str) -> tuple[_Rule
         {field: rule[field] for field in ("cidr", "except") if field in rule},
         description,
     )
+    if "endPort" in rule and "port" not in rule:
+        raise ScriptError(f"{description}.endPort requires port")
     if "protocol" not in rule:
-        if "port" in rule or "endPort" in rule:
+        if "port" in rule:
             raise ScriptError(f"{description}.port requires protocol")
         return (_Rule(addresses, None, None, None),)
     protocol = rule["protocol"]
     if not isinstance(protocol, str) or protocol not in _RULE_PROTOCOLS:
         raise ScriptError(f"{description}.protocol must be tcp, udp, icmp, or any")
     if "port" not in rule:
-        if "endPort" in rule:
-            raise ScriptError(f"{description}.endPort requires port")
         return (_Rule(addresses, None if protocol == "any" else protocol, None, None),)
     if protocol == "icmp":
         raise ScriptError(f"{description}.port is not supported with icmp")
     start = _port(rule["port"], f"{description}.port")
     end = _port(rule.get("endPort", start), f"{description}.endPort")
     if end < start:
-        raise ScriptError(f"{description}.endPort cannot be below port")
+        raise ScriptError(f"{description}.endPort {end} cannot be below port {start}")
     protocols = _PORT_PROTOCOLS if protocol == "any" else (protocol,)
     return tuple(_Rule(addresses, selected, start, end) for selected in protocols)
 
@@ -220,7 +224,7 @@ def _parse_mxc_port(value: object, description: str) -> tuple[_PortSelector, ...
     start = _port(port["port"], f"{description}.port")
     end = _port(port.get("endPort", start), f"{description}.endPort")
     if end < start:
-        raise ScriptError(f"{description}.endPort cannot be below port")
+        raise ScriptError(f"{description}.endPort {end} cannot be below port {start}")
     protocols = _PORT_PROTOCOLS if protocol == "any" else (protocol,)
     return tuple((selected, start, end) for selected in protocols)
 
@@ -329,7 +333,7 @@ def _lower_protocol_rules(
     category: str,
     covered: _AddressIntervals,
     remaining_budget: int,
-) -> list[tuple[ipaddress.IPv4Network, str, int]]:
+) -> list[_NativeRule]:
     events: dict[int, list[tuple[int, _AddressIntervals]]] = {}
     for rule in rules:
         if (
@@ -346,42 +350,58 @@ def _lower_protocol_rules(
         events.setdefault(rule.end_port + 1, []).append((-1, rule.addresses))
 
     active: Counter[_AddressIntervals] = Counter()
-    lowered: list[tuple[ipaddress.IPv4Network, str, int]] = []
+    # Each network's port ranges in port order. Every network of one segment
+    # is a distinct native rule, so a segment cannot exceed the budget alone.
+    port_ranges: dict[ipaddress.IPv4Network, list[_PortRange]] = {}
+    rule_count = 0
     previous_port: int | None = None
     for port in sorted(events):
         if previous_port is not None and previous_port < port and active:
             addresses = _merge_intervals(
                 interval for intervals in active for interval in intervals
             )
-            port_count = port - previous_port
-            network_budget = (remaining_budget - len(lowered)) // port_count
             networks = _protocol_intervals_to_networks(
                 addresses,
                 covered,
-                network_budget,
+                remaining_budget,
                 category,
             )
-            lowered.extend(
-                (network, protocol, current_port)
-                for current_port in range(previous_port, port)
-                for network in networks
-            )
+            for network in networks:
+                ranges = port_ranges.setdefault(network, [])
+                # A network that the previous segment also matched extends
+                # that segment's range, so equivalent policies lower alike.
+                if ranges and ranges[-1][1] == previous_port - 1:
+                    ranges[-1] = (ranges[-1][0], port - 1)
+                    continue
+                if rule_count >= remaining_budget:
+                    raise ScriptError(
+                        f"{category} emits at most {MAX_RULES_PER_ACTION} native rules"
+                    )
+                ranges.append((previous_port, port - 1))
+                rule_count += 1
         for direction, addresses in events[port]:
             active[addresses] += direction
             if active[addresses] == 0:
                 del active[addresses]
         previous_port = port
-    return lowered
+    return [
+        (network, protocol, port_range)
+        for network, ranges in port_ranges.items()
+        for port_range in ranges
+    ]
 
 
 def _native_rule(
-    network: ipaddress.IPv4Network, protocol: str | None, port: int | None
+    network: ipaddress.IPv4Network, protocol: str | None, ports: _PortRange | None
 ) -> str:
     if protocol is None:
         return str(network)
-    if port is None:
+    if ports is None:
         return f"{network}:{protocol}"
-    return f"{network}:{protocol}:{port}"
+    start, end = ports
+    if start == end:
+        return f"{network}:{protocol}:{start}"
+    return f"{network}:{protocol}:{start}-{end}"
 
 
 def _compile_category(value: object, category: str) -> tuple[str, ...]:
@@ -402,7 +422,7 @@ def _compile_category(value: object, category: str) -> tuple[str, ...]:
         MAX_RULES_PER_ACTION,
         category,
     )
-    lowered: list[tuple[ipaddress.IPv4Network, str | None, int | None]] = [
+    lowered: list[_NativeRule] = [
         (network, None, None) for network in address_only_networks
     ]
     # Addresses that already match every port of each protocol.
@@ -441,11 +461,11 @@ def _compile_category(value: object, category: str) -> tuple[str, ...]:
             int(item[0].network_address),
             item[0].prefixlen,
             "" if item[1] is None else item[1],
-            0 if item[2] is None else item[2],
+            (0, 0) if item[2] is None else item[2],
         )
     )
     return tuple(
-        _native_rule(network, protocol, port) for network, protocol, port in lowered
+        _native_rule(network, protocol, ports) for network, protocol, ports in lowered
     )
 
 

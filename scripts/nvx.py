@@ -106,10 +106,11 @@ from nvx_tools.time_abi import (
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
 NETWORK_PROFILES = ("portable",)
-NETWORK_EGRESS_RULE_METAVAR = "CIDR[:PROTOCOL[:PORT]]"
+NETWORK_EGRESS_RULE_METAVAR = "CIDR[:PROTOCOL[:PORT[-PORT]]]"
 NETWORK_EGRESS_RULE_HELP = (
     "{action} guest egress to an IPv4 CIDR, optionally only for PROTOCOL tcp, "
-    "udp, or icmp, and for tcp or udp only on PORT; repeat to add rules"
+    "udp, or icmp, and for tcp or udp only on PORT or on the inclusive range "
+    "PORT-PORT; repeat to add rules"
 )
 MAX_ENVIRONMENT_FILE_BYTES = 1024 * 1024
 SYSTEMD_ENTRYPOINTS = frozenset(("/usr/lib/systemd/systemd", "/lib/systemd/systemd"))

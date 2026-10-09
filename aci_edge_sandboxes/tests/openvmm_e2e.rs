@@ -863,6 +863,93 @@ fn network_protocol_selectors_are_enforced() {
 
 #[test]
 #[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
+fn network_port_ranges_are_enforced() {
+    // The TCP probe targets port 53 of the gateway, so a range admits or blocks it when the range
+    // contains port 53: at its first or last port, or inside it, but not from the next port up
+    // or through the next port down, and a UDP range never does.
+    let (nvx, backend) = client("ranges");
+    let gateway = || NetworkRule::to("10.0.0.1");
+    let allow = |rule: NetworkRule| NetworkPolicy {
+        egress: EgressPolicy::new(Access::Deny).with_allow(rule),
+        ..NetworkPolicy::deny_all()
+    };
+    // The address-only allow rule admits the probe, so only deny precedence can block it.
+    let deny = |rule: NetworkRule| NetworkPolicy {
+        egress: EgressPolicy::new(Access::Deny)
+            .with_allow(gateway())
+            .with_deny(rule),
+        ..NetworkPolicy::deny_all()
+    };
+    let cases: [(&str, NetworkPolicy, &[u8]); 10] = [
+        (
+            "allow a tcp range from the port",
+            allow(gateway().on_port_range(Protocol::Tcp, 53, 60)),
+            b"reached\n",
+        ),
+        (
+            "allow a tcp range through the port",
+            allow(gateway().on_port_range(Protocol::Tcp, 40, 53)),
+            b"reached\n",
+        ),
+        (
+            "allow an any range around the port",
+            allow(gateway().on_port_range(Protocol::Any, 50, 60)),
+            b"reached\n",
+        ),
+        (
+            "allow a tcp range from the next port",
+            allow(gateway().on_port_range(Protocol::Tcp, 54, 60)),
+            b"blocked\n",
+        ),
+        (
+            "allow a tcp range through the previous port",
+            allow(gateway().on_port_range(Protocol::Tcp, 40, 52)),
+            b"blocked\n",
+        ),
+        (
+            "allow every udp port",
+            allow(gateway().on_port_range(Protocol::Udp, 1, 65535)),
+            b"blocked\n",
+        ),
+        (
+            "allow a tcp range around a denied port",
+            NetworkPolicy {
+                egress: EgressPolicy::new(Access::Deny)
+                    .with_allow(gateway().on_port_range(Protocol::Tcp, 50, 60))
+                    .with_deny(gateway().on_port(Protocol::Tcp, 53)),
+                ..NetworkPolicy::deny_all()
+            },
+            b"blocked\n",
+        ),
+        (
+            "deny a tcp range around the port",
+            deny(gateway().on_port_range(Protocol::Tcp, 50, 60)),
+            b"blocked\n",
+        ),
+        (
+            "deny a tcp range from the next port",
+            deny(gateway().on_port_range(Protocol::Tcp, 54, 60)),
+            b"reached\n",
+        ),
+        (
+            "deny every udp port",
+            deny(gateway().on_port_range(Protocol::Udp, 1, 65535)),
+            b"reached\n",
+        ),
+    ];
+    for (name, policy, expected) in cases {
+        let sandbox = started(
+            &nvx,
+            &backend,
+            &ProvisionRequest::new().with_network(policy),
+        );
+        let output = shell(&nvx, id(&sandbox), GATEWAY_TCP_PROBE);
+        assert_eq!(output.stdout, expected, "{name}: {output:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
 fn openvmm_lifecycle_on_a_real_hypervisor() {
     let state_root = env::var("ACI_EDGE_SANDBOXES_E2E_STATE_ROOT")
         .map(PathBuf::from)

@@ -288,6 +288,18 @@ impl NetworkRule {
         self
     }
 
+    /// Restricts the rule to the ports of `protocol` from `port` through `end_port`, both
+    /// included.
+    #[must_use]
+    pub fn on_port_range(mut self, protocol: Protocol, port: u16, end_port: u16) -> Self {
+        self.ports.push(NetworkPort {
+            protocol,
+            port: Some(port),
+            end_port: Some(end_port),
+        });
+        self
+    }
+
     /// Restricts the rule to `protocol` on every port.
     #[must_use]
     pub fn on_protocol(mut self, protocol: Protocol) -> Self {
@@ -806,6 +818,14 @@ mod tests {
             .unwrap(),
             rule
         );
+        // A port range carries its inclusive last port as `endPort`.
+        let rule = NetworkRule::to("192.0.2.1").on_port_range(Protocol::Tcp, 8000, 8010);
+        let json = serde_json::json!({
+            "to": [{ "cidr": "192.0.2.1" }],
+            "ports": [{ "protocol": "tcp", "port": 8000, "endPort": 8010 }]
+        });
+        assert_eq!(serde_json::to_value(&rule).unwrap(), json);
+        assert_eq!(serde_json::from_value::<NetworkRule>(json).unwrap(), rule);
     }
 
     #[test]

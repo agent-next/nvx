@@ -1401,9 +1401,8 @@ class CliTests(unittest.TestCase):
 
         command = format_command.call_args.args[0]
         self.assertNotIn("--network-egress-policy-file", command)
-        self.assertEqual(command.count("--network-egress-allow"), 3)
-        self.assertIn("192.0.2.0/25:tcp:8000", command)
-        self.assertIn("192.0.2.0/25:tcp:8001", command)
+        self.assertEqual(command.count("--network-egress-allow"), 2)
+        self.assertIn("192.0.2.0/25:tcp:8000-8001", command)
         self.assertIn("192.0.2.200/32", command)
         self.assertEqual(command.count("--network-egress-deny"), 1)
         self.assertIn("192.0.2.0/24:tcp:8001", command)
@@ -1582,7 +1581,7 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(
                 config["network_egress_allow"],
-                ["192.0.2.0/25:tcp:8000", "192.0.2.0/25:tcp:8001"],
+                ["192.0.2.0/25:tcp:8000-8001"],
             )
             self.assertEqual(
                 config["network_egress_deny"],

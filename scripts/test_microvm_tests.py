@@ -28,6 +28,7 @@ from nvx_tools import (  # noqa: E402
     benchmark,
     common,
     control_session,
+    egress_policy,
     managed_exec_tests,
     microvm_tests,
     openvmm_process,
@@ -4355,14 +4356,16 @@ class MicrovmTests(unittest.TestCase):
             (22001, 22002, 22003),
         )
 
-        self.assertIn("192.0.2.0/24:tcp:21001", policy.allow)
-        self.assertIn("192.0.2.0/24:tcp:21003", policy.allow)
-        self.assertIn("192.0.2.0/24:udp:22001", policy.allow)
-        self.assertIn("192.0.2.0/24:udp:22003", policy.allow)
+        # The excluded gateway's own rule fills the exclusion, so each range
+        # lowers to one rule for the whole subnet.
+        self.assertEqual(
+            policy.allow,
+            ("192.0.2.0/24:tcp:21001-21003", "192.0.2.0/24:udp:22001-22003"),
+        )
         self.assertIn("192.0.2.0/24:tcp:21002", policy.deny)
         self.assertIn("192.0.2.0/24:udp:22002", policy.deny)
-        self.assertNotIn("192.0.2.0/24:tcp:21000", policy.allow)
-        self.assertNotIn("192.0.2.0/24:tcp:21004", policy.allow)
+        self.assertIn("192.0.2.128/25:tcp:21001", policy.deny)
+        self.assertIn("192.0.2.128/25:udp:22003", policy.deny)
 
     def test_l3_l4_egress_acceptance_invokes_public_nvx_policy_file(self):
         class ImmediateThread:
@@ -5032,6 +5035,542 @@ class MicrovmTests(unittest.TestCase):
                 guest="alpine",
             )
         self.assertIn("l3-l4-egress-protocols", microvm_tests.MICROVM_TEST_SCENARIOS)
+
+    def test_egress_port_range_cases_cover_each_range_as_allow_and_deny(self):
+        cases = {
+            case.name: case
+            for case in microvm_tests._egress_port_range_cases(
+                "192.0.2.1", 20001, 20002, 20003
+            )
+        }
+        every_probe = frozenset(microvm_tests.L3_L4_EGRESS_RANGE_PROBES)
+        self.assertEqual(
+            microvm_tests.L3_L4_EGRESS_RANGE_PROBES,
+            tuple(
+                f"{protocol}-{position}"
+                for protocol in ("tcp", "udp")
+                for position in ("below", "first", "inside", "last", "above")
+            ),
+        )
+
+        def in_range(protocol: str) -> set[str]:
+            return {
+                f"{protocol}-{position}" for position in ("first", "inside", "last")
+            }
+
+        expected = {
+            "tcp": in_range("tcp"),
+            "udp": in_range("udp"),
+            "any": in_range("tcp") | in_range("udp"),
+        }
+        self.assertEqual(
+            set(cases),
+            {f"{action}-{name}" for action in ("allow", "deny") for name in expected}
+            | {"allow-tcp-deny-inside"},
+        )
+        destination = [{"cidr": "192.0.2.1/32"}]
+        for name, matched in expected.items():
+            rule = {
+                "to": destination,
+                "ports": [{"protocol": name, "port": 20001, "endPort": 20003}],
+            }
+            with self.subTest(protocol=name):
+                allow = cases[f"allow-{name}"]
+                self.assertEqual((allow.allow, allow.deny), ((rule,), ()))
+                self.assertEqual(allow.reached, matched)
+                deny = cases[f"deny-{name}"]
+                self.assertEqual(
+                    (deny.allow, deny.deny), (({"to": destination},), (rule,))
+                )
+                self.assertEqual(deny.reached, every_probe - matched)
+        inside = cases["allow-tcp-deny-inside"]
+        self.assertEqual(
+            inside.deny,
+            ({"to": destination, "ports": [{"protocol": "tcp", "port": 20002}]},),
+        )
+        self.assertEqual(inside.reached, {"tcp-first", "tcp-last"})
+
+    def test_egress_port_range_cases_lower_each_range_to_one_native_rule(self):
+        tcp = "192.0.2.1/32:tcp:20001-20003"
+        udp = "192.0.2.1/32:udp:20001-20003"
+        expected = {
+            "allow-tcp": ((tcp,), ()),
+            "deny-tcp": (("192.0.2.1/32",), (tcp,)),
+            "allow-udp": ((udp,), ()),
+            "deny-udp": (("192.0.2.1/32",), (udp,)),
+            "allow-any": ((tcp, udp), ()),
+            "deny-any": (("192.0.2.1/32",), (tcp, udp)),
+            "allow-tcp-deny-inside": ((tcp,), ("192.0.2.1/32:tcp:20002",)),
+        }
+        for case in microvm_tests._egress_port_range_cases(
+            "192.0.2.1", 20001, 20002, 20003
+        ):
+            with self.subTest(case=case.name):
+                compiled = egress_policy.compile_policy(
+                    {"allow": list(case.allow), "deny": list(case.deny)}
+                )
+                self.assertEqual((compiled.allow, compiled.deny), expected[case.name])
+
+    def _run_egress_port_ranges(
+        self,
+        output_dir: Path,
+        *,
+        leaked: tuple[str, str] | None = None,
+        guest_report: tuple[str, str, str] | None = None,
+        openvmm_accepts: str | None = None,
+        nvx_accepts: str | None = None,
+    ) -> tuple[MagicMock, MagicMock, MagicMock]:
+        tcp = [MagicMock(spec=socket.socket) for _ in range(5)]
+        udp = [MagicMock(spec=socket.socket) for _ in range(5)]
+        for index, endpoint in enumerate((*tcp, *udp)):
+            endpoint.getsockname.return_value = ("0.0.0.0", 20000 + index % 5)
+        cases = {
+            case.name: case
+            for case in microvm_tests._egress_port_range_cases(
+                microvm_tests.DIRECTIONAL_NETWORK_GATEWAY_IPV4, 20001, 20002, 20003
+            )
+        }
+        current: list[str] = []
+
+        def policy_name(command: list[str]) -> str:
+            policy = Path(command[command.index("--network-egress-policy-file") + 1])
+            return policy.name.removeprefix("l3-l4-egress-range-").removesuffix(
+                "-policy.json"
+            )
+
+        def guest(
+            command: list[str], _script: str, _marker: bytes, **_kwargs: object
+        ) -> dict[str, str]:
+            name = policy_name(command)
+            current.append(name)
+            reports = {
+                probe: "sent"
+                if probe.startswith("udp")
+                else "reached"
+                if probe in cases[name].reached
+                else "blocked"
+                for probe in microvm_tests.L3_L4_EGRESS_RANGE_PROBES
+            }
+            if guest_report is not None and guest_report[0] == name:
+                reports[guest_report[1]] = guest_report[2]
+            # The tty echoes script lines, which must not count as reports.
+            text = 'echo "NVX-L3-L4-PROBE tcp-first=echoed"\r\n' + "".join(
+                f"NVX-L3-L4-PROBE {probe}={value}\r\n"
+                for probe, value in reports.items()
+            )
+            return {"text": text + "NVX-L3-L4-EGRESS-PORT-RANGES-OK\r\n"}
+
+        class FakeServer:
+            def __init__(
+                self, endpoints: dict[str, socket.socket], _timeout: float
+            ) -> None:
+                assert list(endpoints.values()) == [*tcp, *udp]
+                assert list(endpoints) == list(microvm_tests.L3_L4_EGRESS_RANGE_PROBES)
+
+            def __enter__(self) -> "FakeServer":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                pass
+
+            def finish(self) -> frozenset[str]:
+                name = current[-1]
+                reached = set(cases[name].reached)
+                if leaked is not None and leaked[0] == name:
+                    reached ^= {leaked[1]}
+                return frozenset(reached)
+
+        def openvmm_result(name: str, output: bytes) -> MagicMock:
+            if openvmm_accepts == name:
+                return MagicMock(returncode=0, output=microvm_tests.BOOT_MARKER)
+            return MagicMock(returncode=2, output=output)
+
+        def public_dry_run(command: list[str], **_kwargs: object) -> MagicMock:
+            if nvx_accepts == policy_name(command):
+                return MagicMock(returncode=0, stderr=b"")
+            path = Path(command[command.index("--network-egress-policy-file") + 1])
+            try:
+                egress_policy.compile_policy_file(path)
+            except common.ScriptError as error:
+                return MagicMock(returncode=1, stderr=f"error: {error}\n".encode())
+            return MagicMock(returncode=0, stderr=b"")
+
+        with (
+            patch.object(
+                microvm_tests, "_bind_dual_protocol_ports", return_value=(tcp, udp)
+            ),
+            patch.object(microvm_tests, "_EgressProbeServer", FakeServer),
+            patch.object(
+                microvm_tests, "run_guest_script", side_effect=guest
+            ) as run_guest_script,
+            patch.object(microvm_tests, "OpenvmmProcess") as openvmm_process,
+            patch.object(
+                microvm_tests.subprocess, "run", side_effect=public_dry_run
+            ) as nvx_run,
+        ):
+            wait = openvmm_process.return_value.__enter__.return_value.wait
+            wait.side_effect = (
+                openvmm_result(
+                    "reversed-range",
+                    b"egress port range 20003-20001 ends below its first port",
+                ),
+                openvmm_result(
+                    "missing-first-port",
+                    b"invalid egress port range '-20003'; expected <FIRST>-<LAST>",
+                ),
+            )
+            try:
+                microvm_tests.run_l3_l4_egress_port_ranges(
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initramfs"),
+                    "whp",
+                    memory_mib=128,
+                    timeout=1,
+                    output_dir=output_dir,
+                )
+            finally:
+                for endpoint in (*tcp, *udp):
+                    endpoint.close.assert_called_once_with()
+        return run_guest_script, openvmm_process, nvx_run
+
+    def test_l3_l4_egress_port_ranges_run_every_case_through_public_nvx_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            run_guest_script, openvmm_process, nvx_run = self._run_egress_port_ranges(
+                output_dir
+            )
+
+            names = [
+                case.name
+                for case in microvm_tests._egress_port_range_cases(
+                    microvm_tests.DIRECTIONAL_NETWORK_GATEWAY_IPV4, 20001, 20002, 20003
+                )
+            ]
+            self.assertEqual(run_guest_script.call_count, len(names))
+            public_run = [
+                sys.executable,
+                str(Path(microvm_tests.__file__).parents[1] / "nvx.py"),
+                "run",
+                "--guest",
+                "alpine",
+                "--hypervisor",
+                "whp",
+                "--memory-mib",
+                "128",
+                "--net",
+                microvm_tests.DIRECTIONAL_NETWORK_CIDR,
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-ingress",
+                "deny",
+            ]
+            for call, name in zip(run_guest_script.call_args_list, names, strict=True):
+                policy_path = output_dir / f"l3-l4-egress-range-{name}-policy.json"
+                self.assertEqual(
+                    call.args[0],
+                    [
+                        *public_run,
+                        "--network-egress-policy-file",
+                        str(policy_path),
+                        "--cmdline",
+                        "quiet loglevel=0",
+                    ],
+                )
+                self.assertNotIn("@", call.args[1])
+                for port in range(20000, 20005):
+                    self.assertIn(f" {port} &\n", call.args[1])
+                self.assertEqual(
+                    call.args[2],
+                    microvm_tests.L3_L4_EGRESS_PORT_RANGES_COMPLETION_MARKER,
+                )
+                self.assertIs(call.kwargs["contain_process_tree"], True)
+
+            requested = json.loads(
+                (
+                    output_dir / "l3-l4-egress-range-allow-tcp-deny-inside-policy.json"
+                ).read_text(encoding="utf-8")
+            )
+            destination = [{"cidr": "192.0.2.1/32"}]
+            self.assertEqual(
+                requested,
+                {
+                    "allow": [
+                        {
+                            "to": destination,
+                            "ports": [
+                                {"protocol": "tcp", "port": 20001, "endPort": 20003}
+                            ],
+                        }
+                    ],
+                    "deny": [
+                        {
+                            "to": destination,
+                            "ports": [{"protocol": "tcp", "port": 20002}],
+                        }
+                    ],
+                },
+            )
+            rejected = [call.args[0][-1] for call in openvmm_process.call_args_list]
+            self.assertEqual(
+                rejected, ["192.0.2.1:tcp:20003-20001", "192.0.2.1:udp:-20003"]
+            )
+            dry_runs = [call.args[0] for call in nvx_run.call_args_list]
+            self.assertEqual(len(dry_runs), 2)
+            for command, name in zip(
+                dry_runs, ("reversed-end-port", "end-port-without-port"), strict=True
+            ):
+                self.assertEqual(
+                    command,
+                    [
+                        *public_run,
+                        "--network-egress-policy-file",
+                        str(output_dir / f"l3-l4-egress-range-{name}-policy.json"),
+                        "--dry-run",
+                    ],
+                )
+
+            results = json.loads(
+                (output_dir / "l3-l4-egress-port-ranges-results.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                results["ports"],
+                {
+                    "below": 20000,
+                    "first": 20001,
+                    "inside": 20002,
+                    "last": 20003,
+                    "above": 20004,
+                },
+            )
+            by_case = {case["case"]: case for case in results["cases"]}
+            self.assertEqual(list(by_case), names)
+            self.assertEqual(
+                by_case["allow-any"]["native_rules"],
+                {
+                    "allow": [
+                        "192.0.2.1/32:tcp:20001-20003",
+                        "192.0.2.1/32:udp:20001-20003",
+                    ],
+                    "deny": [],
+                },
+            )
+            self.assertEqual(
+                by_case["allow-tcp-deny-inside"]["host_reached"],
+                ["tcp-first", "tcp-last"],
+            )
+            self.assertEqual(
+                by_case["deny-udp"]["host_reached"],
+                [
+                    "tcp-above",
+                    "tcp-below",
+                    "tcp-first",
+                    "tcp-inside",
+                    "tcp-last",
+                    "udp-above",
+                    "udp-below",
+                ],
+            )
+            self.assertEqual(by_case["allow-udp"]["guest"]["udp-below"], "sent")
+
+    def test_l3_l4_egress_port_ranges_reject_leaks_and_missed_traffic(self):
+        failures: tuple[
+            tuple[tuple[str, str] | None, tuple[str, str, str] | None, str], ...
+        ] = (
+            (
+                ("allow-tcp", "tcp-above"),
+                None,
+                "allow-tcp: tcp-above should be blocked",
+            ),
+            (
+                ("allow-tcp", "tcp-below"),
+                None,
+                "allow-tcp: tcp-below should be blocked",
+            ),
+            (("allow-udp", "udp-last"), None, "allow-udp: udp-last should be reached"),
+            (
+                ("allow-udp", "tcp-first"),
+                None,
+                "allow-udp: tcp-first should be blocked",
+            ),
+            (
+                ("allow-tcp-deny-inside", "tcp-inside"),
+                None,
+                "allow-tcp-deny-inside: tcp-inside should be blocked",
+            ),
+            (("deny-any", "udp-first"), None, "deny-any: udp-first should be blocked"),
+            (
+                None,
+                ("allow-tcp", "tcp-first", "blocked"),
+                "allow-tcp: tcp-first should be reached",
+            ),
+            (
+                None,
+                ("deny-tcp", "tcp-last", "reached"),
+                "deny-tcp: tcp-last should be blocked",
+            ),
+            (None, ("allow-any", "udp-inside", "failed-2"), "allow-any: udp-inside"),
+        )
+        for leaked, guest_report, message in failures:
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                output_dir = Path(temporary)
+                with self.assertRaisesRegex(
+                    RuntimeError, "port-range case " + re.escape(message)
+                ):
+                    self._run_egress_port_ranges(
+                        output_dir, leaked=leaked, guest_report=guest_report
+                    )
+                self.assertFalse(
+                    (output_dir / "l3-l4-egress-port-ranges-results.json").exists()
+                )
+
+    def test_l3_l4_egress_port_ranges_require_rejection_before_launch(self):
+        # Each case lets OpenVMM, or the public run, accept one invalid range.
+        for openvmm_accepts, nvx_accepts, message in (
+            (
+                "reversed-range",
+                None,
+                "port range reversed-range was not rejected before boot",
+            ),
+            (
+                "missing-first-port",
+                None,
+                "port range missing-first-port was not rejected before boot",
+            ),
+            (
+                None,
+                "reversed-end-port",
+                "policy reversed-end-port was not rejected before launch",
+            ),
+            (
+                None,
+                "end-port-without-port",
+                "policy end-port-without-port was not rejected before launch",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                output_dir = Path(temporary)
+                with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                    self._run_egress_port_ranges(
+                        output_dir,
+                        openvmm_accepts=openvmm_accepts,
+                        nvx_accepts=nvx_accepts,
+                    )
+                self.assertFalse(
+                    (output_dir / "l3-l4-egress-port-ranges-results.json").exists()
+                )
+
+    def test_l3_l4_egress_port_range_script_reports_each_probe(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+
+        script = microvm_tests._render_script(
+            "l3-l4-egress-port-ranges.sh.in",
+            GATEWAY_IPV4="192.0.2.1",
+            BELOW_PORT="20000",
+            FIRST_PORT="20001",
+            INSIDE_PORT="20002",
+            LAST_PORT="20003",
+            ABOVE_PORT="20004",
+        ).replace("nvx-exit", "record_exit")
+        stubs = (
+            "record_exit() { printf 'NVX-EXIT %s\\n' \"$1\"; }\n"
+            "wget() {\n"
+            "    for url; do :; done\n"
+            '    case "$url" in\n'
+            "    *:20001/tcp-first) printf NVX-EGRESS-PROBE-tcp-first ;;\n"
+            "    *:20002/tcp-inside) printf WRONG ;;\n"
+            "    *) return 4 ;;\n"
+            "    esac\n"
+            "}\n"
+            "nc() {\n"
+            "    cat >/dev/null\n"
+            "    for port; do :; done\n"
+            '    case "$port" in\n'
+            "    20000) return 1 ;;\n"
+            "    20004) return 2 ;;\n"
+            "    esac\n"
+            "}\n"
+        )
+        result = subprocess.run(
+            [shell],
+            input=stubs + script,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "NVX-L3-L4-PROBE tcp-below=blocked",
+                "NVX-L3-L4-PROBE tcp-first=reached",
+                "NVX-L3-L4-PROBE tcp-inside=unexpected",
+                "NVX-L3-L4-PROBE tcp-last=blocked",
+                "NVX-L3-L4-PROBE tcp-above=blocked",
+                "NVX-L3-L4-PROBE udp-below=sent",
+                "NVX-L3-L4-PROBE udp-first=sent",
+                "NVX-L3-L4-PROBE udp-inside=sent",
+                "NVX-L3-L4-PROBE udp-last=sent",
+                "NVX-L3-L4-PROBE udp-above=failed-2",
+                "NVX-L3-L4-EGRESS-PORT-RANGES-OK",
+                "NVX-EXIT 0",
+            ],
+        )
+
+    def test_runner_dispatches_l3_l4_egress_port_ranges(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "validate_openvmm_test_backend"),
+            patch.object(microvm_tests, "require_file", side_effect=require),
+            patch.object(
+                microvm_tests, "run_l3_l4_egress_port_ranges"
+            ) as run_l3_l4_egress_port_ranges,
+        ):
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "kvm",
+                    "--scenario",
+                    "l3-l4-egress-port-ranges",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            self.assertEqual(microvm_tests.run(args), 0)
+
+            run_l3_l4_egress_port_ranges.assert_called_once_with(
+                microvm_tests.openvmm_binary_path(),
+                microvm_tests.artifact_path(
+                    microvm_tests.KernelBuildConstants.BINARY_NAME
+                ),
+                microvm_tests.artifact_path(
+                    microvm_tests.guest_descriptor("alpine").initramfs_name
+                ),
+                "kvm",
+                memory_mib=128,
+                timeout=60.0,
+                output_dir=Path(temporary),
+                guest="alpine",
+            )
+        self.assertIn("l3-l4-egress-port-ranges", microvm_tests.MICROVM_TEST_SCENARIOS)
 
     def test_sandbox_blocks_use_fixed_roles_and_access(self):
         with (

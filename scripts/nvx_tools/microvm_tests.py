@@ -103,6 +103,7 @@ MICROVM_TEST_SCENARIOS = (
     "host-loopback-policy",
     "lifecycle",
     "l3-l4-egress-policy",
+    "l3-l4-egress-port-ranges",
     "l3-l4-egress-protocols",
     "managed-lifecycle",
     "managed-exec-config",
@@ -167,10 +168,20 @@ NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS = 0.25
 NETWORK_SERVER_JOIN_TIMEOUT_SECONDS = 1.0
 L3_L4_EGRESS_COMPLETION_MARKER = b"NVX-L3-L4-EGRESS-OK"
 L3_L4_EGRESS_PROTOCOLS_COMPLETION_MARKER = b"NVX-L3-L4-EGRESS-PROTOCOLS-OK"
+L3_L4_EGRESS_PORT_RANGES_COMPLETION_MARKER = b"NVX-L3-L4-EGRESS-PORT-RANGES-OK"
 L3_L4_EGRESS_PROBE_PREFIX = "NVX-L3-L4-PROBE "
 # The protocol scenario's guest probes toward the gateway: TCP and UDP to a
 # named port and to the next port, and ICMP echo.
 L3_L4_EGRESS_PROBES = ("tcp-named", "tcp-other", "udp-named", "udp-other", "icmp")
+# The port-range scenario reserves five consecutive ports and selects the
+# middle three as a range. Its guest probes the gateway with TCP and UDP below
+# the range, at the range's first port, inside it, at its last port, and above.
+L3_L4_EGRESS_RANGE_POSITIONS = ("below", "first", "inside", "last", "above")
+L3_L4_EGRESS_RANGE_PROBES = tuple(
+    f"{protocol}-{position}"
+    for protocol in ("tcp", "udp")
+    for position in L3_L4_EGRESS_RANGE_POSITIONS
+)
 HOST_LOOPBACK_DENY_MARKER = b"NVX-HOST-LOOPBACK-DENY-OK"
 HOST_LOOPBACK_UDP_CONTROL_MARKER = b"NVX-HOST-LOOPBACK-UDP-CONTROL-OK"
 HOST_LOOPBACK_ALLOW_MARKER = b"NVX-HOST-LOOPBACK-ALLOW-OK"
@@ -2156,16 +2167,14 @@ def run_l3_l4_egress_policy(
 
 
 @dataclass(frozen=True)
-class _EgressProtocolCase:
+class _EgressCase:
     name: str
     allow: tuple[dict[str, object], ...]
     deny: tuple[dict[str, object], ...]
     reached: frozenset[str]
 
 
-def _egress_protocol_cases(
-    gateway: str, named_port: int
-) -> tuple[_EgressProtocolCase, ...]:
+def _egress_protocol_cases(gateway: str, named_port: int) -> tuple[_EgressCase, ...]:
     """Return an allow case and a deny case for each protocol selector."""
     destination = f"{gateway}/32"
     every_probe = frozenset(L3_L4_EGRESS_PROBES)
@@ -2180,14 +2189,14 @@ def _egress_protocol_cases(
         ),
         ("any", {"protocol": "any"}, every_probe),
     )
-    cases: list[_EgressProtocolCase] = []
+    cases: list[_EgressCase] = []
     for name, selector, matched in protocol_selectors:
         rule: dict[str, object] = {"cidr": destination, **selector}
-        cases.append(_EgressProtocolCase(f"allow-{name}", (rule,), (), matched))
+        cases.append(_EgressCase(f"allow-{name}", (rule,), (), matched))
         # The address-only allow rule admits every probe, so only deny
         # precedence can block one.
         cases.append(
-            _EgressProtocolCase(
+            _EgressCase(
                 f"deny-{name}",
                 ({"cidr": destination},),
                 (rule,),
@@ -2231,7 +2240,7 @@ class _EgressProbeServer:
         self._errors: list[Exception] = []
         self._thread = threading.Thread(
             target=self._serve,
-            name="nvx-l3-l4-egress-protocols",
+            name="nvx-l3-l4-egress-probes",
             daemon=True,
         )
 
@@ -2249,11 +2258,9 @@ class _EgressProbeServer:
         self._stop.set()
         self._thread.join(self._timeout)
         if self._thread.is_alive():
-            raise TimeoutError("L3/L4 protocol probe server did not stop")
+            raise TimeoutError("L3/L4 egress probe server did not stop")
         if self._errors:
-            raise RuntimeError("L3/L4 protocol probe server failed") from self._errors[
-                0
-            ]
+            raise RuntimeError("L3/L4 egress probe server failed") from self._errors[0]
         return frozenset(self._reached)
 
     def _serve(self) -> None:
@@ -2301,12 +2308,14 @@ def _egress_probe_reports(output: str) -> dict[str, str]:
     return reports
 
 
-def _check_egress_protocol_case(
-    case: _EgressProtocolCase,
+def _check_egress_case(
+    kind: str,
+    case: _EgressCase,
+    probes: tuple[str, ...],
     guest_reports: dict[str, str],
     host_reached: frozenset[str],
 ) -> None:
-    for probe in L3_L4_EGRESS_PROBES:
+    for probe in probes:
         expected = probe in case.reached
         report = guest_reports.get(probe)
         if probe.startswith("udp"):
@@ -2318,7 +2327,7 @@ def _check_egress_protocol_case(
         observed = probe in host_reached
         if not guest_matches or (probe != "icmp" and observed != expected):
             raise RuntimeError(
-                f"L3/L4 protocol case {case.name}: {probe} should be "
+                f"L3/L4 {kind} case {case.name}: {probe} should be "
                 f"{'reached' if expected else 'blocked'}, but the guest reported "
                 f"{report!r} and the host "
                 f"{'observed' if observed else 'did not observe'} it"
@@ -2395,7 +2404,9 @@ def run_l3_l4_egress_protocols(
                 )
                 host_reached = server.finish()
             guest_reports = _egress_probe_reports(result["text"])
-            _check_egress_protocol_case(case, guest_reports, host_reached)
+            _check_egress_case(
+                "protocol", case, L3_L4_EGRESS_PROBES, guest_reports, host_reached
+            )
             results.append(
                 {
                     "case": case.name,
@@ -2445,6 +2456,261 @@ def run_l3_l4_egress_protocols(
                     "ports": {"named": named_port, "other": other_port},
                     "cases": results,
                 },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    finally:
+        for endpoint in (*tcp, *udp):
+            endpoint.close()
+
+
+def _egress_port_range_cases(
+    gateway: str, first: int, inside: int, last: int
+) -> tuple[_EgressCase, ...]:
+    """Return an allow case and a deny case for a TCP, a UDP, and an `any`
+    range of ports, and an allowed TCP range around a denied port, as
+    MXC-shaped policy rules."""
+    destination = [{"cidr": f"{gateway}/32"}]
+    every_probe = frozenset(L3_L4_EGRESS_RANGE_PROBES)
+
+    def in_range(*protocols: str) -> frozenset[str]:
+        return frozenset(
+            f"{protocol}-{position}"
+            for protocol in protocols
+            for position in ("first", "inside", "last")
+        )
+
+    def on_ports(**selector: object) -> dict[str, object]:
+        return {"to": destination, "ports": [selector]}
+
+    cases: list[_EgressCase] = []
+    for protocol, matched in (
+        ("tcp", in_range("tcp")),
+        ("udp", in_range("udp")),
+        ("any", in_range("tcp", "udp")),
+    ):
+        rule = on_ports(protocol=protocol, port=first, endPort=last)
+        cases.append(_EgressCase(f"allow-{protocol}", (rule,), (), matched))
+        # The address-only allow rule admits every probe, so only deny
+        # precedence can block one.
+        cases.append(
+            _EgressCase(
+                f"deny-{protocol}",
+                ({"to": destination},),
+                (rule,),
+                every_probe - matched,
+            )
+        )
+    cases.append(
+        _EgressCase(
+            "allow-tcp-deny-inside",
+            (on_ports(protocol="tcp", port=first, endPort=last),),
+            (on_ports(protocol="tcp", port=inside),),
+            frozenset(("tcp-first", "tcp-last")),
+        )
+    )
+    return tuple(cases)
+
+
+def run_l3_l4_egress_port_ranges(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+    guest: str = "alpine",
+) -> None:
+    tcp, udp = _bind_dual_protocol_ports(len(L3_L4_EGRESS_RANGE_POSITIONS))
+    try:
+        ports = {
+            position: int(endpoint.getsockname()[1])
+            for position, endpoint in zip(
+                L3_L4_EGRESS_RANGE_POSITIONS, tcp, strict=True
+            )
+        }
+        endpoints = {
+            f"{protocol}-{position}": endpoint
+            for protocol, reserved in (("tcp", tcp), ("udp", udp))
+            for position, endpoint in zip(
+                L3_L4_EGRESS_RANGE_POSITIONS, reserved, strict=True
+            )
+        }
+        first, last = ports["first"], ports["last"]
+        script = _render_script(
+            "l3-l4-egress-port-ranges.sh.in",
+            GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+            BELOW_PORT=str(ports["below"]),
+            FIRST_PORT=str(first),
+            INSIDE_PORT=str(ports["inside"]),
+            LAST_PORT=str(last),
+            ABOVE_PORT=str(ports["above"]),
+        )
+        public_run = [
+            sys.executable,
+            str(Path(__file__).parents[1] / "nvx.py"),
+            "run",
+            "--guest",
+            guest,
+            "--hypervisor",
+            backend,
+            "--memory-mib",
+            str(memory_mib),
+            "--net",
+            DIRECTIONAL_NETWORK_CIDR,
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "deny",
+            "--network-ingress",
+            "deny",
+        ]
+        results: list[dict[str, object]] = []
+        for case in _egress_port_range_cases(
+            DIRECTIONAL_NETWORK_GATEWAY_IPV4, first, ports["inside"], last
+        ):
+            policy_path = output_dir / f"l3-l4-egress-range-{case.name}-policy.json"
+            policy_path.write_text(
+                json.dumps({"allow": case.allow, "deny": case.deny}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            # Each range must reach OpenVMM as one native rule, not as a rule
+            # for each of its ports.
+            native = compile_policy_file(policy_path)
+            if not any(
+                rule.endswith(f":{first}-{last}")
+                for rule in (*native.allow, *native.deny)
+            ):
+                raise RuntimeError(
+                    f"L3/L4 port-range case {case.name} did not lower its range "
+                    f"to a native range rule: {native!r}"
+                )
+            command = [
+                *public_run,
+                "--network-egress-policy-file",
+                str(policy_path),
+                "--cmdline",
+                "quiet loglevel=0",
+            ]
+            with _EgressProbeServer(endpoints, timeout) as server:
+                result = run_guest_script(
+                    command,
+                    script,
+                    L3_L4_EGRESS_PORT_RANGES_COMPLETION_MARKER,
+                    timeout=timeout,
+                    log_path=output_dir / f"l3-l4-egress-range-{case.name}.log",
+                    contain_process_tree=True,
+                )
+                host_reached = server.finish()
+            guest_reports = _egress_probe_reports(result["text"])
+            _check_egress_case(
+                "port-range",
+                case,
+                L3_L4_EGRESS_RANGE_PROBES,
+                guest_reports,
+                host_reached,
+            )
+            results.append(
+                {
+                    "case": case.name,
+                    "policy_file": policy_path.name,
+                    "native_rules": {
+                        "allow": list(native.allow),
+                        "deny": list(native.deny),
+                    },
+                    "expected_reached": sorted(case.reached),
+                    "guest": guest_reports,
+                    "host_reached": sorted(host_reached),
+                }
+            )
+
+        # OpenVMM rejects a reversed range and a range without its first port
+        # before boot.
+        for name, rule, expected in (
+            (
+                "reversed-range",
+                f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}:tcp:{last}-{first}",
+                b"ends below its first port",
+            ),
+            (
+                "missing-first-port",
+                f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}:udp:-{last}",
+                b"invalid egress port range",
+            ),
+        ):
+            invalid = workload_boot_command(
+                executable,
+                backend,
+                kernel,
+                initrd,
+                memory_mib,
+                "quiet loglevel=0",
+                network=DIRECTIONAL_NETWORK_CIDR,
+            )
+            invalid.extend(("--network-egress", "deny", "--network-egress-allow", rule))
+            with OpenvmmProcess(
+                invalid,
+                output_dir / f"l3-l4-egress-range-{name}.log",
+            ) as process:
+                rejected = process.wait(timeout)
+            if (
+                rejected.returncode == 0
+                or expected not in rejected.output
+                or BOOT_MARKER in rejected.output
+            ):
+                raise RuntimeError(
+                    f"invalid L3/L4 port range {name} was not rejected before boot"
+                )
+
+        # The public run rejects the same shapes in a policy file before it
+        # starts OpenVMM.
+        destination = [{"cidr": f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}/32"}]
+        for name, policy_rule, message in (
+            (
+                "reversed-end-port",
+                {
+                    "to": destination,
+                    "ports": [{"protocol": "tcp", "port": last, "endPort": first}],
+                },
+                f"allow[0].ports[0].endPort {first} cannot be below port {last}",
+            ),
+            (
+                "end-port-without-port",
+                {"to": destination, "ports": [{"protocol": "udp", "endPort": last}]},
+                "allow[0].ports[0].endPort requires port",
+            ),
+        ):
+            policy_path = output_dir / f"l3-l4-egress-range-{name}-policy.json"
+            policy_path.write_text(
+                json.dumps({"allow": [policy_rule]}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            rejected_run = subprocess.run(
+                [
+                    *public_run,
+                    "--network-egress-policy-file",
+                    str(policy_path),
+                    "--dry-run",
+                ],
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            if rejected_run.returncode == 0 or message.encode() not in (
+                rejected_run.stderr
+            ):
+                raise RuntimeError(
+                    f"invalid L3/L4 port range policy {name} was not rejected "
+                    "before launch"
+                )
+
+        (output_dir / "l3-l4-egress-port-ranges-results.json").write_text(
+            json.dumps(
+                {"interface": "nvx.py run", "ports": ports, "cases": results},
                 indent=2,
             )
             + "\n",
@@ -6099,6 +6365,21 @@ def run(args: argparse.Namespace) -> int:
             f"on OpenVMM/{args.backend}"
         )
         run_l3_l4_egress_protocols(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+            guest=descriptor.name,
+        )
+    if "l3-l4-egress-port-ranges" in scenarios:
+        print(
+            "Running public nvx.py L3/L4 egress port-range acceptance "
+            f"on OpenVMM/{args.backend}"
+        )
+        run_l3_l4_egress_port_ranges(
             executable,
             kernel,
             initrd,

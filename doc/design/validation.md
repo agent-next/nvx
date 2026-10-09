@@ -37,7 +37,14 @@ rejection of malformed or incomplete rules. Protocol coverage verifies that
 TCP, UDP, and ICMP rules without a port, `any` with a port, and `any` alone
 each match exactly their traffic, both as allow rules and as deny rules that
 take precedence over an allow rule, with the other protocols and the next port
-as nearby cases. Host-loopback coverage verifies
+as nearby cases. Port-range coverage verifies that TCP, UDP, and `any` ranges
+each match their first and last ports and a port inside them, but neither the
+port below nor the port above them nor another protocol, both as allow rules
+and as deny rules that take precedence over an allow rule; that a deny rule for
+one port inside an allowed range blocks that port alone; that each range
+reaches OpenVMM as one native range rule; and that OpenVMM and `nvx.py run`
+reject reversed ranges and ranges without a first port before launch.
+Host-loopback coverage verifies
 general guest-to-host denial, an exact proxy exception, explicit
 localhost-to-guest forwarding under allow, and pre-boot rejection when both
 directions cannot be enforced. Managed lifecycle coverage authenticates the
