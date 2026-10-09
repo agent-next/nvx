@@ -1622,11 +1622,13 @@ class FilesystemOwnerTests(unittest.TestCase):
 
         both = (1 << 6) | (1 << 7)
         inherited = microvm_tests.identity_capabilities_inherited
-        self.assertTrue(inherited(status(both, both), root=False))
-        self.assertFalse(inherited(status(1 << 7, both), root=False))
-        self.assertFalse(inherited(status(0, both), root=False))
-        self.assertTrue(inherited(status(0, both), root=True))
-        self.assertFalse(inherited(status(both, 1 << 6), root=True))
+        self.assertEqual(inherited(status(both, both), root=False), (True, True))
+        self.assertEqual(inherited(status(1 << 7, both), root=False), (True, False))
+        self.assertEqual(inherited(status(1 << 6, both), root=False), (False, True))
+        self.assertEqual(inherited(status(0, both), root=False), (False, False))
+        self.assertEqual(inherited(status(0, both), root=True), (True, True))
+        self.assertEqual(inherited(status(both, 1 << 6), root=True), (False, True))
+        self.assertEqual(inherited(status(both, 1 << 7), root=True), (True, False))
 
     def test_other_groups_exclude_the_effective_gid(self):
         with (
@@ -1794,7 +1796,7 @@ class FilesystemOwnerTests(unittest.TestCase):
     def test_scenario_runs_as_caller_and_checks_host_ownership(self):
         if sys.platform == "linux":
             if os.geteuid() == 0:
-                self.skipTest("root runs chown the share to another owner")
+                self.skipTest("root would chown the share to another owner")
         scripts: list[str] = []
 
         def guest(command: list[str], script: str, *_args: object, **_kwargs: object):
@@ -1812,7 +1814,7 @@ class FilesystemOwnerTests(unittest.TestCase):
             patch.object(
                 microvm_tests,
                 "openvmm_inherits_identity_capabilities",
-                return_value=False,
+                return_value=(False, False),
             ),
             patch.object(microvm_tests, "openvmm_other_groups", return_value=[]),
         ):
@@ -1856,7 +1858,7 @@ class FilesystemOwnerTests(unittest.TestCase):
         if sys.platform != "linux":
             self.skipTest("caller ownership requires a Linux host")
         if os.geteuid() == 0:
-            self.skipTest("root runs chown the share to another owner")
+            self.skipTest("root would chown the share to another owner")
         scripts: list[str] = []
 
         def run_scenario(*, guest_writes: bool) -> None:
@@ -1876,7 +1878,7 @@ class FilesystemOwnerTests(unittest.TestCase):
                 patch.object(
                     microvm_tests,
                     "openvmm_inherits_identity_capabilities",
-                    return_value=False,
+                    return_value=(False, False),
                 ),
                 patch.object(
                     microvm_tests, "openvmm_other_groups", return_value=[4444]
@@ -1901,8 +1903,74 @@ class FilesystemOwnerTests(unittest.TestCase):
         self.assertNotIn("case owned in", scripts[0])
         self.assertEqual(scripts[0].count("case denied in"), 2)
         self.assertIn("other_group=4444", scripts[0])
-        with self.assertRaisesRegex(RuntimeError, "cannot drop its supplementary"):
+        with self.assertRaisesRegex(
+            RuntimeError, "cannot drop its supplementary groups"
+        ):
             run_scenario(guest_writes=True)
+
+    def test_expectations_derive_guest_root_from_each_capability(self):
+        expect = microvm_tests.filesystem_owner_expectations
+        cases: list[
+            tuple[
+                tuple[int, int],
+                tuple[int, int],
+                tuple[bool, bool],
+                list[int],
+                tuple[bool, bool],
+            ]
+        ] = [
+            # (export, openvmm, (cap_setuid, cap_setgid), groups, (root, foreign))
+            # Export owned by OpenVMM's own identity.
+            ((1000, 1000), (1000, 1000), (False, False), [4444], (False, False)),
+            ((1000, 1000), (1000, 1000), (False, True), [4444], (True, False)),
+            ((1000, 1000), (1000, 1000), (True, False), [4444], (False, False)),
+            ((1000, 1000), (1000, 1000), (True, True), [4444], (True, True)),
+            ((1000, 1000), (1000, 1000), (False, False), [], (True, False)),
+            ((1000, 1000), (1000, 1000), (False, True), [], (True, False)),
+            ((1000, 1000), (1000, 1000), (True, False), [], (True, False)),
+            ((1000, 1000), (1000, 1000), (True, True), [], (True, True)),
+            # Export owned by 65533:65533 while OpenVMM runs as root.
+            ((65533, 65533), (0, 0), (False, False), [4444], (False, False)),
+            ((65533, 65533), (0, 0), (False, True), [4444], (False, False)),
+            ((65533, 65533), (0, 0), (True, False), [4444], (False, False)),
+            ((65533, 65533), (0, 0), (True, True), [4444], (True, True)),
+            ((65533, 65533), (0, 0), (False, False), [], (False, False)),
+            ((65533, 65533), (0, 0), (False, True), [], (False, False)),
+            ((65533, 65533), (0, 0), (True, False), [], (False, False)),
+            ((65533, 65533), (0, 0), (True, True), [], (True, True)),
+            # Only the export UID differs from OpenVMM's.
+            ((65533, 1000), (1000, 1000), (False, False), [4444], (False, False)),
+            ((65533, 1000), (1000, 1000), (False, True), [4444], (False, False)),
+            ((65533, 1000), (1000, 1000), (True, False), [4444], (False, False)),
+            ((65533, 1000), (1000, 1000), (True, True), [4444], (True, True)),
+            ((65533, 1000), (1000, 1000), (False, False), [], (False, False)),
+            ((65533, 1000), (1000, 1000), (False, True), [], (False, False)),
+            ((65533, 1000), (1000, 1000), (True, False), [], (True, False)),
+            ((65533, 1000), (1000, 1000), (True, True), [], (True, True)),
+            # Only the export GID differs from OpenVMM's.
+            ((1000, 65533), (1000, 1000), (False, False), [4444], (False, False)),
+            ((1000, 65533), (1000, 1000), (False, True), [4444], (True, False)),
+            ((1000, 65533), (1000, 1000), (True, False), [4444], (False, False)),
+            ((1000, 65533), (1000, 1000), (True, True), [4444], (True, True)),
+            ((1000, 65533), (1000, 1000), (False, False), [], (False, False)),
+            ((1000, 65533), (1000, 1000), (False, True), [], (True, False)),
+            ((1000, 65533), (1000, 1000), (True, False), [], (False, False)),
+            ((1000, 65533), (1000, 1000), (True, True), [], (True, True)),
+        ]
+        for export, openvmm, caps, groups, expected in cases:
+            with self.subTest(export=export, openvmm=openvmm, caps=caps, groups=groups):
+                self.assertEqual(
+                    expect(
+                        export_uid=export[0],
+                        export_gid=export[1],
+                        openvmm_uid=openvmm[0],
+                        openvmm_gid=openvmm[1],
+                        cap_setuid=caps[0],
+                        cap_setgid=caps[1],
+                        supplementary_groups=groups,
+                    ),
+                    expected,
+                )
 
 
 class FilesystemSharesScenarioTests(unittest.TestCase):

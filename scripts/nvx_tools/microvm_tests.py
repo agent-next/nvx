@@ -2700,8 +2700,8 @@ def run_denied_filesystem_paths(
                 )
 
 
-def identity_capabilities_inherited(status: str, *, root: bool) -> bool:
-    """Return whether a child process inherits CAP_SETUID and CAP_SETGID.
+def identity_capabilities_inherited(status: str, *, root: bool) -> tuple[bool, bool]:
+    """Return the CAP_SETUID and CAP_SETGID a child process inherits.
 
     `status` is the content of `/proc/self/status`. A root process passes the
     capabilities on through its bounding set, and an unprivileged one only
@@ -2712,19 +2712,51 @@ def identity_capabilities_inherited(status: str, *, root: bool) -> bool:
         name, separator, value = line.partition(":")
         if separator:
             fields[name] = value.strip()
-    required = (1 << CAP_SETUID) | (1 << CAP_SETGID)
     capabilities = int(fields["CapBnd" if root else "CapAmb"], 16)
-    return capabilities & required == required
+    return (
+        capabilities & (1 << CAP_SETUID) != 0,
+        capabilities & (1 << CAP_SETGID) != 0,
+    )
 
 
-def openvmm_inherits_identity_capabilities() -> bool:
-    """Return whether a child OpenVMM can assume other host identities."""
+def openvmm_inherits_identity_capabilities() -> tuple[bool, bool]:
+    """Return the CAP_SETUID and CAP_SETGID a child OpenVMM inherits."""
     if sys.platform != "linux":
-        return False
+        return (False, False)
     return identity_capabilities_inherited(
         Path("/proc/self/status").read_text(encoding="ascii"),
         root=os.geteuid() == 0,
     )
+
+
+def filesystem_owner_expectations(
+    *,
+    export_uid: int,
+    export_gid: int,
+    openvmm_uid: int,
+    openvmm_gid: int,
+    cap_setuid: bool,
+    cap_setgid: bool,
+    supplementary_groups: Sequence[int],
+) -> tuple[bool, bool]:
+    """Derive the filesystem-owner expectations for guest callers.
+
+    Returns (root_allowed, foreign_allowed): whether squashed guest root and
+    foreign guest callers, respectively, must own the files they create rather
+    than fail with EPERM.
+
+    Per `lxutil::with_fs_identity`, a request that runs as squashed guest root
+    runs as the export owner: it needs CAP_SETUID only when the export root's
+    UID differs from OpenVMM's filesystem UID, and CAP_SETGID only when the
+    export root's GID differs from OpenVMM's filesystem GID or OpenVMM has
+    supplementary groups to drop. Foreign callers always differ from OpenVMM
+    in both UID and GID, so they need both capabilities.
+    """
+    needs_setuid = export_uid != openvmm_uid
+    needs_setgid = export_gid != openvmm_gid or bool(supplementary_groups)
+    root_allowed = (not needs_setuid or cap_setuid) and (not needs_setgid or cap_setgid)
+    foreign_allowed = cap_setuid and cap_setgid
+    return root_allowed, foreign_allowed
 
 
 def openvmm_other_groups() -> list[int]:
@@ -2801,20 +2833,39 @@ def run_filesystem_owner(
         while foreign_uid in taken or foreign_gid in taken:
             foreign_uid, foreign_gid = foreign_uid + 2, foreign_gid + 2
         foreign = (foreign_uid, foreign_gid)
-        privileged = openvmm_inherits_identity_capabilities()
+        cap_setuid, cap_setgid = openvmm_inherits_identity_capabilities()
         other_groups = openvmm_other_groups()
-        # Without CAP_SETGID, OpenVMM cannot drop its other supplementary
-        # groups, so it fails even requests from guest root.
-        root_allowed = privileged or not other_groups
+        # Guest root keeps its privileges only when OpenVMM can assume the
+        # export owner identity: CAP_SETUID when the export UID differs,
+        # CAP_SETGID when the export GID differs or supplementary groups
+        # must be dropped.
+        root_allowed, foreign_allowed = filesystem_owner_expectations(
+            export_uid=owner[0],
+            export_gid=owner[1],
+            openvmm_uid=os.geteuid(),
+            openvmm_gid=os.getegid(),
+            cap_setuid=cap_setuid,
+            cap_setgid=cap_setgid,
+            supplementary_groups=other_groups,
+        )
+        # Group dropping is only the blocker when there are supplementary
+        # groups to drop and CAP_SETGID is absent; otherwise the blocker is
+        # a mismatched export UID/GID.
+        groups_blocked = bool(other_groups) and not cap_setgid
+        identity_cause = (
+            "drop its supplementary groups"
+            if groups_blocked
+            else "assume the export's identity"
+        )
         print(
             "OpenVMM "
-            + ("can" if privileged else "cannot")
+            + ("can" if (cap_setuid and cap_setgid) else "cannot")
             + " assume other host identities"
-            + ("" if root_allowed else " or drop its supplementary groups")
+            + ("" if root_allowed else f" or {identity_cause}")
             + "; guest root must "
             + ("own its files" if root_allowed else "fail with EPERM")
             + ", and foreign guest callers must "
-            + ("own their files" if privileged else "fail with EPERM")
+            + ("own their files" if foreign_allowed else "fail with EPERM")
         )
         # Squashed guest root must not give a file one of OpenVMM's groups.
         chgrp_targets = [group for group in other_groups if group != owner[1]]
@@ -2826,7 +2877,7 @@ def run_filesystem_owner(
                 FOREIGN=f"{foreign[0]}:{foreign[1]}",
                 OTHER_GROUP=str(chgrp_targets[0]) if chgrp_targets else "none",
                 ROOT_RESULT="owned" if root_allowed else "denied",
-                FOREIGN_RESULT="owned" if privileged else "denied",
+                FOREIGN_RESULT="owned" if foreign_allowed else "denied",
             ),
             FILESYSTEM_OWNER_MARKER,
             timeout=timeout,
@@ -2841,7 +2892,7 @@ def run_filesystem_owner(
             if any(root.iterdir()):
                 raise RuntimeError(
                     "a guest caller wrote to the share although OpenVMM cannot "
-                    "drop its supplementary groups"
+                    + identity_cause
                 )
         else:
             status = (root / "root-file").lstat()
@@ -2851,7 +2902,7 @@ def run_filesystem_owner(
                 )
             if os.path.lexists(root / "device"):
                 raise RuntimeError("squashed guest root created a device node")
-            if privileged:
+            if foreign_allowed:
                 status = (root / "foreign" / "nested" / "file").lstat()
                 if (status.st_uid, status.st_gid) != foreign:
                     raise RuntimeError("a foreign guest caller does not own its file")
