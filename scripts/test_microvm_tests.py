@@ -2230,6 +2230,46 @@ class ControlSessionTests(unittest.TestCase):
 
 
 class MicrovmTests(unittest.TestCase):
+    def test_managed_lifecycle_spawns_openvmm_with_a_prepared_capability_pipe(self):
+        # OpenVMM reads its capability as soon as it starts, so the scenario hands
+        # it a pipe that already holds the capability and the end of file (#440).
+        prepared: list[int] = []
+        spawned: list[object] = []
+
+        def prepare(capability: bytes) -> int:
+            descriptor = control_session.capability_pipe(capability)
+            prepared.append(descriptor)
+            return descriptor
+
+        def launch(_command: list[str], *, stdin: object, **_options: object) -> None:
+            # The pipe stays open until OpenVMM has started with it.
+            self.assertIsInstance(stdin, int)
+            os.fstat(cast(int, stdin))
+            spawned.append(stdin)
+            raise RuntimeError("stopped after the spawn")
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "capability_pipe", side_effect=prepare),
+            patch.object(microvm_tests.subprocess, "Popen", side_effect=launch),
+            self.assertRaisesRegex(RuntimeError, "^stopped after the spawn$"),
+        ):
+            microvm_tests.run_managed_lifecycle(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initramfs.cpio.gz"),
+                "kvm",
+                memory_mib=256,
+                timeout=5,
+                output_dir=Path(temporary),
+            )
+
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(spawned, prepared)
+        # The scenario closes its copy of the pipe once OpenVMM has it.
+        with self.assertRaises(OSError):
+            os.fstat(prepared[0])
+
     def test_host_loopback_listener_pair_retries_protocol_port_conflict(self):
         first_udp = MagicMock()
         first_udp.getsockname.return_value = ("127.0.0.1", 50000)

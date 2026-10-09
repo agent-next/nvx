@@ -27,6 +27,7 @@ from .control_session import (
     ControlEndpointClosed,
     ControlSession,
     ManagedExecResult,
+    capability_pipe,
 )
 from .sandbox import SandboxLaunch, SandboxLayer, SandboxMount
 
@@ -640,16 +641,20 @@ def start(state_path: Path, timeout: float) -> None:
     )
     process: subprocess.Popen[bytes] | None = None
     try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=os.name != "nt",
-            creationflags=creationflags,
-        )
-        if process.stdin is None:
-            raise ScriptError("failed to create the OpenVMM capability pipe")
+        # OpenVMM reads its capability as soon as it starts, so the capability is
+        # in the pipe, and the pipe's write end closed, before OpenVMM starts.
+        capability_input = capability_pipe(capability)
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=capability_input,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=os.name != "nt",
+                creationflags=creationflags,
+            )
+        finally:
+            os.close(capability_input)
         # Until this process reaps the child or closes its handle, no other process
         # can reuse its ID, so this identifies OpenVMM itself.
         try:
@@ -664,8 +669,6 @@ def start(state_path: Path, timeout: float) -> None:
                 if process.poll() is not None
                 else "cannot identify the OpenVMM process"
             )
-        process.stdin.write(capability)
-        process.stdin.close()
         _write_json(
             state_dir / RUNTIME_NAME,
             {

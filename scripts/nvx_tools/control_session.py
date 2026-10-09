@@ -75,6 +75,30 @@ def encode_exec_environment(environment: tuple[str, ...]) -> tuple[bytes, ...]:
     return tuple(encoded)
 
 
+def capability_pipe(capability: bytes) -> int:
+    """Returns the read end of a pipe that holds `capability` and then end of file.
+
+    OpenVMM reads `--microvm-control-auth-stdin` without blocking as soon as it
+    starts, and fails unless the whole capability and the end of file are already
+    there, so a launcher passes this descriptor as OpenVMM's standard input. The
+    caller closes it once OpenVMM has started.
+    """
+    if len(capability) != 32 or capability == bytes(32):
+        raise ValueError("control capability must be 32 nonzero bytes")
+    read, write = os.pipe()
+    try:
+        # The capability fits in any pipe's buffer, so these writes cannot block.
+        remaining = memoryview(capability)
+        while remaining:
+            remaining = remaining[os.write(write, remaining) :]
+    except BaseException:
+        os.close(read)
+        raise
+    finally:
+        os.close(write)
+    return read
+
+
 @dataclass(frozen=True)
 class ManagedExecResult:
     returncode: int

@@ -57,7 +57,7 @@ from .common import (
     require_file,
     sha256_file,
 )
-from .control_session import ControlSession, ManagedExecRefused
+from .control_session import ControlSession, ManagedExecRefused, capability_pipe
 from .egress_policy import CompiledEgressPolicy, compile_policy_file
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .managed_exec_tests import run_managed_exec_configuration
@@ -869,18 +869,19 @@ def run_managed_lifecycle(
             try:
                 environment = os.environ.copy()
                 environment["OPENVMM_LOG"] = "off"
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.PIPE,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    env=environment,
-                )
+                # OpenVMM reads its capability as soon as it starts.
+                capability_input = capability_pipe(capability)
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        stdin=capability_input,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        env=environment,
+                    )
+                finally:
+                    os.close(capability_input)
                 record_adversarial_openvmm_pid(process.pid, environment)
-                if process.stdin is None:
-                    raise RuntimeError("failed to create control capability pipe")
-                process.stdin.write(capability)
-                process.stdin.close()
                 # The guest console has no shell to query: init hands the boot
                 # to the managed agent, which serves the control console. The
                 # monitor still fails the run on a violation or failed check

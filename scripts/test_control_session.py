@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # pyright: reportPrivateUsage=false
 
+import os
 import socket
 import struct
 import sys
@@ -12,6 +13,52 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from nvx_tools import control_session  # noqa: E402
+
+
+def _read_like_openvmm(descriptor: int) -> bytes | None:
+    """Reads a capability pipe as OpenVMM reads --microvm-control-auth-stdin.
+
+    OpenVMM switches the pipe to non-blocking mode and reads it at once, so it
+    gets the capability only if the capability and the end of file are already
+    there. Returns what the pipe held, or None if a read would block because the
+    pipe's write end is still open.
+    """
+    if sys.platform == "win32":
+        import _winapi
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(descriptor)
+        pipe_nowait = 1
+        _winapi.SetNamedPipeHandleState(handle, pipe_nowait, None, None)
+
+        def read() -> bytes | None:
+            try:
+                data, _ = _winapi.ReadFile(handle, 64)
+            except OSError as error:
+                if error.winerror == _winapi.ERROR_BROKEN_PIPE:
+                    return b""
+                if error.winerror == _winapi.ERROR_NO_DATA:
+                    return None
+                raise
+            return data
+
+    else:
+        os.set_blocking(descriptor, False)
+
+        def read() -> bytes | None:
+            try:
+                return os.read(descriptor, 64)
+            except BlockingIOError:
+                return None
+
+    data = b""
+    while True:
+        chunk = read()
+        if chunk is None:
+            return None
+        if not chunk:
+            return data
+        data += chunk
 
 
 def _read_exact(connection: socket.socket, length: int) -> bytes:
@@ -576,6 +623,36 @@ class ControlSessionTests(unittest.TestCase):
         self.assertNotIsInstance(
             raised.exception, control_session.ControlEndpointClosed
         )
+
+
+class CapabilityPipeTests(unittest.TestCase):
+    CAPABILITY = bytes(range(1, 33))
+
+    def test_pipe_holds_the_capability_and_then_end_of_file(self):
+        descriptor = control_session.capability_pipe(self.CAPABILITY)
+        try:
+            self.assertEqual(_read_like_openvmm(descriptor), self.CAPABILITY)
+        finally:
+            os.close(descriptor)
+
+    def test_openvmm_refuses_a_pipe_whose_writer_is_open(self):
+        # A launcher that writes the capability only after it starts OpenVMM
+        # leaves the writer open when OpenVMM reads, as before issue #440.
+        read, write = os.pipe()
+        try:
+            os.write(write, self.CAPABILITY)
+            self.assertIsNone(_read_like_openvmm(read))
+        finally:
+            os.close(read)
+            os.close(write)
+
+    def test_invalid_capabilities_are_rejected(self):
+        for capability in (b"", bytes(range(1, 32)), bytes(32), bytes(range(1, 34))):
+            with (
+                self.subTest(capability=capability.hex()),
+                self.assertRaisesRegex(ValueError, "32 nonzero bytes"),
+            ):
+                control_session.capability_pipe(capability)
 
 
 class SocketStreamTests(unittest.TestCase):
