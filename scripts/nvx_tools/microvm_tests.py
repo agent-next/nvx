@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import secrets
+import selectors
 import socket
 import struct
 import subprocess
@@ -18,6 +19,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISUID
 from typing import Any, cast
@@ -101,6 +103,7 @@ MICROVM_TEST_SCENARIOS = (
     "host-loopback-policy",
     "lifecycle",
     "l3-l4-egress-policy",
+    "l3-l4-egress-protocols",
     "managed-lifecycle",
     "managed-exec-config",
     "network-snapshot",
@@ -163,6 +166,11 @@ DIRECTIONAL_NETWORK_INGRESS_PORT = 18080
 NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS = 0.25
 NETWORK_SERVER_JOIN_TIMEOUT_SECONDS = 1.0
 L3_L4_EGRESS_COMPLETION_MARKER = b"NVX-L3-L4-EGRESS-OK"
+L3_L4_EGRESS_PROTOCOLS_COMPLETION_MARKER = b"NVX-L3-L4-EGRESS-PROTOCOLS-OK"
+L3_L4_EGRESS_PROBE_PREFIX = "NVX-L3-L4-PROBE "
+# The protocol scenario's guest probes toward the gateway: TCP and UDP to a
+# named port and to the next port, and ICMP echo.
+L3_L4_EGRESS_PROBES = ("tcp-named", "tcp-other", "udp-named", "udp-other", "icmp")
 HOST_LOOPBACK_DENY_MARKER = b"NVX-HOST-LOOPBACK-DENY-OK"
 HOST_LOOPBACK_UDP_CONTROL_MARKER = b"NVX-HOST-LOOPBACK-UDP-CONTROL-OK"
 HOST_LOOPBACK_ALLOW_MARKER = b"NVX-HOST-LOOPBACK-ALLOW-OK"
@@ -2145,6 +2153,306 @@ def run_l3_l4_egress_policy(
         for endpoint in (*tcp, *udp):
             endpoint.close()
         server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
+
+
+@dataclass(frozen=True)
+class _EgressProtocolCase:
+    name: str
+    allow: tuple[dict[str, object], ...]
+    deny: tuple[dict[str, object], ...]
+    reached: frozenset[str]
+
+
+def _egress_protocol_cases(
+    gateway: str, named_port: int
+) -> tuple[_EgressProtocolCase, ...]:
+    """Return an allow case and a deny case for each protocol selector."""
+    destination = f"{gateway}/32"
+    every_probe = frozenset(L3_L4_EGRESS_PROBES)
+    protocol_selectors: tuple[tuple[str, dict[str, object], frozenset[str]], ...] = (
+        ("tcp", {"protocol": "tcp"}, frozenset(("tcp-named", "tcp-other"))),
+        ("udp", {"protocol": "udp"}, frozenset(("udp-named", "udp-other"))),
+        ("icmp", {"protocol": "icmp"}, frozenset(("icmp",))),
+        (
+            "any-port",
+            {"protocol": "any", "port": named_port},
+            frozenset(("tcp-named", "udp-named")),
+        ),
+        ("any", {"protocol": "any"}, every_probe),
+    )
+    cases: list[_EgressProtocolCase] = []
+    for name, selector, matched in protocol_selectors:
+        rule: dict[str, object] = {"cidr": destination, **selector}
+        cases.append(_EgressProtocolCase(f"allow-{name}", (rule,), (), matched))
+        # The address-only allow rule admits every probe, so only deny
+        # precedence can block one.
+        cases.append(
+            _EgressProtocolCase(
+                f"deny-{name}",
+                ({"cidr": destination},),
+                (rule,),
+                every_probe - matched,
+            )
+        )
+    return tuple(cases)
+
+
+def _bind_dual_protocol_ports(
+    count: int, host: str = "0.0.0.0"
+) -> tuple[list[socket.socket], list[socket.socket]]:
+    """Reserve consecutive port numbers that are free for both TCP and UDP."""
+    for base in range(20000, 60000 - count):
+        tcp: list[socket.socket] = []
+        udp: list[socket.socket] = []
+        try:
+            for port in range(base, base + count):
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                tcp.append(listener)
+                listener.bind((host, port))
+                listener.listen(8)
+                datagram = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                udp.append(datagram)
+                datagram.bind((host, port))
+            return tcp, udp
+        except OSError:
+            for endpoint in (*tcp, *udp):
+                endpoint.close()
+    raise RuntimeError(f"could not reserve {count} consecutive TCP and UDP host ports")
+
+
+class _EgressProbeServer:
+    """Record which host endpoints the guest's egress probes reach."""
+
+    def __init__(self, endpoints: dict[str, socket.socket], timeout: float) -> None:
+        self._endpoints = endpoints
+        self._timeout = timeout
+        self._stop = threading.Event()
+        self._reached: set[str] = set()
+        self._errors: list[Exception] = []
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="nvx-l3-l4-egress-protocols",
+            daemon=True,
+        )
+
+    def __enter__(self) -> _EgressProbeServer:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._stop.set()
+        self._thread.join(NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
+
+    def finish(self) -> frozenset[str]:
+        """Return the reached probes once traffic in flight has had time to land."""
+        time.sleep(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
+        self._stop.set()
+        self._thread.join(self._timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("L3/L4 protocol probe server did not stop")
+        if self._errors:
+            raise RuntimeError("L3/L4 protocol probe server failed") from self._errors[
+                0
+            ]
+        return frozenset(self._reached)
+
+    def _serve(self) -> None:
+        try:
+            with selectors.DefaultSelector() as selector:
+                for name, endpoint in self._endpoints.items():
+                    selector.register(endpoint, selectors.EVENT_READ, name)
+                while not self._stop.is_set():
+                    for key, _ in selector.select(timeout=0.05):
+                        self._receive(
+                            cast(str, key.data), cast(socket.socket, key.fileobj)
+                        )
+        except Exception as error:
+            self._errors.append(error)
+
+    def _receive(self, name: str, endpoint: socket.socket) -> None:
+        token = f"NVX-EGRESS-PROBE-{name}".encode("ascii")
+        if name.startswith("tcp"):
+            connection, _ = endpoint.accept()
+            with connection:
+                connection.settimeout(self._timeout)
+                request = connection.recv(4096)
+                if not request.startswith(f"GET /{name} HTTP/1.".encode("ascii")):
+                    raise RuntimeError(f"unexpected {name} probe request: {request!r}")
+                connection.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: "
+                    + str(len(token)).encode("ascii")
+                    + b"\r\nConnection: close\r\n\r\n"
+                    + token
+                )
+        else:
+            payload, _ = endpoint.recvfrom(128)
+            if payload != token:
+                raise RuntimeError(f"unexpected {name} probe payload: {payload!r}")
+        self._reached.add(name)
+
+
+def _egress_probe_reports(output: str) -> dict[str, str]:
+    reports: dict[str, str] = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith(L3_L4_EGRESS_PROBE_PREFIX):
+            name, _, value = line[len(L3_L4_EGRESS_PROBE_PREFIX) :].partition("=")
+            reports[name] = value
+    return reports
+
+
+def _check_egress_protocol_case(
+    case: _EgressProtocolCase,
+    guest_reports: dict[str, str],
+    host_reached: frozenset[str],
+) -> None:
+    for probe in L3_L4_EGRESS_PROBES:
+        expected = probe in case.reached
+        report = guest_reports.get(probe)
+        if probe.startswith("udp"):
+            guest_matches = report == "sent"
+        else:
+            guest_matches = report == ("reached" if expected else "blocked")
+        # Consomme answers echo requests to the gateway itself, so only the
+        # guest observes ICMP.
+        observed = probe in host_reached
+        if not guest_matches or (probe != "icmp" and observed != expected):
+            raise RuntimeError(
+                f"L3/L4 protocol case {case.name}: {probe} should be "
+                f"{'reached' if expected else 'blocked'}, but the guest reported "
+                f"{report!r} and the host "
+                f"{'observed' if observed else 'did not observe'} it"
+            )
+
+
+def run_l3_l4_egress_protocols(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+    guest: str = "alpine",
+) -> None:
+    tcp, udp = _bind_dual_protocol_ports(2)
+    try:
+        named_port, other_port = (int(endpoint.getsockname()[1]) for endpoint in tcp)
+        # Consomme answers ICMP echo itself, so only TCP and UDP have host endpoints.
+        endpoints = {
+            "tcp-named": tcp[0],
+            "tcp-other": tcp[1],
+            "udp-named": udp[0],
+            "udp-other": udp[1],
+        }
+        script = _render_script(
+            "l3-l4-egress-protocols.sh.in",
+            GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+            NAMED_PORT=str(named_port),
+            OTHER_PORT=str(other_port),
+        )
+        results: list[dict[str, object]] = []
+        for case in _egress_protocol_cases(
+            DIRECTIONAL_NETWORK_GATEWAY_IPV4, named_port
+        ):
+            policy_path = output_dir / f"l3-l4-egress-{case.name}-policy.json"
+            policy_path.write_text(
+                json.dumps({"allow": case.allow, "deny": case.deny}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            command = [
+                sys.executable,
+                str(Path(__file__).parents[1] / "nvx.py"),
+                "run",
+                "--guest",
+                guest,
+                "--hypervisor",
+                backend,
+                "--memory-mib",
+                str(memory_mib),
+                "--net",
+                DIRECTIONAL_NETWORK_CIDR,
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-ingress",
+                "deny",
+                "--network-egress-policy-file",
+                str(policy_path),
+                "--cmdline",
+                "quiet loglevel=0",
+            ]
+            with _EgressProbeServer(endpoints, timeout) as server:
+                result = run_guest_script(
+                    command,
+                    script,
+                    L3_L4_EGRESS_PROTOCOLS_COMPLETION_MARKER,
+                    timeout=timeout,
+                    log_path=output_dir / f"l3-l4-egress-{case.name}.log",
+                    contain_process_tree=True,
+                )
+                host_reached = server.finish()
+            guest_reports = _egress_probe_reports(result["text"])
+            _check_egress_protocol_case(case, guest_reports, host_reached)
+            results.append(
+                {
+                    "case": case.name,
+                    "policy_file": policy_path.name,
+                    "expected_reached": sorted(case.reached),
+                    "guest": guest_reports,
+                    "host_reached": sorted(host_reached),
+                }
+            )
+
+        for name, rule, expected in (
+            (
+                "icmp-port",
+                "192.0.2.1:icmp:443",
+                b"ICMP egress rules do not take a port",
+            ),
+            ("any-protocol", "192.0.2.1:any", b"invalid egress transport"),
+        ):
+            invalid = workload_boot_command(
+                executable,
+                backend,
+                kernel,
+                initrd,
+                memory_mib,
+                "quiet loglevel=0",
+                network=DIRECTIONAL_NETWORK_CIDR,
+            )
+            invalid.extend(("--network-egress", "deny", "--network-egress-allow", rule))
+            with OpenvmmProcess(
+                invalid,
+                output_dir / f"l3-l4-egress-{name}.log",
+            ) as process:
+                rejected = process.wait(timeout)
+            if (
+                rejected.returncode == 0
+                or expected not in rejected.output
+                or BOOT_MARKER in rejected.output
+            ):
+                raise RuntimeError(
+                    f"invalid L3/L4 protocol rule {name} was not rejected before boot"
+                )
+
+        (output_dir / "l3-l4-egress-protocols-results.json").write_text(
+            json.dumps(
+                {
+                    "interface": "nvx.py run",
+                    "ports": {"named": named_port, "other": other_port},
+                    "cases": results,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    finally:
+        for endpoint in (*tcp, *udp):
+            endpoint.close()
 
 
 def _http_server(
@@ -5725,6 +6033,21 @@ def run(args: argparse.Namespace) -> int:
             f"on OpenVMM/{args.backend}"
         )
         run_l3_l4_egress_policy(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+            guest=descriptor.name,
+        )
+    if "l3-l4-egress-protocols" in scenarios:
+        print(
+            "Running public nvx.py L3/L4 egress protocol acceptance "
+            f"on OpenVMM/{args.backend}"
+        )
+        run_l3_l4_egress_protocols(
             executable,
             kernel,
             initrd,

@@ -33,7 +33,11 @@ egress request and response with ingress denied, denial of a host connection
 to an active guest listener, complete egress denial, and pre-boot rejection of
 unsupported ingress on KVM, MSHV, and WHP. L3/L4 coverage verifies TCP and UDP
 port rules, overlapping deny precedence, default-deny behavior, and pre-boot
-rejection of malformed or incomplete rules. Host-loopback coverage verifies
+rejection of malformed or incomplete rules. Protocol coverage verifies that
+TCP, UDP, and ICMP rules without a port, `any` with a port, and `any` alone
+each match exactly their traffic, both as allow rules and as deny rules that
+take precedence over an allow rule, with the other protocols and the next port
+as nearby cases. Host-loopback coverage verifies
 general guest-to-host denial, an exact proxy exception, explicit
 localhost-to-guest forwarding under allow, and pre-boot rejection when both
 directions cannot be enforced. Managed lifecycle coverage authenticates the
