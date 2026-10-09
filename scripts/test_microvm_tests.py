@@ -1210,7 +1210,15 @@ class FilesystemOwnerTests(unittest.TestCase):
 
     def test_expectations_derive_guest_root_from_each_capability(self):
         expect = microvm_tests.filesystem_owner_expectations
-        cases = [
+        cases: list[
+            tuple[
+                tuple[int, int],
+                tuple[int, int],
+                tuple[bool, bool],
+                list[int],
+                tuple[bool, bool],
+            ]
+        ] = [
             # (export, openvmm, (cap_setuid, cap_setgid), groups, (root, foreign))
             # Export owned by OpenVMM's own identity.
             ((1000, 1000), (1000, 1000), (False, False), [4444], (False, False)),
@@ -1250,9 +1258,7 @@ class FilesystemOwnerTests(unittest.TestCase):
             ((1000, 65533), (1000, 1000), (True, True), [], (True, True)),
         ]
         for export, openvmm, caps, groups, expected in cases:
-            with self.subTest(
-                export=export, openvmm=openvmm, caps=caps, groups=groups
-            ):
+            with self.subTest(export=export, openvmm=openvmm, caps=caps, groups=groups):
                 self.assertEqual(
                     expect(
                         export_uid=export[0],
