@@ -16,7 +16,7 @@ are build products or caches and are not part of the tracked source tree. The
 | `ubuntu` | Pinned Ubuntu supplemental binary-package lock |
 | `azurelinux` | Checksum-pinned Azure Linux supplemental RPM lock |
 | `aci_edge_sandboxes` | Rust crate `aci_edge_sandboxes`: state-aware sandbox API with an OpenVMM backend |
-| `openvmm` | Private OpenVMM submodule pinned to `microvm/mshv` |
+| `openvmm` | OpenVMM Git submodule from `nanvix/openvmm` |
 | `data` | Tracked performance history and generated benchmark data |
 | `scripts/nvx_tools` | Retained NVX build and benchmark implementation |
 | `scripts/nvx.py` | Canonical build, run, benchmark, and packaging CLI |
@@ -75,7 +75,7 @@ nvx/
 |   |-- tests/                   Mock, fake-OpenVMM, and real-hypervisor tests
 |   |-- build.rs                 Stages the bundled artifacts (feature `bundled`)
 |   `-- artifacts.json           Release package pinned for the bundled artifacts
-|-- openvmm/                     Private OpenVMM Git submodule
+|-- openvmm/                     OpenVMM Git submodule
 |-- scripts/                     Build, run, benchmark, and release tooling
 |   |-- nvx_tools/               Python implementation behind the NVX CLI
 |   |   |-- benchmark.py         OpenVMM benchmark coordinator
@@ -181,10 +181,12 @@ protocol. The crate builds independently of the OpenVMM submodule. See its
 
 ### `openvmm/`
 
-A private Git submodule pinned by `.gitmodules` and the parent repository's Git
-tree. It contains the VMM implementation and its own source layout,
-documentation, tests, and build configuration. Changes to OpenVMM should be
-made in that repository and then recorded here by updating the submodule pin.
+A Git submodule of `nanvix/openvmm`. `.gitmodules` records its URL and tracked
+branch, and the parent repository's Git tree pins its exact revision. It
+contains the VMM implementation and its own source layout, documentation,
+tests, and build configuration. Changes to OpenVMM are made in that repository
+and then recorded here by updating the submodule pin; see
+[OpenVMM](contribute.md#openvmm).
 
 ### `scripts/`
 
