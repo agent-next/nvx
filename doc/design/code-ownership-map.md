@@ -25,10 +25,15 @@ contracts between them.
 | State-unit quiesce, start, rollback, inventory, and downtime advance | OpenVMM state-unit framework |
 | Snapshot format, machine contract, publication, and artifact validation | OpenVMM snapshot helpers and platform file primitives |
 | Backend CPU contracts and snapshot clocks | KVM, MSHV, and WHP backends |
-| Sandbox launch and kernel features | NVX sandbox launcher and microVM kernel configuration |
+| Layered sandbox launch and kernel features | NVX sandbox launcher and microVM kernel configuration |
+| Edge sandbox lifecycle API, request validation, backend capabilities, and the serializable contract model | NVX `aci_edge_sandboxes` crate and its data-model crate |
+| Blockless managed launch, durable sandbox records, OpenVMM process reconciliation, host-path export, and egress-rule translation | `aci_edge_sandboxes` default OpenVMM backend |
+| Image-backed edge sandboxes | `aci_edge_sandboxes` optional agent backend, which delegates to a separately supplied native library |
 | Workload namespace and root construction | NVX guest container launch and entry helpers |
 | Guest workload, scratch quiesce, managed lifecycle, and post-restore CPU/RAM repair | NVX guest init agent and snapshot helper |
+| Blockless managed workloads, host-path binds, and workload account creation | NVX guest init and managed agent |
 | OpenVMM control-plane and guest-artifact integration tests | OpenVMM microVM and management-RPC VMM tests |
 | NVX Linux and device integration tests | NVX microVM process tests and guest test scripts |
+| Edge sandbox contract, fake-OpenVMM, and real-hypervisor lifecycle tests | `aci_edge_sandboxes` crate tests |
 | Copilot adversarial controller and typed broker | NVX adversarial controller and broker |
 | Credential-free adversarial executor and independent oracles | NVX adversarial executor and oracle watchdog |

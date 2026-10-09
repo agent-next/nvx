@@ -18,6 +18,17 @@ configuration, Rust agent, and production runtime protocol described below
 are **Proposed**. They must not be inferred from the presence of block devices
 or snapshot-tier metadata alone.
 
+Two host components launch sandboxes on this foundation. The `nvx sandbox`
+command attaches image layers and scratch, from which the guest assembles the
+[layered root](#implemented-filesystem-bootstrap). The
+[`aci_edge_sandboxes` crate](../../aci_edge_sandboxes/README.md) exposes a
+provision, start, exec, stop, and deprovision API. Its default backend launches
+OpenVMM directly, without NVX tooling, with the managed lifecycle and no
+sandbox blocks, so each workload runs in the Alpine initramfs root, as
+[Control protocol and checkpoint handoff](#control-protocol-and-checkpoint-handoff)
+describes. Its optional agent backend delegates the lifecycle to a separately
+supplied native library and an image-backed edge guest that NVX does not build.
+
 ## Implemented filesystem bootstrap
 
 The public `nvx sandbox` command accepts one to three role-bearing EROFS lower
