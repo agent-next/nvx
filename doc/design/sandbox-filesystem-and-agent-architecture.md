@@ -21,7 +21,8 @@ or snapshot-tier metadata alone.
 ## Implemented filesystem bootstrap
 
 The public `nvx sandbox` command accepts one to three role-bearing EROFS lower
-images, a preformatted ext4 scratch image, an absolute entrypoint, and
+images, a preformatted ext4 scratch image, up to two
+[live host shares](#live-host-shares), an absolute entrypoint, and
 individual argument tokens. It supplies non-secret kernel-command-line
 configuration for one-shot runs. Managed execution carries bounded arguments
 and a per-execution environment over the authenticated control channel;
@@ -30,10 +31,10 @@ are not supported by this command. Lower-level OpenVMM capture and restore do
 support sandbox blocks. See [Run](../run.md#experimental-single-workload-sandbox).
 
 The required kernel facilities are already enabled in the NVX microVM kernel
-configuration: virtio-blk, EROFS with compression and xattrs, overlayfs,
-cgroup v2, memory and process controllers, namespaces, BPF system calls, and
-cgroup BPF programs. Kernel support for a device filter does not mean the
-current agent installs one.
+configuration: virtio-blk, virtio-fs, EROFS with compression and xattrs,
+overlayfs, cgroup v2, memory and process controllers, namespaces, BPF system
+calls, and cgroup BPF programs. Kernel support for a device filter does not
+mean the current agent installs one.
 
 The guest init agent performs the assembly:
 
@@ -47,10 +48,17 @@ The guest init agent performs the assembly:
 4. resolve and flush scratch, mount it as ext4 with `rw,nosuid,nodev`, and
    create its `upper` and `work` directories;
 5. mount overlayfs with top-first lower layers and `metacopy=on,xino=on`;
-6. start a child behind a FIFO barrier, place that child in the workload
-   cgroup before releasing it, and retain a runtime-tmpfs machine-ID file;
-7. wait for the child, unmount the overlay, layers, and scratch, and return its
-   status through the guest exit helper.
+6. verify the workload identity in the assembled root, mount each live share
+   at its target inside that root, and write the workload machine ID to a
+   runtime-tmpfs file;
+7. start a child behind a FIFO barrier and place that child in the workload
+   cgroup before releasing it;
+8. wait for the child, unmount the shares in reverse order and then the
+   overlay, layers, and scratch, and return its status through the guest exit
+   helper.
+
+In a managed sandbox, the managed agent repeats step 7 for each requested
+workload, and the teardown in step 8 follows `stop`.
 
 The assembled view is:
 
@@ -61,6 +69,8 @@ The assembled view is:
 /run/nvx/scratch/upper   (ext4) -----------> upperdir
 /run/nvx/scratch/work    (same ext4) ------> workdir
                                           overlay --> /run/nvx/rootfs
+virtio-fs tag microvm    (optional share) ---> /run/nvx/rootfs/TARGET
+virtio-fs tag microvm1   (optional share) ---> /run/nvx/rootfs/TARGET
 ```
 
 At least one lower role is required by the bootstrap; distro plus runtime is
@@ -86,6 +96,41 @@ numeric identity fixed at initial boot. The agent requires an exact user and
 primary-group match in the assembled root, clears supplementary groups and all
 capability sets, and rejects an unavailable identity before starting the
 workload.
+
+### Live host shares
+
+A live share exposes a host directory, such as a source checkout or a tool
+cache, to the workload without copying it into an image: edits are visible in
+both directions without staging or copy-back.
+
+Each `--mount` attaches its own fixed virtio-fs slot, tag `microvm` for the
+first share and `microvm1` for the second, served by its own HostFs server, so
+the two shares keep independent `ro` or `rw` modes and access policies. On
+every request, whichever guest mount or link reaches the share, the host
+enforces the share's mode and its denied, allowed, and writable paths, and
+accesses host files as the identity that `--mount-owner` selects. Guest
+mount flags are therefore not a security boundary, and the access policy adds
+no guest configuration. Before OpenVMM starts, NVX rejects a third share and
+policy paths outside their share. It also rejects guest targets or host
+directories that equal or contain one another, because one share could
+otherwise hide the other or reach its files under a different policy.
+[Machine and device ABI](machine-and-device-abi.md#filesystem) defines the
+device contract.
+
+OpenVMM appends one `virtfs_dir=`, `virtfs_tag=`, `virtfs_mode=` triplet per
+share, in slot order. The init agent parses every triplet before it mounts
+any, so a malformed bootstrap mounts nothing. It creates each target inside
+the container root one component at a time and refuses a path that crosses a
+symbolic link, so an image layer cannot redirect a share outside that root.
+It also refuses a repeated tag, overlapping targets, and targets that the
+container entry helper later mounts or binds over, where the runtime would
+hide the share or write into it. Each share is mounted with its mode and
+`nosuid,nodev`, and the workload's private mount namespace inherits it. Any
+refusal or mount failure aborts the sandbox with status 125 instead of
+starting the workload without its shares. A managed sandbox records its
+shares when it is provisioned and reattaches them on every start.
+[Live host-directory shares](../run.md#live-host-directory-shares) describes
+the options and their rules.
 
 ## Image preparation and distribution (Proposed)
 
@@ -118,8 +163,9 @@ as one partitioned disk, would make each combination a separate cache object.
 Compressed EROFS reduces distribution size and the host's cached image bytes;
 decompression is performed by the guest kernel as blocks are read. A FUSE
 daemon and guest-side lazy-pull agent are not required for these rootfs layers.
-The optional HostFs device remains useful for a live host export and is a
-separate feature, not the container image-delivery path.
+The optional HostFs devices remain useful for
+[live host shares](#live-host-shares) and are a separate feature, not the
+container image-delivery path.
 
 The converter must synthesize OCI deletions as overlay whiteouts and opaque
 directory markers. It must apply a deny-by-default metadata policy to every
@@ -317,8 +363,8 @@ cannot enter the directory, the agent writes a diagnostic to the workload's
 standard error and refuses the request with the `cwd-failed` category and the
 error number as status, so nothing runs in another directory.
 
-Without sandbox layers, host directories reach workloads through OpenVMM's
-single virtio-fs export. The host exports the deepest directory that contains
+Without sandbox layers, the agent maps host directories for workloads from
+one virtio-fs export. The host exports the deepest directory that contains
 every mapped path to `/run/nvx/hostfs/root`; before it accepts control traffic,
 the agent makes `/run/nvx/hostfs` root-only and bind-mounts each mapped path
 named by an `nvx_map=SOURCE,TARGET,ro|rw` kernel token (percent-encoded paths,
