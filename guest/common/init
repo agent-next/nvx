@@ -178,6 +178,8 @@ if [ -n "$nip" ]; then
     nmask=$(sed -n 's/.*virtnet_mask=\([^ ]*\).*/\1/p' /proc/cmdline)
     ngw=$(sed -n 's/.*virtnet_gw=\([^ ]*\).*/\1/p' /proc/cmdline)
     ndns=$(sed -n 's/.*virtnet_dns=\([^ ]*\).*/\1/p' /proc/cmdline)
+    nip6=$(sed -n 's/.*virtnet_ip6=\([^ ]*\).*/\1/p' /proc/cmdline)
+    ngw6=$(sed -n 's/.*virtnet_gw6=\([^ ]*\).*/\1/p' /proc/cmdline)
     virtnet_error() {
         echo "virtnet: $*" >&2
     }
@@ -199,6 +201,18 @@ if [ -n "$nip" ]; then
         virtnet_error "no network interface found after 30s"
     else
         [ -n "$nmask" ] || nmask=255.255.255.0
+        if [ -n "$nip6" ]; then
+            # Besides the kernel's link-local address, the static identity is
+            # the link's only IPv6 configuration: the interface neither
+            # solicits routers nor autoconfigures addresses from their
+            # advertisements, and needs no duplicate address detection on its
+            # private link.
+            for nsetting in accept_ra autoconf accept_dad; do
+                if ! echo 0 >"/proc/sys/net/ipv6/conf/$ndev/$nsetting"; then
+                    virtnet_error "failed to disable IPv6 $nsetting on $ndev"
+                fi
+            done
+        fi
         if ! ifconfig "$ndev" "$nip" netmask "$nmask" up; then
             virtnet_error "failed to configure $ndev as $nip/$nmask"
         fi
@@ -207,6 +221,14 @@ if [ -n "$nip" ]; then
             route add -host "$ngw" dev "$ndev" 2>/dev/null
             if ! route add default gw "$ngw" dev "$ndev"; then
                 virtnet_error "failed to install standalone default route via $ngw"
+            fi
+        fi
+        if [ -n "$nip6" ]; then
+            if ! busybox ip -6 addr add "$nip6" dev "$ndev"; then
+                virtnet_error "failed to configure $ndev as $nip6"
+            elif [ -n "$ngw6" ] &&
+                ! busybox ip -6 route add default via "$ngw6" dev "$ndev"; then
+                virtnet_error "failed to install IPv6 default route via $ngw6"
             fi
         fi
 

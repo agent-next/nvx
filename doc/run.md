@@ -124,6 +124,18 @@ responses to guest-initiated connections remain available, while new inbound
 connections do not. The portable profile supports egress `allow` or `deny` but
 rejects ingress `allow` before the workload starts.
 
+The NIC is dual-stack. The guest's IPv6 address embeds its IPv4 address in the
+unique local prefix `fd00::/96`, with a prefix of 96 plus the IPv4 prefix, and
+its IPv6 gateway embeds the IPv4 gateway in the same way: `10.0.0.2/24` gives
+the guest `fd00::a00:2/120` behind the gateway `fd00::a00:1`. The guest
+configures both identities statically; it neither solicits router
+advertisements nor autoconfigures addresses from them, so its only other IPv6
+address is the kernel's link-local one in `fe80::/64`. Like the IPv4 gateway,
+the IPv6 gateway answers ICMPv6 echo requests and maps TCP and UDP flows onto
+host loopback, here `::1`, when host-loopback access is allowed. Because the
+guest's only IPv6 source address beyond its link is a unique local one,
+standard address selection prefers IPv4 for destinations that have both.
+
 For destination and port rules, select an explicit default and repeat generic
 allow/deny options:
 

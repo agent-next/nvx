@@ -2553,6 +2553,56 @@ class MicrovmTests(unittest.TestCase):
         self.assertIn("nc -u -w 1 10.0.0.1 8444", script)
         self.assertIn("http://10.0.0.1:8443/proxy", script)
 
+    def test_host_loopback_allow_waits_for_a_dual_stack_listener(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        header = "  sl  local_address rem_address st\n"
+        listener = (
+            f"   0: {'0' * 32}:1F90 {'0' * 32}:0000 0A 00000000:00000000 00:00000000\n"
+        )
+        for label, tcp6, expected, marker in (
+            ("listed", header + listener, 0, "NVX-HOST-LOOPBACK-ALLOW-OK"),
+            ("missing", header, 95, "NVX-HOST-LOOPBACK-FAIL code=95"),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "proc" / "net").mkdir(parents=True)
+                (root / "proc" / "net" / "tcp").write_text(header, encoding="utf-8")
+                (root / "proc" / "net" / "tcp6").write_text(tcp6, encoding="utf-8")
+                script = (
+                    microvm_tests._render_script(
+                        "host-loopback-policy.sh.in",
+                        MODE="allow",
+                        GATEWAY_IPV4="10.0.0.1",
+                        GENERAL_PORT="8444",
+                        PROXY_PORT="8443",
+                        GUEST_PORT="8080",
+                    )
+                    .replace("nvx-exit", "nvx_exit")
+                    .replace("/proc/net/", f"{root.as_posix()}/proc/net/")
+                    .replace(
+                        "/tmp/nvx-host-loopback-inbound",
+                        f"{root.as_posix()}/nvx-host-loopback-inbound",
+                    )
+                )
+                result = subprocess.run(
+                    [shell, "-s"],
+                    input=(
+                        "wget() { echo NVX-HOST-LOOPBACK-GENERAL; }\n"
+                        "nc() { sleep 0.3; echo NVX-HOST-LOOPBACK-INBOUND; }\n"
+                        'nvx_exit() { exit "$1"; }\n' + script
+                    ),
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode, expected, result.stdout + result.stderr
+                )
+                self.assertIn(marker, result.stdout)
+
     @staticmethod
     def _outcome_report(
         backend: str,

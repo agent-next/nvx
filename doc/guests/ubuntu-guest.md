@@ -45,7 +45,7 @@ what Ubuntu userland needs on this machine:
 
 Its [patches](../../kernel/patches) add the xe9 early and interactive consoles
 and the shared virtio-mmio interrupt status. The
-[kernel configuration](../../kernel/config-microvm) omits PCI, IPv6, user
+[kernel configuration](../../kernel/config-microvm) omits PCI, user
 namespaces, fanotify, and SquashFS. It enables module support only so that
 strict module memory protection keeps runtime code read-only; NVX ships no
 modules, and `/init` disables module loading before it starts any other
@@ -111,9 +111,10 @@ measured minimum. A restore takes the guest from the captured RAM and machine
 contract, so it needs no guest selection.
 
 The initramfs supports the console, `nvx_exec`, one-shot and managed
-lifecycles, static IPv4 networking, HostFs, SMP, and blockless snapshots,
-including the guest obligations of the time ABI. The test harness rejects the
-`console-snapshot` scenario for Ubuntu instead of substituting Alpine.
+lifecycles, static IPv4 and IPv6 networking, HostFs, SMP, and blockless
+snapshots, including the guest obligations of the time ABI. The test harness
+rejects the `console-snapshot` scenario for Ubuntu instead of substituting
+Alpine.
 
 ## Ubuntu sandbox layer
 
