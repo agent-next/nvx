@@ -218,14 +218,27 @@ fn port_range(protocol: Protocol, end: u16) -> NetworkRule {
     rule
 }
 
+/// A rule with `count` ranges that a port separates, so each needs its own OpenVMM rule.
+fn separate_port_ranges(protocol: Protocol, count: u16) -> NetworkRule {
+    let mut rule = NetworkRule::to("192.0.2.0/24");
+    rule.ports = (0..count)
+        .map(|index| NetworkPort {
+            protocol,
+            port: Some(3 * index + 1),
+            end_port: Some(3 * index + 2),
+        })
+        .collect();
+    rule
+}
+
 #[test]
 fn provision_validation_rejects_backend_policies_before_probing() {
     let (directory, client) = client();
     let before = state_entries(&directory);
     for request in [
         network_request(NetworkRule::to("::/0")),
-        network_request(port_range(Protocol::Tcp, 257)),
-        network_request(port_range(Protocol::Any, 129)),
+        network_request(separate_port_ranges(Protocol::Tcp, 257)),
+        network_request(separate_port_ranges(Protocol::Any, 129)),
     ] {
         assert_eq!(
             client.validate_provision(&request).unwrap_err().code(),
@@ -264,8 +277,10 @@ fn validation_is_side_effect_free_and_host_checks_remain_in_operations() {
     let before = state_entries(&directory);
     for request in [
         ProvisionRequest::new(),
-        network_request(port_range(Protocol::Tcp, 256)),
-        network_request(port_range(Protocol::Any, 128)),
+        network_request(port_range(Protocol::Tcp, 65535)),
+        network_request(port_range(Protocol::Any, 65535)),
+        network_request(separate_port_ranges(Protocol::Tcp, 256)),
+        network_request(separate_port_ranges(Protocol::Any, 128)),
         network_request(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Tcp)),
         network_request(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Udp)),
         network_request(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Icmp)),

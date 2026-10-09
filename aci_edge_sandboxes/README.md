@@ -645,17 +645,18 @@ and deny rules; deny rules take precedence. Each rule lists destination
 networks (`to`, each a CIDR with optional `except` sub-networks) and destination
 `ports` (protocol, `port`, optional `endPort`). An empty `to` matches every
 destination, and an empty `ports` matches every protocol and port. A `tcp` or
-`udp` entry without a `port` matches every port of that protocol, an `icmp`
-entry matches ICMP alone, and `any` matches every protocol or, with a port,
-TCP and UDP on that port.
+`udp` entry without a `port` matches every port of that protocol, one with a
+`port` and an `endPort` matches every port from `port` through `endPort`,
+an `icmp` entry matches ICMP alone, and `any` matches every protocol or, with a
+port or a port range, TCP and UDP on those ports.
 
 Rules are expanded into OpenVMM rules exactly: exceptions are subtracted from
-their networks, port ranges become one rule per port, and protocol `any` with a
-port becomes a TCP and a UDP rule. IPv6 networks and rules that would expand to
-more than 256 OpenVMM rules are rejected. Egress denied without allow rules,
-with ingress denied, attaches no network device; otherwise the guest gets
-`10.0.0.2/24` behind the profile's NAT gateway `10.0.0.1`, which also serves
-DNS.
+their networks, a port range becomes one OpenVMM range rule for each network,
+and protocol `any` with a port or a port range becomes a TCP and a UDP rule.
+IPv6 networks and rules that would expand to more than 256 OpenVMM rules are
+rejected. Egress denied without allow rules, with ingress denied, attaches no
+network device; otherwise the guest gets `10.0.0.2/24` behind the profile's NAT
+gateway `10.0.0.1`, which also serves DNS.
 
 ### Idempotence and concurrency
 
