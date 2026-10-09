@@ -1582,7 +1582,7 @@ class CliTests(unittest.TestCase):
             layer.write_bytes(b"layer")
             scratch.write_bytes(b"scratch")
             policy.write_text(
-                '{"allow":[{"cidr":"192.0.2.0/24","protocol":"tcp"}]}',
+                '{"allow":[{"cidr":"192.0.2.0/24","protocol":"icmp","port":8}]}',
                 encoding="utf-8",
             )
             args = nvx.parse_args(
