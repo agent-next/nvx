@@ -1203,7 +1203,9 @@ class FilesystemOwnerTests(unittest.TestCase):
         self.assertNotIn("case owned in", scripts[0])
         self.assertEqual(scripts[0].count("case denied in"), 2)
         self.assertIn("other_group=4444", scripts[0])
-        with self.assertRaisesRegex(RuntimeError, "cannot drop its supplementary groups"):
+        with self.assertRaisesRegex(
+            RuntimeError, "cannot drop its supplementary groups"
+        ):
             run_scenario(guest_writes=True)
 
     def test_expectations_derive_guest_root_from_each_capability(self):
