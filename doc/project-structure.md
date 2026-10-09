@@ -87,7 +87,8 @@ nvx/
 |   |-- config-microvm           MicroVM kernel configuration
 |   `-- config-microvm-debug     CI debug-kernel fragment (watchdogs on)
 |-- aci_edge_sandboxes/          Rust crate `aci_edge_sandboxes` for the state-aware sandbox API
-|   |-- src/                     Facade, contract model, and backends
+|   |-- model/                   Serializable contract and wire-model crate
+|   |-- src/                     Facade and backends
 |   |   |-- openvmm/             Default backend that drives the openvmm binary
 |   |   `-- bin/                 aci-edge-sandboxes-fake-openvmm test double
 |   |-- examples/                Runnable lifecycle example
