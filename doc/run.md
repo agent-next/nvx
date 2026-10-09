@@ -142,8 +142,11 @@ allow/deny options:
   --network-egress-deny 140.82.114.0/24:tcp:443
 ```
 
-Rules match IPv4 addresses or CIDRs and may add one TCP or UDP destination
-port. Deny matches take precedence over allow matches.
+Rules match IPv4 addresses or CIDRs and may select one protocol: `tcp`, `udp`,
+or `icmp`. A TCP or UDP rule may add one destination port; without a port, it
+matches every port of that protocol. ICMP rules take no port. For example,
+`192.0.2.0/24:udp` matches UDP on every port, and `192.0.2.1:icmp` matches ICMP
+but not TCP or UDP. Deny matches take precedence over allow matches.
 
 NVX can lower inclusive TCP/UDP port ranges and rule-local IPv4 exclusions to
 those native rules:

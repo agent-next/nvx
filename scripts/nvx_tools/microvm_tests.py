@@ -2083,7 +2083,7 @@ def run_l3_l4_egress_policy(
                     "--network-egress",
                     "deny",
                     "--network-egress-allow",
-                    "192.0.2.1:icmp:443",
+                    "192.0.2.1:sctp:443",
                 ),
                 b"invalid egress transport",
             ),
