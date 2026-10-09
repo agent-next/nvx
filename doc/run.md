@@ -143,10 +143,15 @@ allow/deny options:
 ```
 
 Rules match IPv4 addresses or CIDRs and may select one protocol: `tcp`, `udp`,
-or `icmp`. A TCP or UDP rule may add one destination port; without a port, it
-matches every port of that protocol. ICMP rules take no port. For example,
-`192.0.2.0/24:udp` matches UDP on every port, and `192.0.2.1:icmp` matches ICMP
-but not TCP or UDP. Deny matches take precedence over allow matches.
+or `icmp`. A TCP or UDP rule may add one destination port, or an inclusive
+range of them written `FIRST-LAST`; without a port, it matches every port of
+that protocol. Ports are `1` through `65535`, and a range cannot end below its
+first port. ICMP rules take no port. For example, `192.0.2.0/24:udp` matches
+UDP on every port, `192.0.2.1:tcp:8000-8010` matches TCP ports 8000 through
+8010 but not UDP, and `192.0.2.1:icmp` matches ICMP but not TCP or UDP. Deny
+matches take precedence over allow matches, so adding
+`--network-egress-deny 192.0.2.1:tcp:8005` keeps port 8005 blocked inside that
+range.
 
 NVX can lower protocol selectors, inclusive TCP/UDP port ranges, and rule-local
 IPv4 exclusions to those native rules:
