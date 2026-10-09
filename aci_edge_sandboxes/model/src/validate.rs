@@ -8,13 +8,14 @@
 //! [`ErrorCode::PolicyValidation`]: crate::ErrorCode::PolicyValidation
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::capabilities::Capabilities;
 use crate::cidr::Cidr;
 use crate::error::{Error, Result};
 use crate::model::{
-    Access, Command, ExecRequest, FilesystemPolicy, NetworkRule, Protocol, ProvisionRequest,
-    StdinMode, duration_millis,
+    Access, Command, ExecRequest, FilesystemPolicy, NetworkRule, ProcessSpec, Protocol,
+    ProvisionRequest, StdinMode, duration_millis,
 };
 use crate::spec::{self, ImageSource, SandboxSpec};
 
@@ -292,6 +293,15 @@ pub fn exec_structure(request: &ExecRequest) -> Result<()> {
             ));
         }
         no_nul(entry, "process.env")?;
+    }
+    // Compare the exact duration: whole milliseconds would drop a fraction above the maximum.
+    if let Some(timeout) = process.timeout
+        && timeout > Duration::from_millis(ProcessSpec::MAX_TIMEOUT_MS)
+    {
+        return Err(Error::malformed_request(format!(
+            "process.timeout must not exceed {} ms",
+            ProcessSpec::MAX_TIMEOUT_MS
+        )));
     }
     Ok(())
 }
@@ -676,6 +686,25 @@ mod tests {
             ExecRequest::command_line("echo").with_envs(Vec::<String>::new()),
         ] {
             exec_structure(&request).unwrap();
+        }
+    }
+
+    #[test]
+    fn exec_structure_bounds_timeouts_to_the_mxc_range() {
+        let request = |timeout| ExecRequest::command_line("true").with_timeout(timeout);
+        for millis in [0, 3_600_001, 86_400_000, ProcessSpec::MAX_TIMEOUT_MS] {
+            exec_structure(&request(Duration::from_millis(millis))).unwrap();
+        }
+        // Even a fraction of a millisecond above the maximum is refused.
+        let maximum = Duration::from_millis(ProcessSpec::MAX_TIMEOUT_MS);
+        for timeout in [
+            maximum + Duration::from_nanos(1),
+            maximum + Duration::from_millis(1),
+            Duration::MAX,
+        ] {
+            let error = exec_structure(&request(timeout)).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::MalformedRequest, "{timeout:?}");
+            assert!(error.message().contains("4294967295"), "{error}");
         }
     }
 

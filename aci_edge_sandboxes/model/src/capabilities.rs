@@ -58,7 +58,8 @@ pub struct ExecCapabilities {
     pub clear_default_env: bool,
     /// Runs multiple executions against one sandbox simultaneously instead of serializing them.
     pub concurrent: bool,
-    /// Largest accepted `process.timeout`, in milliseconds. `None` means unbounded.
+    /// Largest accepted `process.timeout`, in milliseconds. `None` leaves only the contract's
+    /// limit, [`ProcessSpec::MAX_TIMEOUT_MS`](crate::ProcessSpec::MAX_TIMEOUT_MS).
     pub max_timeout_ms: Option<u64>,
     /// Largest combined stdout and stderr volume of one execution, in bytes. `None` means
     /// unbounded.
