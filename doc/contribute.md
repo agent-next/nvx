@@ -101,10 +101,11 @@ The scenarios that drive the public `nvx.py sandbox` commands live in
 registers them.
 
 Unit tests for the host tooling live in `scripts/test_*.py`. The
-`aci_edge_sandboxes` keeps unit tests alongside its Rust source and integration tests in `aci_edge_sandboxes/tests`, and
-`scripts/nvx.py test-aci-edge-sandboxes --backend BACKEND` runs its lifecycle
-test on a real hypervisor. [Validation](design/validation.md) describes what
-the OpenVMM VMM tests and the NVX microVM suite cover.
+`aci_edge_sandboxes` crate keeps unit tests alongside its Rust source and
+integration tests in `aci_edge_sandboxes/tests`. The
+`scripts/nvx.py test-aci-edge-sandboxes --backend BACKEND` command runs all
+ignored `openvmm_e2e` tests on a real hypervisor. [Validation](design/validation.md)
+describes what the OpenVMM VMM tests and the NVX microVM suite cover.
 
 ## OpenVMM
 
