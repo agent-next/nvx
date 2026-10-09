@@ -139,6 +139,7 @@ nvx/
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
 |   |-- publish_development_release.py Development release publisher run by CI
 |   `-- test_*.py                Python tooling unit tests
+|-- SECURITY.md                 Microsoft security vulnerability reporting policy
 |-- .dockerignore                Docker build-context exclusions
 |-- .gitattributes               Git path attributes
 |-- .gitignore                   Generated-file exclusions
