@@ -193,6 +193,13 @@ impl SetupConfig {
         self
     }
 
+    /// Sets the image settings.
+    #[must_use]
+    pub fn with_images(mut self, images: ImageSettings) -> Self {
+        self.images = images;
+        self
+    }
+
     /// Sets the diagnostic switches.
     #[must_use]
     pub fn with_diagnostics(mut self, diagnostics: Diagnostics) -> Self {
@@ -521,12 +528,76 @@ pub struct ImageSettings {
     /// registered digests. Registry references are reserved for a later version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefetch: Vec<ImageSource>,
+    /// How a host that pulls registry references materializes them.
+    #[serde(default, skip_serializing_if = "ReferenceSettings::is_default")]
+    pub references: ReferenceSettings,
 }
 
 impl ImageSettings {
+    /// Sets how the host materializes registry references.
+    #[must_use]
+    pub fn with_references(mut self, references: ReferenceSettings) -> Self {
+        self.references = references;
+        self
+    }
+
     fn validate(&self) -> Result<()> {
         for (index, image) in self.prefetch.iter().enumerate() {
             image.validate(&format!("setup images.prefetch[{index}]"))?;
+        }
+        self.references.validate()
+    }
+}
+
+/// How a host that pulls registry references materializes them.
+///
+/// Such a host converts an [`ImageSource::Reference`] into a local disk image with an external
+/// tool the first time a sandbox uses it, and caches the result by the reference's text: later
+/// sandboxes with the same reference boot the cached image, and the host does not check a tag
+/// again. A moving tag such as `latest` therefore keeps naming the content that was first pulled;
+/// use a version tag or a digest (`repository@sha256:…`) to control what a sandbox boots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReferenceSettings {
+    /// Longest time that materializing one reference may take, in milliseconds. The host abandons
+    /// a pull that takes longer.
+    #[serde(default = "default_pull_timeout_ms")]
+    pub pull_timeout_ms: u64,
+}
+
+/// Default limit on materializing one reference: 30 minutes.
+pub const DEFAULT_PULL_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+fn default_pull_timeout_ms() -> u64 {
+    DEFAULT_PULL_TIMEOUT_MS
+}
+
+impl Default for ReferenceSettings {
+    fn default() -> Self {
+        Self {
+            pull_timeout_ms: default_pull_timeout_ms(),
+        }
+    }
+}
+
+impl ReferenceSettings {
+    /// Sets the longest time that materializing one reference may take, in milliseconds.
+    #[must_use]
+    pub fn with_pull_timeout_ms(mut self, pull_timeout_ms: u64) -> Self {
+        self.pull_timeout_ms = pull_timeout_ms;
+        self
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.pull_timeout_ms == 0 || self.pull_timeout_ms > Timeouts::MAX_MS {
+            return Err(Error::malformed_request(format!(
+                "setup images.references.pullTimeoutMs must be between 1 and {}",
+                Timeouts::MAX_MS
+            )));
         }
         Ok(())
     }
@@ -625,6 +696,30 @@ mod tests {
         assert!(config.guest_session.hold);
         assert_eq!(config.defaults, SandboxDefaults::default());
         assert_eq!(config.exec, ExecSettings::default());
+        assert_eq!(config.images, ImageSettings::default());
+        assert_eq!(
+            config.images.references.pull_timeout_ms,
+            DEFAULT_PULL_TIMEOUT_MS
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn reference_settings_are_omitted_until_set_and_round_trip() {
+        let config = SetupConfig::new("/var/lib/nvx", files());
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("references"), "{json}");
+
+        let config = config.with_images(
+            ImageSettings::default()
+                .with_references(ReferenceSettings::default().with_pull_timeout_ms(60_000)),
+        );
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains(r#""references":{"pullTimeoutMs":60000}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<SetupConfig>(&json).unwrap(), config);
         config.validate().unwrap();
     }
 
@@ -672,6 +767,15 @@ mod tests {
         let mut config = SetupConfig::new("/var/lib/nvx", files());
         config.defaults.resources.memory_mib = None;
         bad.push(config);
+        for references in [
+            ReferenceSettings::default().with_pull_timeout_ms(0),
+            ReferenceSettings::default().with_pull_timeout_ms(Timeouts::MAX_MS + 1),
+        ] {
+            bad.push(
+                SetupConfig::new("/var/lib/nvx", files())
+                    .with_images(ImageSettings::default().with_references(references)),
+            );
+        }
         for config in bad {
             let error = config.validate().unwrap_err();
             assert_eq!(error.code(), ErrorCode::MalformedRequest, "{config:?}");

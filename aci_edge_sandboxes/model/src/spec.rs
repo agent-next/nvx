@@ -114,7 +114,8 @@ impl SandboxSpec {
 #[non_exhaustive]
 pub enum ImageSource {
     /// A container image reference, such as `registry/repository:tag` or
-    /// `registry/repository@sha256:…`.
+    /// `registry/repository@sha256:…`. A host that pulls references caches each one by its text
+    /// and does not check a tag again; see [`ReferenceSettings`](crate::ReferenceSettings).
     Reference(String),
     /// An image already registered with the backend, by content.
     Digest(ImageId),
