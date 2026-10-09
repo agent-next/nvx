@@ -126,6 +126,13 @@ Check both Ubuntu outputs for deterministic rebuilds with:
 python3 scripts/nvx.py verify-guest-determinism --guest ubuntu
 ```
 
+Azure Linux builds only in Docker and adds:
+
+```text
+build/initramfs-azurelinux.cpio.gz
+build/initramfs-azurelinux.cpio.gz.packages.json
+```
+
 Run the two test layers separately:
 
 ```bash
@@ -254,10 +261,15 @@ and SHA-256. The debug kernel is a CI artifact and is never packaged. The
 `build-guest-artifacts` action caches and builds it only when its
 `debug-kernel` input is `true`.
 
-Release packaging stages and verifies a complete output before replacing an
-existing `dist/` version. Its `SOURCE-MANIFEST.json` records the package
-version and exact hashes for OpenVMM, Linux, the generated kernel config, and
-the unchanged Alpine initramfs. The OpenVMM section advertises microVM ABI 2,
+Release packaging needs the OpenVMM binary, the guest artifacts in the layout
+below, and the OpenVMM, kernel, and Alpine initramfs provenance sidecars, so run
+`build-openvmm` and `build-guest --guest all` first. A source-inclusive package
+does not need the Azure Linux artifacts. Packaging stages and verifies a
+complete output before replacing an existing `dist/` version, which requires
+`--force`. Its `SOURCE-MANIFEST.json` records the package version and exact
+hashes for OpenVMM, Linux, the generated kernel config, each packaged guest
+initramfs and its package manifest, and the Ubuntu distro layer and its
+manifest. The OpenVMM section advertises microVM ABI 2,
 control-session protocol 1, and contract
 `nvx-microvm-v2-control-v2`; product guest-agent metadata is intentionally not
 part of this platform manifest.
@@ -270,6 +282,12 @@ guest/vmlinux
 guest/vmlinux.config
 guest/initramfs.cpio.gz
 guest/initramfs.cpio.gz.packages.json
+guest/initramfs-ubuntu.cpio.gz
+guest/initramfs-ubuntu.cpio.gz.packages.json
+guest/ubuntu-distro.erofs
+guest/ubuntu-distro.erofs.manifest.json
+guest/initramfs-azurelinux.cpio.gz
+guest/initramfs-azurelinux.cpio.gz.packages.json
 provenance/openvmm.provenance.json
 provenance/initramfs.provenance.json
 provenance/vmlinux.provenance.json
