@@ -690,12 +690,13 @@ fn environments_leave_the_workload_contained() {
     assert_eq!(leftover.stdout, b"none\n");
 }
 
+/// Reports whether TCP reaches the portable profile's DNS service on the guest's gateway. Probing
+/// it needs no Internet access, so the tests that use it are deterministic.
+const GATEWAY_TCP_PROBE: &str = "nc -w 3 10.0.0.1 53 </dev/null && echo reached || echo blocked";
+
 #[test]
 #[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
 fn network_policies_are_enforced() {
-    // The guest reaches the portable profile's DNS service on its gateway over TCP. Probing it
-    // needs no Internet access, so the test is deterministic.
-    const PROBE: &str = "nc -w 3 10.0.0.1 53 </dev/null && echo reached || echo blocked";
     let (nvx, backend) = client("network");
     let cases: [(&str, NetworkPolicy, &[u8]); 5] = [
         ("no device", NetworkPolicy::deny_all(), b"lo\n"),
@@ -736,9 +737,91 @@ fn network_policies_are_enforced() {
         let command = if name == "no device" {
             "ls /sys/class/net"
         } else {
-            PROBE
+            GATEWAY_TCP_PROBE
         };
         let output = shell(&nvx, id(&sandbox), command);
+        assert_eq!(output.stdout, expected, "{name}: {output:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
+fn network_protocol_selectors_are_enforced() {
+    // Unprivileged workloads cannot send ICMP, and UDP replies from the gateway's DNS service
+    // depend on the host resolver, so every selector is observed through the TCP probe: a rule
+    // for another protocol must neither admit nor block it.
+    let (nvx, backend) = client("protocol");
+    let gateway = || NetworkRule::to("10.0.0.1");
+    let allow = |rule: NetworkRule| NetworkPolicy {
+        egress: EgressPolicy::new(Access::Deny).with_allow(rule),
+        ..NetworkPolicy::deny_all()
+    };
+    // The address-only allow rule admits the probe, so only deny precedence can block it.
+    let deny = |rule: NetworkRule| NetworkPolicy {
+        egress: EgressPolicy::new(Access::Deny)
+            .with_allow(gateway())
+            .with_deny(rule),
+        ..NetworkPolicy::deny_all()
+    };
+    let cases: [(&str, NetworkPolicy, &[u8]); 10] = [
+        (
+            "allow tcp",
+            allow(gateway().on_protocol(Protocol::Tcp)),
+            b"reached\n",
+        ),
+        (
+            "allow udp",
+            allow(gateway().on_protocol(Protocol::Udp)),
+            b"blocked\n",
+        ),
+        (
+            "allow icmp",
+            allow(gateway().on_protocol(Protocol::Icmp)),
+            b"blocked\n",
+        ),
+        (
+            "allow any on the port",
+            allow(gateway().on_port(Protocol::Any, 53)),
+            b"reached\n",
+        ),
+        (
+            "allow any on another port",
+            allow(gateway().on_port(Protocol::Any, 54)),
+            b"blocked\n",
+        ),
+        (
+            "deny tcp",
+            deny(gateway().on_protocol(Protocol::Tcp)),
+            b"blocked\n",
+        ),
+        (
+            "deny udp",
+            deny(gateway().on_protocol(Protocol::Udp)),
+            b"reached\n",
+        ),
+        (
+            "deny icmp",
+            deny(gateway().on_protocol(Protocol::Icmp)),
+            b"reached\n",
+        ),
+        (
+            "deny any on the port",
+            deny(gateway().on_port(Protocol::Any, 53)),
+            b"blocked\n",
+        ),
+        (
+            "deny any on another port",
+            deny(gateway().on_port(Protocol::Any, 54)),
+            b"reached\n",
+        ),
+    ];
+    for (name, policy, expected) in cases {
+        let sandbox = started(
+            &nvx,
+            &backend,
+            &ProvisionRequest::new().with_network(policy),
+        );
+        let output = shell(&nvx, id(&sandbox), GATEWAY_TCP_PROBE);
         assert_eq!(output.stdout, expected, "{name}: {output:?}");
     }
 }

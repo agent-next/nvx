@@ -222,15 +222,8 @@ fn port_range(protocol: Protocol, end: u16) -> NetworkRule {
 fn provision_validation_rejects_backend_policies_before_probing() {
     let (directory, client) = client();
     let before = state_entries(&directory);
-    let mut icmp = NetworkRule::to("192.0.2.0/24");
-    icmp.ports.push(NetworkPort {
-        protocol: Protocol::Icmp,
-        port: None,
-        end_port: None,
-    });
     for request in [
         network_request(NetworkRule::to("::/0")),
-        network_request(icmp),
         network_request(port_range(Protocol::Tcp, 257)),
         network_request(port_range(Protocol::Any, 129)),
     ] {
@@ -273,6 +266,9 @@ fn validation_is_side_effect_free_and_host_checks_remain_in_operations() {
         ProvisionRequest::new(),
         network_request(port_range(Protocol::Tcp, 256)),
         network_request(port_range(Protocol::Any, 128)),
+        network_request(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Tcp)),
+        network_request(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Udp)),
+        network_request(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Icmp)),
         ProvisionRequest::new().with_filesystem(FilesystemPolicy {
             readonly_paths: vec![directory.path().join("missing-mapped-file")],
             ..FilesystemPolicy::default()

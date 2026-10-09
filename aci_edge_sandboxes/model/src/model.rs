@@ -287,6 +287,17 @@ impl NetworkRule {
         });
         self
     }
+
+    /// Restricts the rule to `protocol` on every port.
+    #[must_use]
+    pub fn on_protocol(mut self, protocol: Protocol) -> Self {
+        self.ports.push(NetworkPort {
+            protocol,
+            port: None,
+            end_port: None,
+        });
+        self
+    }
 }
 
 /// A destination network of a [`NetworkRule`].
@@ -782,6 +793,19 @@ mod tests {
         assert_eq!(round_trip, policy);
         let port: NetworkPort = serde_json::from_str("{}").unwrap();
         assert_eq!(port.protocol, Protocol::Any);
+        // A protocol without a port matches every port of that protocol.
+        let rule = NetworkRule::to("192.0.2.1").on_protocol(Protocol::Icmp);
+        assert_eq!(
+            serde_json::to_value(&rule).unwrap(),
+            serde_json::json!({ "to": [{ "cidr": "192.0.2.1" }], "ports": [{ "protocol": "icmp" }] })
+        );
+        assert_eq!(
+            serde_json::from_str::<NetworkRule>(
+                r#"{ "to": [{ "cidr": "192.0.2.1" }], "ports": [{ "protocol": "icmp" }] }"#
+            )
+            .unwrap(),
+            rule
+        );
     }
 
     #[test]
