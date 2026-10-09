@@ -1351,19 +1351,26 @@ class CliTests(unittest.TestCase):
                     {
                         "allow": [
                             {
-                                "cidr": "192.0.2.0/24",
-                                "except": ["192.0.2.128/25"],
-                                "protocol": "tcp",
-                                "port": 8000,
-                                "endPort": 8001,
+                                "to": [
+                                    {
+                                        "cidr": "192.0.2.0/24",
+                                        "except": ["192.0.2.128/25"],
+                                    }
+                                ],
+                                "ports": [
+                                    {
+                                        "protocol": "tcp",
+                                        "port": 8000,
+                                        "endPort": 8001,
+                                    }
+                                ],
                             },
-                            {"cidr": "192.0.2.200/32"},
+                            {"to": [{"cidr": "192.0.2.200/32"}]},
                         ],
                         "deny": [
                             {
-                                "cidr": "192.0.2.0/24",
-                                "protocol": "tcp",
-                                "port": 8001,
+                                "to": [{"cidr": "192.0.2.0/24"}],
+                                "ports": [{"protocol": "tcp", "port": 8001}],
                             }
                         ],
                     }
@@ -1463,8 +1470,12 @@ class CliTests(unittest.TestCase):
                     {
                         "allow": [
                             {
-                                "cidr": "192.0.2.0/24",
-                                "except": ["192.0.2.128/25"],
+                                "to": [
+                                    {
+                                        "cidr": "192.0.2.0/24",
+                                        "except": ["192.0.2.128/25"],
+                                    }
+                                ],
                             }
                         ]
                     }
@@ -1513,18 +1524,25 @@ class CliTests(unittest.TestCase):
                     {
                         "allow": [
                             {
-                                "cidr": "192.0.2.0/24",
-                                "except": ["192.0.2.128/25"],
-                                "protocol": "tcp",
-                                "port": 8000,
-                                "endPort": 8001,
+                                "to": [
+                                    {
+                                        "cidr": "192.0.2.0/24",
+                                        "except": ["192.0.2.128/25"],
+                                    }
+                                ],
+                                "ports": [
+                                    {
+                                        "protocol": "tcp",
+                                        "port": 8000,
+                                        "endPort": 8001,
+                                    }
+                                ],
                             }
                         ],
                         "deny": [
                             {
-                                "cidr": "192.0.2.0/24",
-                                "protocol": "tcp",
-                                "port": 8001,
+                                "to": [{"cidr": "192.0.2.0/24"}],
+                                "ports": [{"protocol": "tcp", "port": 8001}],
                             }
                         ],
                     }
@@ -1582,7 +1600,8 @@ class CliTests(unittest.TestCase):
             layer.write_bytes(b"layer")
             scratch.write_bytes(b"scratch")
             policy.write_text(
-                '{"allow":[{"cidr":"192.0.2.0/24","protocol":"icmp","port":8}]}',
+                '{"allow":[{"to":[{"cidr":"192.0.2.0/24"}],'
+                '"ports":[{"protocol":"icmp","port":8}]}]}',
                 encoding="utf-8",
             )
             args = nvx.parse_args(

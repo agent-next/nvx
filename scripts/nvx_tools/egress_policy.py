@@ -16,13 +16,18 @@ MAX_RULES_PER_ACTION = 256
 MAX_POLICY_FILE_SIZE = 1024 * 1024
 _MAX_JSON_INTEGER_DIGITS = 64
 _ROOT_FIELDS = frozenset(("allow", "deny"))
-_RULE_FIELDS = frozenset(("cidr", "except", "protocol", "port", "endPort"))
+_MXC_RULE_FIELDS = frozenset(("to", "ports"))
+_PEER_FIELDS = frozenset(("cidr", "except"))
+_PORT_FIELDS = frozenset(("protocol", "port", "endPort"))
+_LEGACY_RULE_FIELDS = frozenset(("cidr", "except", "protocol", "port", "endPort"))
 _RULE_PROTOCOLS = ("tcp", "udp", "icmp", "any")
 # Protocols that a native rule can select on every port, and those with ports.
 _NATIVE_PROTOCOLS = ("icmp", "tcp", "udp")
 _PORT_PROTOCOLS = ("tcp", "udp")
 _AddressInterval = tuple[int, int]
 _AddressIntervals = tuple[_AddressInterval, ...]
+_PortSelector = tuple[str | None, int | None, int | None]
+_ALL_IPV4: _AddressIntervals = ((0, (1 << 32) - 1),)
 
 
 @dataclass(frozen=True)
@@ -149,17 +154,28 @@ def _subtract_exclusions(
     return _subtract_intervals((parent_interval,), _merge_intervals(parsed))
 
 
-def _parse_rule(value: object, description: str) -> tuple[_Rule, ...]:
-    rule = _object(value, description)
-    unknown = sorted(set(rule) - _RULE_FIELDS)
+def _parse_peer(value: object, description: str) -> _AddressIntervals:
+    peer = _object(value, description)
+    unknown = sorted(set(peer) - _PEER_FIELDS)
+    if unknown:
+        raise ScriptError(f"{description} has unknown field '{unknown[0]}'")
+    if "cidr" not in peer:
+        raise ScriptError(f"{description}.cidr is required")
+    parent = _network(peer["cidr"], f"{description}.cidr")
+    exclusions = _array(peer.get("except", []), f"{description}.except")
+    return _subtract_exclusions(parent, exclusions, description)
+
+
+def _parse_legacy_rule(rule: dict[str, object], description: str) -> tuple[_Rule, ...]:
+    unknown = sorted(set(rule) - _LEGACY_RULE_FIELDS)
     if unknown:
         raise ScriptError(f"{description} has unknown field '{unknown[0]}'")
     if "cidr" not in rule:
         raise ScriptError(f"{description}.cidr is required")
-    parent = _network(rule["cidr"], f"{description}.cidr")
-    exclusions = _array(rule.get("except", []), f"{description}.except")
-    addresses = _subtract_exclusions(parent, exclusions, description)
-
+    addresses = _parse_peer(
+        {field: rule[field] for field in ("cidr", "except") if field in rule},
+        description,
+    )
     if "protocol" not in rule:
         if "port" in rule or "endPort" in rule:
             raise ScriptError(f"{description}.port requires protocol")
@@ -179,6 +195,82 @@ def _parse_rule(value: object, description: str) -> tuple[_Rule, ...]:
         raise ScriptError(f"{description}.endPort cannot be below port")
     protocols = _PORT_PROTOCOLS if protocol == "any" else (protocol,)
     return tuple(_Rule(addresses, selected, start, end) for selected in protocols)
+
+
+def _parse_mxc_port(value: object, description: str) -> tuple[_PortSelector, ...]:
+    port = _object(value, description)
+    unknown = sorted(set(port) - _PORT_FIELDS)
+    if unknown:
+        raise ScriptError(f"{description} has unknown field '{unknown[0]}'")
+    protocol = port.get("protocol", "any")
+    if not isinstance(protocol, str) or protocol not in _RULE_PROTOCOLS:
+        raise ScriptError(f"{description}.protocol must be tcp, udp, icmp, or any")
+    if "port" not in port:
+        if "endPort" in port:
+            raise ScriptError(f"{description}.endPort requires port")
+        return (
+            (
+                None if protocol == "any" else protocol,
+                None,
+                None,
+            ),
+        )
+    if protocol == "icmp":
+        raise ScriptError(f"{description}.port is not supported with icmp")
+    start = _port(port["port"], f"{description}.port")
+    end = _port(port.get("endPort", start), f"{description}.endPort")
+    if end < start:
+        raise ScriptError(f"{description}.endPort cannot be below port")
+    protocols = _PORT_PROTOCOLS if protocol == "any" else (protocol,)
+    return tuple((selected, start, end) for selected in protocols)
+
+
+def _parse_mxc_rule(
+    rule: dict[str, object],
+    description: str,
+) -> tuple[_Rule, ...]:
+    unknown = sorted(set(rule) - _MXC_RULE_FIELDS)
+    if unknown:
+        raise ScriptError(f"{description} has unknown field '{unknown[0]}'")
+
+    addresses = _ALL_IPV4
+    if "to" in rule:
+        peers = _array(rule["to"], f"{description}.to")
+        if not peers:
+            raise ScriptError(f"{description}.to must contain at least one destination")
+        addresses = _merge_intervals(
+            interval
+            for index, peer in enumerate(peers)
+            for interval in _parse_peer(peer, f"{description}.to[{index}]")
+        )
+
+    selectors: list[_PortSelector] = [(None, None, None)]
+    if "ports" in rule:
+        ports = _array(rule["ports"], f"{description}.ports")
+        if not ports:
+            raise ScriptError(f"{description}.ports must contain at least one selector")
+        selectors = [
+            selector
+            for index, port in enumerate(ports)
+            for selector in _parse_mxc_port(port, f"{description}.ports[{index}]")
+        ]
+    return tuple(
+        _Rule(addresses, protocol, start_port, end_port)
+        for protocol, start_port, end_port in selectors
+    )
+
+
+def _parse_rule(value: object, description: str) -> tuple[_Rule, ...]:
+    rule = _object(value, description)
+    legacy = set(rule) & _LEGACY_RULE_FIELDS
+    mxc = set(rule) & _MXC_RULE_FIELDS
+    if legacy:
+        if mxc:
+            raise ScriptError(
+                f"{description} cannot mix MXC to/ports fields with legacy flat fields"
+            )
+        return _parse_legacy_rule(rule, description)
+    return _parse_mxc_rule(rule, description)
 
 
 def _intervals_to_networks(

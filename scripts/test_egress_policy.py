@@ -32,16 +32,24 @@ class EgressPolicyTests(unittest.TestCase):
             {
                 "allow": [
                     {
-                        "cidr": "192.0.2.7",
-                        "protocol": "tcp",
-                        "port": 8000,
-                        "endPort": 8002,
+                        "to": [{"cidr": "192.0.2.7"}],
+                        "ports": [
+                            {
+                                "protocol": "tcp",
+                                "port": 8000,
+                                "endPort": 8002,
+                            }
+                        ],
                     },
                     {
-                        "cidr": "198.51.100.0/24",
-                        "protocol": "udp",
-                        "port": 5000,
-                        "endPort": 5001,
+                        "to": [{"cidr": "198.51.100.0/24"}],
+                        "ports": [
+                            {
+                                "protocol": "udp",
+                                "port": 5000,
+                                "endPort": 5001,
+                            }
+                        ],
                     },
                 ]
             }
@@ -200,15 +208,23 @@ class EgressPolicyTests(unittest.TestCase):
             {
                 "allow": [
                     {
-                        "cidr": "192.0.2.0/24",
-                        "except": ["192.0.2.128/25"],
+                        "to": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "except": ["192.0.2.128/25"],
+                            }
+                        ],
                     },
-                    {"cidr": "192.0.2.200/32"},
+                    {"to": [{"cidr": "192.0.2.200/32"}]},
                 ],
                 "deny": [
                     {
-                        "cidr": "198.51.100.0/24",
-                        "except": ["198.51.100.128/25"],
+                        "to": [
+                            {
+                                "cidr": "198.51.100.0/24",
+                                "except": ["198.51.100.128/25"],
+                            }
+                        ],
                     }
                 ],
             }
@@ -219,6 +235,41 @@ class EgressPolicyTests(unittest.TestCase):
             ("192.0.2.0/25", "192.0.2.200/32"),
         )
         self.assertEqual(compiled.deny, ("198.51.100.0/25",))
+
+    def test_compiles_mxc_destination_and_port_unions(self):
+        compiled = self.compile(
+            {
+                "allow": [
+                    {
+                        "ports": [
+                            {"port": 53},
+                            {"protocol": "icmp"},
+                        ]
+                    }
+                ],
+                "deny": [
+                    {
+                        "to": [
+                            {"cidr": "198.51.100.0/25"},
+                            {"cidr": "198.51.100.128/25"},
+                        ],
+                        "ports": [
+                            {"protocol": "tcp", "port": 80},
+                            {"protocol": "udp", "port": 53},
+                        ],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(
+            compiled.allow,
+            ("0.0.0.0/0:icmp", "0.0.0.0/0:tcp:53", "0.0.0.0/0:udp:53"),
+        )
+        self.assertEqual(
+            compiled.deny,
+            ("198.51.100.0/24:tcp:80", "198.51.100.0/24:udp:53"),
+        )
 
     def test_deduplicates_overlapping_exclusions_and_collapses_safe_prefixes(self):
         compiled = self.compile(
@@ -266,12 +317,33 @@ class EgressPolicyTests(unittest.TestCase):
                     {
                         "allow": [
                             {
-                                "cidr": "192.0.2.0/24",
-                                "except": [excluded],
+                                "to": [
+                                    {
+                                        "cidr": "192.0.2.0/24",
+                                        "except": [excluded],
+                                    }
+                                ],
                             }
                         ]
                     }
                 )
+
+    def test_rejects_invalid_mxc_rule_shapes(self):
+        invalid_rules: tuple[object, ...] = (
+            {"to": list[object]()},
+            {"to": [dict[str, object]()]},
+            {"to": [{"cidr": "192.0.2.0/24", "unknown": True}]},
+            {"ports": list[object]()},
+            {"ports": [{"protocol": "icmp", "port": 8}]},
+            {"ports": [{"protocol": "ICMP"}]},
+            {"ports": [{"protocol": "sctp"}]},
+            {"ports": [{"endPort": 80}]},
+            {"to": [{"cidr": "192.0.2.0/24"}], "cidr": "192.0.2.0/24"},
+        )
+
+        for rule in invalid_rules:
+            with self.subTest(rule=rule), self.assertRaises(ScriptError):
+                self.compile({"allow": [rule]})
 
     def test_rejects_unknown_and_malformed_fields(self):
         invalid: tuple[object, ...] = (
