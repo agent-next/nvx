@@ -20,7 +20,7 @@ are build products or caches and are not part of the tracked source tree. The
 | `ubuntu` | Pinned Ubuntu supplemental binary-package lock |
 | `azurelinux` | Checksum-pinned Azure Linux supplemental RPM lock |
 | `aci_edge_sandboxes` | Rust crate `aci_edge_sandboxes`: state-aware sandbox API with an OpenVMM backend |
-| `openvmm` | OpenVMM Git submodule from `nanvix/openvmm` |
+| `openvmm` | Public OpenVMM Git submodule from `nanvix/openvmm`, tracking its `main` branch |
 | `data` | Tracked performance history and generated benchmark data |
 | `scripts/nvx_tools` | Implementation of the `nvx.py` commands |
 | `scripts/nvx.py` | Canonical build, run, test, benchmark, and packaging CLI |
