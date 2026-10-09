@@ -8,18 +8,23 @@ are build products or caches and are not part of the tracked source tree. The
 
 | Path | Purpose |
 | --- | --- |
+| `.github/workflows` | CI, release verification, adversarial campaign, and Copilot environment workflows |
+| `.github/actions` | Reusable local CI actions |
 | `.github/skills` | Copilot agent skills for common development workflows |
 | `.github/agents` | Bounded Copilot strategist definitions |
 | `.github/specula` | Incremental formal verification adapter and runner setup |
+| `doc` | User and contributor documentation |
+| `docker` | Reproducible guest build environment |
 | `kernel` | Reproducible configs and complete Linux patch series |
-| `guest` | Common guest sources plus Alpine-control-specific helpers |
+| `guest` | Common guest sources plus Alpine-control and Ubuntu shell helpers |
 | `ubuntu` | Pinned Ubuntu supplemental binary-package lock |
 | `azurelinux` | Checksum-pinned Azure Linux supplemental RPM lock |
 | `aci_edge_sandboxes` | Rust crate `aci_edge_sandboxes`: state-aware sandbox API with an OpenVMM backend |
-| `openvmm` | OpenVMM Git submodule from `nanvix/openvmm` |
+| `openvmm` | Public OpenVMM Git submodule from `nanvix/openvmm`, tracking its `main` branch |
 | `data` | Tracked performance history and generated benchmark data |
-| `scripts/nvx_tools` | Retained NVX build and benchmark implementation |
-| `scripts/nvx.py` | Canonical build, run, benchmark, and packaging CLI |
+| `scripts/nvx_tools` | Implementation of the `nvx.py` commands |
+| `scripts/nvx.py` | Canonical build, run, test, benchmark, and packaging CLI |
+| `scripts/setup` | Development host and GitHub Actions runner bootstrap scripts |
 | `scripts/nvx_adversarial_executor.py` | Credential-free adversarial executor protocol entry point |
 | `.cache/linux` | Generated verified/patched Linux tree; ignored by Git |
 | `build/sources` | Generated Linux, Alpine, and Ubuntu release sources; ignored by Git |
@@ -29,15 +34,25 @@ are build products or caches and are not part of the tracked source tree. The
 ```text
 nvx/
 |-- .github/                     GitHub automation and Copilot customizations
+|   |-- ISSUE_TEMPLATE/          CPU profile request issue form
 |   |-- actions/                 Reusable local CI actions
 |   |-- agents/                  Bounded Copilot strategist definitions
 |   |-- skills/                  Copilot development workflow skills
 |   |-- specula/                 Incremental formal verification integration
-|   |-- workflows/adversarial.yml Trusted scheduled/manual adversarial campaigns
-|   |-- workflows/ci.yml         Main build, test, and benchmark workflow
-|   `-- workflows/copilot-setup-steps.yml Copilot cloud agent environment
+|   |-- workflows/               GitHub Actions workflows
+|   |   |-- adversarial.yml      Trusted scheduled/manual adversarial campaigns
+|   |   |-- build-openvmm-binary.yml Reusable OpenVMM binary build
+|   |   |-- ci.yml               Main build, test, benchmark, and release workflow
+|   |   |-- copilot-code-review.yml Copilot code review environment
+|   |   |-- copilot-setup-steps.yml Copilot cloud agent environment
+|   |   |-- run-nvx-microvm-tests.yml Reusable NVX microVM test job
+|   |   |-- run-platform.yml     Reusable platform benchmark and package job
+|   |   `-- specula-release.yml  Specula verification of published releases
+|   |-- actionlint.yaml          Self-hosted runner labels for actionlint
+|   `-- copilot-instructions.md  Repository-wide Copilot instructions
+|-- .vscode/settings.json        Shared VS Code settings
 |-- guest/                       Guest-owned scripts and static helpers
-|   |-- common/                  Shared init, lifecycle, console, and test helpers
+|   |-- common/                  Shared init, agent, snapshot, time, and test helpers
 |   |-- alpine/                  Alpine-control container entry helpers
 |   `-- ubuntu/                  Ubuntu interactive-shell startup policy
 |-- ubuntu/
@@ -56,19 +71,24 @@ nvx/
 |   |-- benchmarks.md            Benchmark commands and measurement methodology
 |   |-- build.md                 Guest and OpenVMM build workflows
 |   |-- ci.md                    Continuous integration overview
+|   |-- contribute.md            Contribution guidelines
 |   |-- design.md                Design index
 |   |-- design/                  MicroVM, sandbox, and snapshot design chapters
 |   |-- distribution.md          Packaging and source delivery
+|   |-- guests/                  Guest userland chapters (Ubuntu)
+|   |-- openvmm-upstream-roadmap.md Plan for upstreaming the OpenVMM fork's microVM commits
 |   |-- project-structure.md     This guide
 |   |-- run.md                   Guest launch and host mapping
-|   `-- setup.md                 Initialization and development prerequisites
+|   |-- setup.md                 Initialization and development prerequisites
+|   `-- usage.md                 Complete nvx.py command and option reference
 |-- kernel/                      Linux configuration and NVX patch set
 |   |-- patches/                 Ordered patches applied to Linux
 |   |-- COPYING-LINUX            Linux copyright and license notice
 |   |-- config-microvm           MicroVM kernel configuration
 |   `-- config-microvm-debug     CI debug-kernel fragment (watchdogs on)
-|-- aci_edge_sandboxes/                      Rust crate `aci_edge_sandboxes` for the state-aware sandbox API
-|   |-- src/                     Facade, contract model, and backends
+|-- aci_edge_sandboxes/          Rust crate `aci_edge_sandboxes` for the state-aware sandbox API
+|   |-- model/                   Serializable contract and wire-model crate
+|   |-- src/                     Facade and backends
 |   |   |-- openvmm/             Default backend that drives the openvmm binary
 |   |   `-- bin/                 aci-edge-sandboxes-fake-openvmm test double
 |   |-- examples/                Runnable lifecycle example
@@ -78,26 +98,49 @@ nvx/
 |-- openvmm/                     OpenVMM Git submodule
 |-- scripts/                     Build, run, benchmark, and release tooling
 |   |-- nvx_tools/               Python implementation behind the NVX CLI
+|   |   |-- aci_edge_sandboxes_tests.py Real-hypervisor aci_edge_sandboxes lifecycle test harness
+|   |   |-- adversarial.py       Copilot controller and campaign coordinator
+|   |   |-- adversarial_broker.py Typed action catalog and replay journal
+|   |   |-- adversarial_cases/   Deterministic campaign catalogs
+|   |   |-- adversarial_executor.py Credential-free target executor
+|   |   |-- adversarial_oracles.py Independent canaries and watchdog
+|   |   |-- archive.py           Reproducible source and release archives
+|   |   |-- azurelinux.py        Azure Linux package lock and build-input identity
 |   |   |-- benchmark.py         OpenVMM benchmark coordinator
 |   |   |-- benchmark_scripts/   Shell programs and benchmark templates
 |   |   |-- build.py             Artifact build workflows
 |   |   |-- build_config.py      Per-invocation build configuration
 |   |   |-- build_constants.py   Grouped build pins, paths, and fixed defaults
-|   |   |-- performance.py       Performance commands
-|   |   |-- adversarial.py       Copilot controller and campaign coordinator
-|   |   |-- adversarial_broker.py Typed action catalog and replay journal
-|   |   |-- adversarial_executor.py Credential-free target executor
-|   |   |-- adversarial_oracles.py Independent canaries and watchdog
-|   |   |-- adversarial_cases/   Deterministic campaign catalogs
+|   |   |-- ci.py                CI change classification, required jobs, and OpenVMM tests
 |   |   |-- collect_alpine_sources.py Alpine source collection
 |   |   |-- collect_ubuntu_sources.py Ubuntu source collection
-|   |   |-- guests.py           Typed guest descriptors
-|   |   |-- aci_edge_sandboxes_tests.py     Real-hypervisor aci_edge_sandboxes lifecycle test harness
-|   |   |-- ubuntu.py           Verified Ubuntu rootfs and EROFS preparation
-|   |   `-- create_linux_source_archive.py Linux source packaging
-|   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
+|   |   |-- common.py            Shared process and configuration helpers
+|   |   |-- control_session.py   Control-session client for managed workloads
+|   |   |-- create_linux_source_archive.py Linux source packaging
+|   |   |-- development_release.py Resumable development release publication
+|   |   |-- doctor.py            Time ABI host qualification
+|   |   |-- egress_policy.py     Egress policy compiler for OpenVMM's rule grammar
+|   |   |-- guests.py            Typed guest descriptors
+|   |   |-- host_time_probe.rs   Host TSC probe that doctor builds and runs
+|   |   |-- managed_exec_tests.py Managed workload environment, directory, and timeout tests
+|   |   |-- microvm_test_scripts/ Guest workloads for the microVM tests
+|   |   |-- microvm_tests.py     NVX microVM correctness tests
+|   |   |-- openvmm_process.py   Foreground OpenVMM process control for tests
+|   |   |-- performance.py       CI performance collection, persistence, and gates
+|   |   |-- process_supervisor.py Linux supervisor for one owned process tree
+|   |   |-- release.py           Release download, source collection, and packaging
+|   |   |-- sandbox.py           Host-side sandbox launch contract
+|   |   |-- sandbox_lifecycle.py Managed sandbox lifecycle operations
+|   |   |-- sandbox_lifecycle_tests.py Managed sandbox lifecycle and security tests
+|   |   |-- time_abi.py          Time ABI harness checks and CPU profile guidance
+|   |   `-- ubuntu.py            Verified Ubuntu rootfs and EROFS preparation
+|   |-- setup/                   Host and Actions runner bootstrap scripts
+|   |-- nvx-hosts.example.json   Template for the ignored .nvx-hosts.json
 |   |-- nvx.py                   Supported command-line entry point
-|   `-- test_*.py                Python tooling tests
+|   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
+|   |-- publish_development_release.py Development release publisher run by CI
+|   `-- test_*.py                Python tooling unit tests
+|-- SECURITY.md                 Microsoft security vulnerability reporting policy
 |-- .dockerignore                Docker build-context exclusions
 |-- .gitattributes               Git path attributes
 |-- .gitignore                   Generated-file exclusions
@@ -120,28 +163,46 @@ contains downloaded and prepared upstream source trees, including Linux.
 ### `.github/`
 
 Repository automation and Copilot customizations live here. `workflows/ci.yml`
-defines the main CI pipeline and its job-level orchestration. The `actions/`
-directory contains the reusable implementations for validation, artifact
-builds, benchmarks, packaging, releases, and performance history management.
-The `skills/` directory defines Copilot agent skills for common development
-workflows. The `specula/` directory contains the adapter, tests, and dedicated
-runner setup for incremental formal verification of the pinned OpenVMM release.
+defines the main CI pipeline and its job-level orchestration. It calls three
+reusable workflows: `build-openvmm-binary.yml` builds OpenVMM for one target,
+`run-nvx-microvm-tests.yml` runs the NVX microVM tests on one backend, and
+`run-platform.yml` benchmarks one platform and, on `dev` pushes, packages its
+release. The other workflows run adversarial campaigns, verify published
+releases with Specula, and prepare the Copilot cloud agent and code review
+environments. See [Continuous integration](ci.md) for the jobs and gates.
 
-### `guest/` and `ubuntu/`
+The `actions/` directory contains the reusable implementations for validation,
+artifact builds, benchmarks, packaging, releases, and performance history
+management. The `skills/` directory defines Copilot agent skills for common
+development workflows, and `copilot-instructions.md` holds the repository-wide
+Copilot instructions. The `specula/` directory contains the adapter, tests, and
+dedicated runner setup for incremental formal verification of the pinned
+OpenVMM release.
 
-`guest/common` contains scripts and static helper sources shared by the Alpine
-and Ubuntu initramfs builds. `init` controls early boot, emits a stable
-distribution marker, and launches either the normal guest shell or the
-Alpine-only `nvx-init-agent` sandbox profile. `guest/alpine` contains the
-musl-linked container-entry helpers that are not installed in the Ubuntu
-initramfs. The sandbox helpers resolve fixed virtio-blk roles through
+### `guest/`, `ubuntu/`, and `azurelinux/`
+
+`guest/common` contains scripts and static helper sources shared by the Alpine,
+Ubuntu, and Azure Linux initramfs builds, plus the Azure Linux variants of the
+container-entry helpers. `init` controls early boot and then starts an
+initramfs program named by `nvx_exec=`, the Alpine-only `nvx-init-agent`
+sandbox profile, `nvx-managed-agent` for a managed workload, a virtio restore
+probe for benchmark profiling, or the interactive shell. On an interactive
+boot, `init` prints a stable distribution boot marker for Alpine and Azure
+Linux, and `guest/ubuntu/nvx-bashrc` prints Ubuntu's. `guest/alpine` contains
+the container launch and entry scripts that only the Alpine initramfs installs;
+the entry script stages Alpine's musl loader and `setpriv` inside the
+workload's root.
+
+The sandbox helpers resolve fixed virtio-blk roles through
 sysfs, assemble EROFS lower layers over ext4 scratch, place the workload in its
 cgroup before release, construct its mount/PID/UTS namespaces, enter its
 filesystem root after dropping capabilities, and retain the agent as the outer
 PID 1. In a managed sandbox, the agent supervises `nvx-managed-agent` and
 performs the ordered unmount teardown after a stop request. The remaining
-common helpers handle shutdown, virtio-fs mounting, and
-snapshot preparation. `ubuntu/packages.lock.json` pins the complete
+common helpers handle shutdown, virtio-fs mounting, snapshot preparation, and
+the guest side of the time ABI, or provide device-access and diagnostic probes.
+
+`ubuntu/packages.lock.json` pins the complete
 supplemental `.deb` closure installed without maintainer-script execution.
 `azurelinux/packages.lock.json` pins the SHA-256 of every RPM that the Azure
 Linux initramfs adds to its digest-pinned base image; the Docker build
@@ -190,7 +251,7 @@ and then recorded here by updating the submodule pin; see
 
 ### `scripts/`
 
-Host-side Python tooling. `nvx.py` is the public entry point; command
+Host-side tooling. `nvx.py` is the public entry point; command
 implementations live in `nvx_tools/`, and `nvx_tools/build_config.py` carries
 the aggregate runtime configuration plus specialized Docker, initramfs,
 distro-layer, kernel, and OpenVMM build configurations consumed by each
@@ -198,15 +259,23 @@ workflow. Fixed inputs and defaults live in
 [`nvx_tools/build_constants.py`](../scripts/nvx_tools/build_constants.py), using
 class-qualified constants such as `KernelBuildConstants.VERSION`. The constants
 module has no dependencies on the workflow or configuration modules.
+
 Standalone benchmark shell programs and parameterized guest templates
-live in `nvx_tools/benchmark_scripts/`.
-Source-collection scripts assemble corresponding-source archives for Linux and
+live in `nvx_tools/benchmark_scripts/`, and the guest workloads of the microVM
+tests live in `nvx_tools/microvm_test_scripts/`.
+Source-collection scripts assemble corresponding-source archives for Linux,
 Alpine, and Ubuntu. The adversarial controller, typed broker, credential-free
 executor, watchdog, and tracked deterministic catalogs also live in
 `nvx_tools/`; `nvx_adversarial_executor.py` is the restricted protocol entry
 point used by local children and administrator-owned remote wrappers.
-Performance scripts analyze benchmark outputs, with adjacent `test_*.py` files
-covering those utilities.
+`performance.py` collects, persists, and gates CI performance results, and the
+`test_*.py` files beside `nvx.py` are the tooling's unit tests.
+
+The `setup/` scripts bootstrap development hosts and GitHub Actions runners;
+see [Automated environment bootstrap](setup.md#automated-environment-bootstrap).
+`nvx-hosts.example.json` is the template for the
+[remote agent host](setup.md#remote-agent-hosts) inventory, and CI runs
+`publish_development_release.py` to publish development releases.
 
 ## Root files
 
@@ -216,7 +285,7 @@ covering those utilities.
 | `pyproject.toml` | Strict Pyright policy plus Ruff lint and format settings |
 | `requirements-dev.txt` | Pinned Python tools used by contributors and CI |
 | `rust-toolchain.toml` | Rust release that builds OpenVMM, its test guests, and the repository's Rust code |
-| `SOURCE-MANIFEST.json` | Exact Linux, Alpine, and Ubuntu source identities and output locations |
+| `SOURCE-MANIFEST.json` | Distribution version, OpenVMM microVM ABI and control-protocol versions, and exact Linux, Alpine, Ubuntu, and Azure Linux input identities and output locations |
 | `VERSION` | Distribution version consumed by packaging tools |
 | `.gitmodules` | OpenVMM repository URL, path, and tracking branch |
 | `.gitignore` | Excludes build products, caches, virtual environments, logs, and platform metadata |
