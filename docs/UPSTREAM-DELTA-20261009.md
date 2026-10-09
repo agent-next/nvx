@@ -10,9 +10,9 @@ fetched 2026-10-09. microsoft/nvx has **no `main`/`master` branch**; its default
 
 - merge-base: `fc6fea5c0d6a4627c40b11174b47f18e04542d3a` ("Merge pull request #311 from
   microsoft/code-documentation/benchmark-warmups-default-20261002-…", 2026-10-02)
-- upstream ahead: **537 commits** (448 direct + **89 PR merges**; PRs #66–#442), tip
-  `33bd2fe5` = `v0.1.0-dev.60b22d98647d-1-g33bd2fe5`, 55 dev-release tags since the fork
-  point
+- upstream ahead: **537 commits** (446 non-merge + **91 merges**: 89 PR merges, PRs
+  #66–#442, plus 2 non-PR "Merge NVX dev with…" syncs), tip `33bd2fe5` =
+  `v0.1.0-dev.60b22d98647d-1-g33bd2fe5`, 55 dev-release tags since the fork point
 - fork ahead: **13 commits** (12 direct + merge #3), tip `07adc613`
 
 Both trees still report `VERSION` = 0.1.0. Upstream landed heavy machinery in one week:
@@ -25,8 +25,8 @@ provenance-hardened release pipeline.
 
 ### 1.1 Features
 
-- **Time ABI v1** — PR #325 (merge `86661676`, branch tip `a453866e`; 81 files,
-  +19,716/−1,971; largest single theme).
+- **Time ABI v1** — PR #325 (merge `86661676`, branch tip `a453866e`; 69 files,
+  +19,716/−1,860; largest single theme).
   Guest-visible time discipline for snapshots: `nvx-time` guest agent + probe
   (`ead100cc`, `4fd86484`), deferred boot/restore checks (`0e03977d`, `10b331d8`),
   spec under `doc/` (`9d2c04b3` "specify NVX time ABI v1"), host qualification via
@@ -397,8 +397,8 @@ only p50 is tracked — no p95):
 | `openvmm_cold_start` (boot→`ALPINE-MICROVM-BOOT-OK`) | 272.3 | 229.0 | 464.8 | 119 (cold start) |
 | `openvmm_snapshot_restore` | 66.4 | 36.4 | 125.2 | 7.0–8.3 |
 | `shell_snapshot_restore_512_mib` | 57.6 | 44.3 | 132.3 | — |
-| `openvmm_snapshot_restore_guest_exit_teardown` (first fork/exec/exit) | 46.6 | 8.4 | — | — |
-| `openvmm_snapshot_generation` | 1.3 | 4.8 | — | — |
+| `openvmm_snapshot_restore_guest_exit_teardown` (first fork/exec/exit) | 46.6 | 8.4 | 17.5 | — |
+| `openvmm_snapshot_generation` | 1.3 | 4.8 | 1114.1 | — |
 
 Even the fastest upstream CI restore (MSHV 36.4 ms) is ~4–5× our bare-metal 7–9 ms,
 consistent with upstream's own nested-virt CI context; our warm-pool work targets
