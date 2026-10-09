@@ -141,17 +141,19 @@ approved, and a `SetupConfig`, which the library applies once per process:
     "resources": { "vcpus": 1, "memoryMib": 256 },
     "guestNetwork": "10.0.0.2/24"
   },
-  // How a library that pulls registry references materializes them; "tool" overrides the
-  // library's own converter.
+  // How long a library that pulls registry references may take to materialize one.
   "images": { "references": { "pullTimeoutMs": 1800000 } },
   "diagnostics": { "guestDebug": false, "contentVerification": false }
 }
 ```
 
-Every field except `stateRoot` and `runtime` has a default. A bundle directory holds a format-1
-`SOURCE-MANIFEST.json` of the `edge` profile, `bin/openvmm[.exe]`, `guest/vmlinux`, and
-`guest/initramfs-edge.cpio.gz`; the manifest pins every file's SHA-256 and the guest's runtime
-ABI. Explicit files can be pinned with `RuntimeFiles::approved_sha256`.
+Every field except `stateRoot` and `runtime` has a default. A bundle directory holds a format-2
+`SOURCE-MANIFEST.json` of the `edge` profile, `bin/openvmm[.exe]`, `bin/direct-images[.exe]`,
+the library itself (`bin/aci_edge_agent.dll` or `bin/libaci_edge_agent.so`), `guest/vmlinux`,
+and `guest/initramfs-edge.cpio.gz`. The manifest pins every file's SHA-256 and the guest's
+runtime ABI. The library checks every file but itself: the caller passes the library's SHA-256
+(`agent.library_sha256` in the manifest) to `AgentConfig`. Explicit files can be pinned with
+`RuntimeFiles::approved_sha256`.
 
 A `SandboxSpec`, passed to `AciEdgeSandbox::provision_with` beside the provision request, sets
 one sandbox's image (`ImageSource::Path` of a local GPT disk, `ImageSource::Digest` of a
@@ -164,10 +166,11 @@ with `spec.resources.memoryMib`.
 
 A library that honors `spec.imageReference` converts a reference into a local disk image with an
 external tool the first time a sandbox uses it, and caches the result by the reference's text.
-It does not check a tag again, so a moving tag such as `latest` keeps naming the content that was
-first pulled: use a version tag or a digest (`repository@sha256:…`) to control what a sandbox
-boots. The setup's `images.references` selects the tool (`tool`; the library's default
-otherwise) and limits each pull (`pullTimeoutMs`, 30 minutes by default).
+The tool comes from the runtime bundle (`bin/direct-images[.exe]`), so a library given explicit
+runtime files does not materialize references. It does not check a tag again, so a moving tag
+such as `latest` keeps naming the content that was first pulled: use a version tag or a digest
+(`repository@sha256:…`) to control what a sandbox boots. `images.references.pullTimeoutMs`
+limits each pull (30 minutes by default).
 
 - **Loading.** `AgentBackend::new` checks the library's SHA-256 and sandbox ABI version and
   loads it once per process; it stays loaded until the process exits. It loads the bytes that it

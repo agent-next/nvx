@@ -559,10 +559,6 @@ impl ImageSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReferenceSettings {
-    /// The program that converts a reference into a disk image; `None` selects the host's own
-    /// default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool: Option<PathBuf>,
     /// Longest time that materializing one reference may take, in milliseconds. The host abandons
     /// a pull that takes longer.
     #[serde(default = "default_pull_timeout_ms")]
@@ -579,20 +575,12 @@ fn default_pull_timeout_ms() -> u64 {
 impl Default for ReferenceSettings {
     fn default() -> Self {
         Self {
-            tool: None,
             pull_timeout_ms: default_pull_timeout_ms(),
         }
     }
 }
 
 impl ReferenceSettings {
-    /// Selects the program that converts references into disk images.
-    #[must_use]
-    pub fn with_tool(mut self, tool: impl Into<PathBuf>) -> Self {
-        self.tool = Some(tool.into());
-        self
-    }
-
     /// Sets the longest time that materializing one reference may take, in milliseconds.
     #[must_use]
     pub fn with_pull_timeout_ms(mut self, pull_timeout_ms: u64) -> Self {
@@ -605,15 +593,6 @@ impl ReferenceSettings {
     }
 
     fn validate(&self) -> Result<()> {
-        if self
-            .tool
-            .as_ref()
-            .is_some_and(|tool| tool.as_os_str().is_empty())
-        {
-            return Err(Error::malformed_request(
-                "setup images.references.tool is empty",
-            ));
-        }
         if self.pull_timeout_ms == 0 || self.pull_timeout_ms > Timeouts::MAX_MS {
             return Err(Error::malformed_request(format!(
                 "setup images.references.pullTimeoutMs must be between 1 and {}",
@@ -732,15 +711,12 @@ mod tests {
         assert!(!json.contains("references"), "{json}");
 
         let config = config.with_images(
-            ImageSettings::default().with_references(
-                ReferenceSettings::default()
-                    .with_tool("/opt/tools/convert")
-                    .with_pull_timeout_ms(60_000),
-            ),
+            ImageSettings::default()
+                .with_references(ReferenceSettings::default().with_pull_timeout_ms(60_000)),
         );
         let json = serde_json::to_string(&config).unwrap();
         assert!(
-            json.contains(r#""references":{"tool":"/opt/tools/convert","pullTimeoutMs":60000}"#),
+            json.contains(r#""references":{"pullTimeoutMs":60000}"#),
             "{json}"
         );
         assert_eq!(serde_json::from_str::<SetupConfig>(&json).unwrap(), config);
@@ -794,7 +770,6 @@ mod tests {
         for references in [
             ReferenceSettings::default().with_pull_timeout_ms(0),
             ReferenceSettings::default().with_pull_timeout_ms(Timeouts::MAX_MS + 1),
-            ReferenceSettings::default().with_tool(""),
         ] {
             bad.push(
                 SetupConfig::new("/var/lib/nvx", files())
