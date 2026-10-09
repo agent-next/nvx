@@ -58,14 +58,117 @@ class EgressPolicyTests(unittest.TestCase):
         self.assertEqual(
             compiled.allow,
             (
-                "192.0.2.7/32:tcp:8000",
-                "192.0.2.7/32:tcp:8001",
-                "192.0.2.7/32:tcp:8002",
-                "198.51.100.0/24:udp:5000",
-                "198.51.100.0/24:udp:5001",
+                "192.0.2.7/32:tcp:8000-8002",
+                "198.51.100.0/24:udp:5000-5001",
             ),
         )
         self.assertEqual(compiled.deny, ())
+
+    def test_lowers_each_range_to_one_native_range_rule(self):
+        ranges: tuple[tuple[dict[str, object], tuple[str, ...]], ...] = (
+            (
+                {"protocol": "tcp", "port": 8000, "endPort": 8010},
+                ("192.0.2.7/32:tcp:8000-8010",),
+            ),
+            (
+                {"protocol": "udp", "port": 5000, "endPort": 5010},
+                ("192.0.2.7/32:udp:5000-5010",),
+            ),
+            (
+                {"protocol": "tcp", "port": 1, "endPort": 65535},
+                ("192.0.2.7/32:tcp:1-65535",),
+            ),
+            (
+                {"protocol": "any", "port": 1, "endPort": 65535},
+                ("192.0.2.7/32:tcp:1-65535", "192.0.2.7/32:udp:1-65535"),
+            ),
+            # A range of one port lowers to that port's rule.
+            (
+                {"protocol": "tcp", "port": 8000, "endPort": 8000},
+                ("192.0.2.7/32:tcp:8000",),
+            ),
+        )
+
+        for category in ("allow", "deny"):
+            for selector, expected in ranges:
+                for rule in (
+                    {"to": [{"cidr": "192.0.2.7"}], "ports": [selector]},
+                    {"cidr": "192.0.2.7", **selector},
+                ):
+                    with self.subTest(category=category, rule=rule):
+                        compiled = self.compile({category: [rule]})
+                        self.assertEqual(getattr(compiled, category), expected)
+
+    def test_keeps_a_denied_port_inside_an_allowed_range(self):
+        compiled = self.compile(
+            {
+                "allow": [
+                    {
+                        "to": [{"cidr": "192.0.2.0/24"}],
+                        "ports": [{"protocol": "tcp", "port": 8000, "endPort": 8010}],
+                    }
+                ],
+                "deny": [
+                    {
+                        "to": [{"cidr": "192.0.2.0/24"}],
+                        "ports": [{"protocol": "tcp", "port": 8005}],
+                    }
+                ],
+            }
+        )
+
+        # OpenVMM applies deny precedence, so each list keeps its own rule.
+        self.assertEqual(compiled.allow, ("192.0.2.0/24:tcp:8000-8010",))
+        self.assertEqual(compiled.deny, ("192.0.2.0/24:tcp:8005",))
+
+    def test_merges_adjacent_and_overlapping_ranges_of_one_network(self):
+        def ranges(*bounds: tuple[int, int]) -> list[dict[str, object]]:
+            return [
+                {
+                    "cidr": "192.0.2.7",
+                    "protocol": "tcp",
+                    "port": start,
+                    "endPort": end,
+                }
+                for start, end in bounds
+            ]
+
+        for rules, expected in (
+            (ranges((8000, 8004), (8005, 8010)), ("192.0.2.7/32:tcp:8000-8010",)),
+            (ranges((8000, 8008), (8003, 8010)), ("192.0.2.7/32:tcp:8000-8010",)),
+            (
+                [
+                    *ranges((8000, 8010)),
+                    *ranges(*((port, port) for port in range(8000, 8011))),
+                ],
+                ("192.0.2.7/32:tcp:8000-8010",),
+            ),
+            (
+                ranges((8000, 8004), (8006, 8010)),
+                ("192.0.2.7/32:tcp:8000-8004", "192.0.2.7/32:tcp:8006-8010"),
+            ),
+        ):
+            with self.subTest(rules=rules):
+                self.assertEqual(self.compile({"allow": rules}).allow, expected)
+
+        # Networks keep their own ranges where their segments differ.
+        compiled = self.compile(
+            {
+                "allow": [
+                    {"cidr": "192.0.2.7", "protocol": "udp", "port": 1, "endPort": 10},
+                    {
+                        "cidr": "198.51.100.9",
+                        "protocol": "udp",
+                        "port": 5,
+                        "endPort": 20,
+                    },
+                ]
+            }
+        )
+        self.assertEqual(
+            compiled.allow,
+            ("192.0.2.7/32:udp:1-10", "198.51.100.9/32:udp:5-20"),
+        )
 
     def test_rejects_invalid_port_shapes_and_values(self):
         invalid_rules = (
@@ -92,6 +195,57 @@ class EgressPolicyTests(unittest.TestCase):
             with self.subTest(rule=rule), self.assertRaises(ScriptError):
                 self.compile({"allow": [rule]})
 
+    def test_reports_invalid_port_ranges_clearly(self):
+        cidr = "192.0.2.0/24"
+        cases: tuple[tuple[dict[str, object], str], ...] = (
+            (
+                {
+                    "to": [{"cidr": cidr}],
+                    "ports": [{"protocol": "tcp", "port": 8010, "endPort": 8000}],
+                },
+                r"^deny\[0\]\.ports\[0\]\.endPort 8000 cannot be below port 8010$",
+            ),
+            (
+                {"ports": [{"protocol": "udp", "endPort": 8010}]},
+                r"^deny\[0\]\.ports\[0\]\.endPort requires port$",
+            ),
+            (
+                {"ports": [{"endPort": 8010}]},
+                r"^deny\[0\]\.ports\[0\]\.endPort requires port$",
+            ),
+            (
+                {"ports": [{"protocol": "tcp", "port": 8000, "endPort": 65536}]},
+                r"^deny\[0\]\.ports\[0\]\.endPort must be between 1 and 65535$",
+            ),
+            (
+                {"cidr": cidr, "protocol": "tcp", "port": 8010, "endPort": 8000},
+                r"^deny\[0\]\.endPort 8000 cannot be below port 8010$",
+            ),
+            (
+                {"cidr": cidr, "protocol": "udp", "endPort": 8010},
+                r"^deny\[0\]\.endPort requires port$",
+            ),
+            (
+                {"cidr": cidr, "endPort": 8010},
+                r"^deny\[0\]\.endPort requires port$",
+            ),
+            (
+                {"cidr": cidr, "protocol": "tcp", "port": 8000, "endPort": 65536},
+                r"^deny\[0\]\.endPort must be between 1 and 65535$",
+            ),
+            (
+                {"cidr": cidr, "protocol": "tcp", "port": 0, "endPort": 8010},
+                r"^deny\[0\]\.port must be between 1 and 65535$",
+            ),
+        )
+
+        for rule, message in cases:
+            with (
+                self.subTest(rule=rule),
+                self.assertRaisesRegex(ScriptError, message),
+            ):
+                self.compile({"deny": [rule]})
+
     def test_compiles_protocol_selectors_with_and_without_ports(self):
         selectors: tuple[tuple[dict[str, object], tuple[str, ...]], ...] = (
             ({"protocol": "tcp"}, ("192.0.2.7/32:tcp",)),
@@ -105,12 +259,7 @@ class EgressPolicyTests(unittest.TestCase):
             ),
             (
                 {"protocol": "any", "port": 443, "endPort": 444},
-                (
-                    "192.0.2.7/32:tcp:443",
-                    "192.0.2.7/32:tcp:444",
-                    "192.0.2.7/32:udp:443",
-                    "192.0.2.7/32:udp:444",
-                ),
+                ("192.0.2.7/32:tcp:443-444", "192.0.2.7/32:udp:443-444"),
             ),
         )
 
@@ -185,19 +334,19 @@ class EgressPolicyTests(unittest.TestCase):
                     ]
                 }
             )
+
+        # Protocol `any` with a port range lowers to a TCP and a UDP range.
+        any_range = {
+            "cidr": "192.0.2.1",
+            "protocol": "any",
+            "port": 1,
+            "endPort": 129,
+        }
+        accepted = self.compile({"deny": [*address_only[:-2], any_range]})
+        self.assertEqual(len(accepted.deny), MAX_RULES_PER_ACTION)
+        self.assertIn("192.0.2.1/32:udp:1-129", accepted.deny)
         with self.assertRaisesRegex(ScriptError, "at most 256"):
-            self.compile(
-                {
-                    "deny": [
-                        {
-                            "cidr": "192.0.2.1",
-                            "protocol": "any",
-                            "port": 1,
-                            "endPort": 129,
-                        }
-                    ]
-                }
-            )
+            self.compile({"deny": [*address_only[:-1], any_range]})
 
     def test_normalizes_host_bits_like_the_native_cidr_parser(self):
         compiled = self.compile({"allow": [{"cidr": "10.0.0.5/24"}]})
@@ -428,31 +577,33 @@ class EgressPolicyTests(unittest.TestCase):
         self.assertEqual(compiled.allow, ("192.0.2.0/23:tcp:80",))
 
     def test_accepts_exact_256_rule_boundaries(self):
+        def separate_ranges(cidr: str, protocol: str) -> list[dict[str, object]]:
+            # Ranges with a port between them cannot merge.
+            return [
+                {
+                    "cidr": cidr,
+                    "protocol": protocol,
+                    "port": 3 * index + 1,
+                    "endPort": 3 * index + 2,
+                }
+                for index in range(MAX_RULES_PER_ACTION)
+            ]
+
         compiled = self.compile(
             {
-                "allow": [
-                    {
-                        "cidr": "192.0.2.1",
-                        "protocol": "tcp",
-                        "port": 1,
-                        "endPort": 256,
-                    }
-                ],
-                "deny": [
-                    {
-                        "cidr": "198.51.100.1",
-                        "protocol": "udp",
-                        "port": 1,
-                        "endPort": 256,
-                    }
-                ],
+                "allow": separate_ranges("192.0.2.1", "tcp"),
+                "deny": separate_ranges("198.51.100.1", "udp"),
             }
         )
 
         self.assertEqual(len(compiled.allow), 256)
         self.assertEqual(len(compiled.deny), 256)
+        self.assertEqual(
+            compiled.allow[:2], ("192.0.2.1/32:tcp:1-2", "192.0.2.1/32:tcp:4-5")
+        )
+        self.assertEqual(compiled.deny[-1], "198.51.100.1/32:udp:766-767")
 
-    def test_rejects_257_rules_before_materializing_large_ranges(self):
+    def test_rejects_257_rules_before_materializing_them(self):
         for category in ("allow", "deny"):
             with (
                 self.subTest(category=category),
@@ -464,43 +615,43 @@ class EgressPolicyTests(unittest.TestCase):
                             {
                                 "cidr": "192.0.2.1",
                                 "protocol": "tcp",
-                                "port": 1,
-                                "endPort": 65535,
+                                "port": 2 * index + 1,
                             }
+                            for index in range(MAX_RULES_PER_ACTION + 1)
                         ]
                     }
                 )
 
-    def test_bounds_exclusion_times_range_expansion(self):
-        accepted = self.compile(
-            {
-                "allow": [
-                    {
-                        "cidr": "192.0.2.0/24",
-                        "except": ["192.0.2.128/25"],
-                        "protocol": "tcp",
-                        "port": 1,
-                        "endPort": 256,
-                    }
-                ]
-            }
-        )
+    def test_bounds_exclusions_times_port_segments(self):
+        def rules(count: int) -> list[dict[str, object]]:
+            # The exclusion leaves eight networks, and the gap between ports
+            # keeps each port a segment of its own.
+            return [
+                {
+                    "cidr": "192.0.2.0/24",
+                    "except": ["192.0.2.1/32"],
+                    "protocol": "tcp",
+                    "port": 2 * index + 1,
+                }
+                for index in range(count)
+            ]
+
+        accepted = self.compile({"allow": rules(32)})
         self.assertEqual(len(accepted.allow), 256)
 
         with self.assertRaisesRegex(ScriptError, "at most 256"):
-            self.compile(
-                {
-                    "allow": [
-                        {
-                            "cidr": "192.0.2.0/24",
-                            "except": ["192.0.2.128/25"],
-                            "protocol": "tcp",
-                            "port": 1,
-                            "endPort": 257,
-                        }
-                    ]
-                }
-            )
+            self.compile({"allow": rules(33)})
+
+        # Adjacent ports merge into one range for each network.
+        merged = self.compile(
+            {
+                "allow": [
+                    {**rule, "port": index + 1} for index, rule in enumerate(rules(33))
+                ]
+            }
+        )
+        self.assertEqual(len(merged.allow), 8)
+        self.assertTrue(all(rule.endswith(":tcp:1-33") for rule in merged.allow))
 
     def test_delays_fragment_conversion_until_after_covering_union(self):
         exclusions = [
@@ -530,10 +681,7 @@ class EgressPolicyTests(unittest.TestCase):
             for rules in ([fragmented, covering], [covering, fragmented]):
                 with self.subTest(order=rules):
                     compiled = self.compile({"allow": rules})
-                    self.assertEqual(
-                        compiled.allow,
-                        ("192.0.0.0/16:tcp:80", "192.0.0.0/16:tcp:81"),
-                    )
+                    self.assertEqual(compiled.allow, ("192.0.0.0/16:tcp:80-81",))
 
         self.assertEqual(summarize.call_count, 2)
 

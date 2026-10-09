@@ -250,15 +250,22 @@ are rejected. Policy files are limited to 1 MiB of UTF-8 input. The previous
 flat `cidr`/`except`/`protocol`/`port` rule form remains accepted for
 compatibility, but new policy files should use the MXC shape.
 
+A port range lowers to one native `FIRST-LAST` rule for each destination
+network. The policy above therefore allows `192.0.2.0/25:tcp:8000-8010`, which
+matches TCP ports 8000 through 8010 of that network but not UDP or ports 7999
+and 8011, and its deny rule `192.0.2.0/24:tcp:8005` keeps port 8005 blocked
+inside the range.
+
 Exclusions affect only their containing rule: they never become global deny
 rules. A later allow rule may therefore match an address excluded from an
 earlier allow rule, while an address excluded from a deny rule falls through to
 other rules and the explicit default. Explicit deny matches still take
 precedence over allow matches.
 
-NVX canonicalizes safely equivalent prefixes and rejects policies that lower to
-more than 256 allow rules or 256 deny rules; protocol `any` with a port range
-lowers to one TCP and one UDP rule per port. NVX rejects oversized expansions
+NVX canonicalizes safely equivalent prefixes, merges the adjacent and
+overlapping port ranges of each network, and rejects policies that lower to
+more than 256 allow rules or 256 deny rules; protocol `any` with a port or a
+port range lowers to one TCP and one UDP rule. NVX rejects oversized expansions
 before launch rather than truncating or widening them. Managed provision stores
 the validated lowered rules in sandbox state, so later starts do not reread a
 mutable source policy file.

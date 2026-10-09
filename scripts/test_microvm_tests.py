@@ -4355,14 +4355,16 @@ class MicrovmTests(unittest.TestCase):
             (22001, 22002, 22003),
         )
 
-        self.assertIn("192.0.2.0/24:tcp:21001", policy.allow)
-        self.assertIn("192.0.2.0/24:tcp:21003", policy.allow)
-        self.assertIn("192.0.2.0/24:udp:22001", policy.allow)
-        self.assertIn("192.0.2.0/24:udp:22003", policy.allow)
+        # The excluded gateway's own rule fills the exclusion, so each range
+        # lowers to one rule for the whole subnet.
+        self.assertEqual(
+            policy.allow,
+            ("192.0.2.0/24:tcp:21001-21003", "192.0.2.0/24:udp:22001-22003"),
+        )
         self.assertIn("192.0.2.0/24:tcp:21002", policy.deny)
         self.assertIn("192.0.2.0/24:udp:22002", policy.deny)
-        self.assertNotIn("192.0.2.0/24:tcp:21000", policy.allow)
-        self.assertNotIn("192.0.2.0/24:tcp:21004", policy.allow)
+        self.assertIn("192.0.2.128/25:tcp:21001", policy.deny)
+        self.assertIn("192.0.2.128/25:udp:22003", policy.deny)
 
     def test_l3_l4_egress_acceptance_invokes_public_nvx_policy_file(self):
         class ImmediateThread:
