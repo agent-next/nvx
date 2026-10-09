@@ -64,7 +64,9 @@ because the VM stopped.
 
 Request types serialize with the contract's JSON field names (`readonlyPaths`,
 `memoryMib`, `commandLine`, and so on) and reject unknown fields. Every
-provision field is optional, so `{}` is a valid provision request. The wire
+provision field is optional, so `{}` is a valid provision request. Like MXC's
+schema, they accept a `process.timeout` from 0 through 4,294,967,295
+milliseconds, about 49.7 days, and refuse a negative or larger one. The wire
 envelope (`version`, `phase`, and `containment`) belongs to the caller.
 
 ## Architecture
@@ -514,7 +516,7 @@ terminate the VM when the caller exits.
 | `process.commandLine` | n/a | run as `/bin/sh -c <commandLine>`; at most 4096 bytes |
 | `process.argv` (ACI Edge Sandboxes extension) | n/a | applied; absolute program, up to 64 arguments of 4096 bytes |
 | `process.cwd` | n/a | applied; an absolute guest path of at most 4095 bytes, `/` when omitted; see [Working directories](#working-directories) |
-| `process.timeout` | n/a | applied, up to 3,600,000 ms |
+| `process.timeout` | n/a | applied, up to 4,294,967,295 ms (about 49.7 days), the most that MXC allows; `0` disables it |
 | `process.env`, `inheritDefaultEnv` | n/a | applied per execution; see [Environment](#environment) |
 | Piped standard input | n/a | rejected; the workload reads end-of-file |
 
@@ -675,7 +677,7 @@ behind the profile's NAT gateway `10.0.0.1`, which also serves DNS.
 
 | Condition | `ErrorCode` | Wire code |
 | --- | --- | --- |
-| Invalid request shape, relative or non-UTF-8 path, zero `memoryMib` | `MalformedRequest` | `malformed_request` |
+| Invalid request shape, relative or non-UTF-8 path, zero `memoryMib`, `process.timeout` above 4,294,967,295 ms | `MalformedRequest` | `malformed_request` |
 | ID without the `aci-edge-sandboxes:` prefix or a 32-digit lowercase hexadecimal token | `MalformedId` | `malformed_id` |
 | No state directory for the ID (never provisioned, or deprovisioned) | `StaleId` | `stale_id` |
 | `exec` on a stopped sandbox, or a VM that died | `NotStarted` | `not_started` |

@@ -54,8 +54,9 @@ pub(crate) const MAX_ARGUMENT_BYTES: usize = 4096;
 pub(crate) const MAX_CWD_BYTES: usize = 4095;
 /// Largest number of workload environment entries.
 pub(crate) const MAX_ENVIRONMENT: usize = 256;
-/// Largest workload timeout the guest agent accepts.
-pub(crate) const MAX_TIMEOUT_MS: u32 = 60 * 60 * 1000;
+/// Largest workload timeout the guest agent accepts: any value of the exec request's 32-bit
+/// timeout field, which is also the largest `process.timeout` that MXC's schema allows.
+pub(crate) const MAX_TIMEOUT_MS: u32 = u32::MAX;
 /// Largest combined stdout and stderr volume the guest agent forwards for one execution.
 pub(crate) const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
@@ -216,10 +217,10 @@ pub(crate) struct Workload<'a> {
 ///
 /// The guest agent requires 1 to [`MAX_ARGUMENTS`] non-empty arguments without NUL bytes, each
 /// at most [`MAX_ARGUMENT_BYTES`] long, an absolute program path, an absolute working directory
-/// of at most [`MAX_ARGUMENT_BYTES`] without NUL bytes, at most [`MAX_ENVIRONMENT`] `KEY=VALUE`
-/// environment entries with unique names, and a timeout of at most [`MAX_TIMEOUT_MS`] (zero
-/// disables it). A workload without a working directory or an explicit environment keeps the
-/// legacy payload.
+/// of at most [`MAX_ARGUMENT_BYTES`] without NUL bytes, and at most [`MAX_ENVIRONMENT`]
+/// `KEY=VALUE` environment entries with unique names. It accepts any timeout up to
+/// [`MAX_TIMEOUT_MS`], and zero disables it. A workload without a working directory or an
+/// explicit environment keeps the legacy payload.
 pub(crate) fn encode_exec_payload(workload: &Workload<'_>) -> Result<Vec<u8>, ProtocolError> {
     let argv = &workload.argv;
     if argv.is_empty() || argv.len() > MAX_ARGUMENTS {
@@ -229,11 +230,6 @@ pub(crate) fn encode_exec_payload(workload: &Workload<'_>) -> Result<Vec<u8>, Pr
     }
     if !argv[0].starts_with('/') {
         return Err(violation("exec program must be an absolute guest path"));
-    }
-    if workload.timeout_ms > MAX_TIMEOUT_MS {
-        return Err(violation(format!(
-            "exec timeout must not exceed {MAX_TIMEOUT_MS} ms"
-        )));
     }
     let cwd = workload.cwd.map(str::as_bytes);
     if let Some(cwd) = cwd
@@ -507,6 +503,27 @@ mod tests {
     }
 
     #[test]
+    fn exec_payload_carries_every_32_bit_timeout() {
+        let workload = Workload {
+            timeout_ms: MAX_TIMEOUT_MS,
+            ..program(&["/bin/true"])
+        };
+        assert_eq!(
+            hex(&encode_exec_payload(&workload).unwrap()),
+            concat!("ffffffff01000000", "090000002f62696e2f74727565"),
+        );
+        for timeout_ms in [0, 3_600_001, 86_400_000, MAX_TIMEOUT_MS] {
+            let workload = Workload {
+                timeout_ms,
+                cwd: Some("/tmp"),
+                ..program(&["/bin/true"])
+            };
+            let payload = encode_exec_payload(&workload).unwrap();
+            assert_eq!(payload[..4], timeout_ms.to_le_bytes(), "{timeout_ms}");
+        }
+    }
+
+    #[test]
     fn exec_payload_carries_the_working_directory_natively() {
         let workload = Workload {
             cwd: Some("/tmp"),
@@ -598,7 +615,6 @@ mod tests {
         let argument = |value: &str| vec![value.to_owned()];
         assert!(encode(argument("bin/sh"), 0).is_err());
         assert!(encode(Vec::new(), 0).is_err());
-        assert!(encode(argument("/bin/sh"), MAX_TIMEOUT_MS + 1).is_err());
         assert!(encode(argument(&format!("/{}", "a".repeat(4096))), 0).is_err());
         assert!(encode(vec!["/bin/true".to_owned(); 65], 0).is_err());
         assert!(encode(vec!["/bin/echo".to_owned(), String::new()], 0).is_err());

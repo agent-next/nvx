@@ -526,8 +526,15 @@ pub struct ProcessSpec {
     /// replacing it; an entry then replaces the default variable of the same name. `None` means
     /// `false`, and the value has no effect without `env`.
     pub inherit_default_env: Option<bool>,
-    /// Workload timeout. `None` or zero disables it. Serialized in milliseconds.
+    /// Workload timeout. `None` or zero disables it. Serialized in milliseconds, at most
+    /// [`MAX_TIMEOUT_MS`](Self::MAX_TIMEOUT_MS).
     pub timeout: Option<Duration>,
+}
+
+impl ProcessSpec {
+    /// Largest [`timeout`](Self::timeout), in milliseconds, that MXC's schema allows for
+    /// `process.timeout`: 4,294,967,295, about 49.7 days.
+    pub const MAX_TIMEOUT_MS: u64 = u32::MAX as u64;
 }
 
 /// What an execution runs.
@@ -558,7 +565,11 @@ struct ProcessSpecWire {
     env: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     inherit_default_env: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "timeout_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     timeout: Option<u64>,
 }
 
@@ -606,6 +617,68 @@ where
     D: serde::Deserializer<'de>,
 {
     Vec::deserialize(deserializer).map(Some)
+}
+
+/// Reads `process.timeout`, which MXC's schema bounds to whole milliseconds from 0 through
+/// [`ProcessSpec::MAX_TIMEOUT_MS`], so that a negative or larger value is refused with that
+/// range. Like an omitted timeout, `null` disables it.
+fn timeout_millis<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Millis;
+
+    impl<'de> serde::de::Visitor<'de> for Millis {
+        type Value = Option<u64>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "process.timeout in whole milliseconds from 0 through {}",
+                ProcessSpec::MAX_TIMEOUT_MS
+            )
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        // A deserializer that buffered the request, as a flattening envelope does, reports
+        // `null` as a unit.
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_u64(self)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, millis: u64) -> Result<Self::Value, E> {
+            if millis <= ProcessSpec::MAX_TIMEOUT_MS {
+                Ok(Some(millis))
+            } else {
+                Err(E::invalid_value(
+                    serde::de::Unexpected::Unsigned(millis),
+                    &self,
+                ))
+            }
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, millis: i64) -> Result<Self::Value, E> {
+            match u64::try_from(millis) {
+                Ok(millis) => self.visit_u64(millis),
+                Err(_) => Err(E::invalid_value(
+                    serde::de::Unexpected::Signed(millis),
+                    &self,
+                )),
+            }
+        }
+    }
+
+    deserializer.deserialize_option(Millis)
 }
 
 /// Converts a duration to whole milliseconds, rounding a nonzero sub-millisecond duration up.
@@ -829,5 +902,68 @@ mod tests {
         assert_eq!(duration_millis(Duration::from_micros(10)), 1);
         assert_eq!(duration_millis(Duration::ZERO), 0);
         assert_eq!(duration_millis(Duration::from_millis(1500)), 1500);
+    }
+
+    #[test]
+    fn exec_timeouts_follow_the_mxc_schema() {
+        let parse = |timeout: &str| {
+            serde_json::from_str::<ExecRequest>(&format!(
+                r#"{{ "process": {{ "commandLine": "true", "timeout": {timeout} }} }}"#
+            ))
+        };
+        assert_eq!(ProcessSpec::MAX_TIMEOUT_MS, 4_294_967_295);
+        for millis in [0, 3_600_001, 86_400_000, ProcessSpec::MAX_TIMEOUT_MS] {
+            let request = parse(&millis.to_string()).unwrap();
+            assert_eq!(
+                request,
+                ExecRequest::command_line("true").with_timeout(Duration::from_millis(millis))
+            );
+            assert_eq!(
+                serde_json::to_value(&request).unwrap()["process"]["timeout"],
+                millis
+            );
+        }
+        // Like an omitted timeout, `null` disables it.
+        assert_eq!(parse("null").unwrap(), ExecRequest::command_line("true"));
+        // Also when a caller's envelope flattens the request, which buffers it.
+        #[derive(Deserialize)]
+        struct Envelope {
+            phase: String,
+            #[serde(flatten)]
+            request: ExecRequest,
+        }
+        for (timeout, expected) in [
+            ("null", ExecRequest::command_line("true")),
+            (
+                "4294967295",
+                ExecRequest::command_line("true")
+                    .with_timeout(Duration::from_millis(ProcessSpec::MAX_TIMEOUT_MS)),
+            ),
+        ] {
+            let json = format!(
+                r#"{{ "phase": "exec", "process": {{ "commandLine": "true", "timeout": {timeout} }} }}"#
+            );
+            let envelope = serde_json::from_str::<Envelope>(&json).unwrap();
+            assert_eq!(envelope.phase, "exec");
+            assert_eq!(envelope.request, expected, "{timeout}");
+        }
+        let flattened = serde_json::from_str::<Envelope>(
+            r#"{ "phase": "exec", "process": { "commandLine": "true", "timeout": -1 } }"#,
+        );
+        let error = flattened.err().unwrap().to_string();
+        assert!(error.contains("from 0 through 4294967295"), "{error}");
+        for invalid in [
+            "-1",
+            "4294967296",
+            "18446744073709551615",
+            "1.5",
+            r#""1000""#,
+        ] {
+            let error = parse(invalid).unwrap_err().to_string();
+            assert!(
+                error.contains("process.timeout in whole milliseconds from 0 through 4294967295"),
+                "{invalid}: {error}"
+            );
+        }
     }
 }

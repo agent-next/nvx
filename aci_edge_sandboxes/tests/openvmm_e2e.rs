@@ -22,8 +22,8 @@ use aci_edge_sandboxes::openvmm::{
 };
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
-    ExecRequest, FilesystemPolicy, NetworkPolicy, NetworkRule, Protocol, ProvisionRequest,
-    SandboxId, StdinMode,
+    ExecRequest, FilesystemPolicy, NetworkPolicy, NetworkRule, ProcessSpec, Protocol,
+    ProvisionRequest, SandboxId, StdinMode,
 };
 
 mod support;
@@ -814,6 +814,21 @@ fn openvmm_lifecycle_on_a_real_hypervisor() {
         ExecRequest::command_line("sleep 30").with_timeout(Duration::from_millis(500)),
     );
     assert_eq!(timed_out.outcome, ExecOutcome::TimedOut);
+    // The guest agent accepts every timeout that MXC allows, far beyond an hour, and a workload
+    // that ends first finishes normally.
+    for millis in [3_600_001, 86_400_000, ProcessSpec::MAX_TIMEOUT_MS] {
+        let output = run(
+            &nvx,
+            &sandbox_id,
+            ExecRequest::command_line("sleep 1; echo done")
+                .with_timeout(Duration::from_millis(millis)),
+        );
+        assert_eq!(
+            (output.outcome, output.stdout.as_slice()),
+            (ExecOutcome::Exited(0), &b"done\n"[..]),
+            "{millis} ms"
+        );
+    }
     // Piped standard input is the one exec feature that remains unsupported.
     assert_eq!(
         nvx.exec(
