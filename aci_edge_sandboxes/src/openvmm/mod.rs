@@ -35,7 +35,7 @@
 //! | `microvm.provision.memoryMib` | applied | n/a |
 //! | `process.commandLine` | n/a | run as `/bin/sh -c <commandLine>`, at most 4096 bytes |
 //! | `process.cwd` | n/a | an absolute guest path of at most 4095 bytes; `/` when omitted |
-//! | `process.timeout` | n/a | up to one hour |
+//! | `process.timeout` | n/a | up to 4,294,967,295 ms (about 49.7 days), the most that MXC allows |
 //! | `process.env`, `inheritDefaultEnv` | n/a | applied per execution; see [Environment](#environment) |
 //! | piped stdin | n/a | rejected |
 //!
@@ -338,10 +338,12 @@ fn workload_argv(process: &ProcessSpec) -> Result<Vec<String>> {
 }
 
 fn exec_timeout_ms(process: &ProcessSpec) -> Result<u32> {
-    let millis = process.timeout.map_or(0, duration_millis);
-    u32::try_from(millis)
+    let timeout = process.timeout.unwrap_or_default();
+    // The guest agent accepts every timeout that the request's 32-bit field carries. Compare the
+    // exact duration: whole milliseconds would drop a fraction above the limit.
+    u32::try_from(duration_millis(timeout))
         .ok()
-        .filter(|millis| *millis <= MAX_TIMEOUT_MS)
+        .filter(|_| timeout <= Duration::from_millis(MAX_TIMEOUT_MS.into()))
         .ok_or_else(|| {
             Error::policy_validation(format!(
                 "process.timeout exceeds the openvmm backend limit of {MAX_TIMEOUT_MS} ms"
@@ -1023,14 +1025,42 @@ mod tests {
     }
 
     #[test]
-    fn timeouts_are_bounded_by_the_guest_agent() {
-        let within = ExecRequest::command_line("true").with_timeout(Duration::from_secs(3600));
-        assert_eq!(exec_timeout_ms(&within.process).unwrap(), MAX_TIMEOUT_MS);
-        let beyond = ExecRequest::command_line("true").with_timeout(Duration::from_secs(3601));
-        assert_eq!(
-            exec_timeout_ms(&beyond.process).unwrap_err().code(),
-            ErrorCode::PolicyValidation
-        );
+    fn timeouts_cover_the_mxc_range() {
+        let timeout =
+            |millis| ExecRequest::command_line("true").with_timeout(Duration::from_millis(millis));
+        for millis in [
+            1,
+            3_600_000,
+            3_600_001,
+            86_400_000,
+            ProcessSpec::MAX_TIMEOUT_MS,
+        ] {
+            let request = timeout(millis);
+            assert_eq!(
+                u64::from(exec_timeout_ms(&request.process).unwrap()),
+                millis
+            );
+            assert_eq!(
+                u64::from(prepare_exec(&request.process).unwrap().timeout_ms),
+                millis
+            );
+        }
+        // Even a fraction of a millisecond above the limit is refused.
+        let maximum = Duration::from_millis(ProcessSpec::MAX_TIMEOUT_MS);
+        for beyond in [
+            maximum + Duration::from_nanos(1),
+            maximum + Duration::from_millis(1),
+            Duration::MAX,
+        ] {
+            let request = ExecRequest::command_line("true").with_timeout(beyond);
+            assert_eq!(
+                exec_timeout_ms(&request.process).unwrap_err().code(),
+                ErrorCode::PolicyValidation,
+                "{beyond:?}"
+            );
+        }
+        // Zero and an omitted timeout both disable it.
+        assert_eq!(exec_timeout_ms(&timeout(0).process).unwrap(), 0);
         let none = ExecRequest::command_line("true");
         assert_eq!(exec_timeout_ms(&none.process).unwrap(), 0);
     }

@@ -516,7 +516,7 @@ terminate the VM when the caller exits.
 | `process.commandLine` | n/a | run as `/bin/sh -c <commandLine>`; at most 4096 bytes |
 | `process.argv` (ACI Edge Sandboxes extension) | n/a | applied; absolute program, up to 64 arguments of 4096 bytes |
 | `process.cwd` | n/a | applied; an absolute guest path of at most 4095 bytes, `/` when omitted; see [Working directories](#working-directories) |
-| `process.timeout` | n/a | applied, up to 3,600,000 ms |
+| `process.timeout` | n/a | applied, up to 4,294,967,295 ms (about 49.7 days), the most that MXC allows; `0` disables it |
 | `process.env`, `inheritDefaultEnv` | n/a | applied per execution; see [Environment](#environment) |
 | Piped standard input | n/a | rejected; the workload reads end-of-file |
 

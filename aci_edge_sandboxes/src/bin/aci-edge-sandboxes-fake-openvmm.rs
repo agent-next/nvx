@@ -9,15 +9,15 @@
 //! or `printenv` in any directory, which prints its environment. A script is a `;`-separated
 //! list of commands: `echo TEXT`, `echoerr TEXT`, `sleep MS`, `exit CODE`, `signal NUMBER`,
 //! `flood BYTES`, `write KEY VALUE`, `read KEY`, `mkdir DIRECTORY`, `env`, `printenv NAME`,
-//! `pwd`, `fail`, and `launchfail`. Like `sh`, a script exits with the status of its last
-//! command; `printenv NAME` prints nothing and fails with status 1 when `NAME` is unset. Values written with `write` and directories made with
+//! `pwd`, `timeout`, `fail`, and `launchfail`. Like `sh`, a script exits with the status of its
+//! last command; `printenv NAME` prints nothing and fails with status 1 when `NAME` is unset. Values written with `write` and directories made with
 //! `mkdir` live in memory until the VM stops, like files in the guest's RAM root file system.
 //! A `CANCEL` request ends a sleeping workload with the cancelled outcome, and a client that
 //! disconnects during an exec abandons it, as the real guest agent does. `pwd` prints the
-//! working directory of the exec request. Like the guest agent, the fake refuses a working
-//! directory that does not exist (any but `/`, `/tmp`, `/work`, a mapped directory, or a
-//! directory made with `mkdir`), or that is a mapped regular file, with a diagnostic and the
-//! `cwd-failed` category.
+//! working directory of the exec request, and `timeout` its timeout in milliseconds. Like the
+//! guest agent, the fake refuses a working directory that does not exist (any but `/`, `/tmp`,
+//! `/work`, a mapped directory, or a directory made with `mkdir`), or that is a mapped regular
+//! file, with a diagnostic and the `cwd-failed` category.
 //!
 //! Each workload gets the environment that its exec request selects, in the order in which the
 //! guest agent builds it. The default environment is the documented guest bootstrap environment:
@@ -849,6 +849,10 @@ impl<S: Read + Write + Pending> Session<'_, S> {
                 }
                 "pwd" => {
                     let line = format!("{cwd}\n");
+                    self.send(APP_STDOUT, request_id, 0, line.as_bytes())?;
+                }
+                "timeout" => {
+                    let line = format!("{timeout_ms}\n");
                     self.send(APP_STDOUT, request_id, 0, line.as_bytes())?;
                 }
                 "fail" => return self.send_some(APP_EXIT, request_id, 125, b"failed"),

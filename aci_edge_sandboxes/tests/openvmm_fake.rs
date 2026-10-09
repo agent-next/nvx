@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime};
 use aci_edge_sandboxes::openvmm::{Hypervisor, OpenVmmConfig};
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
-    ExecRequest, FilesystemPolicy, NetworkPolicy, NetworkRule, Protocol, ProvisionRequest,
-    SandboxId, StdinMode,
+    ExecRequest, FilesystemPolicy, NetworkPolicy, NetworkRule, ProcessSpec, Protocol,
+    ProvisionRequest, SandboxId, StdinMode,
 };
 use tempfile::TempDir;
 
@@ -725,6 +725,56 @@ fn workload_outcomes_are_distinguished() {
 }
 
 #[test]
+fn timeouts_cover_the_mxc_range() {
+    let fixture = Fixture::new();
+    let nvx = fixture.nvx();
+    assert_eq!(
+        nvx.capabilities().exec.max_timeout_ms,
+        Some(ProcessSpec::MAX_TIMEOUT_MS)
+    );
+    let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
+    nvx.start(&sandbox_id).unwrap();
+
+    // Every timeout up to MXC's maximum reaches the guest agent unchanged, and a workload that
+    // ends first is not held up by it.
+    let started = Instant::now();
+    for millis in [0, 3_600_001, 86_400_000, ProcessSpec::MAX_TIMEOUT_MS] {
+        let output = output_of(
+            &nvx,
+            &sandbox_id,
+            ExecRequest::command_line("timeout; sleep 50")
+                .with_timeout(Duration::from_millis(millis)),
+        );
+        assert_eq!(output.stdout, format!("{millis}\n").as_bytes(), "{millis}");
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    // Without a timeout, the guest agent receives zero, which disables it.
+    let unbounded = output_of(&nvx, &sandbox_id, ExecRequest::command_line("timeout"));
+    assert_eq!(unbounded.stdout, b"0\n");
+
+    // A timeout still ends a workload that overruns it.
+    let timed_out = nvx
+        .exec(
+            &sandbox_id,
+            &ExecRequest::command_line("echo started; sleep 30000")
+                .with_timeout(Duration::from_millis(200)),
+        )
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(timed_out.outcome, ExecOutcome::TimedOut);
+    assert_eq!(timed_out.stdout, b"started\n");
+    assert_eq!(run(&nvx, &sandbox_id, "echo after").stdout, b"after\n");
+
+    nvx.stop(&sandbox_id).unwrap();
+    nvx.deprovision(&sandbox_id).unwrap();
+}
+
+#[test]
 fn working_directories_apply_to_each_execution() {
     let fixture = Fixture::new();
     let nvx = fixture.nvx();
@@ -862,7 +912,6 @@ fn unsupported_requests_are_rejected_before_anything_runs() {
         write().with_envs(["KEY=one", "KEY=two"]),
         write().with_cwd(format!("/{}", "d".repeat(4095))),
         write().with_stdin(StdinMode::Piped),
-        write().with_timeout(Duration::from_secs(2 * 60 * 60)),
         write().with_env(format!("BIG={}", "x".repeat(5000))),
         write().with_envs((0..257).map(|index| format!("V{index}=x"))),
         ExecRequest::argv(["relative/program"]),
@@ -879,6 +928,7 @@ fn unsupported_requests_are_rejected_before_anything_runs() {
         write().with_env("NOVALUE"),
         write().with_env("=value"),
         write().with_envs(["A=1", "B"]),
+        write().with_timeout(Duration::from_millis(ProcessSpec::MAX_TIMEOUT_MS + 1)),
     ] {
         assert_eq!(
             nvx.exec(&sandbox_id, &request).unwrap_err().code(),

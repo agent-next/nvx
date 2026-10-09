@@ -9,7 +9,8 @@ use std::time::Duration;
 use aci_edge_sandboxes::openvmm::{Hypervisor, OpenVmmConfig};
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, ErrorCode, ExecIo, ExecRequest, FilesystemPolicy, NetworkPolicy,
-    NetworkPort, NetworkRule, OutputSink, Protocol, ProvisionRequest, SandboxId, StdinMode,
+    NetworkPort, NetworkRule, OutputSink, ProcessSpec, Protocol, ProvisionRequest, SandboxId,
+    StdinMode,
 };
 
 fn config(directory: &tempfile::TempDir) -> OpenVmmConfig {
@@ -108,7 +109,6 @@ fn exec_validation_and_execution_share_guest_policy_checks() {
         // The working directory shares the control protocol's 64 KiB request bound.
         ExecRequest::argv(vec![full_argument.as_str(); 15])
             .with_cwd(format!("/{}", "x".repeat(4094))),
-        ExecRequest::command_line("true").with_timeout(Duration::from_millis(3_600_001)),
         ExecRequest::command_line("true").with_envs(entries(257)),
         ExecRequest::command_line("true")
             .with_envs(entries(257))
@@ -139,7 +139,11 @@ fn exec_validation_accepts_the_exact_guest_limits() {
         // Linux paths, including their terminating NUL, fit in 4096 bytes.
         ExecRequest::command_line("true").with_cwd(format!("/{}", "x".repeat(4094))),
         ExecRequest::argv(vec![full_argument.as_str(); 15]),
-        ExecRequest::command_line("true").with_timeout(Duration::from_millis(3_600_000)),
+        // Timeouts cover MXC's whole range, far beyond an hour.
+        ExecRequest::command_line("true").with_timeout(Duration::from_millis(3_600_001)),
+        ExecRequest::command_line("true").with_timeout(Duration::from_millis(86_400_000)),
+        ExecRequest::command_line("true")
+            .with_timeout(Duration::from_millis(ProcessSpec::MAX_TIMEOUT_MS)),
         ExecRequest::command_line("true").with_envs(entries(256)),
         ExecRequest::command_line("true")
             .with_envs(entries(256))
@@ -159,6 +163,41 @@ fn exec_validation_accepts_the_exact_guest_limits() {
     ] {
         client.validate_exec(&request).unwrap();
         client.backend().validate_exec(&request).unwrap();
+    }
+    assert_eq!(state_entries(&directory), before);
+}
+
+#[test]
+fn exec_validation_rejects_timeouts_beyond_the_mxc_range() {
+    let (directory, client) = client();
+    let before = state_entries(&directory);
+    let maximum = Duration::from_millis(ProcessSpec::MAX_TIMEOUT_MS);
+    // Even a fraction of a millisecond above the maximum is refused.
+    for timeout in [
+        maximum + Duration::from_millis(1),
+        maximum + Duration::from_nanos(1),
+    ] {
+        let request = ExecRequest::command_line("true").with_timeout(timeout);
+        // The contract bounds `process.timeout`, so the client refuses a larger one as malformed
+        // before any backend sees it.
+        for error in [
+            client.validate_exec(&request).unwrap_err(),
+            client.exec(&stale_id(), &request).unwrap_err(),
+        ] {
+            assert_eq!(error.code(), ErrorCode::MalformedRequest, "{error}");
+            assert!(error.message().contains("4294967295"), "{error}");
+        }
+        // The backend's own checks refuse what the guest agent's 32-bit timeout cannot carry.
+        assert_eq!(
+            client.backend().validate_exec(&request).unwrap_err().code(),
+            ErrorCode::PolicyValidation,
+            "{timeout:?}"
+        );
+        let error = match client.backend().exec(&stale_id(), &request, unused_io()) {
+            Err(error) => error,
+            Ok(_) => panic!("the backend accepted a timeout beyond its limit"),
+        };
+        assert_eq!(error.code(), ErrorCode::PolicyValidation, "{error}");
     }
     assert_eq!(state_entries(&directory), before);
 }
