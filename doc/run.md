@@ -177,7 +177,7 @@ as its DNS server when the policy allows TCP or UDP port 53 to it, and
 otherwise the IPv6 gateway when the policy allows DNS to that one.
 
 NVX can lower protocol selectors, inclusive TCP/UDP port ranges, and rule-local
-IPv4 exclusions to those native rules:
+IPv4 or IPv6 exclusions to those native rules:
 
 ```json
 {
@@ -228,6 +228,20 @@ IPv4 exclusions to those native rules:
           "protocol": "icmp"
         }
       ]
+    },
+    {
+      "to": [
+        {
+          "cidr": "2001:db8::/48",
+          "except": ["2001:db8::/56"]
+        }
+      ],
+      "ports": [
+        {
+          "protocol": "tcp",
+          "port": 443
+        }
+      ]
     }
   ],
   "deny": [
@@ -254,24 +268,27 @@ Pass the file with `--network-egress-policy-file PATH` on `run`, one-shot
 `--network-egress-allow` or `--network-egress-deny`.
 
 The root accepts only `allow` and `deny` arrays. Each element uses the MXC
-`NetworkRule` shape: optional `to` and `ports` arrays. Omitting `to` matches all
-IPv4 destinations. Each `to` entry requires one IPv4 `cidr`; optional `except`
-entries must be IPv4 CIDRs contained by that parent. Host bits are normalized
-like the native CIDR syntax: `10.0.0.5/24` means `10.0.0.0/24`, not one host.
-Use `/32` to select one IPv4 address.
+`NetworkRule` shape: optional `to` and `ports` arrays. Omitting `to` matches
+every IPv4 and IPv6 destination. Each `to` entry requires one IPv4 or IPv6
+`cidr`; optional `except` entries must be CIDRs of the same family contained by
+that parent, and the entries of each family lower to native rules of that
+family. Host bits are normalized like the native CIDR syntax: `10.0.0.5/24`
+means `10.0.0.0/24`, not one host. Use `/32` to select one IPv4 address and
+`/128` to select one IPv6 address; IPv6 scope IDs are rejected.
 
-Omitting `ports` matches every IPv4 transport supported by the native rule.
-Each port selector follows MXC: `protocol` defaults to `any`. Without `port`,
-`tcp` and `udp` match every port of that protocol, `icmp` matches ICMP alone,
-and `any` matches every IPv4 protocol. A `port` in `1..65535` applies to
-`tcp`, `udp`, or `any`, which expands to TCP and UDP on that port but not ICMP.
-Optional inclusive `endPort` requires `port` and cannot be below it. IPv6 is
-not supported.
+Omitting `ports` matches every transport supported by the native rule. Each
+port selector follows MXC: `protocol` defaults to `any`. Without `port`, `tcp`
+and `udp` match every port of that protocol, `icmp` matches ICMP alone, or
+ICMPv6 for IPv6 destinations, and `any` matches every protocol. A `port` in
+`1..65535` applies to `tcp`, `udp`, or `any`, which expands to TCP and UDP on
+that port but not ICMP. Optional inclusive `endPort` requires `port` and cannot
+be below it.
 
 Duplicate JSON properties, unknown fields, and explicit `null` protocol values
 are rejected. Policy files are limited to 1 MiB of UTF-8 input. The previous
 flat `cidr`/`except`/`protocol`/`port` rule form remains accepted for
-compatibility, but new policy files should use the MXC shape.
+compatibility, with an IPv4 or IPv6 `cidr`, but new policy files should use the
+MXC shape.
 
 A port range lowers to one native `FIRST-LAST` rule for each destination
 network. The policy above therefore allows `192.0.2.0/25:tcp:8000-8010`, which
@@ -287,11 +304,11 @@ precedence over allow matches.
 
 NVX canonicalizes safely equivalent prefixes, merges the adjacent and
 overlapping port ranges of each network, and rejects policies that lower to
-more than 256 allow rules or 256 deny rules; protocol `any` with a port or a
-port range lowers to one TCP and one UDP rule. NVX rejects oversized expansions
-before launch rather than truncating or widening them. Managed provision stores
-the validated lowered rules in sandbox state, so later starts do not reread a
-mutable source policy file.
+more than 256 allow rules or 256 deny rules, counting both families together;
+protocol `any` with a port or a port range lowers to one TCP and one UDP rule.
+NVX rejects oversized expansions before launch rather than truncating or
+widening them. Managed provision stores the validated lowered rules in sandbox
+state, so later starts do not reread a mutable source policy file.
 
 Host-loopback denial and deliberate localhost port publishing are separately
 controlled from ordinary egress:
