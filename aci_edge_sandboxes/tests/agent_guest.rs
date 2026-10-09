@@ -30,7 +30,7 @@ use aci_edge_sandboxes::agent::{
 use aci_edge_sandboxes::openvmm::resolve_guest_path;
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, Error, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
-    ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward, ImageSource,
+    ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward, ImageSource, NetworkPeer,
     NetworkPolicy, NetworkRule, Protocol, ProvisionRequest, Result, SandboxId, SandboxSpec,
     StdinMode, StopResult,
 };
@@ -2144,6 +2144,14 @@ fn network_policies_are_enforced() {
     });
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let host_rule = || NetworkRule::to(format!("{host}/32"));
+    let host_network = format!("{}/24", Ipv4Addr::from(u32::from(host) & 0xffff_ff00));
+    let excluding_host = || NetworkRule {
+        to: vec![NetworkPeer {
+            cidr: host_network.clone(),
+            except: vec![format!("{host}/32")],
+        }],
+        ports: Vec::new(),
+    };
     let contained = |egress: EgressPolicy| NetworkPolicy {
         egress,
         ..NetworkPolicy::deny_all()
@@ -2166,6 +2174,29 @@ fn network_policies_are_enforced() {
             contained(
                 EgressPolicy::new(Access::Deny)
                     .with_allow(host_rule().on_port(Protocol::Tcp, ports[0].parse().unwrap())),
+            ),
+            [false, true, false],
+        ),
+        (
+            "allow exclusion is rule local",
+            contained(
+                EgressPolicy::new(Access::Deny)
+                    .with_allow(excluding_host())
+                    .with_allow(host_rule().on_port(Protocol::Tcp, ports[0].parse().unwrap())),
+            ),
+            [false, true, false],
+        ),
+        (
+            "deny exclusion follows default",
+            contained(EgressPolicy::new(Access::Allow).with_deny(excluding_host())),
+            [true, true, true],
+        ),
+        (
+            "explicit deny takes precedence",
+            contained(
+                EgressPolicy::new(Access::Deny)
+                    .with_allow(host_rule())
+                    .with_deny(host_rule().on_port(Protocol::Tcp, ports[1].parse().unwrap())),
             ),
             [false, true, false],
         ),

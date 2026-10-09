@@ -155,30 +155,66 @@ IPv4 exclusions to those native rules:
 {
   "allow": [
     {
-      "cidr": "192.0.2.0/24",
-      "except": ["192.0.2.128/25"],
-      "protocol": "tcp",
-      "port": 8000,
-      "endPort": 8010
+      "to": [
+        {
+          "cidr": "192.0.2.0/24",
+          "except": ["192.0.2.128/25"]
+        }
+      ],
+      "ports": [
+        {
+          "protocol": "tcp",
+          "port": 8000,
+          "endPort": 8010
+        }
+      ]
     },
     {
-      "cidr": "192.0.2.200/32"
+      "to": [
+        {
+          "cidr": "192.0.2.200/32"
+        }
+      ]
     },
     {
-      "cidr": "198.51.100.0/24",
-      "protocol": "any",
-      "port": 443
+      "to": [
+        {
+          "cidr": "198.51.100.0/24"
+        }
+      ],
+      "ports": [
+        {
+          "protocol": "any",
+          "port": 443
+        }
+      ]
     },
     {
-      "cidr": "198.51.100.7/32",
-      "protocol": "icmp"
+      "to": [
+        {
+          "cidr": "198.51.100.7/32"
+        }
+      ],
+      "ports": [
+        {
+          "protocol": "icmp"
+        }
+      ]
     }
   ],
   "deny": [
     {
-      "cidr": "192.0.2.0/24",
-      "protocol": "tcp",
-      "port": 8005
+      "to": [
+        {
+          "cidr": "192.0.2.0/24"
+        }
+      ],
+      "ports": [
+        {
+          "protocol": "tcp",
+          "port": 8005
+        }
+      ]
     }
   ]
 }
@@ -189,19 +225,25 @@ Pass the file with `--network-egress-policy-file PATH` on `run`, one-shot
 `deny` is required. The file option cannot be mixed with
 `--network-egress-allow` or `--network-egress-deny`.
 
-The root accepts only `allow` and `deny` arrays. Each rule requires one IPv4
-`cidr`; optional `except` entries must be IPv4 CIDRs contained by that parent.
-Host bits are normalized like the native CIDR syntax: `10.0.0.5/24` means
-`10.0.0.0/24`, not one host. Use `/32` to select one IPv4 address.
+The root accepts only `allow` and `deny` arrays. Each element uses the MXC
+`NetworkRule` shape: optional `to` and `ports` arrays. Omitting `to` matches all
+IPv4 destinations. Each `to` entry requires one IPv4 `cidr`; optional `except`
+entries must be IPv4 CIDRs contained by that parent. Host bits are normalized
+like the native CIDR syntax: `10.0.0.5/24` means `10.0.0.0/24`, not one host.
+Use `/32` to select one IPv4 address.
+
+Omitting `ports` matches every IPv4 transport supported by the native rule.
+Each port selector follows MXC: `protocol` defaults to `any`. Without `port`,
+`tcp` and `udp` match every port of that protocol, `icmp` matches ICMP alone,
+and `any` matches every IPv4 protocol. A `port` in `1..65535` applies to
+`tcp`, `udp`, or `any`, which expands to TCP and UDP on that port but not ICMP.
+Optional inclusive `endPort` requires `port` and cannot be below it. IPv6 is
+not supported.
+
 Duplicate JSON properties, unknown fields, and explicit `null` protocol values
-are rejected. Policy files are limited to 1 MiB of UTF-8 input.
-`protocol` is `tcp`, `udp`, `icmp`, or `any`. Without `port`, `tcp` and `udp`
-match every port of that protocol, `icmp` matches ICMP alone, and `any` matches
-every IPv4 protocol, like a rule without `protocol`. A `port` in `1..65535`
-applies to `tcp`, `udp`, or `any`, which matches TCP and UDP on that port but
-not ICMP; `icmp` rejects ports, and a `port` without `protocol` is rejected.
-Optional `endPort` requires `port`, is inclusive, must be in `1..65535`, and
-cannot be below `port`. IPv6 is not supported.
+are rejected. Policy files are limited to 1 MiB of UTF-8 input. The previous
+flat `cidr`/`except`/`protocol`/`port` rule form remains accepted for
+compatibility, but new policy files should use the MXC shape.
 
 Exclusions affect only their containing rule: they never become global deny
 rules. A later allow rule may therefore match an address excluded from an

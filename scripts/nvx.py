@@ -1125,7 +1125,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--network-egress-policy-file",
         type=Path,
         metavar="PATH",
-        help="load bounded IPv4 ranges and rule-local exclusions from JSON",
+        help="load bounded MXC-shaped IPv4 egress rules from JSON",
     )
     run.add_argument("--host-loopback", choices=("allow", "deny"))
     run.add_argument("--network-proxy", metavar="IPV4:TCP-PORT")
