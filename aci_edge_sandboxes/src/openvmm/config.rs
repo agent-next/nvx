@@ -46,6 +46,9 @@ pub struct OpenVmmConfig {
     /// UTS hostname of workloads.
     pub hostname: String,
     /// Static guest IPv4 address and prefix used when a network device is attached.
+    ///
+    /// OpenVMM derives the guest's IPv6 address by embedding this one in `fd00::/96`: the default
+    /// `10.0.0.2/24` yields `fd00::a00:2/120`, whose gateway is `fd00::a00:1`.
     pub guest_network: String,
     /// Extra kernel parameters. `nvx_*`, `tsc=`, and `hostname=` tokens are reserved.
     ///

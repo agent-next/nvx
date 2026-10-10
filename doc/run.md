@@ -124,6 +124,18 @@ responses to guest-initiated connections remain available, while new inbound
 connections do not. The portable profile supports egress `allow` or `deny` but
 rejects ingress `allow` before the workload starts.
 
+The NIC is dual-stack. The guest's IPv6 address embeds its IPv4 address in the
+unique local prefix `fd00::/96`, with a prefix of 96 plus the IPv4 prefix, and
+its IPv6 gateway embeds the IPv4 gateway in the same way: `10.0.0.2/24` gives
+the guest `fd00::a00:2/120` behind the gateway `fd00::a00:1`. The guest
+configures both identities statically; it neither solicits router
+advertisements nor autoconfigures addresses from them, so its only other IPv6
+address is the kernel's link-local one in `fe80::/64`. Like the IPv4 gateway,
+the IPv6 gateway answers ICMPv6 echo requests and maps TCP and UDP flows onto
+host loopback, here `::1`, when host-loopback access is allowed. Because the
+guest's only IPv6 source address beyond its link is a unique local one,
+standard address selection prefers IPv4 for destinations that have both.
+
 For destination and port rules, select an explicit default and repeat generic
 allow/deny options:
 
@@ -142,19 +154,30 @@ allow/deny options:
   --network-egress-deny 140.82.114.0/24:tcp:443
 ```
 
-Rules match IPv4 addresses or CIDRs and may select one protocol: `tcp`, `udp`,
-or `icmp`. A TCP or UDP rule may add one destination port, or an inclusive
-range of them written `FIRST-LAST`; without a port, it matches every port of
-that protocol. Ports are `1` through `65535`, and a range cannot end below its
-first port. ICMP rules take no port. For example, `192.0.2.0/24:udp` matches
-UDP on every port, `192.0.2.1:tcp:8000-8010` matches TCP ports 8000 through
-8010 but not UDP, and `192.0.2.1:icmp` matches ICMP but not TCP or UDP. Deny
-matches take precedence over allow matches, so adding
-`--network-egress-deny 192.0.2.1:tcp:8005` keeps port 8005 blocked inside that
-range.
+Rules match IPv4 or IPv6 addresses or CIDRs and may select one protocol: `tcp`,
+`udp`, or `icmp`. A TCP or UDP rule may add one destination port, or an
+inclusive range of them written `FIRST-LAST`; without a port, it matches every
+port of that protocol. Ports are `1` through `65535`, and a range cannot end
+below its first port. ICMP rules take no port, and an IPv6 ICMP rule matches
+ICMPv6. For example, `192.0.2.0/24:udp` matches UDP on every port,
+`192.0.2.1:tcp:8000-8010` matches TCP ports 8000 through 8010 but not UDP,
+`192.0.2.1:icmp` matches ICMP but not TCP or UDP, and `2001:db8::/32:tcp:443`
+matches TCP port 443 on that IPv6 network. Deny matches take precedence over
+allow matches, so adding `--network-egress-deny 192.0.2.1:tcp:8005` keeps port
+8005 blocked inside that range.
+
+A rule matches only destinations of its own address family, so IPv4 rules never
+admit IPv6 traffic, or the reverse, and a `deny` default blocks every IPv6
+destination that no IPv6 rule allows. Use `0.0.0.0/0` and `::/0` to match
+every destination of one family. Like ARP for the IPv4 gateway, Neighbor
+Discovery for the IPv6 gateway is allowed under an `allow` default or with any
+IPv6 allow rule. The gateway never forwards IPv6 packets that carry extension
+headers or that target IPv4-mapped addresses. The guest names the IPv4 gateway
+as its DNS server when the policy allows TCP or UDP port 53 to it, and
+otherwise the IPv6 gateway when the policy allows DNS to that one.
 
 NVX can lower protocol selectors, inclusive TCP/UDP port ranges, and rule-local
-IPv4 exclusions to those native rules:
+IPv4 or IPv6 exclusions to those native rules:
 
 ```json
 {
@@ -205,6 +228,20 @@ IPv4 exclusions to those native rules:
           "protocol": "icmp"
         }
       ]
+    },
+    {
+      "to": [
+        {
+          "cidr": "2001:db8::/48",
+          "except": ["2001:db8::/56"]
+        }
+      ],
+      "ports": [
+        {
+          "protocol": "tcp",
+          "port": 443
+        }
+      ]
     }
   ],
   "deny": [
@@ -231,24 +268,27 @@ Pass the file with `--network-egress-policy-file PATH` on `run`, one-shot
 `--network-egress-allow` or `--network-egress-deny`.
 
 The root accepts only `allow` and `deny` arrays. Each element uses the MXC
-`NetworkRule` shape: optional `to` and `ports` arrays. Omitting `to` matches all
-IPv4 destinations. Each `to` entry requires one IPv4 `cidr`; optional `except`
-entries must be IPv4 CIDRs contained by that parent. Host bits are normalized
-like the native CIDR syntax: `10.0.0.5/24` means `10.0.0.0/24`, not one host.
-Use `/32` to select one IPv4 address.
+`NetworkRule` shape: optional `to` and `ports` arrays. Omitting `to` matches
+every IPv4 and IPv6 destination. Each `to` entry requires one IPv4 or IPv6
+`cidr`; optional `except` entries must be CIDRs of the same family contained by
+that parent, and the entries of each family lower to native rules of that
+family. Host bits are normalized like the native CIDR syntax: `10.0.0.5/24`
+means `10.0.0.0/24`, not one host. Use `/32` to select one IPv4 address and
+`/128` to select one IPv6 address; IPv6 scope IDs are rejected.
 
-Omitting `ports` matches every IPv4 transport supported by the native rule.
-Each port selector follows MXC: `protocol` defaults to `any`. Without `port`,
-`tcp` and `udp` match every port of that protocol, `icmp` matches ICMP alone,
-and `any` matches every IPv4 protocol. A `port` in `1..65535` applies to
-`tcp`, `udp`, or `any`, which expands to TCP and UDP on that port but not ICMP.
-Optional inclusive `endPort` requires `port` and cannot be below it. IPv6 is
-not supported.
+Omitting `ports` matches every transport supported by the native rule. Each
+port selector follows MXC: `protocol` defaults to `any`. Without `port`, `tcp`
+and `udp` match every port of that protocol, `icmp` matches ICMP alone, or
+ICMPv6 for IPv6 destinations, and `any` matches every protocol. A `port` in
+`1..65535` applies to `tcp`, `udp`, or `any`, which expands to TCP and UDP on
+that port but not ICMP. Optional inclusive `endPort` requires `port` and cannot
+be below it.
 
 Duplicate JSON properties, unknown fields, and explicit `null` protocol values
 are rejected. Policy files are limited to 1 MiB of UTF-8 input. The previous
 flat `cidr`/`except`/`protocol`/`port` rule form remains accepted for
-compatibility, but new policy files should use the MXC shape.
+compatibility, with an IPv4 or IPv6 `cidr`, but new policy files should use the
+MXC shape.
 
 A port range lowers to one native `FIRST-LAST` rule for each destination
 network. The policy above therefore allows `192.0.2.0/25:tcp:8000-8010`, which
@@ -264,11 +304,11 @@ precedence over allow matches.
 
 NVX canonicalizes safely equivalent prefixes, merges the adjacent and
 overlapping port ranges of each network, and rejects policies that lower to
-more than 256 allow rules or 256 deny rules; protocol `any` with a port or a
-port range lowers to one TCP and one UDP rule. NVX rejects oversized expansions
-before launch rather than truncating or widening them. Managed provision stores
-the validated lowered rules in sandbox state, so later starts do not reread a
-mutable source policy file.
+more than 256 allow rules or 256 deny rules, counting both families together;
+protocol `any` with a port or a port range lowers to one TCP and one UDP rule.
+NVX rejects oversized expansions before launch rather than truncating or
+widening them. Managed provision stores the validated lowered rules in sandbox
+state, so later starts do not reread a mutable source policy file.
 
 Host-loopback denial and deliberate localhost port publishing are separately
 controlled from ordinary egress:

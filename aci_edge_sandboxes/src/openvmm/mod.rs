@@ -30,7 +30,7 @@
 //! | --- | --- | --- |
 //! | `filesystem.readonlyPaths`, `readwritePaths` | mapped at their [`guest_path`] | n/a |
 //! | `filesystem.deniedPaths` | hidden inside mapped paths | n/a |
-//! | `network.egress` | default and IPv4 rules applied | n/a |
+//! | `network.egress` | default and IPv4 and IPv6 rules applied | n/a |
 //! | `network.ingress`, `hostLoopback` | `deny` only | n/a |
 //! | `microvm.provision.memoryMib` | applied | n/a |
 //! | `process.commandLine` | n/a | run as `/bin/sh -c <commandLine>`, at most 4096 bytes |
@@ -49,7 +49,7 @@
 //! Host paths share OpenVMM's single virtio-fs export: the backend exports the deepest directory
 //! that contains every mapped path to a guest directory that only the guest's root can enter, and
 //! the guest agent bind-mounts each mapped path, read-only or read-write. Egress rules are expanded
-//! into OpenVMM's IPv4 rules exactly; IPv6 and rules that would need more than 256 OpenVMM rules
+//! into OpenVMM's IPv4 and IPv6 rules exactly; rules that would need more than 256 OpenVMM rules
 //! are rejected. Egress denied without allow rules, with ingress denied,
 //! attaches no network device. Workloads run as the fixed non-root identity of
 //! [`OpenVmmConfig::workload_uid`] and [`OpenVmmConfig::workload_gid`] (see

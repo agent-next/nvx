@@ -298,6 +298,7 @@ def _write_release_fixture(
                 *KernelBuildConstants.REQUIRED_VIRTIO_CONSOLE_CONFIG,
                 *KernelBuildConstants.REQUIRED_SHARED_STATUS_CONFIG,
                 *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
+                *KernelBuildConstants.REQUIRED_NETWORK_CONFIG,
                 *KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
                 *KernelBuildConstants.REQUIRED_HARDENING_CONFIG,
             )
@@ -6891,6 +6892,7 @@ class BuildTests(unittest.TestCase):
                         *KernelBuildConstants.REQUIRED_VIRTIO_CONSOLE_CONFIG,
                         *KernelBuildConstants.REQUIRED_SHARED_STATUS_CONFIG,
                         *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
+                        *KernelBuildConstants.REQUIRED_NETWORK_CONFIG,
                         *KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
                         *KernelBuildConstants.REQUIRED_HARDENING_CONFIG,
                     )
@@ -8306,6 +8308,50 @@ class BuildTests(unittest.TestCase):
                     with self.assertRaisesRegex(common.ScriptError, missing):
                         build._assert_sandbox_kernel_config(config)
 
+    def test_network_kernel_config_requires_every_feature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / ".config"
+            config.write_text(
+                "\n".join(KernelBuildConstants.REQUIRED_NETWORK_CONFIG) + "\n",
+                encoding="utf-8",
+            )
+            build._assert_network_kernel_config(config)
+
+            for missing in KernelBuildConstants.REQUIRED_NETWORK_CONFIG:
+                with self.subTest(missing=missing):
+                    config.write_text(
+                        "\n".join(
+                            setting
+                            for setting in KernelBuildConstants.REQUIRED_NETWORK_CONFIG
+                            if setting != missing
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        common.ScriptError, "portable network profile"
+                    ) as raised:
+                        build._assert_network_kernel_config(config)
+                    self.assertIn(missing, str(raised.exception))
+
+            # An enabled SIT device leaves the "is not set" line out.
+            config.write_text(
+                "\n".join(
+                    "CONFIG_IPV6_SIT=y"
+                    if setting == "# CONFIG_IPV6_SIT is not set"
+                    else setting
+                    for setting in KernelBuildConstants.REQUIRED_NETWORK_CONFIG
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(common.ScriptError, "CONFIG_IPV6_SIT"):
+                build._assert_network_kernel_config(config)
+
+    def test_checked_in_config_provides_the_portable_network_profile(self):
+        config = BuildConstants.REPO_ROOT / KernelBuildConstants.INPUT_CONFIG
+        build._assert_network_kernel_config(config)
+
     def test_checked_in_config_preserves_generic_sandbox_capabilities(self):
         config = BuildConstants.REPO_ROOT / "kernel" / "config-microvm"
         build._assert_sandbox_kernel_config(config)
@@ -8500,6 +8546,7 @@ class BuildTests(unittest.TestCase):
                         *KernelBuildConstants.REQUIRED_VIRTIO_CONSOLE_CONFIG,
                         *KernelBuildConstants.REQUIRED_SHARED_STATUS_CONFIG,
                         *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
+                        *KernelBuildConstants.REQUIRED_NETWORK_CONFIG,
                         *KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
                         *KernelBuildConstants.REQUIRED_HARDENING_CONFIG,
                         "# CONFIG_DEBUG_KERNEL is not set",

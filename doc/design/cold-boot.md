@@ -100,7 +100,8 @@ tokens. A fresh boot then appends host-owned tokens in this order:
    by `nvx_control_tty=hvc2`, and the second filesystem slot when a second
    HostFs export is attached; and
 5. network bootstrap tokens, including gateway DNS only when the egress
-   policy permits it, followed by
+   policy permits it, which names the IPv4 gateway or else the IPv6 one,
+   followed by
    [filesystem bootstrap tokens](machine-and-device-abi.md#filesystem) for
    each attached HostFs export, in slot order.
 
@@ -110,10 +111,10 @@ LAPIC rates from the [time ABI](time-abi.md#rates) MSRs, and a
 fails with `E_CMDLINE_CLOCK_TOKEN`.
 
 Callers may not supply `earlycon=`, `console=`, `virtio_mmio.device=`,
-`virtnet_ip=`, `virtnet_mask=`, `virtnet_gw=`, `virtnet_dns=`, `virtfs_dir=`,
-`virtfs_tag=`, `virtfs_mode=`, `nvx_snapshot_tier=`, `nr_cpus=`,
-`nvx_workload_uid=`, `nvx_workload_gid=`, or `nvx_lifecycle=` tokens. A
-machine with a control console also applies the
+`virtnet_ip=`, `virtnet_mask=`, `virtnet_gw=`, `virtnet_dns=`, `virtnet_ip6=`,
+`virtnet_gw6=`, `virtfs_dir=`, `virtfs_tag=`, `virtfs_mode=`,
+`nvx_snapshot_tier=`, `nr_cpus=`, `nvx_workload_uid=`, `nvx_workload_gid=`,
+or `nvx_lifecycle=` tokens. A machine with a control console also applies the
 [control-console command-line rules](machine-and-device-abi.md#control-console).
 Embedded NULs are rejected, and the complete NUL-terminated command line must
 fit in 64 KiB. The same effective string and its SHA-256 digest become part of

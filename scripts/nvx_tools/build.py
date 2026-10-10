@@ -111,6 +111,14 @@ def _assert_sandbox_kernel_config(path: Path) -> None:
     )
 
 
+def _assert_network_kernel_config(path: Path) -> None:
+    _assert_kernel_config(
+        path,
+        KernelBuildConstants.REQUIRED_NETWORK_CONFIG,
+        "kernel configuration cannot support the portable network profile: ",
+    )
+
+
 def _assert_shared_status_kernel_config(path: Path) -> None:
     _assert_kernel_config(
         path,
@@ -171,6 +179,7 @@ def assert_required_kernel_config(path: Path, *, debug: bool = False) -> None:
     _assert_direct_boot_kernel_config(path)
     _assert_virtio_console_kernel_config(path)
     _assert_sandbox_kernel_config(path)
+    _assert_network_kernel_config(path)
     _assert_shared_status_kernel_config(path)
     _assert_time_abi_kernel_config(path)
     _assert_hardening_kernel_config(path)

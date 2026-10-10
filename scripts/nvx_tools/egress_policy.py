@@ -1,11 +1,12 @@
-"""Compile structured IPv4 egress policies to the native OpenVMM rule grammar."""
+"""Compile structured IPv4 and IPv6 egress policies to the native OpenVMM rule
+grammar."""
 
 from __future__ import annotations
 
 import ipaddress
 import json
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -24,14 +25,22 @@ _RULE_PROTOCOLS = ("tcp", "udp", "icmp", "any")
 # Protocols that a native rule can select on every port, and those with ports.
 _NATIVE_PROTOCOLS = ("icmp", "tcp", "udp")
 _PORT_PROTOCOLS = ("tcp", "udp")
+_IP_VERSIONS = (4, 6)
 _AddressInterval = tuple[int, int]
 _AddressIntervals = tuple[_AddressInterval, ...]
+_Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 _PortSelector = tuple[str | None, int | None, int | None]
-_ALL_IPV4: _AddressIntervals = ((0, (1 << 32) - 1),)
+# Each IP version with its addresses; a rule without destinations matches every
+# address of both families.
+_Destinations = tuple[tuple[int, _AddressIntervals], ...]
+_ALL_ADDRESSES: _Destinations = (
+    (4, ((0, (1 << 32) - 1),)),
+    (6, ((0, (1 << 128) - 1),)),
+)
 # An inclusive range of destination ports.
 _PortRange = tuple[int, int]
 # A native rule: a network, and optionally a protocol and its port range.
-_NativeRule = tuple[ipaddress.IPv4Network, str | None, _PortRange | None]
+_NativeRule = tuple[_Network, str | None, _PortRange | None]
 
 
 @dataclass(frozen=True)
@@ -42,8 +51,10 @@ class CompiledEgressPolicy:
 
 @dataclass(frozen=True)
 class _Rule:
+    # IP version of the addresses, each an interval of integers in its family.
+    version: int
     addresses: _AddressIntervals
-    # None matches every IPv4 protocol.
+    # None matches every protocol.
     protocol: str | None
     # None matches every port of the protocol.
     start_port: int | None
@@ -65,16 +76,40 @@ def _array(value: object, description: str) -> list[object]:
     return cast(list[object], value)
 
 
-def _network(value: object, description: str) -> ipaddress.IPv4Network:
+def _network(value: object, description: str) -> _Network:
     if not isinstance(value, str):
-        raise ScriptError(f"{description} must be an IPv4 CIDR string")
+        raise ScriptError(f"{description} must be an IPv4 or IPv6 CIDR string")
     try:
         parsed = ipaddress.ip_network(value, strict=False)
     except ValueError as error:
-        raise ScriptError(f"{description} is not a valid IPv4 CIDR: {value}") from error
-    if not isinstance(parsed, ipaddress.IPv4Network):
-        raise ScriptError(f"{description} must be an IPv4 CIDR")
+        raise ScriptError(
+            f"{description} is not a valid IPv4 or IPv6 CIDR: {value}"
+        ) from error
+    if isinstance(parsed, ipaddress.IPv6Network) and parsed.network_address.scope_id:
+        raise ScriptError(f"{description} must not name an IPv6 scope: {value}")
     return parsed
+
+
+def _contains(parent: _Network, child: _Network) -> bool:
+    if isinstance(parent, ipaddress.IPv4Network) and isinstance(
+        child, ipaddress.IPv4Network
+    ):
+        return child.subnet_of(parent)
+    if isinstance(parent, ipaddress.IPv6Network) and isinstance(
+        child, ipaddress.IPv6Network
+    ):
+        return child.subnet_of(parent)
+    return False
+
+
+def _summarize(start: int, end: int, version: int) -> Iterator[_Network]:
+    if version == 4:
+        return ipaddress.summarize_address_range(
+            ipaddress.IPv4Address(start), ipaddress.IPv4Address(end)
+        )
+    return ipaddress.summarize_address_range(
+        ipaddress.IPv6Address(start), ipaddress.IPv6Address(end)
+    )
 
 
 def _port(value: object, description: str) -> int:
@@ -136,14 +171,14 @@ def _subtract_intervals(
 
 
 def _subtract_exclusions(
-    parent: ipaddress.IPv4Network,
+    parent: _Network,
     exclusions: list[object],
     description: str,
 ) -> _AddressIntervals:
     parsed: list[_AddressInterval] = []
     for index, value in enumerate(exclusions):
         exclusion = _network(value, f"{description}.except[{index}]")
-        if not exclusion.subnet_of(parent):
+        if not _contains(parent, exclusion):
             raise ScriptError(
                 f"{description}.except[{index}] must be contained in {parent}"
             )
@@ -158,7 +193,8 @@ def _subtract_exclusions(
     return _subtract_intervals((parent_interval,), _merge_intervals(parsed))
 
 
-def _parse_peer(value: object, description: str) -> _AddressIntervals:
+def _parse_peer(value: object, description: str) -> tuple[int, _AddressIntervals]:
+    """Return a destination's IP version and the addresses that it selects."""
     peer = _object(value, description)
     unknown = sorted(set(peer) - _PEER_FIELDS)
     if unknown:
@@ -167,7 +203,7 @@ def _parse_peer(value: object, description: str) -> _AddressIntervals:
         raise ScriptError(f"{description}.cidr is required")
     parent = _network(peer["cidr"], f"{description}.cidr")
     exclusions = _array(peer.get("except", []), f"{description}.except")
-    return _subtract_exclusions(parent, exclusions, description)
+    return parent.version, _subtract_exclusions(parent, exclusions, description)
 
 
 def _parse_legacy_rule(rule: dict[str, object], description: str) -> tuple[_Rule, ...]:
@@ -176,7 +212,7 @@ def _parse_legacy_rule(rule: dict[str, object], description: str) -> tuple[_Rule
         raise ScriptError(f"{description} has unknown field '{unknown[0]}'")
     if "cidr" not in rule:
         raise ScriptError(f"{description}.cidr is required")
-    addresses = _parse_peer(
+    version, addresses = _parse_peer(
         {field: rule[field] for field in ("cidr", "except") if field in rule},
         description,
     )
@@ -185,12 +221,20 @@ def _parse_legacy_rule(rule: dict[str, object], description: str) -> tuple[_Rule
     if "protocol" not in rule:
         if "port" in rule:
             raise ScriptError(f"{description}.port requires protocol")
-        return (_Rule(addresses, None, None, None),)
+        return (_Rule(version, addresses, None, None, None),)
     protocol = rule["protocol"]
     if not isinstance(protocol, str) or protocol not in _RULE_PROTOCOLS:
         raise ScriptError(f"{description}.protocol must be tcp, udp, icmp, or any")
     if "port" not in rule:
-        return (_Rule(addresses, None if protocol == "any" else protocol, None, None),)
+        return (
+            _Rule(
+                version,
+                addresses,
+                None if protocol == "any" else protocol,
+                None,
+                None,
+            ),
+        )
     if protocol == "icmp":
         raise ScriptError(f"{description}.port is not supported with icmp")
     start = _port(rule["port"], f"{description}.port")
@@ -198,7 +242,9 @@ def _parse_legacy_rule(rule: dict[str, object], description: str) -> tuple[_Rule
     if end < start:
         raise ScriptError(f"{description}.endPort {end} cannot be below port {start}")
     protocols = _PORT_PROTOCOLS if protocol == "any" else (protocol,)
-    return tuple(_Rule(addresses, selected, start, end) for selected in protocols)
+    return tuple(
+        _Rule(version, addresses, selected, start, end) for selected in protocols
+    )
 
 
 def _parse_mxc_port(value: object, description: str) -> tuple[_PortSelector, ...]:
@@ -237,15 +283,29 @@ def _parse_mxc_rule(
     if unknown:
         raise ScriptError(f"{description} has unknown field '{unknown[0]}'")
 
-    addresses = _ALL_IPV4
+    destinations = _ALL_ADDRESSES
     if "to" in rule:
         peers = _array(rule["to"], f"{description}.to")
         if not peers:
             raise ScriptError(f"{description}.to must contain at least one destination")
-        addresses = _merge_intervals(
-            interval
+        parsed = [
+            _parse_peer(peer, f"{description}.to[{index}]")
             for index, peer in enumerate(peers)
-            for interval in _parse_peer(peer, f"{description}.to[{index}]")
+        ]
+        # A native rule names one family, so the peers of each family form
+        # their own destination set.
+        destinations = tuple(
+            (
+                version,
+                _merge_intervals(
+                    interval
+                    for peer_version, intervals in parsed
+                    if peer_version == version
+                    for interval in intervals
+                ),
+            )
+            for version in _IP_VERSIONS
+            if any(peer_version == version for peer_version, _ in parsed)
         )
 
     selectors: list[_PortSelector] = [(None, None, None)]
@@ -259,7 +319,8 @@ def _parse_mxc_rule(
             for selector in _parse_mxc_port(port, f"{description}.ports[{index}]")
         ]
     return tuple(
-        _Rule(addresses, protocol, start_port, end_port)
+        _Rule(version, addresses, protocol, start_port, end_port)
+        for version, addresses in destinations
         for protocol, start_port, end_port in selectors
     )
 
@@ -279,15 +340,13 @@ def _parse_rule(value: object, description: str) -> tuple[_Rule, ...]:
 
 def _intervals_to_networks(
     intervals: _AddressIntervals,
+    version: int,
     maximum: int,
     category: str,
-) -> tuple[ipaddress.IPv4Network, ...]:
-    networks: list[ipaddress.IPv4Network] = []
+) -> tuple[_Network, ...]:
+    networks: list[_Network] = []
     for start, end in intervals:
-        summarized = ipaddress.summarize_address_range(
-            ipaddress.IPv4Address(start),
-            ipaddress.IPv4Address(end),
-        )
+        summarized = _summarize(start, end, version)
         for network in summarized:
             if len(networks) >= maximum:
                 raise ScriptError(
@@ -300,18 +359,16 @@ def _intervals_to_networks(
 def _protocol_intervals_to_networks(
     protocol_intervals: _AddressIntervals,
     covered: _AddressIntervals,
+    version: int,
     maximum: int,
     category: str,
-) -> tuple[ipaddress.IPv4Network, ...]:
+) -> tuple[_Network, ...]:
     # Rules over `covered` already match this selector, so widening prefixes
     # into it keeps the output compact without changing what matches.
     combined = _merge_intervals((*protocol_intervals, *covered))
-    networks: list[ipaddress.IPv4Network] = []
+    networks: list[_Network] = []
     for start, end in combined:
-        summarized = ipaddress.summarize_address_range(
-            ipaddress.IPv4Address(start),
-            ipaddress.IPv4Address(end),
-        )
+        summarized = _summarize(start, end, version)
         for network in summarized:
             network_interval = (
                 int(network.network_address),
@@ -330,6 +387,7 @@ def _protocol_intervals_to_networks(
 def _lower_protocol_rules(
     rules: list[_Rule],
     protocol: str,
+    version: int,
     category: str,
     covered: _AddressIntervals,
     remaining_budget: int,
@@ -352,7 +410,7 @@ def _lower_protocol_rules(
     active: Counter[_AddressIntervals] = Counter()
     # Each network's port ranges in port order. Every network of one segment
     # is a distinct native rule, so a segment cannot exceed the budget alone.
-    port_ranges: dict[ipaddress.IPv4Network, list[_PortRange]] = {}
+    port_ranges: dict[_Network, list[_PortRange]] = {}
     rule_count = 0
     previous_port: int | None = None
     for port in sorted(events):
@@ -363,6 +421,7 @@ def _lower_protocol_rules(
             networks = _protocol_intervals_to_networks(
                 addresses,
                 covered,
+                version,
                 remaining_budget,
                 category,
             )
@@ -392,7 +451,7 @@ def _lower_protocol_rules(
 
 
 def _native_rule(
-    network: ipaddress.IPv4Network, protocol: str | None, ports: _PortRange | None
+    network: _Network, protocol: str | None, ports: _PortRange | None
 ) -> str:
     if protocol is None:
         return str(network)
@@ -404,13 +463,12 @@ def _native_rule(
     return f"{network}:{protocol}:{start}-{end}"
 
 
-def _compile_category(value: object, category: str) -> tuple[str, ...]:
-    values = _array(value, category)
-    rules = [
-        rule
-        for index, item in enumerate(values)
-        for rule in _parse_rule(item, f"{category}[{index}]")
-    ]
+def _compile_family(
+    rules: list[_Rule],
+    version: int,
+    category: str,
+    budget: int,
+) -> list[_NativeRule]:
     address_only = _merge_intervals(
         interval
         for rule in rules
@@ -419,7 +477,8 @@ def _compile_category(value: object, category: str) -> tuple[str, ...]:
     )
     address_only_networks = _intervals_to_networks(
         address_only,
-        MAX_RULES_PER_ACTION,
+        version,
+        budget,
         category,
     )
     lowered: list[_NativeRule] = [
@@ -441,7 +500,8 @@ def _compile_category(value: object, category: str) -> tuple[str, ...]:
             for network in _protocol_intervals_to_networks(
                 protocol_wide,
                 address_only,
-                MAX_RULES_PER_ACTION - len(lowered),
+                version,
+                budget - len(lowered),
                 category,
             )
         )
@@ -451,13 +511,39 @@ def _compile_category(value: object, category: str) -> tuple[str, ...]:
             _lower_protocol_rules(
                 rules,
                 protocol,
+                version,
                 category,
                 covered[protocol],
-                MAX_RULES_PER_ACTION - len(lowered),
+                budget - len(lowered),
             )
         )
+    return lowered
+
+
+def _compile_category(value: object, category: str) -> tuple[str, ...]:
+    values = _array(value, category)
+    rules = [
+        rule
+        for index, item in enumerate(values)
+        for rule in _parse_rule(item, f"{category}[{index}]")
+    ]
+    # A native rule matches only its own address family, so each family is
+    # lowered on its own, within the action's shared rule limit.
+    lowered: list[_NativeRule] = []
+    for version in _IP_VERSIONS:
+        family = [rule for rule in rules if rule.version == version]
+        if family:
+            lowered.extend(
+                _compile_family(
+                    family,
+                    version,
+                    category,
+                    MAX_RULES_PER_ACTION - len(lowered),
+                )
+            )
     lowered.sort(
         key=lambda item: (
+            item[0].version,
             int(item[0].network_address),
             item[0].prefixlen,
             "" if item[1] is None else item[1],

@@ -39,9 +39,10 @@ allow)
     listener_pid=$!
     port_hex=$(printf '%04X' @GUEST_PORT@)
     tries=0
+    # The listener is dual-stack, so the kernel lists it among IPv6 sockets.
     while ! awk -v port=":$port_hex" \
         '$2 ~ port "$" && $4 == "0A" { found = 1 } END { exit !found }' \
-        /proc/net/tcp; do
+        /proc/net/tcp /proc/net/tcp6; do
         kill -0 "$listener_pid" 2>/dev/null || fail 95
         [ "$tries" -lt 100 ] || fail 95
         tries=$((tries + 1))

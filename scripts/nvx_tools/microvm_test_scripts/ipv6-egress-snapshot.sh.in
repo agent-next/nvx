@@ -1,0 +1,21 @@
+set -eu
+fail() {
+    code="$1"
+    echo "NVX-IPV6-EGRESS-FAIL code=$code"
+    nvx-exit "$code"
+    exit "$code"
+}
+
+# The restored NIC must keep the IPv6 identity and the policy that admits it.
+probe() {
+    response=$(wget -T 5 -qO- 'http://[@GATEWAY_IPV6@]:@NAMED_PORT@/tcp6-named') ||
+        fail "$1"
+    [ "$response" = NVX-EGRESS-PROBE-tcp6-named ] || fail "$1"
+}
+
+probe 80
+echo NVX-IPV6-EGRESS-BEFORE
+nvx-snapshot
+probe 81
+echo NVX-IPV6-EGRESS-AFTER
+nvx-exit 0

@@ -411,9 +411,18 @@ class EgressPolicyTests(unittest.TestCase):
             }
         )
 
+        # A rule without destinations matches every destination of both
+        # families.
         self.assertEqual(
             compiled.allow,
-            ("0.0.0.0/0:icmp", "0.0.0.0/0:tcp:53", "0.0.0.0/0:udp:53"),
+            (
+                "0.0.0.0/0:icmp",
+                "0.0.0.0/0:tcp:53",
+                "0.0.0.0/0:udp:53",
+                "::/0:icmp",
+                "::/0:tcp:53",
+                "::/0:udp:53",
+            ),
         )
         self.assertEqual(
             compiled.deny,
@@ -457,9 +466,15 @@ class EgressPolicyTests(unittest.TestCase):
         )
 
     def test_rejects_exclusions_outside_parent_or_wrong_family(self):
-        for excluded in ("198.51.100.0/24", "2001:db8::/32"):
+        for cidr, excluded in (
+            ("192.0.2.0/24", "198.51.100.0/24"),
+            ("192.0.2.0/24", "2001:db8::/32"),
+            ("2001:db8::/32", "2001:db9::/48"),
+            ("2001:db8::/32", "192.0.2.0/24"),
+            ("::/96", "0.0.0.0/8"),
+        ):
             with (
-                self.subTest(excluded=excluded),
+                self.subTest(cidr=cidr, excluded=excluded),
                 self.assertRaisesRegex(ScriptError, "except"),
             ):
                 self.compile(
@@ -468,7 +483,7 @@ class EgressPolicyTests(unittest.TestCase):
                             {
                                 "to": [
                                     {
-                                        "cidr": "192.0.2.0/24",
+                                        "cidr": cidr,
                                         "except": [excluded],
                                     }
                                 ],
@@ -476,6 +491,179 @@ class EgressPolicyTests(unittest.TestCase):
                         ]
                     }
                 )
+
+    def test_compiles_ipv6_networks_with_every_selector(self):
+        selectors: tuple[tuple[dict[str, object], tuple[str, ...]], ...] = (
+            ({"ports": [{"protocol": "tcp"}]}, ("2001:db8::7/128:tcp",)),
+            ({"ports": [{"protocol": "udp"}]}, ("2001:db8::7/128:udp",)),
+            ({"ports": [{"protocol": "icmp"}]}, ("2001:db8::7/128:icmp",)),
+            ({}, ("2001:db8::7/128",)),
+            (
+                {"ports": [{"protocol": "any", "port": 443}]},
+                ("2001:db8::7/128:tcp:443", "2001:db8::7/128:udp:443"),
+            ),
+            (
+                {"ports": [{"protocol": "tcp", "port": 8000, "endPort": 8010}]},
+                ("2001:db8::7/128:tcp:8000-8010",),
+            ),
+        )
+        for category in ("allow", "deny"):
+            for selector, expected in selectors:
+                with self.subTest(category=category, selector=selector):
+                    compiled = self.compile(
+                        {category: [{"to": [{"cidr": "2001:db8::7"}], **selector}]}
+                    )
+                    self.assertEqual(getattr(compiled, category), expected)
+
+    def test_compiles_one_allowed_ipv6_network_with_a_denied_address(self):
+        compiled = self.compile(
+            {
+                "allow": [
+                    {
+                        "to": [{"cidr": "2001:db8:1::/64"}],
+                        "ports": [{"protocol": "tcp", "port": 443}],
+                    },
+                    {
+                        "to": [{"cidr": "::/0"}],
+                        "ports": [{"protocol": "udp", "port": 53}],
+                    },
+                ],
+                "deny": [{"to": [{"cidr": "2001:db8:1::123"}]}],
+            }
+        )
+        self.assertEqual(compiled.allow, ("::/0:udp:53", "2001:db8:1::/64:tcp:443"))
+        self.assertEqual(compiled.deny, ("2001:db8:1::123/128",))
+
+    def test_flat_rules_accept_ipv6_networks(self):
+        compiled = self.compile(
+            {
+                "allow": [
+                    {
+                        "cidr": "2001:db8::/32",
+                        "except": ["2001:db8::/33"],
+                        "protocol": "tcp",
+                        "port": 443,
+                    }
+                ]
+            }
+        )
+        self.assertEqual(compiled.allow, ("2001:db8:8000::/33:tcp:443",))
+
+    def test_keeps_each_address_family_separate(self):
+        # IPv4 0.0.0.0/0 and IPv6 ::/96 span the same integers, so lowering
+        # both families together would merge or cover one with the other.
+        compiled = self.compile(
+            {
+                "allow": [
+                    {
+                        "to": [{"cidr": "::/96"}, {"cidr": "0.0.0.0/0"}],
+                        "ports": [{"protocol": "tcp", "port": 80}],
+                    },
+                    {"to": [{"cidr": "192.0.2.0/24"}]},
+                    {
+                        "to": [{"cidr": "::c000:200/120"}],
+                        "ports": [{"protocol": "udp", "port": 53}],
+                    },
+                ],
+                "deny": [
+                    {"to": [{"cidr": "0.0.0.0/0"}]},
+                    {"to": [{"cidr": "::/96"}], "ports": [{"protocol": "icmp"}]},
+                ],
+            }
+        )
+        self.assertEqual(
+            compiled.allow,
+            (
+                "0.0.0.0/0:tcp:80",
+                "192.0.2.0/24",
+                "::/96:tcp:80",
+                "::c000:200/120:udp:53",
+            ),
+        )
+        self.assertEqual(compiled.deny, ("0.0.0.0/0", "::/96:icmp"))
+
+    def test_lowers_the_destinations_of_each_family_separately(self):
+        compiled = self.compile(
+            {
+                "allow": [
+                    {
+                        "to": [
+                            {"cidr": "192.0.2.0/25"},
+                            {"cidr": "2001:db8::/32", "except": ["2001:db8::/33"]},
+                            {"cidr": "192.0.2.128/25"},
+                        ],
+                        "ports": [{"protocol": "tcp", "port": 443}],
+                    }
+                ]
+            }
+        )
+        self.assertEqual(
+            compiled.allow,
+            ("192.0.2.0/24:tcp:443", "2001:db8:8000::/33:tcp:443"),
+        )
+
+    def test_subtracts_ipv6_exclusions(self):
+        compiled = self.compile(
+            {
+                "deny": [
+                    {
+                        "to": [
+                            {
+                                "cidr": "2001:db8::/32",
+                                "except": ["2001:db8:1::/48", "2001:db8:1::/64"],
+                            }
+                        ],
+                        "ports": [{"protocol": "tcp", "port": 22}],
+                    }
+                ]
+            }
+        )
+        expected = sorted(
+            ipaddress.IPv6Network("2001:db8::/32").address_exclude(
+                ipaddress.IPv6Network("2001:db8:1::/48")
+            ),
+            key=lambda network: int(network.network_address),
+        )
+        self.assertEqual(
+            compiled.deny, tuple(f"{network}:tcp:22" for network in expected)
+        )
+        self.assertEqual(len(compiled.deny), 16)
+
+    def test_rejects_ipv6_scopes(self):
+        for cidr in ("fe80::%eth0/64", "fe80::1%1"):
+            with (
+                self.subTest(cidr=cidr),
+                self.assertRaisesRegex(ScriptError, "scope"),
+            ):
+                self.compile({"allow": [{"to": [{"cidr": cidr}]}]})
+
+    def test_both_families_share_the_native_rule_budget(self):
+        # Ports that are not adjacent cannot form one range, so each lowers to
+        # its own native rule.
+        def rules(ipv4_ports: int, ipv6_ports: int) -> dict[str, object]:
+            return {
+                "allow": [
+                    {
+                        "to": [{"cidr": cidr}],
+                        "ports": [
+                            {"protocol": "tcp", "port": 2 * index + 1}
+                            for index in range(ports)
+                        ],
+                    }
+                    for cidr, ports in (
+                        ("192.0.2.1", ipv4_ports),
+                        ("2001:db8::1", ipv6_ports),
+                    )
+                ]
+            }
+
+        self.assertEqual(len(self.compile(rules(128, 128)).allow), 256)
+        for ipv4_ports, ipv6_ports in ((129, 128), (128, 129)):
+            with (
+                self.subTest(ipv4_ports=ipv4_ports, ipv6_ports=ipv6_ports),
+                self.assertRaisesRegex(ScriptError, "at most 256"),
+            ):
+                self.compile(rules(ipv4_ports, ipv6_ports))
 
     def test_rejects_invalid_mxc_rule_shapes(self):
         invalid_rules: tuple[object, ...] = (

@@ -108,8 +108,8 @@ HYPERVISORS = ("auto", "whp", "kvm", "mshv")
 NETWORK_PROFILES = ("portable",)
 NETWORK_EGRESS_RULE_METAVAR = "CIDR[:PROTOCOL[:PORT[-PORT]]]"
 NETWORK_EGRESS_RULE_HELP = (
-    "{action} guest egress to an IPv4 CIDR, optionally only for PROTOCOL tcp, "
-    "udp, or icmp, and for tcp or udp only on PORT or on the inclusive range "
+    "{action} guest egress to an IPv4 or IPv6 CIDR, optionally only for PROTOCOL "
+    "tcp, udp, or icmp, and for tcp or udp only on PORT or on the inclusive range "
     "PORT-PORT; repeat to add rules"
 )
 MAX_ENVIRONMENT_FILE_BYTES = 1024 * 1024
@@ -1126,7 +1126,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--network-egress-policy-file",
         type=Path,
         metavar="PATH",
-        help="load bounded MXC-shaped IPv4 egress rules from JSON",
+        help="load bounded MXC-shaped IPv4 and IPv6 egress rules from JSON",
     )
     run.add_argument("--host-loopback", choices=("allow", "deny"))
     run.add_argument("--network-proxy", metavar="IPV4:TCP-PORT")
@@ -1299,7 +1299,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--network-egress-policy-file",
         type=Path,
         metavar="PATH",
-        help="load bounded IPv4 ranges and rule-local exclusions for run/provision",
+        help=(
+            "load bounded IPv4 and IPv6 ranges and rule-local exclusions for "
+            "run/provision"
+        ),
     )
     sandbox.add_argument("--host-loopback", choices=("allow", "deny"))
     sandbox.add_argument("--network-proxy", metavar="IPV4:TCP-PORT")

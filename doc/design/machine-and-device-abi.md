@@ -312,20 +312,39 @@ the MAC-address feature and virtio version 1.
 deterministic guest and gateway MAC addresses from the final three IPv4
 octets. The profile is mandatory and selects the same in-process Consomme data
 plane on KVM, MSHV, and WHP; TAP attachments are rejected for this profile.
-The static identity advertises no routable IPv6 prefix.
+The NIC is dual-stack: its static IPv6 identity embeds the guest and gateway
+IPv4 addresses in `fd00::/96`, with a prefix of 96 plus the IPv4 prefix, so
+`10.0.0.2/24` becomes `fd00::a00:2/120` behind `fd00::a00:1`. The gateway
+shares the IPv4 gateway's MAC address, and the guest configures the identity
+from the `virtnet_ip6=` and `virtnet_gw6=` tokens without router
+advertisements, autoconfiguration from them, or duplicate address detection.
+The guest kernel's EUI-64 link-local address is its only other IPv6 address,
+and egress rules admit it only as the source of Neighbor Solicitations.
+The `virtnet_dns=` token names the IPv4 gateway when the egress policy permits
+DNS to it, and otherwise the IPv6 gateway when the policy permits DNS to that
+one. The static identity advertises no routable IPv6 prefix. The snapshot records
+the IPv6 identity; a snapshot whose network predates it restores IPv4-only.
 
-The portable profile provides gateway DNS over UDP and TCP, ICMP echo,
-outbound TCP and UDP, deterministic rejection of fragmented IPv4 packets, and
-bounded flow, DNS, buffer, and packet-queue state. At most 128 TCP, 256 UDP,
-and 16 ICMP guest flows are active at once, and excess flows are rejected
-before a host socket is created. It applies one canonical egress policy before
-externally visible transmission:
+The portable profile provides gateway DNS over UDP and TCP, ICMP and ICMPv6
+echo, outbound TCP and UDP over IPv4 and IPv6, deterministic rejection of
+fragmented IPv4 packets, IPv6 extension headers, and IPv4-mapped IPv6
+destinations, and bounded flow, DNS, buffer, and packet-queue state. At most
+128 TCP, 256 UDP, and 16 ICMP guest flows are active at once, and excess flows
+are rejected before a host socket is created. It applies one canonical egress
+policy before externally visible transmission:
 
 - allow only listed IPv4 hosts or CIDRs;
 - allow IPv4 except listed hosts or CIDRs; or
 - allow only exact IPv4 TCP endpoints; or
-- combine canonical IPv4/CIDR allow and deny rules with optional TCP or UDP
-  destination ports and deny precedence.
+- combine canonical IPv4 or IPv6 CIDR allow and deny rules with an optional
+  TCP, UDP, or ICMP selector, optional TCP or UDP destination ports, and deny
+  precedence.
+
+The legacy modes deny all IPv6 traffic. In the generic rule mode, a rule
+matches only destinations of its own address family, and the IPv6 gateway's
+Neighbor Discovery is authorized like the IPv4 gateway's ARP. A policy bound to
+an IPv6 identity uses canonical encoding version 4, while one restored from a
+snapshot that predates IPv6 keeps version 3 and its recorded digest.
 
 The legacy modes are mutually exclusive. The generic rule mode requires an
 explicit default action, accepts at most 256 allow and 256 deny rules, and

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use aci_edge_sandboxes::openvmm::{Hypervisor, OpenVmmConfig};
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
-    ExecRequest, FilesystemPolicy, NetworkPolicy, NetworkRule, ProcessSpec, Protocol,
+    ExecRequest, FilesystemPolicy, NetworkPolicy, NetworkPort, NetworkRule, ProcessSpec, Protocol,
     ProvisionRequest, SandboxId, StdinMode,
 };
 use tempfile::TempDir;
@@ -868,12 +868,21 @@ fn unsupported_requests_are_rejected_before_anything_runs() {
         nvx.provision(&missing).unwrap_err().code(),
         ErrorCode::PolicyValidation
     );
-    let ipv6 = NetworkPolicy {
-        egress: EgressPolicy::new(Access::Deny).with_allow(NetworkRule::to("2001:db8::/32")),
+    // Ports that are not adjacent each need their own OpenVMM rule.
+    let mut ports = NetworkRule::to("192.0.2.0/24");
+    ports.ports = (0..257)
+        .map(|index| NetworkPort {
+            protocol: Protocol::Tcp,
+            port: Some(2 * index + 1),
+            end_port: None,
+        })
+        .collect();
+    let oversized = NetworkPolicy {
+        egress: EgressPolicy::new(Access::Deny).with_allow(ports),
         ..NetworkPolicy::deny_all()
     };
     assert_eq!(
-        nvx.provision(&ProvisionRequest::new().with_network(ipv6))
+        nvx.provision(&ProvisionRequest::new().with_network(oversized))
             .unwrap_err()
             .code(),
         ErrorCode::PolicyValidation
@@ -1365,8 +1374,10 @@ fn filesystem_and_network_policies_reach_openvmm() {
                     8010,
                 ))
                 .with_allow(NetworkRule::to("192.0.2.9").on_protocol(Protocol::Icmp))
+                .with_allow(NetworkRule::to("2001:db8::/32").on_port(Protocol::Tcp, 443))
                 .with_deny(NetworkRule::to("192.0.2.0/24").on_protocol(Protocol::Udp))
-                .with_deny(NetworkRule::to("192.0.2.7").on_port(Protocol::Tcp, 8005)),
+                .with_deny(NetworkRule::to("192.0.2.7").on_port(Protocol::Tcp, 8005))
+                .with_deny(NetworkRule::to("2001:db8::1")),
             ..NetworkPolicy::deny_all()
         });
     let sandbox_id = nvx.provision(&request).unwrap().sandbox_id;
@@ -1390,12 +1401,17 @@ fn filesystem_and_network_policies_reach_openvmm() {
         [
             "192.0.2.0/24:tcp:443",
             "192.0.2.0/24:tcp:8000-8010",
-            "192.0.2.9/32:icmp"
+            "192.0.2.9/32:icmp",
+            "2001:db8::/32:tcp:443"
         ]
     );
     assert_eq!(
         value("--network-egress-deny"),
-        ["192.0.2.0/24:udp", "192.0.2.7/32:tcp:8005"]
+        [
+            "192.0.2.0/24:udp",
+            "192.0.2.7/32:tcp:8005",
+            "2001:db8::1/128"
+        ]
     );
     let command_line = &value("--cmdline")[0];
     let maps: Vec<&str> = command_line

@@ -79,6 +79,14 @@ class KernelBuildConstants:
         "CONFIG_VETH=y",
         "CONFIG_VIRTIO_BLK=y",
     )
+    # The portable network profile configures an IPv6 identity next to the
+    # IPv4 one. SIT would add an sit0 device that decapsulates IPv6 from IPv4.
+    REQUIRED_NETWORK_CONFIG: Final = (
+        "CONFIG_INET=y",
+        "CONFIG_IPV6=y",
+        "# CONFIG_IPV6_SIT is not set",
+        "CONFIG_VIRTIO_NET=y",
+    )
     REQUIRED_TIME_ABI_CONFIG: Final = (
         "CONFIG_HYPERVISOR_GUEST=y",
         "CONFIG_PARAVIRT=y",

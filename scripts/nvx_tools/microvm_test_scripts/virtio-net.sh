@@ -24,6 +24,13 @@ grep -q 'virtio_mmio.device=0x1000@0xd0000000:' /proc/cmdline || fail 21
 grep -q 'virtnet_ip=10.0.0.2' /proc/cmdline || fail 22
 grep -q 'virtnet_mask=255.255.255.0' /proc/cmdline || fail 23
 grep -q 'virtnet_gw=10.0.0.1' /proc/cmdline || fail 24
+# The guest configures the IPv6 identity that embeds the IPv4 one, which the
+# kernel's tables show whichever userland configured it.
+grep -q 'virtnet_ip6=fd00::a00:2/120' /proc/cmdline || fail 31
+grep -q 'virtnet_gw6=fd00::a00:1' /proc/cmdline || fail 32
+grep -q '^fd00000000000000000000000a000002 [0-9a-f]* 78 ' /proc/net/if_inet6 || fail 33
+grep -q '^00000000000000000000000000000000 00 00000000000000000000000000000000 00 fd00000000000000000000000a000001 ' \
+    /proc/net/ipv6_route || fail 34
 [ "$(cat /sys/class/net/$device/address)" = '52:54:00:00:00:02' ] || fail 25
 grep -qi 'd0000000-d0000fff.*virtio' /proc/iomem || fail 26
 ifconfig "$device" 10.0.0.2 netmask 255.255.255.0 up || fail 27

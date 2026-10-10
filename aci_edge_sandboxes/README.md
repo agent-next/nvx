@@ -341,10 +341,13 @@ provisioned again to accept the change.
   path.
 - A policy that denies egress without allow rules or a proxy attaches no network device.
   Otherwise the guest gets its spec's `guestNetwork`, or the setup's default (`10.0.0.2/24`
-  unless set), behind OpenVMM's NAT gateway, the network's first address, and names that
-  gateway as its DNS server in `/etc/resolv.conf` when the policy allows TCP or UDP port 53 to
-  it. Choose a guest network that contains no address the guest must reach. Ingress must be
-  `deny`, and host-loopback access must be `deny` unless ports are forwarded, as described next.
+  unless set), behind OpenVMM's NAT gateway, the network's first address. OpenVMM also gives
+  the guest the IPv6 network that embeds this one in `fd00::/96`, such as `fd00::a00:2/120`,
+  behind the gateway's counterpart, such as `fd00::a00:1`. The guest names the gateway as its
+  DNS server in `/etc/resolv.conf` when the policy allows TCP or UDP port 53 to it, and
+  otherwise the gateway's IPv6 address when the policy allows DNS to that one. Choose a guest
+  network that contains no address the guest must reach. Ingress must be `deny`, and
+  host-loopback access must be `deny` unless ports are forwarded, as described next.
 
 ### Native proxy and forwarded ports
 
@@ -655,23 +658,27 @@ rest of the export, so place mapped paths under one directory when possible.
 
 ### Network rules
 
-OpenVMM's portable network profile enforces an egress default plus IPv4 allow
-and deny rules; deny rules take precedence. Each rule lists destination
-networks (`to`, each a CIDR with optional `except` sub-networks) and destination
-`ports` (protocol, `port`, optional `endPort`). An empty `to` matches every
-destination, and an empty `ports` matches every protocol and port. A `tcp` or
-`udp` entry without a `port` matches every port of that protocol, one with a
-`port` and an `endPort` matches every port from `port` through `endPort`,
-an `icmp` entry matches ICMP alone, and `any` matches every protocol or, with a
-port or a port range, TCP and UDP on those ports.
+OpenVMM's portable network profile enforces an egress default plus IPv4 and
+IPv6 allow and deny rules; deny rules take precedence, and a rule matches only
+destinations of its networks' family, so a denied default blocks the other
+family. Each rule lists destination networks (`to`, each a CIDR with optional
+`except` sub-networks) and destination `ports` (protocol, `port`, optional
+`endPort`). An empty `to` matches every destination of both families, such as
+`0.0.0.0/0` and `::/0` together, and an empty `ports` matches every protocol
+and port. A `tcp` or `udp` entry without a `port` matches every port of that
+protocol, one with a `port` and an `endPort` matches every port from `port`
+through `endPort`, an `icmp` entry matches ICMP alone, or ICMPv6 for IPv6
+networks, and `any` matches every protocol or, with a port or a port range,
+TCP and UDP on those ports.
 
 Rules are expanded into OpenVMM rules exactly: exceptions are subtracted from
 their networks, a port range becomes one OpenVMM range rule for each network,
 and protocol `any` with a port or a port range becomes a TCP and a UDP rule.
-IPv6 networks and rules that would expand to more than 256 OpenVMM rules are
-rejected. Egress denied without allow rules, with ingress denied, attaches no
-network device; otherwise the guest gets `10.0.0.2/24` behind the profile's NAT
-gateway `10.0.0.1`, which also serves DNS.
+Rules that would expand to more than 256 OpenVMM rules are rejected. Egress
+denied without allow rules, with ingress denied, attaches no network device;
+otherwise the guest gets `10.0.0.2/24` behind the profile's NAT gateway
+`10.0.0.1`, which also serves DNS, and `fd00::a00:2/120` behind the gateway's
+IPv6 address `fd00::a00:1`.
 
 ### Idempotence and concurrency
 
