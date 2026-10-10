@@ -31,26 +31,39 @@ retention policy, or protection against host-side copying.
 
 ## Snapshot identity and admission
 
-The common trusted-storage path identifies a snapshot's consumed sealed block
-objects by one immutable storage generation, their artifact roles, exact sizes,
-and block geometry. The generation must be authenticated by the publisher or
-storage control plane and bound to the exact immutable block-object versions.
-Restore compares that block metadata; it does not reread every logical block
-byte merely to reconstruct a content digest.
+A snapshot binds each consumed sandbox block by role, access mode, exact
+length, and block geometry, plus an identity under one policy shared by every
+bound block. The [block contract](machine-and-device-abi.md#block) defines
+these fields, and the [capture boundary](snapshot-and-restore.md#capture-boundary)
+describes the capture options.
 
-Whole-file SHA-256 remains an optional diagnostic, export, deduplication, or
-deep-verification identity. If an external transport supplies SHA-256, compute
-it inline while downloading rather than as a second local-disk pass. An object
-store ETag or version ID can identify an immutable object version, but does not
-necessarily provide a server-generated SHA-256; publisher metadata must bind
-any SHA-256 to that exact version. Upload payloads first and commit the
-manifest last.
+| Identity policy | Selected by | Capture | Restore | Vouches for the bytes |
+| --- | --- | --- | --- | --- |
+| `sha256` | Default | Hashes each bound block | Rehashes each bound block and rejects a mismatch | OpenVMM |
+| `generation` | `--snapshot-block-identity generation --snapshot-generation-id <32-HEX>` | Records the supplied generation for each bound block | Requires one shared nonzero generation and checks the structural fields without reading the blocks | The storage owner, which must keep the generation immutable and bound to the exact files |
 
-External bytes are an unverified import candidate until admitted. A sealed
-snapshot is immutable. A clone creates a separate writable descendant, while
-a resume atomically claims the snapshot and transfers its continuation into a
-live instance. The claimed continuation is no longer an available snapshot;
-there is no mutable-snapshot state.
+Generation mode trades a full read of every block for trust in the storage
+owner. The generation is not a byte digest, and OpenVMM does not authenticate
+it.
+
+A sealed snapshot is immutable. A clone creates a separate writable
+descendant, while a resume atomically claims the snapshot and transfers its
+continuation into a live instance. The claimed continuation is no longer an
+available snapshot; there is no mutable-snapshot state.
+
+### Trusted storage and transport (Proposed)
+
+OpenVMM neither issues nor authenticates storage generations, and NVX does not
+import or transport snapshots. A deployment that selects generation identity
+needs a publisher or storage control plane that authenticates each generation
+and binds it to the exact immutable block-object versions. Whole-file SHA-256
+then serves as a diagnostic, export, deduplication, or deep-verification
+identity. If an external transport supplies SHA-256, compute it inline while
+downloading rather than as a second local-disk pass. An object store ETag or
+version ID can identify an immutable object version, but does not necessarily
+provide a server-generated SHA-256; publisher metadata must bind any SHA-256
+to that exact version. Upload payloads first and commit the manifest last.
+External bytes are an unverified import candidate until admitted.
 
 ## Independent backing files (Proposed)
 
