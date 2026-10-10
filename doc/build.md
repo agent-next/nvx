@@ -19,6 +19,25 @@ Build every guest artifact, including the Ubuntu EROFS distro layer, with:
 python3 scripts/nvx.py build-guest --guest all
 ```
 
+On a Linux host, `--native` builds the kernel and the selected Alpine or Ubuntu
+initramfs without Docker, using the host packages that
+[Setup](setup.md#prerequisites) lists. Azure Linux builds only in Docker, so a
+native build rejects `--guest azurelinux` and `--guest all`. Because only
+`--guest all` builds the Ubuntu EROFS distro layer, build it after a native
+build with `build-distro-layer`, described below.
+
+```bash
+python3 scripts/nvx.py build-guest --native
+python3 scripts/nvx.py build-guest --native --guest ubuntu
+```
+
+The native build keeps the Linux archive, the Ubuntu Base archive, and the
+supplemental Ubuntu packages under `downloads/` in the cache directory,
+`.cache/` or `$NVX_CACHE_DIR`. It reuses a file there whose SHA-256 matches its
+pin and downloads it again otherwise, so staging the pinned archives in that
+directory lets a host without access to their download servers build natively.
+The Alpine minirootfs and packages still come from the Alpine servers.
+
 The OpenVMM restore step excludes the compatibility IGVM artifact, which NVX
 does not build or package, so builds do not depend on unrelated upstream
 workflow artifacts.
