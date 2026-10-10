@@ -25,13 +25,17 @@ contracts between them.
 | State-unit quiesce, start, rollback, inventory, and downtime advance | OpenVMM state-unit framework |
 | Snapshot format, machine contract, publication, and artifact validation | OpenVMM snapshot helpers and platform file primitives |
 | Backend CPU contracts and snapshot clocks | KVM, MSHV, and WHP backends |
+| Guest-visible CPU profiles: the pinned catalog, `--cpu-profile` selection, host profiles and the `auto` fallback, backend support and restore checks, and CPU fingerprints | OpenVMM CPU-profile catalog, with the shared time-ABI layer that builds each VM's effective CPUID |
 | Layered sandbox launch and kernel features | NVX sandbox launcher and microVM kernel configuration |
+| Structured egress-policy files and their translation to OpenVMM egress rules | NVX launcher's egress-policy compiler |
 | Edge sandbox lifecycle API, request validation, backend capabilities, and the serializable contract model | NVX `aci_edge_sandboxes` crate and its data-model crate |
 | Blockless managed launch, durable sandbox records, OpenVMM process reconciliation, host-path export, and egress-rule translation | `aci_edge_sandboxes` default OpenVMM backend |
 | Image-backed edge sandboxes | `aci_edge_sandboxes` optional agent backend, which delegates to a separately supplied native library |
 | Workload namespace and root construction | NVX guest container launch and entry helpers |
-| Guest workload, scratch quiesce, managed lifecycle, and post-restore CPU/RAM repair | NVX guest init agent and snapshot helper |
+| Guest workload, scratch quiesce, managed lifecycle, post-restore CPU/RAM repair, and restore entropy | NVX guest init agent, snapshot helper, and reseed helper |
+| Guest time-ABI obligations: conformance checks, violation watcher, wall-clock discipline, and snapshot time steps | NVX guest time component |
 | Blockless managed workloads, host-path binds, and workload account creation | NVX guest init and managed agent |
+| Host qualification for the time ABI | NVX host doctor, a subset of which CI's runner validation runs |
 | OpenVMM control-plane and guest-artifact integration tests | OpenVMM microVM and management-RPC VMM tests |
 | NVX Linux and device integration tests | NVX microVM process tests and guest test scripts |
 | Edge sandbox contract, fake-OpenVMM, and real-hypervisor lifecycle tests | `aci_edge_sandboxes` crate tests |
