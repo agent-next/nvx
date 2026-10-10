@@ -86,10 +86,12 @@ def _with_control_retry(operation: str, action: Callable[[], None]) -> None:
         try:
             action()
             return
-        # BrokenPipeError and ConnectionResetError are ConnectionError
-        # subclasses; the base also covers the endpoint-closed error raised
-        # when the peer drops the control socket mid-handshake.
-        except ConnectionError as error:
+        # Only the raw peer-closed failures (boot-storm EPIPE, measured as
+        # Errno 32 in ~13% of starts) are transient. ControlEndpointClosed —
+        # upstream's signal that OpenVMM is tearing itself down to publish its
+        # outcome report (#439) — must NOT be retried: a retry would spawn a
+        # fresh VM and lose the report the first one died to deliver.
+        except (BrokenPipeError, ConnectionResetError) as error:
             if attempt == len(CONTROL_RETRY_BACKOFF_S):
                 raise
             delay = CONTROL_RETRY_BACKOFF_S[attempt]
@@ -957,7 +959,7 @@ def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
         pass
     state_dir = _prepare_state_directory(state_path, create=False)
     runtime, capability = _load_running(state_dir)
-    pid = int(runtime["pid"])
+    pid, start_time = _runtime_process(runtime)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     bound = False
     try:
@@ -970,7 +972,7 @@ def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
             _endpoint(runtime), capability, timeout
         ) as session:
             while True:
-                if not _process_running(pid):
+                if not _process_running(pid, start_time):
                     raise ScriptError(
                         "sandbox VM exited; sandbox execd is shutting down"
                     )

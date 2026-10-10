@@ -44,6 +44,8 @@ python3 scripts/nvx.py performance gate --help
 | `download` | Install the selected platform package built from this checkout or a released first-parent ancestor. |
 | `run` | Run an OpenVMM microVM. |
 | `sandbox` | Run or manage workloads over EROFS layers and private ext4 scratch. |
+| `setup-submodule` | Initialize the OpenVMM submodule, preserving a release-installed binary. |
+| `warmpool` | Manage a pool of pre-captured snapshots for fast sandbox restores. |
 | `benchmark` | Run the OpenVMM-native benchmark coordinator. |
 | `performance` | Collect, gate, and persist CI performance results. |
 | `collect-sources` | Materialize verified Linux, Alpine, and Ubuntu release sources. |
@@ -548,10 +550,11 @@ error itself names `--cpu-profile host`.
 
 ```text
 python3 scripts/nvx.py sandbox
-    [{run,provision,start,exec,stop,deprovision}]
+    [{run,provision,start,exec,execd,stop,deprovision}]
     [--layer ROLE,PATH,EROFS_UUID]...
     [--scratch PATH]
     [--state-dir PATH]
+    [--socket PATH]
     [--entrypoint PATH]
     [--arg VALUE]...
     [--hostname NAME]
@@ -630,6 +633,95 @@ launches.
 
 See [Run](run.md) for artifact preparation, the security boundary, and current
 snapshot/configuration limitations.
+
+### `setup-submodule`
+
+```text
+python3 scripts/nvx.py setup-submodule
+```
+
+`setup-submodule` initializes the OpenVMM source submodule around a release
+install. `download` places the packaged OpenVMM binary under
+`openvmm/target/release/`, which leaves `openvmm/` non-empty and blocks
+submodule initialization; this command moves the installed binary aside,
+initializes the submodule, and restores the binary, so a later benchmark run
+that reuses the release binary finds both the source tree and the binary.
+
+### `warmpool`
+
+```text
+python3 scripts/nvx.py warmpool
+    {fill,status,acquire,release,prune,bench}
+```
+
+`warmpool` manages a directory of pre-captured OpenVMM snapshots that `sandbox`
+restores into fresh sandboxes, trading capture-time cost for restore-time
+speed. Pool entries carry a `cpu_class_frequencies_khz` manifest tag; a pool
+whose CPU class this host does not expose, or whose CPUs fall outside the
+current process affinity, is refused rather than served a snapshot that fails
+the destination CPU contract check. Untagged pools from before the tag existed
+serve unchanged.
+
+#### `warmpool fill`
+
+```text
+python3 scripts/nvx.py warmpool fill
+    --pool-dir POOL_DIR [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+    [--size SIZE] [--memory-mib MEMORY_MIB]
+    [--processors {1,2,4,8}] [--backend {kvm,mshv}] [--timeout TIMEOUT]
+```
+
+Captures snapshots until the pool holds `--size` entries.
+
+#### `warmpool status`
+
+```text
+python3 scripts/nvx.py warmpool status
+    --pool-dir POOL_DIR [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+```
+
+Reports the pool's entry count, CPU-class tag, and claimed entries.
+
+#### `warmpool acquire`
+
+```text
+python3 scripts/nvx.py warmpool acquire
+    --pool-dir POOL_DIR [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+    [--count COUNT]
+```
+
+Atomically claims up to `--count` entries by renaming them aside.
+
+#### `warmpool release`
+
+```text
+python3 scripts/nvx.py warmpool release
+    --pool-dir POOL_DIR [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+    --entry ENTRY
+```
+
+Returns a claimed entry to the pool.
+
+#### `warmpool prune`
+
+```text
+python3 scripts/nvx.py warmpool prune
+    --pool-dir POOL_DIR [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+    --ttl-s TTL_S
+```
+
+Drops entries older than `--ttl-s` seconds.
+
+#### `warmpool bench`
+
+```text
+python3 scripts/nvx.py warmpool bench
+    --pool-dir POOL_DIR [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+    [--duration-s DURATION_S] [--workers WORKERS] [--timeout TIMEOUT]
+```
+
+Drives concurrent acquire/restore/release cycles and reports restore
+throughput and latency percentiles.
 
 ## CPU profiles
 

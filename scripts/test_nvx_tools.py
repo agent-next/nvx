@@ -13595,6 +13595,11 @@ class SandboxTests(unittest.TestCase):
                 patch.object(
                     sandbox_lifecycle.subprocess, "Popen", side_effect=spawn
                 ),
+                # the mocks use arbitrary pid numbers, so the new upstream
+                # process-identity check (start_time) must be fed a constant
+                patch.object(
+                    sandbox_lifecycle, "_process_start_time", return_value=456
+                ),
                 patch.object(
                     sandbox_lifecycle.ControlSession, "connect", connects
                 ),
@@ -13698,7 +13703,7 @@ class SandboxTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    sandbox_lifecycle, "_process_running", lambda _pid: running[0]
+                    sandbox_lifecycle, "_process_running", lambda _pid, _t: running[0]
                 ),
                 patch.object(
                     sandbox_lifecycle.ControlSession,
@@ -16419,7 +16424,9 @@ class BenchmarkTests(unittest.TestCase):
                     "--nvx-dir",
                     str(root),
                     "--cpus",
-                    "0-2",
+                    ",".join(str(cpu) for cpu in range(os.cpu_count() or 1)),
+                    "--host-cpu-reserve",
+                    "0",
                     "--warmups",
                     "1",
                     "--runs",
@@ -19353,11 +19360,18 @@ class WarmpoolTests(unittest.TestCase):
     def test_pool_class_tag_guard(self) -> None:
         pool = self.make_pool(entries=1)
         real_affinity = os.sched_getaffinity(0)
-        classes = {6_000_000: {0}, 5_700_000: {2}, 4_200_000: {16, 17}}
+        # pick two CPUs this host actually has, so the test runs anywhere
+        present = sorted(real_affinity)
+        in_affinity, out_of_affinity = present[0], present[-1]
+        classes = {
+            6_000_000: {out_of_affinity},
+            5_700_000: {in_affinity},
+            4_200_000: {16, 17},
+        }
         with (
             patch.object(warmpool, "cpu_frequency_classes", return_value=classes),
             patch.object(
-                os, "sched_getaffinity", return_value=real_affinity & {0, 2}
+                os, "sched_getaffinity", return_value=real_affinity & {in_affinity}
             ),
         ):
             warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": [5_700_000]})
