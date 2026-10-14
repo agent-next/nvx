@@ -3,6 +3,11 @@
 Analysis only; no rebase was performed and no code was changed upstream or here beyond
 this document.
 
+This is a historical comparison. The
+[10-14 sync](UPSTREAM-SYNC-20261014.md) supersedes its open compatibility questions:
+upstream CPU profiles permit cross-class restore on the tested hybrid host.
+Current ordinary commands apply CPU-class affinity only when explicitly requested.
+
 **Method.** Upstream remote added as `upstream` (https://github.com/microsoft/nvx.git) and
 fetched 2026-10-09. microsoft/nvx has **no `main`/`master` branch**; its default branch is
 `dev`, so `upstream/dev` is the comparison line throughout. Merge-base of

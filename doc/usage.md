@@ -72,7 +72,9 @@ Initializes and recursively updates the OpenVMM Git submodule.
 python3 scripts/nvx.py setup-submodule
 ```
 
-Initializes the pinned OpenVMM source without replacing downloaded artifacts.
+Initializes the pinned OpenVMM source and nested submodules recursively.
+Preserves the downloaded `openvmm` binary (`openvmm.exe` on Windows), including
+when initialization fails.
 
 ### `verify`
 
@@ -1051,6 +1053,19 @@ The destination must be outside the source directory and end in `.tar.gz` or
 ### `warmpool`
 
 Snapshots in this pool are bare benchmark snapshots, not provisioned managed sandboxes.
+Fill and placement validation require Linux CPU-affinity support.
+An available snapshot is an `entry-*` directory. Acquire renames it to
+`claimed-<unix-time-nanoseconds>-<id>` so concurrent callers cannot claim the
+same entry. Restore does not consume the snapshot; release returns it for reuse.
+
+Ordinary commands preserve the caller's CPU affinity by default.
+`NVX_CPU_CLASS=performance` or `efficiency` opts into single-class placement,
+including available SMT siblings. Benchmark pinning remains separate for
+latency measurement. Single-class pools record a frequency-based placement
+tag; acquire and bench reject tags absent from the host or outside the caller's
+affinity, or tags spanning classes. Unpinned multi-class captures have no
+single-class tag. OpenVMM's CPU contract still decides restore compatibility,
+including cross-class restore.
 
 #### `warmpool fill`
 
@@ -1062,12 +1077,18 @@ python3 scripts/nvx.py warmpool fill [-h] --pool-dir POOL_DIR
                             [--timeout TIMEOUT]
 ```
 
+Captures `--size` snapshots and writes `pool.json` with the guest shape,
+backend and placement metadata. Kernel, initramfs and OpenVMM artifacts must
+already exist. Keep the pool on a filesystem supporting atomic directory rename.
+
 #### `warmpool status`
 
 ```text
 python3 scripts/nvx.py warmpool status [-h] --pool-dir POOL_DIR
                               [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
 ```
+
+Prints the fill-time manifest and current available/claimed directory counts.
 
 #### `warmpool acquire`
 
@@ -1077,6 +1098,11 @@ python3 scripts/nvx.py warmpool acquire [-h] --pool-dir POOL_DIR
                                [--count COUNT]
 ```
 
+Prints exactly `--count` claim paths, one per line. Each rename is atomic;
+the batch is not a single transaction. If the batch cannot complete, it releases
+all partial claims before failing. Callers must release each claim after restore
+finishes, including when restore fails.
+
 #### `warmpool release`
 
 ```text
@@ -1084,6 +1110,9 @@ python3 scripts/nvx.py warmpool release [-h] --pool-dir POOL_DIR
                                [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
                                --entry ENTRY
 ```
+
+Accepts only a plain `claimed-*` directory directly inside the specified pool,
+not an arbitrary directory or a symbolic link. Prints its new available path.
 
 #### `warmpool prune`
 
@@ -1093,6 +1122,13 @@ python3 scripts/nvx.py warmpool prune [-h] --pool-dir POOL_DIR
                              --ttl-s TTL_S
 ```
 
+Deletes claims whose claim-name timestamp is at least `--ttl-s` seconds old,
+not snapshots whose capture-time directory mtime is old. Unknown timestamp
+formats are left untouched. This is destructive expiration, not automatic
+recovery to the available pool. It does not check whether a caller is alive or
+renew leases: choose a TTL longer than the longest restore/use period, and do
+not prune claims still in use. Expired snapshots must be replenished with fill.
+
 #### `warmpool bench`
 
 ```text
@@ -1101,3 +1137,7 @@ python3 scripts/nvx.py warmpool bench [-h] --pool-dir POOL_DIR
                              [--duration-s DURATION_S] [--workers WORKERS]
                              [--timeout TIMEOUT]
 ```
+
+Workers repeatedly acquire, restore and release for the requested duration.
+The command reports latency, failures, pool-exhaustion waits and leaked claims.
+It fails if any restore fails or pool counts do not return to their initial values.
