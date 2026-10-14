@@ -3549,7 +3549,7 @@ class CiConfigurationTests(unittest.TestCase):
                     )
                     return result.stdout.strip()
 
-                git("init", "--quiet")
+                git("init", "--quiet", "-b", "fixture")
                 git("config", "user.name", "Reproduction")
                 git("config", "user.email", "repro@example.invalid")
                 git("config", "commit.gpgsign", "false")
