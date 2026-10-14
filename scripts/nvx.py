@@ -776,12 +776,17 @@ def command_sandbox(args: argparse.Namespace) -> None:
     if operation in ("run", "provision"):
         if (args.net is None) != (args.network_profile is None):
             raise ScriptError("--net and --network-profile must be specified together")
-        if not args.layer or args.scratch is None:
+        if not args.layer or (args.scratch is None and restore_snapshot is None):
             raise ScriptError(f"sandbox {operation} requires --layer and --scratch")
+        if args.scratch is None:
+            assert restore_snapshot is not None
+            scratch = restore_snapshot / "scratch.img"
+        else:
+            scratch = args.scratch
         network_egress_allow, network_egress_deny = _resolve_network_egress_rules(args)
         launch = SandboxLaunch(
             layers=tuple(args.layer),
-            scratch=args.scratch,
+            scratch=scratch,
             entrypoint=args.entrypoint,
             args=tuple(args.sandbox_arg),
             hostname=args.hostname,
@@ -791,7 +796,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
             mounts=_sandbox_mounts(args),
             processors=1 if args.processors is None else args.processors,
             snapshot_capture=snapshot_destination is not None,
-        ).validated()
+        ).validated(restore=restore_snapshot is not None)
         _validate_sandbox_systemd_policy(launch)
     else:
         launch = None

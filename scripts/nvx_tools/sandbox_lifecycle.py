@@ -811,7 +811,7 @@ def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
         snapshot_paths(config)
     elif config.get("format") != _config_format(launch.mounts):
         raise ScriptError("sandbox configuration format does not match its mounts")
-    return launch.validated()
+    return launch.validated(restore=config.get("restore_snapshot") is not None)
 
 
 def _linux_start_time(stat: bytes) -> int | None:
@@ -1040,7 +1040,7 @@ def provision(
         _write_json(
             config_path,
             _serialize_launch(
-                launch.validated(),
+                launch.validated(restore=restore_snapshot is not None),
                 hypervisor=hypervisor,
                 memory_mib=memory_mib,
                 net=net,
@@ -1280,8 +1280,13 @@ def _start(
             os.close(capability_input)
         if snapshot_destination is not None:
             status = process.wait(timeout=timeout)
-            if status != 0 or not snapshot_destination.is_dir():
+            if status != 0:
                 raise ScriptError(_startup_exit_message(outcome_path, status))
+            if not all(
+                (snapshot_destination / name).is_file()
+                for name in ("manifest.bin", "state.bin", "memory.bin", "scratch.img")
+            ):
+                raise ScriptError("sandbox capture did not publish a complete instance checkpoint")
             if os.name != "nt":
                 Path(endpoint_value).unlink(missing_ok=True)
             capability_path.unlink(missing_ok=True)
@@ -1339,7 +1344,10 @@ def _start(
                     Path(endpoint_value).unlink(missing_ok=True)
                 capability_path.unlink(missing_ok=True)
                 (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
-        if status is not None and isinstance(error, Exception):
+        if (
+            status is not None and isinstance(error, Exception)
+            and not (snapshot_destination is not None and status == 0)
+        ):
             raise ScriptError(_startup_exit_message(outcome_path, status)) from error
         raise
     finally:

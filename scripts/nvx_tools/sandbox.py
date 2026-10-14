@@ -558,11 +558,12 @@ class SandboxLaunch:
                 raise ScriptError(f"--{name} must be positive")
         validate_mounts(self.mounts)
 
-    def validated(self) -> SandboxLaunch:
+    def validated(self, *, restore: bool = False) -> SandboxLaunch:
         for layer in self.layers:
             require_file(layer.path, f"{layer.role} EROFS layer")
             _reject_disk_path(layer.path)
-        require_file(self.scratch, "ext4 scratch image")
+        if not restore:
+            require_file(self.scratch, "ext4 scratch image")
         _reject_disk_path(self.scratch)
         for mount in self.mounts:
             mount.validated()

@@ -3,16 +3,18 @@
 
 import dataclasses
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import nvx
-from nvx_tools import sandbox
-from nvx_tools import sandbox_lifecycle as lifecycle
-from nvx_tools.common import ScriptError
+sys.path.insert(0, str(Path(__file__).parent))
+import nvx  # noqa: E402
+from nvx_tools import sandbox  # noqa: E402
+from nvx_tools import sandbox_lifecycle as lifecycle  # noqa: E402
+from nvx_tools.common import ScriptError  # noqa: E402
 
 
 class SandboxSnapshotTests(unittest.TestCase):
@@ -106,6 +108,22 @@ class SandboxSnapshotTests(unittest.TestCase):
         self.assertNotIn("sandboxsnap", launch.kernel_command_line())
         self.assertIn(f"distro:file:{self.layer},ro", arguments)
 
+    def test_restore_uses_paired_scratch_without_original_image(self):
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir()
+        self.scratch.unlink()
+        args = nvx.parse_args([
+            "sandbox", "provision", "--state-dir", str(self.root / "state"),
+            "--layer", f"distro,{self.layer},11111111-1111-1111-1111-111111111111",
+            "--restore-snapshot", str(snapshot),
+        ])
+        with patch.object(lifecycle, "provision") as provision:
+            nvx.command_sandbox(args)
+        launch = provision.call_args.args[1]
+        self.assertEqual(launch.scratch, snapshot / "scratch.img")
+        config = self.config(restore_snapshot=snapshot)
+        lifecycle._deserialize_launch(config)
+
     def test_namespace_rejects_public_parent_symlink_and_existing_destination(self):
         public = self.root / "public"
         public.mkdir(mode=0o755)
@@ -148,6 +166,8 @@ class SandboxSnapshotTests(unittest.TestCase):
 
         def captured(timeout: float) -> int:
             destination.mkdir()
+            for name in ("manifest.bin", "state.bin", "memory.bin", "scratch.img"):
+                (destination / name).touch()
             return 0
 
         process.wait.side_effect = captured
@@ -199,6 +219,28 @@ class SandboxSnapshotTests(unittest.TestCase):
         self.assertNotIn("--restore-entropy", command)
         runtime = json.loads((state / lifecycle.RUNTIME_NAME).read_text())
         self.assertEqual(runtime["control_endpoint"], str(self.root / "control.sock"))
+
+    def test_empty_capture_publication_is_not_success(self):
+        destination = self.root / "snap"
+        state = self.root / "state"
+        lifecycle.provision(
+            state, self.launch, **self.options, timeout=10,
+            snapshot_destination=destination,
+        )
+        process = MagicMock()
+        process.poll.return_value = 0
+        def empty_capture(timeout: float) -> int:
+            destination.mkdir()
+            return 0
+        process.wait.side_effect = empty_capture
+        with (
+            patch.object(lifecycle, "require_file", side_effect=self.require),
+            patch.object(lifecycle.subprocess, "Popen", return_value=process),
+            self.assertRaisesRegex(ScriptError, "complete instance checkpoint"),
+        ):
+            lifecycle.start(state, 10)
+        self.assertFalse((state / lifecycle.RUNTIME_NAME).exists())
+        self.assertFalse((state / lifecycle.CAPABILITY_NAME).exists())
 
     @staticmethod
     def require(path: Path, _description: str) -> Path:

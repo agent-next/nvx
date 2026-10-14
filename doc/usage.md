@@ -611,7 +611,7 @@ launches.
 | --- | --- | --- |
 | `{run,provision,start,exec,execd,stop,deprovision}` | `run` | Select a one-shot run or a managed lifecycle operation. |
 | `--layer ROLE,PATH,EROFS_UUID` | required for `run` and `provision` | Attach a `distro`, `runtime`, or `custom` EROFS layer. Repeat once per distinct role. |
-| `--scratch PATH` | required for `run` and `provision` | Attach a preformatted ext4 scratch image as the writable overlay. |
+| `--scratch PATH` | required for cold `run` and `provision` | Attach a preformatted ext4 scratch image. A snapshot restore uses its paired scratch and does not require the original image or this option. |
 | `--state-dir PATH` | required for managed operations | Select persistent sandbox state. One-shot `run` rejects this option. |
 | `--socket PATH` | none | Private Unix socket for the persistent `execd` daemon. Required for `execd`. |
 | `--processors {1,2,4,8}` | `1` | Guest vCPU count for `run` or `provision`. |
