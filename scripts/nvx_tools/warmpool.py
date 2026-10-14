@@ -23,18 +23,21 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Sequence
+from typing import Any, cast
 
 from nvx_tools.benchmark import (
     RESTORE_MARKER,
-    SNAPSHOT_FILENAMES,
     benchmark,
     capture_snapshot,
     cpu_frequency_classes,
     snapshot_restore_command,
     workload_boot_command,
+)
+from nvx_tools.benchmark import (
+    SNAPSHOT_FILENAMES as SNAPSHOT_FILENAMES,
 )
 from nvx_tools.build_constants import (
     AlpineBuildConstants,
@@ -61,11 +64,14 @@ def write_manifest(pool_dir: Path, fields: dict[str, object]) -> None:
     manifest.write_text(json.dumps(fields, indent=2, sort_keys=True) + "\n")
 
 
-def read_manifest(pool_dir: Path) -> dict[str, object]:
+def read_manifest(pool_dir: Path) -> dict[str, Any]:
     manifest = pool_dir / POOL_MANIFEST
     if not manifest.is_file():
         raise ScriptError(f"{pool_dir} is not a pool: missing {POOL_MANIFEST}")
-    return json.loads(manifest.read_text())
+    value = json.loads(manifest.read_text())
+    if not isinstance(value, dict):
+        raise ScriptError("pool manifest must be a JSON object")
+    return cast(dict[str, Any], value)
 
 
 def pool_class_frequencies() -> list[int]:
@@ -78,12 +84,15 @@ def pool_class_frequencies() -> list[int]:
 def validate_pool_class(pool_dir: Path) -> None:
     """Refuse to serve a pool captured on a CPU class this host does not have.
 
-    Snapshot restores are portable only within one CPU frequency class (the
-    destination CPU contract check); a pool tagged with frequencies this host
-    does not expose, or whose CPUs are outside this process affinity, must not
-    be served. Pools filled before the tag existed are served unchanged.
+    This is a conservative placement policy, not OpenVMM's compatibility
+    classifier. A pool tagged with frequencies this host does not expose, or
+    whose CPUs are outside this process affinity, must not be served.
+    Pools filled before the tag existed are served unchanged.
     """
-    tag = [int(frequency) for frequency in read_manifest(pool_dir).get("cpu_class_frequencies_khz") or []]
+    frequencies = cast(
+        list[int], read_manifest(pool_dir).get("cpu_class_frequencies_khz") or []
+    )
+    tag = [int(frequency) for frequency in frequencies]
     if not tag:
         return
     classes = cpu_frequency_classes()
@@ -236,7 +245,7 @@ def command_bench(args: argparse.Namespace) -> int:
     failures = 0
     exhaust_waits = 0
 
-    def worker() -> None:
+    def worker(_index: int) -> None:
         nonlocal failures, exhaust_waits
         deadline = time.monotonic() + args.duration_s
         while time.monotonic() < deadline:
@@ -277,7 +286,7 @@ def command_bench(args: argparse.Namespace) -> int:
 
     started = time.monotonic()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        list(pool.map(lambda _: worker(), range(args.workers)))
+        list(pool.map(worker, range(args.workers)))
     elapsed = time.monotonic() - started
 
     samples_ms.sort()

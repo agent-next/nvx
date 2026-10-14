@@ -16884,11 +16884,14 @@ class SandboxTests(unittest.TestCase):
                 except BaseException as error:
                     failure.append(error)
 
+            def process_running(_pid: int, _start_time: int | None) -> bool:
+                return running[0]
+
             with (
                 patch.object(
                     sandbox_lifecycle,
                     "_process_running",
-                    lambda *_args: running[0],
+                    process_running,
                 ),
                 patch.object(
                     sandbox_lifecycle.ControlSession,
@@ -22648,13 +22651,15 @@ class EnsureOpenvmmSourceTests(unittest.TestCase):
 
             original_run = release.subprocess.run
 
-            def fake_run(command, **kwargs):
+            def fake_run(command: list[str], **kwargs: Any) -> Any:
                 if "submodule" in command:
                     (root / "openvmm" / "Cargo.toml").write_text(
                         "[package]\n", encoding="ascii"
                     )
                     return None
-                return original_run(command, **kwargs)
+                return cast(
+                    subprocess.CompletedProcess[bytes], original_run(command, **kwargs)
+                )
 
             with patch.object(
                 release.subprocess, "run", side_effect=fake_run

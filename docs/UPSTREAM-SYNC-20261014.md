@@ -42,12 +42,12 @@ the inspected upstream tree, not that every issue was searched.
 | 05203da5 | Correct analysis citations | Keep | Historical factual correction, 7c5f9e96. |
 | 293a31ed | Merge fork PR #5 | Drop merge | No additional patch beyond the three analysis commits. |
 | ced8288b | Snapshot / processors | Rewrite | fe073da7 adds format 7, not old fork format 3; upstream already owns formats 3-6. |
-| 1f67500f | Snapshot config live share | Rewrite | Format 7 uses upstream's full `mounts` representation, including owners, policies, and file kind. Nine regression oracles added. |
+| 1f67500f | Snapshot config live share | Rewrite | Format 7 uses upstream's full `mounts` representation, including owners, policies, and file kind. Eleven snapshot regression oracles added. |
 | 82e93566 | Snapshot console namespace | Rewrite | Managed control endpoint lives beside the snapshot, with collision rejection and external-endpoint cleanup. |
 | 80d21fd9 | Private snapshot parent | Rewrite | Validate plain parent, current owner and mode 0700 on POSIX; reject symbolic links, missing restore directories and existing capture destinations. |
 | 9fba310a | Capture before consuming scratch | Rewrite | Guest trigger runs after layer/rootfs/share assembly, before managed agent or one-shot workload handoff. Successful managed capture returns with no live runtime record. |
 | 1b98bf53 | Instance-checkpoint tier | Rewrite | Reuse upstream `nvx-snapshot --tier instance-checkpoint`; platform/workload-start have different admission rules. |
-| c9dc6828 | Paired scratch restore | Rewrite | Omit scratch and workload-identity redeclarations on restore; preserve read-only layer and live-share attachments. 5929a0ba also removes obsolete `--restore-entropy` (upstream 5a92c86f). |
+| c9dc6828 | Paired scratch restore | Rewrite | Omit scratch and workload-identity redeclarations on restore; preserve read-only layer and live-share attachments. 5929a0ba removes obsolete `--restore-entropy` (upstream 5a92c86f). 80da9e6d allows absent original scratch and checks complete capture publication. |
 
 The seven PR #2 commits are consolidated into a reviewed rewrite rather than
 cherry-picked over incompatible schemas. Old fork snapshot-format-3 configs
@@ -80,6 +80,9 @@ must be reprovisioned; they are not interchangeable with upstream owner-format-3
 - Fork-only commands remain `warmpool`, `setup-submodule`, and `sandbox execd`.
   The stacked rewrite adds sandbox `--processors`, `--snapshot-destination`,
   and `--restore-snapshot`. These are not on pristine upstream's sandbox parser.
+  The inspected gateway does not pass processors or snapshot flags
+  (**client** `gateway/src/gateway/nvx_upstream.py:288-297`); it keeps the existing
+  one-vCPU default until it explicitly opts in.
 
 ### Wire and control protocol
 
@@ -141,11 +144,12 @@ The OpenVMM snapshot contract still validates layer identity and paired scratch.
 Detailed commands, logs, binary provenance, measured latency and PR links:
 `task-runs/20261014-nvx-sync/W1-RECEIPT.md` in the task workspace.
 
-At the unit checkpoint:
+Final unit checks:
 
 ```text
 Pristine 4acf7eb0, all scripts: 2 failed, 1089 passed, 20 skipped
-Rewritten stack, all scripts: 1 failed, 1121 passed, 20 skipped
+Product, all scripts: 1 failed, 1113 passed, 20 skipped
+Rewritten stack, all scripts: 1 failed, 1124 passed, 20 skipped
 ```
 
 The remaining rewritten-stack failure,
@@ -153,6 +157,10 @@ The remaining rewritten-stack failure,
 the host refuses a fixture commit on its default `main` branch. The second
 pristine failure is fixed by the retained provenance-fixture isolation.
 No policy guard was disabled.
+Full-tree Ruff and strict Pyright pass. Final static checking also corrected
+retained warm-pool/test typing without changing the execd wire contract.
+The retained `guest_exit_prequeued` benchmark argument is already upstream
+(`scripts/nvx_tools/benchmark.py:1850`); the real warm-pool restore check exercises it.
 
 Real KVM, matching release, i9-14900K, 128 MiB / 1 vCPU, CPU 0 (P core),
 two excluded warmups and 20 retained samples per series:
@@ -173,5 +181,21 @@ Raw samples and that policy are recorded in the receipt JSON.
 
 One-shot, managed exec, and three requests on one persistent execd session
 passed on KVM, including a guest exit 7 with stderr followed by a successful
-request. Full suite and managed snapshot results are recorded separately in
-the final receipt; incomplete checks are not implied by these smoke successes.
+request. The full default `test-microvm --backend kvm` suite passed with CPU
+affinity 0,2,4,6,8,10,12,14. Pinning the SMP suite to CPU 0 alone was invalid;
+pristine reproduces that failure. The corrected CPU matrix also verifies
+successful cross-class restore rather than the fork's obsolete rejection oracle.
+
+The stacked branch additionally passed real two-vCPU instance-checkpoint
+capture, deletion of the original scratch, paired-scratch restore without
+`--scratch`, managed exec, and three requests on the same persistent execd.
+Capture publication requires manifest, state, memory, and paired scratch.
+The fork init-agent was repacked into the matching release initramfs with
+upstream's packer, preserving executable and root-directory permissions.
+Five affected default KVM scenarios passed again with that guest.
+Warm-pool fill and restore churn also passed with zero leaked claims.
+
+This verifies runtime against a digest-checked matching OpenVMM release, not an
+OpenVMM source build. Windows and opt-in-only correctness scenarios were not run.
+Fork-only PRs: [product #6](https://github.com/agent-next/nvx/pull/6) and
+[stacked snapshot/processors #7](https://github.com/agent-next/nvx/pull/7).
