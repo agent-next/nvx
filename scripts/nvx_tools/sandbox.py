@@ -576,7 +576,7 @@ class SandboxLaunch:
 
     def openvmm_arguments(self, *, restore: bool = False) -> list[str]:
         arguments = ["--machine", "microvm"]
-        if self.processors != 1:
+        if self.processors != 1 and not restore:
             arguments.extend(("--processors", str(self.processors)))
         for layer in self.ordered_layers():
             arguments.extend(
@@ -586,12 +586,14 @@ class SandboxLaunch:
                 )
             )
         if not restore:
-            arguments.extend((
-                "--microvm-sandbox-block",
-                f"scratch:file:{os.fspath(self.scratch)}",
-                "--microvm-workload-identity",
-                f"{self.workload_identity[0]}:{self.workload_identity[1]}",
-            ))
+            arguments.extend(
+                (
+                    "--microvm-sandbox-block",
+                    f"scratch:file:{os.fspath(self.scratch)}",
+                    "--microvm-workload-identity",
+                    f"{self.workload_identity[0]}:{self.workload_identity[1]}",
+                )
+            )
         arguments.extend(mounts_openvmm_arguments(self.mounts))
         return arguments
 
@@ -599,7 +601,7 @@ class SandboxLaunch:
         if "\0" in user_command_line:
             raise ScriptError("kernel command line contains an embedded NUL")
         for token in user_command_line.split():
-            if token.startswith("nvx_"):
+            if token.startswith("nvx_") or token == "sandboxsnap":
                 raise ScriptError(
                     f"{token.split('=', 1)[0]} is owned by the sandbox profile"
                 )

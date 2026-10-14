@@ -684,7 +684,9 @@ def _serialize_launch(
         config.update(
             processors=launch.processors,
             snapshot_destination=(
-                None if snapshot_destination is None else os.fspath(snapshot_destination)
+                None
+                if snapshot_destination is None
+                else os.fspath(snapshot_destination)
             ),
             restore_snapshot=(
                 None if restore_snapshot is None else os.fspath(restore_snapshot)
@@ -695,7 +697,8 @@ def _serialize_launch(
             _serialize_mount(
                 mount,
                 policy=config_format != MULTI_MOUNT_CONFIG_FORMAT,
-                kind=config_format in (FILE_MOUNT_CONFIG_FORMAT, SNAPSHOT_CONFIG_FORMAT),
+                kind=config_format
+                in (FILE_MOUNT_CONFIG_FORMAT, SNAPSHOT_CONFIG_FORMAT),
             )
             for mount in launch.mounts
         ]
@@ -771,7 +774,8 @@ def _deserialize_mounts(config: dict[str, Any]) -> tuple[SandboxMount, ...]:
             _deserialize_mount(
                 mount,
                 policy=config_format != MULTI_MOUNT_CONFIG_FORMAT,
-                kind=config_format in (FILE_MOUNT_CONFIG_FORMAT, SNAPSHOT_CONFIG_FORMAT),
+                kind=config_format
+                in (FILE_MOUNT_CONFIG_FORMAT, SNAPSHOT_CONFIG_FORMAT),
             )
             for mount in cast(list[object], mounts)
         )
@@ -801,7 +805,9 @@ def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
             pids_max=None if config["pids_max"] is None else int(config["pids_max"]),
             mounts=_deserialize_mounts(config),
             processors=(
-                config["processors"] if config.get("format") == SNAPSHOT_CONFIG_FORMAT else 1
+                config["processors"]
+                if config.get("format") == SNAPSHOT_CONFIG_FORMAT
+                else 1
             ),
             snapshot_capture=config.get("snapshot_destination") is not None,
         )
@@ -1024,7 +1030,9 @@ def provision(
     snapshot_destination, restore_snapshot = snapshot_paths(
         {
             "snapshot_destination": (
-                None if snapshot_destination is None else os.fspath(snapshot_destination)
+                None
+                if snapshot_destination is None
+                else os.fspath(snapshot_destination)
             ),
             "restore_snapshot": (
                 None if restore_snapshot is None else os.fspath(restore_snapshot)
@@ -1061,6 +1069,13 @@ def provision(
 
 def snapshot_paths(config: dict[str, Any]) -> tuple[Path | None, Path | None]:
     """Validate capture/restore paths and their private device namespace."""
+    if os.name == "nt" and any(
+        config.get(key) is not None
+        for key in ("snapshot_destination", "restore_snapshot")
+    ):
+        raise ScriptError(
+            "--snapshot-destination and --restore-snapshot are unsupported on Windows"
+        )
     paths: list[Path | None] = []
     for key in ("snapshot_destination", "restore_snapshot"):
         value = config.get(key)
@@ -1082,7 +1097,9 @@ def snapshot_paths(config: dict[str, Any]) -> tuple[Path | None, Path | None]:
         if os.name != "nt" and (
             metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
-            raise ScriptError("sandbox snapshot parent must be owned by this user with mode 0700")
+            raise ScriptError(
+                "sandbox snapshot parent must be owned by this user with mode 0700"
+            )
         if path.is_symlink():
             raise ScriptError("sandbox snapshot must not be a symbolic link")
         if key == "restore_snapshot":
@@ -1103,9 +1120,7 @@ def _start_first_wait_s() -> float:
     try:
         value = float(raw)
     except ValueError as error:
-        raise ScriptError(
-            f"NVX_START_FIRST_WAIT_S is not a number: {raw!r}"
-        ) from error
+        raise ScriptError(f"NVX_START_FIRST_WAIT_S is not a number: {raw!r}") from error
     if not 0 < value < float("inf"):
         raise ScriptError(f"NVX_START_FIRST_WAIT_S must be positive: {raw!r}")
     return value
@@ -1113,9 +1128,7 @@ def _start_first_wait_s() -> float:
 
 def _start_with_endpoint_retry(state_path: Path, timeout: float) -> None:
     try:
-        _start_once(
-            state_path, timeout, endpoint_wait_s=_start_first_wait_s()
-        )
+        _start_once(state_path, timeout, endpoint_wait_s=_start_first_wait_s())
     except TimeoutError as error:
         if "did not become available" not in str(error):
             raise
@@ -1128,6 +1141,16 @@ def _start_with_endpoint_retry(state_path: Path, timeout: float) -> None:
 
 
 def start(state_path: Path, timeout: float) -> None:
+    config_path = state_path / CONFIG_NAME
+    config = (
+        _read_json(config_path, "sandbox configuration", version=CONFIG_FORMATS)
+        if config_path.is_file()
+        else {}
+    )
+    if config.get("restore_snapshot") is not None:
+        # Instance checkpoints are claimed by the first attempt, even if it fails.
+        _start_once(state_path, timeout)
+        return
     _with_control_retry(
         "start", lambda: _start_with_endpoint_retry(state_path, timeout)
     )
@@ -1160,6 +1183,64 @@ def _create_capability(path: Path, capability: bytes) -> None:
         raise
 
 
+def _socket_identity(endpoint: Path) -> list[int] | None:
+    try:
+        metadata = endpoint.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISSOCK(metadata.st_mode):
+        return None
+    return [metadata.st_dev, metadata.st_ino]
+
+
+def _reserve_snapshot_endpoint(endpoint: Path) -> str:
+    """Exclude starts across state directories before OpenVMM binds the socket."""
+    owner = uuid.uuid4().hex
+    reservation = Path(f"{endpoint}.lock")
+    try:
+        descriptor = os.open(reservation, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise ScriptError("sandbox control endpoint is already reserved") from error
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            output.write(owner)
+        if path_exists(endpoint):
+            raise ScriptError("sandbox control endpoint already exists")
+    except BaseException:
+        reservation.unlink(missing_ok=True)
+        raise
+    return owner
+
+
+def _cleanup_snapshot_endpoint(endpoint: Path, owner: object, identity: object) -> None:
+    # Old runtime records and stale owners cannot vouch for an external socket.
+    if not isinstance(owner, str):
+        return
+    reservation = Path(f"{endpoint}.lock")
+    try:
+        if reservation.read_text() != owner:
+            return
+    except FileNotFoundError:
+        return
+    current = _socket_identity(endpoint)
+    if current is not None and current == identity:
+        endpoint.unlink(missing_ok=True)
+    reservation.unlink(missing_ok=True)
+
+
+def _cleanup_runtime_endpoint(state_dir: Path, runtime: dict[str, Any]) -> None:
+    (state_dir / CONTROL_SOCKET_NAME).unlink(missing_ok=True)
+    if os.name == "nt":
+        return
+    endpoint = _endpoint(runtime)
+    if endpoint.is_absolute() and endpoint != state_dir / CONTROL_SOCKET_NAME:
+        _cleanup_snapshot_endpoint(
+            endpoint,
+            runtime.get("control_endpoint_owner"),
+            runtime.get("control_socket_identity"),
+        )
+
+
 def _start(
     state_dir: Path, timeout: float, endpoint_wait_s: float | None = None
 ) -> None:
@@ -1189,13 +1270,12 @@ def _start(
     capability = secrets.token_bytes(32)
     if capability == bytes(32):
         raise AssertionError("secrets.token_bytes returned an all-zero capability")
-    endpoint_value = (
-        f"//./pipe/openvmm-microvm-{uuid.uuid4().hex}"
-        if os.name == "nt"
-        else os.fspath(
-            (state_dir if snapshot is None else snapshot.parent) / CONTROL_SOCKET_NAME
-        )
-    )
+    if snapshot is not None:
+        endpoint_value = os.fspath(snapshot.with_name(f"{snapshot.name}.control.sock"))
+    elif os.name == "nt":
+        endpoint_value = f"//./pipe/openvmm-microvm-{uuid.uuid4().hex}"
+    else:
+        endpoint_value = os.fspath(state_dir / CONTROL_SOCKET_NAME)
     if os.name != "nt" and path_exists(Path(endpoint_value)):
         raise ScriptError("sandbox control endpoint already exists")
     command = [
@@ -1215,18 +1295,29 @@ def _start(
     if restore_snapshot is not None:
         command.extend(["--restore-snapshot", os.fspath(restore_snapshot)])
     else:
-        command.extend([
-            "--microvm-lifecycle", "managed",
-            "--memory", f"{int(config['memory_mib'])}M",
-            "--kernel", os.fspath(kernel),
-            "--initrd", os.fspath(initrd),
-            "--cmdline", launch.kernel_command_line(str(config["cmdline"])),
-        ])
+        command.extend(
+            [
+                "--microvm-lifecycle",
+                "managed",
+                "--memory",
+                f"{int(config['memory_mib'])}M",
+                "--kernel",
+                os.fspath(kernel),
+                "--initrd",
+                os.fspath(initrd),
+                "--cmdline",
+                launch.kernel_command_line(str(config["cmdline"])),
+            ]
+        )
         if snapshot_destination is not None:
-            command.extend([
-                "--snapshot-destination", os.fspath(snapshot_destination),
-                "--snapshot-tier", SNAPSHOT_CAPTURE_TIER,
-            ])
+            command.extend(
+                [
+                    "--snapshot-destination",
+                    os.fspath(snapshot_destination),
+                    "--snapshot-tier",
+                    SNAPSHOT_CAPTURE_TIER,
+                ]
+            )
     net = config.get("net")
     network_profile = config.get("network_profile")
     if net is not None and restore_snapshot is None:
@@ -1253,16 +1344,22 @@ def _start(
 
     capability_path = state_dir / CAPABILITY_NAME
     _create_capability(capability_path, capability)
+    endpoint_owner: str | None = None
     log_path = state_dir / LOG_NAME
     try:
+        if snapshot is not None:
+            endpoint_owner = _reserve_snapshot_endpoint(Path(endpoint_value))
         log = log_path.open("ab", buffering=0)
     except BaseException:
+        if endpoint_owner is not None:
+            _cleanup_snapshot_endpoint(Path(endpoint_value), endpoint_owner, None)
         capability_path.unlink(missing_ok=True)
         raise
     creationflags = (
         getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
     )
     process: subprocess.Popen[bytes] | None = None
+    socket_identity: list[int] | None = None
     try:
         # OpenVMM reads its capability as soon as it starts, so the capability is
         # in the pipe, and the pipe's write end closed, before OpenVMM starts.
@@ -1279,16 +1376,27 @@ def _start(
         finally:
             os.close(capability_input)
         if snapshot_destination is not None:
-            status = process.wait(timeout=timeout)
+            try:
+                status = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                raise ScriptError(
+                    f"sandbox capture timed out after {timeout:g} seconds; "
+                    "increase --timeout to cover boot, layer hashing and capture"
+                ) from error
             if status != 0:
                 raise ScriptError(_startup_exit_message(outcome_path, status))
             if not all(
                 (snapshot_destination / name).is_file()
                 for name in ("manifest.bin", "state.bin", "memory.bin", "scratch.img")
             ):
-                raise ScriptError("sandbox capture did not publish a complete instance checkpoint")
-            if os.name != "nt":
-                Path(endpoint_value).unlink(missing_ok=True)
+                raise ScriptError(
+                    "sandbox capture did not publish a complete instance checkpoint"
+                )
+            _cleanup_snapshot_endpoint(
+                Path(endpoint_value),
+                endpoint_owner,
+                _socket_identity(Path(endpoint_value)),
+            )
             capability_path.unlink(missing_ok=True)
             return
         # Until this process reaps the child or closes its handle, no other process
@@ -1305,26 +1413,32 @@ def _start(
                 if process.poll() is not None
                 else "cannot identify the OpenVMM process"
             )
-        _write_json(
-            state_dir / RUNTIME_NAME,
-            {
-                "format": STATE_FORMAT,
-                "pid": process.pid,
-                "start_time": start_time,
-                "control_endpoint": endpoint_value,
-            },
-        )
+        runtime: dict[str, Any] = {
+            "format": STATE_FORMAT,
+            "pid": process.pid,
+            "start_time": start_time,
+            "control_endpoint": endpoint_value,
+        }
+        if endpoint_owner is not None:
+            runtime["control_endpoint_owner"] = endpoint_owner
+        _write_json(state_dir / RUNTIME_NAME, runtime)
         with ControlSession.connect(
             Path(endpoint_value),
             capability,
             timeout if endpoint_wait_s is None else endpoint_wait_s,
         ) as session:
+            if endpoint_owner is not None:
+                socket_identity = _socket_identity(Path(endpoint_value))
+                runtime["control_socket_identity"] = socket_identity
+                _write_json(state_dir / RUNTIME_NAME, runtime)
             session.ping(timeout)
     except BaseException as error:
         status: int | None = None
         ended = process is None
         try:
             if process is not None:
+                if endpoint_owner is not None and socket_identity is None:
+                    socket_identity = _socket_identity(Path(endpoint_value))
                 # OpenVMM closes the control endpoint as it tears the VM down,
                 # before it publishes its outcome report and exits, so only a
                 # closed endpoint warrants waiting for it.
@@ -1341,11 +1455,18 @@ def _start(
             # cannot vouch for.
             if ended:
                 if os.name != "nt":
-                    Path(endpoint_value).unlink(missing_ok=True)
+                    if endpoint_owner is not None:
+                        _cleanup_snapshot_endpoint(
+                            Path(endpoint_value), endpoint_owner, socket_identity
+                        )
+                    else:
+                        Path(endpoint_value).unlink(missing_ok=True)
                 capability_path.unlink(missing_ok=True)
                 (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
         if (
-            status is not None and isinstance(error, Exception)
+            status is not None
+            and isinstance(error, Exception)
+            and not isinstance(error, ScriptError)
             and not (snapshot_destination is not None and status == 0)
         ):
             raise ScriptError(_startup_exit_message(outcome_path, status)) from error
@@ -1390,9 +1511,7 @@ def _execd_read_request(connection: socket.socket) -> bytes:
         chunk = connection.recv(65_536)
         if not chunk:
             if not data:
-                raise ScriptError(
-                    "sandbox execd connection closed without a request"
-                )
+                raise ScriptError("sandbox execd connection closed without a request")
             return bytes(data)
         data.extend(chunk)
 
@@ -1410,7 +1529,9 @@ def _execd_parse_request(raw: bytes) -> tuple[tuple[str, ...], int]:
     if (
         not isinstance(command, list)
         or not command
-        or not all(isinstance(argument, str) for argument in cast(list[object], command))
+        or not all(
+            isinstance(argument, str) for argument in cast(list[object], command)
+        )
     ):
         raise ScriptError("sandbox execd request requires a non-empty cmd list")
     if (
@@ -1441,13 +1562,9 @@ def _execd_result_payload(result: ManagedExecResult) -> dict[str, Any]:
     return {"rc": result.returncode, "out": stdout, "err": stderr, "b64": encoded}
 
 
-def _execd_serve_connection(
-    connection: socket.socket, session: ControlSession
-) -> None:
+def _execd_serve_connection(connection: socket.socket, session: ControlSession) -> None:
     try:
-        command, timeout_ms = _execd_parse_request(
-            _execd_read_request(connection)
-        )
+        command, timeout_ms = _execd_parse_request(_execd_read_request(connection))
     except (ScriptError, OSError) as error:
         _execd_send(connection, {"error": str(error)})
         return
@@ -1505,9 +1622,7 @@ def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
         os.chmod(socket_path, 0o600)
         listener.listen(16)
         listener.settimeout(EXECD_POLL_S)
-        with ControlSession.connect(
-            _endpoint(runtime), capability, timeout
-        ) as session:
+        with ControlSession.connect(_endpoint(runtime), capability, timeout) as session:
             while True:
                 if not _process_running(pid, start_time):
                     raise ScriptError(
@@ -1546,13 +1661,7 @@ def _stop(state_dir: Path, timeout: float) -> dict[str, Any]:
         outcome = _read_openvmm_outcome(state_dir / OUTCOME_NAME)
     finally:
         # As in a failed start, the runtime record goes last.
-        (state_dir / CONTROL_SOCKET_NAME).unlink(missing_ok=True)
-        if (
-            os.name != "nt"
-            and _endpoint(runtime).is_absolute()
-            and _endpoint(runtime) != state_dir / CONTROL_SOCKET_NAME
-        ):
-            _endpoint(runtime).unlink(missing_ok=True)
+        _cleanup_runtime_endpoint(state_dir, runtime)
         (state_dir / CAPABILITY_NAME).unlink(missing_ok=True)
         (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
     return outcome
@@ -1566,8 +1675,7 @@ def deprovision(state_path: Path, timeout: float) -> None:
             runtime = _read_json(runtime_path, "sandbox runtime state")
             if _process_running(*_runtime_process(runtime)):
                 raise ScriptError("sandbox must be stopped before deprovision")
-            if os.name != "nt" and _endpoint(runtime).is_absolute():
-                _endpoint(runtime).unlink(missing_ok=True)
+            _cleanup_runtime_endpoint(state_dir, runtime)
         elif any(path_exists(state_dir / name) for name in RUNTIME_FILE_NAMES):
             # As start does, refuse runtime files that no record vouches for.
             raise ScriptError(

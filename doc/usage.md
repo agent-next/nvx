@@ -607,6 +607,20 @@ python3 scripts/nvx.py sandbox
 Network policy and live-share options configure only the `run` and `provision`
 launches.
 
+Managed checkpoints must retain their original absolute path, including the
+snapshot name and parent directory. Capture and restore use
+`<snapshot-name>.control.sock` beside the checkpoint, reserved atomically by
+`<snapshot-name>.control.sock.lock`; different snapshots in the same private
+parent can run independently. Cleanup removes only the recorded owner's socket
+and reservation. After an interrupted start, stale reservations are kept rather
+than risking another VM's endpoint. Verify the owning OpenVMM has exited before
+removing a stale reservation manually.
+
+An instance checkpoint is consumed by the first restore attempt, including a
+failed attempt. Restore is never retried automatically. After a restored sandbox
+is stopped, it cannot be started from that checkpoint again; provision a fresh
+checkpoint instead.
+
 | Option | Default | Description |
 | --- | --- | --- |
 | `{run,provision,start,exec,execd,stop,deprovision}` | `run` | Select a one-shot run or a managed lifecycle operation. |
@@ -615,8 +629,8 @@ launches.
 | `--state-dir PATH` | required for managed operations | Select persistent sandbox state. One-shot `run` rejects this option. |
 | `--socket PATH` | none | Private Unix socket for the persistent `execd` daemon. Required for `execd`. |
 | `--processors {1,2,4,8}` | `1` | Guest vCPU count for `run` or `provision`. |
-| `--snapshot-destination DIR` | none | Capture before workload handoff using the instance-checkpoint tier. Valid for `run` or `provision`; its parent must be private (0700 on Linux). Managed `start` returns after capture, with no running VM. |
-| `--restore-snapshot DIR` | none | Restore an instance checkpoint, valid only for `provision`. The snapshot fixes the guest and network contract and supplies its paired scratch. Mutually exclusive with capture. |
+| `--snapshot-destination DIR` | none | Capture before workload handoff using the instance-checkpoint tier. Valid only for managed `provision` on POSIX; its parent must be owned by the current user with mode 0700. Managed `start` returns after capture, with no running VM. Unsupported on Windows and for one-shot `run`. |
+| `--restore-snapshot DIR` | none | Restore a single-use instance checkpoint, valid only for `provision` on POSIX. The snapshot fixes the workload, guest and network contract and supplies its paired scratch. Explicit `--scratch`, `--processors`, `--memory-mib`, `--cmdline`, `--entrypoint`, `--arg`, `--hostname`, `--memory-max`, `--pids-max` and `--workload-user` overrides are rejected. Mutually exclusive with capture; unsupported on Windows. |
 | `--entrypoint PATH` | `/bin/sh` | Select an absolute workload entrypoint without whitespace. |
 | `--arg VALUE` | none | Append one whitespace-free entrypoint argument. Repeat to pass multiple arguments. |
 | `--hostname NAME` | `nvx-sandbox` | Set the workload UTS hostname. |
@@ -624,7 +638,7 @@ launches.
 | `--memory-max BYTES` | none | Set the workload cgroup memory limit. |
 | `--pids-max COUNT` | none | Set the workload cgroup process limit. |
 | `--memory-mib MIB` | `256` | Set guest memory in MiB. |
-| `--timeout SECONDS` | `60` | Set the timeout for each managed control request and its response in `start`, `exec`, and `stop`, and the longest time that `provision`, `start`, `stop`, and `deprovision` wait for another lifecycle transition of the sandbox. It must be finite and greater than 0. |
+| `--timeout SECONDS` | `60` | Set the timeout for each managed control request and its response in `start`, `exec`, and `stop`, and the longest time that `provision`, `start`, `stop`, and `deprovision` wait for another lifecycle transition of the sandbox. For capture, it also covers the complete boot, layer hashing and checkpoint publication; increase it for large layers or snapshots. It must be finite and greater than 0. |
 | `--exec-timeout-ms MILLISECONDS` | `0` | Set the managed `exec` guest workload timeout in the unsigned 32-bit range `0..4294967295`; zero disables the workload deadline. This is separate from the finite host `--timeout` control deadline. |
 | `--cwd GUEST_PATH` | `/` | Set an absolute working directory inside the workload root for managed `exec`. It is resolved after the workload identity and root are applied; missing, inaccessible, or non-directory paths fail the workload launch. Default and layered environments point `PWD` at this directory; an exact replacement environment controls `PWD` itself. |
 | `--environment KEY=VALUE` | omitted | Set the exact managed `exec` environment. Repeat for multiple entries. Empty values, spaces, additional equals signs, and UTF-8 are preserved. Inline values are visible in the invoking host process arguments; use `--environment-file` for sensitive values. |

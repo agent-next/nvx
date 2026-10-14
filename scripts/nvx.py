@@ -751,28 +751,39 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError("--socket is only valid for sandbox execd")
     if args.restore_snapshot is not None and operation != "provision":
         raise ScriptError("--restore-snapshot is only valid for sandbox provision")
-    if args.snapshot_destination is not None and operation not in ("run", "provision"):
-        raise ScriptError("--snapshot-destination is only valid for sandbox run or provision")
+    if args.snapshot_destination is not None and operation != "provision":
+        raise ScriptError("--snapshot-destination is only valid for sandbox provision")
     if args.processors is not None and operation not in ("run", "provision"):
         raise ScriptError("--processors is only valid for sandbox run or provision")
     snapshot_destination, restore_snapshot = sandbox_lifecycle.snapshot_paths(
         {
             "snapshot_destination": (
-                None if args.snapshot_destination is None
+                None
+                if args.snapshot_destination is None
                 else os.fspath(args.snapshot_destination.absolute())
             ),
             "restore_snapshot": (
-                None if args.restore_snapshot is None
+                None
+                if args.restore_snapshot is None
                 else os.fspath(args.restore_snapshot.absolute())
             ),
         }
     )
     if restore_snapshot is not None and (
         any(value is not None for value in network_options)
-        or args.network_egress_allow or args.network_egress_deny
+        or args.network_egress_allow
+        or args.network_egress_deny
         or args.host_loopback_forward
     ):
-        raise ScriptError("a snapshot restore takes its network configuration from the snapshot")
+        raise ScriptError(
+            "a snapshot restore takes its network configuration from the snapshot"
+        )
+    if restore_snapshot is not None and args.sandbox_restore_overrides:
+        raise ScriptError(
+            "a snapshot restore takes its workload and machine configuration "
+            "from the snapshot; incompatible options: "
+            + ", ".join(args.sandbox_restore_overrides)
+        )
     if operation in ("run", "provision"):
         if (args.net is None) != (args.network_profile is None):
             raise ScriptError("--net and --network-profile must be specified together")
@@ -858,9 +869,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
             raise ScriptError("sandbox execd requires --state-dir")
         if args.socket is None:
             raise ScriptError("sandbox execd requires --socket")
-        sandbox_lifecycle.exec_daemon(
-            args.state_dir, args.socket, timeout=args.timeout
-        )
+        sandbox_lifecycle.exec_daemon(args.state_dir, args.socket, timeout=args.timeout)
         return
     if operation == "stop":
         if args.state_dir is None:
@@ -903,11 +912,6 @@ def command_sandbox(args: argparse.Namespace) -> None:
         "--cmdline",
         launch.kernel_command_line(args.cmdline),
     ]
-    if snapshot_destination is not None:
-        command.extend([
-            "--snapshot-destination", os.fspath(snapshot_destination),
-            "--snapshot-tier", sandbox_lifecycle.SNAPSHOT_CAPTURE_TIER,
-        ])
     _extend_network_arguments(
         command,
         args,
@@ -1312,6 +1316,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     sandbox = subparsers.add_parser(
         "sandbox",
+        allow_abbrev=False,
         help="run or manage workloads over EROFS layers and private ext4 scratch",
     )
 
@@ -1330,9 +1335,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument(
         "sandbox_operation",
         nargs="?",
-        choices=(
-            "run", "provision", "start", "exec", "execd", "stop", "deprovision"
-        ),
+        choices=("run", "provision", "start", "exec", "execd", "stop", "deprovision"),
         default="run",
     )
     sandbox.add_argument(
@@ -1567,7 +1570,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     verify = subparsers.add_parser("verify", help="verify source and submodule inputs")
     verify.set_defaults(handler=command_verify)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command == "sandbox":
+        restore_owned = {
+            "--memory-mib",
+            "--processors",
+            "--cmdline",
+            "--entrypoint",
+            "--arg",
+            "--hostname",
+            "--memory-max",
+            "--pids-max",
+            "--workload-user",
+            "--scratch",
+        }
+        args.sandbox_restore_overrides = [
+            token.split("=", 1)[0]
+            for token in (sys.argv[1:] if argv is None else argv)
+            if token.split("=", 1)[0] in restore_owned
+        ]
+    return args
 
 
 def apply_hybrid_process_affinity() -> None:
