@@ -651,11 +651,9 @@ def cpu_frequency_classes() -> dict[int, set[int]]:
 
     Hybrid parts (Intel P+E cores, AMD hybrid) expose distinct per-CPU
     maximum frequencies; homogeneous parts collapse to a single class.
-    CPUs without cpufreq information are ignored. Used to keep snapshot
-    capture and restore on one CPU model: KVM exposes CPUID leaves that
-    differ between core types (notably leaf 4 cache parameters), so a
-    snapshot taken on one core type fails OpenVMM's destination CPU
-    contract check when restored on another.
+    CPUs without cpufreq information are ignored. This remains a conservative
+    placement policy, not a snapshot compatibility classifier: current OpenVMM
+    profiles normalize the guest CPU contract across this host's P/E cores.
     """
     classes: dict[int, set[int]] = {}
     for entry in sorted(
@@ -679,8 +677,8 @@ def _cpu_number(name: str) -> int:
 def apply_hybrid_cpu_filter(representatives: set[int]) -> set[int]:
     """Restrict representatives to one frequency class on hybrid parts.
 
-    Selects the highest-frequency (performance) class by default so that
-    snapshot capture and restore observe an identical CPU contract.
+    Selects the highest-frequency (performance) class by default for consistent
+    benchmark placement. OpenVMM, not the frequency class, admits snapshots.
     ``NVX_CPU_CLASS=all`` disables the filter; ``NVX_CPU_CLASS=efficiency``
     selects the lowest-frequency class instead. Frequencies within 10% of
     each other are treated as one class: turbo-favored cores of the same

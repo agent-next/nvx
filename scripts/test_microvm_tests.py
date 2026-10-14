@@ -2642,6 +2642,32 @@ class _PortExclusionSockets:
 
 
 class MicrovmTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux CPU affinity")
+    def test_snapshot_class_matrix_selects_host_profile_and_restores_affinity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            process = MagicMock()
+            process.__enter__.return_value.wait.return_value.returncode = 0
+            with (
+                patch.object(microvm_tests, "_frequency_class_representatives", return_value=({0}, {16})),
+                patch.object(microvm_tests.os, "sched_getaffinity", return_value={0, 16}),
+                patch.object(microvm_tests.os, "sched_setaffinity") as affinity,
+                patch.object(microvm_tests, "capture_snapshot") as capture,
+                patch.object(microvm_tests, "OpenvmmProcess", return_value=process) as launch,
+            ):
+                microvm_tests.run_snapshot_class_matrix(
+                    root / "openvmm", root / "vmlinux", root / "initramfs", "kvm",
+                    memory_mib=128, timeout=10, output_dir=root,
+                )
+            for command in (
+                capture.call_args.args[0], *[call.args[0] for call in launch.call_args_list],
+            ):
+                self.assertEqual(command[command.index("--cpu-profile") + 1], "host")
+            self.assertEqual(launch.call_count, 2)
+            self.assertEqual(
+                [call.args[1] for call in affinity.call_args_list], [{0}, {16}, {0, 16}]
+            )
+
     def test_managed_lifecycle_spawns_openvmm_with_a_prepared_capability_pipe(self):
         # OpenVMM reads its capability as soon as it starts, so the scenario hands
         # it a pipe that already holds the capability and the end of file (#440).

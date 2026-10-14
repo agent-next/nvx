@@ -24,7 +24,7 @@ the inspected upstream tree, not that every issue was searched.
 
 | Original SHA | Patch | Decision | Evidence and implementation |
 | --- | --- | --- | --- |
-| ec38aa01 | Hybrid affinity / NVX_CPU_CLASS | Keep | Upstream benchmark still selected all physical representatives; retained as 1e5ba273. CPU profiles reduce exposure but host-profile snapshots still bind effective CPUID. |
+| ec38aa01 | Hybrid affinity / NVX_CPU_CLASS | Rewrite | Keep placement policy (1e5ba273), not the old compatibility claim. Upstream CPU profiles (16237e29, 00f8884d, PRs #394/#435) supersede the measured cross-class rejection on this host: both auto and intel.host.v1 restored across P/E successfully. |
 | a4811e5e | Provenance fixture isolation | Keep | Pristine fixture commits hit this host's protected-main policy; retained as 6d890682. |
 | ac82a417 | setup-submodule | Keep | Upstream release installs a binary into the uninitialized submodule directory; no preservation helper there. Retained as 5f0fd1a0; usage added in cc53b463. |
 | fa60c840 | Wait for async process-tree kills in tests | Drop | Upstream df532ce2 (fixes microsoft/nvx #320) waits for killed descendants and repairs the same oracles. |
@@ -33,7 +33,7 @@ the inspected upstream tree, not that every issue was searched.
 | 3af39256 | Doubled CR marker fix | Keep | Upstream `contains_output_line` removed only one CR; retained rstrip correction as fa97deab. |
 | 041c67a7 | Warm pool | Rewrite | Upstream has snapshot primitives but no fork pool CLI. Adapted capture signature as 34a0a8ef. Pool entries remain bare snapshots, not managed state directories. |
 | 84306756 | SLO / warm-pool evidence | Keep | Fork-specific historical evidence; 7b61da8d. Not a fresh performance receipt. |
-| 05695641 | CPU-class matrix / pool tags | Rewrite | Adapted upstream capture API as 667f4adf; frequency tagging remains conservative. Actual matrix behavior must account for upstream CPU profiles. |
+| 05695641 | CPU-class matrix / pool tags | Rewrite | Adapted capture API as 667f4adf. Replaced obsolete cross-class-refusal oracle with same- and cross-class readiness checks using the host profile; real KVM proves both succeed. Pool frequency tagging remains conservative placement metadata. |
 | a065aa3c | execd / EPIPE retry, fork PR #1 | Rewrite | c1da7eb8 retains daemon and transport retries, reuses upstream `ManagedExecRefused`, capability pipe, PID/start-time identity, and lifecycle lock. cc53b463 excludes intentional endpoint closure from retries. |
 | 9f9277af | Boot-tail retry | Rewrite | 1fafd679 retains unavailable-endpoint retry and threads its bound into upstream startup. Upstream start at :979-982 has no such retry; bb2ba395 supplies safe teardown, not retry. |
 | 07adc613 | Merge fork PR #3 | Drop merge | No additional patch beyond 9f9277af. |
@@ -152,5 +152,26 @@ The remaining rewritten-stack failure,
 `test_ci_change_detector_classifies_real_git_paths`, also fails on pristine:
 the host refuses a fixture commit on its default `main` branch. The second
 pristine failure is fixed by the retained provenance-fixture isolation.
-No policy guard was disabled. Runtime verification results follow in the final
-receipt; until recorded, KVM, latency, and managed snapshot success are unverified.
+No policy guard was disabled.
+
+Real KVM, matching release, i9-14900K, 128 MiB / 1 vCPU, CPU 0 (P core),
+two excluded warmups and 20 retained samples per series:
+
+| Tree | Cold p50 / p95 (ms) | Restore p50 / p95 (ms) |
+| --- | --- | --- |
+| Product | 174.178 / 222.572 | 9.682 / 12.152 |
+| Pristine upstream | 172.800 / 201.723 | 11.747 / 15.426 |
+| 10-02 baseline | 120 (p50; p95 not cited) | 7-9 (p50 range; p95 not cited) |
+
+The cold p50 is 45% above the historical baseline, but pristine is nearly
+identical on the same current host. This is not evidence of a fork regression.
+The host falls back to `intel.host.v1`, with a measured 24.7-ms CPU fingerprint
+step in the one-shot log. Time ABI work and shared-host load also differ from
+the old campaign; causal attribution is unverified. Two restore attempts were
+remeasured by upstream's harness because peak RSS was missed at the marker.
+Raw samples and that policy are recorded in the receipt JSON.
+
+One-shot, managed exec, and three requests on one persistent execd session
+passed on KVM, including a guest exit 7 with stderr followed by a successful
+request. Full suite and managed snapshot results are recorded separately in
+the final receipt; incomplete checks are not implied by these smoke successes.
