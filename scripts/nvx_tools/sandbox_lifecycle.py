@@ -808,7 +808,7 @@ def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
     except (KeyError, TypeError, ValueError) as error:
         raise ScriptError("sandbox configuration is malformed") from error
     if config.get("format") == SNAPSHOT_CONFIG_FORMAT:
-        _snapshot_paths(config)
+        snapshot_paths(config)
     elif config.get("format") != _config_format(launch.mounts):
         raise ScriptError("sandbox configuration format does not match its mounts")
     return launch.validated()
@@ -1021,7 +1021,7 @@ def provision(
     snapshot_destination: Path | None = None,
     restore_snapshot: Path | None = None,
 ) -> None:
-    snapshot_destination, restore_snapshot = _snapshot_paths(
+    snapshot_destination, restore_snapshot = snapshot_paths(
         {
             "snapshot_destination": (
                 None if snapshot_destination is None else os.fspath(snapshot_destination)
@@ -1059,7 +1059,8 @@ def provision(
         )
 
 
-def _snapshot_paths(config: dict[str, Any]) -> tuple[Path | None, Path | None]:
+def snapshot_paths(config: dict[str, Any]) -> tuple[Path | None, Path | None]:
+    """Validate capture/restore paths and their private device namespace."""
     paths: list[Path | None] = []
     for key in ("snapshot_destination", "restore_snapshot"):
         value = config.get(key)
@@ -1176,7 +1177,7 @@ def _start(
     outcome_path = state_dir / OUTCOME_NAME
     outcome_path.unlink(missing_ok=True)
     launch = _deserialize_launch(config)
-    snapshot_destination, restore_snapshot = _snapshot_paths(config)
+    snapshot_destination, restore_snapshot = snapshot_paths(config)
     snapshot = restore_snapshot or snapshot_destination
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
     kernel = require_file(
@@ -1212,7 +1213,7 @@ def _start(
         os.fspath(outcome_path),
     ]
     if restore_snapshot is not None:
-        command.extend(["--restore-snapshot", os.fspath(restore_snapshot), "--restore-entropy"])
+        command.extend(["--restore-snapshot", os.fspath(restore_snapshot)])
     else:
         command.extend([
             "--microvm-lifecycle", "managed",

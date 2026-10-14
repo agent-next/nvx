@@ -1,14 +1,17 @@
 """Regression oracles for the snapshot/processors configuration rewrite."""
+# pyright: reportPrivateUsage=false
 
 import dataclasses
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import nvx
-from nvx_tools import sandbox, sandbox_lifecycle as lifecycle
+from nvx_tools import sandbox
+from nvx_tools import sandbox_lifecycle as lifecycle
 from nvx_tools.common import ScriptError
 
 
@@ -22,19 +25,31 @@ class SandboxSnapshotTests(unittest.TestCase):
         self.layer.touch()
         self.scratch.touch()
         self.launch = sandbox.SandboxLaunch(
-            layers=(sandbox.SandboxLayer(
-                "distro", self.layer, "11111111-1111-1111-1111-111111111111"
-            ),),
+            layers=(
+                sandbox.SandboxLayer(
+                    "distro", self.layer, "11111111-1111-1111-1111-111111111111"
+                ),
+            ),
             scratch=self.scratch,
         )
-        self.options = dict(
-            hypervisor="kvm", memory_mib=128, net=None, network_profile=None,
-            network_egress=None, network_ingress=None, network_egress_allow=(),
-            network_egress_deny=(), host_loopback=None, network_proxy=None,
-            host_loopback_forward=(), cmdline="quiet",
+        self.options: dict[str, Any] = dict(
+            hypervisor="kvm",
+            memory_mib=128,
+            net=None,
+            network_profile=None,
+            network_egress=None,
+            network_ingress=None,
+            network_egress_allow=(),
+            network_egress_deny=(),
+            host_loopback=None,
+            network_proxy=None,
+            host_loopback_forward=(),
+            cmdline="quiet",
         )
 
-    def config(self, launch=None, **options):
+    def config(
+        self, launch: sandbox.SandboxLaunch | None = None, **options: Any
+    ) -> dict[str, Any]:
         return lifecycle._serialize_launch(
             self.launch if launch is None else launch, **self.options, **options
         )
@@ -95,20 +110,22 @@ class SandboxSnapshotTests(unittest.TestCase):
         public = self.root / "public"
         public.mkdir(mode=0o755)
         with self.assertRaisesRegex(ScriptError, "0700"):
-            lifecycle._snapshot_paths({"snapshot_destination": str(public / "snap")})
+            lifecycle.snapshot_paths({"snapshot_destination": str(public / "snap")})
         link = self.root / "link"
         link.symlink_to(self.root, target_is_directory=True)
         with self.assertRaisesRegex(ScriptError, "plain directory"):
-            lifecycle._snapshot_paths({"snapshot_destination": str(link / "snap")})
+            lifecycle.snapshot_paths({"snapshot_destination": str(link / "snap")})
         existing = self.root / "snap"
         existing.mkdir()
         with self.assertRaisesRegex(ScriptError, "already exists"):
-            lifecycle._snapshot_paths({"snapshot_destination": str(existing)})
+            lifecycle.snapshot_paths({"snapshot_destination": str(existing)})
         with self.assertRaisesRegex(ScriptError, "mutually exclusive"):
-            lifecycle._snapshot_paths({
-                "snapshot_destination": str(self.root / "new"),
-                "restore_snapshot": str(existing),
-            })
+            lifecycle.snapshot_paths(
+                {
+                    "snapshot_destination": str(self.root / "new"),
+                    "restore_snapshot": str(existing),
+                }
+            )
 
     def test_cli_rejects_snapshot_options_on_nonlaunch_operations(self):
         for option in ("--processors", "--snapshot-destination", "--restore-snapshot"):
@@ -120,19 +137,22 @@ class SandboxSnapshotTests(unittest.TestCase):
         destination = self.root / "snap"
         state = self.root / "state"
         lifecycle.provision(
-            state, self.launch, **self.options, timeout=10,
+            state,
+            self.launch,
+            **self.options,
+            timeout=10,
             snapshot_destination=destination,
         )
         process = MagicMock()
         process.poll.return_value = 0
 
-        def captured(timeout):
+        def captured(timeout: float) -> int:
             destination.mkdir()
             return 0
 
         process.wait.side_effect = captured
         with (
-            patch.object(lifecycle, "require_file", side_effect=lambda path, _: path),
+            patch.object(lifecycle, "require_file", side_effect=self.require),
             patch.object(lifecycle.subprocess, "Popen", return_value=process) as popen,
             patch.object(lifecycle.ControlSession, "connect") as connect,
         ):
@@ -152,23 +172,37 @@ class SandboxSnapshotTests(unittest.TestCase):
         snapshot.mkdir()
         state = self.root / "state"
         lifecycle.provision(
-            state, self.launch, **self.options, timeout=10, restore_snapshot=snapshot,
+            state,
+            self.launch,
+            **self.options,
+            timeout=10,
+            restore_snapshot=snapshot,
         )
         process = MagicMock()
         process.pid = 123
         with (
-            patch.object(lifecycle, "require_file", side_effect=lambda path, _: path),
+            patch.object(lifecycle, "require_file", side_effect=self.require),
             patch.object(lifecycle.subprocess, "Popen", return_value=process) as popen,
             patch.object(lifecycle, "_process_start_time", return_value=456),
             patch.object(lifecycle.ControlSession, "connect"),
         ):
             lifecycle.start(state, 10)
         command = popen.call_args.args[0]
-        for forbidden in ("--cmdline", "--kernel", "--initrd", "--memory", "--microvm-lifecycle"):
+        for forbidden in (
+            "--cmdline",
+            "--kernel",
+            "--initrd",
+            "--memory",
+            "--microvm-lifecycle",
+        ):
             self.assertNotIn(forbidden, command)
-        self.assertIn("--restore-entropy", command)
+        self.assertNotIn("--restore-entropy", command)
         runtime = json.loads((state / lifecycle.RUNTIME_NAME).read_text())
         self.assertEqual(runtime["control_endpoint"], str(self.root / "control.sock"))
+
+    @staticmethod
+    def require(path: Path, _description: str) -> Path:
+        return path
 
 
 if __name__ == "__main__":

@@ -755,7 +755,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError("--snapshot-destination is only valid for sandbox run or provision")
     if args.processors is not None and operation not in ("run", "provision"):
         raise ScriptError("--processors is only valid for sandbox run or provision")
-    snapshot_destination, restore_snapshot = sandbox_lifecycle._snapshot_paths(
+    snapshot_destination, restore_snapshot = sandbox_lifecycle.snapshot_paths(
         {
             "snapshot_destination": (
                 None if args.snapshot_destination is None
