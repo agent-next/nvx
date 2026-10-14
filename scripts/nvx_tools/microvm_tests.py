@@ -5776,11 +5776,12 @@ def run_snapshot_class_matrix(
     timeout: float,
     output_dir: Path,
 ) -> None:
-    """Snapshot pools are portable only within one CPU frequency class.
+    """Check same- and cross-class restores under the current CPU contract.
 
-    Capture on the performance class, then assert the same-class restore
-    succeeds while the cross-class (efficiency) restore is refused with the
-    destination CPU contract error. Hosts with a single frequency class skip.
+    Current OpenVMM profiles normalize guest CPUID, including the host-profile
+    contract on this hybrid host. Core frequency alone no longer implies an
+    incompatible destination. Exercise both classes with real guest readiness.
+    Hosts with a single frequency class skip.
     """
     if sys.platform != "linux":
         print("snapshot-class-matrix: skipped (Linux-only CPU class detection)")
@@ -5805,6 +5806,8 @@ def run_snapshot_class_matrix(
                         memory_mib,
                         "quiet loglevel=0",
                     ),
+                    "--cpu-profile",
+                    "host",
                     "--snapshot-destination",
                     str(snapshot_path),
                 ],
@@ -5817,6 +5820,7 @@ def run_snapshot_class_matrix(
                 backend,
                 snapshot_path,
             )
+            restore_command.extend(["--cpu-profile", "host"])
             with OpenvmmProcess(
                 restore_command,
                 output_dir / "snapshot-class-matrix-restore-same.log",
@@ -5828,13 +5832,16 @@ def run_snapshot_class_matrix(
                     f"same-class restore exited with {same_result.returncode}"
                 )
             os.sched_setaffinity(0, efficiency)
-            _expect_process_failure(
+            with OpenvmmProcess(
                 restore_command,
                 output_dir / "snapshot-class-matrix-restore-cross.log",
-                timeout,
-                b"destination CPU contract does not match",
-                forbidden_markers=(RESTORE_MARKER,),
-            )
+            ) as process:
+                process.wait_for(RESTORE_MARKER, timeout)
+                cross_result = process.wait(timeout)
+            if cross_result.returncode != 0:
+                raise RuntimeError(
+                    f"cross-class restore exited with {cross_result.returncode}"
+                )
     finally:
         os.sched_setaffinity(0, capture_cpus)
 
