@@ -1604,7 +1604,7 @@ def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
         raise ScriptError("sandbox execd is unsupported on Windows")
     # Default SIGTERM kills the process without running the finally below,
     # leaving the socket file behind; exit through an exception instead so
-    # cleanup happens (ccz fork review F1). signal.signal only works from the
+    # cleanup happens. signal.signal only works from the
     # main thread (ValueError otherwise) -- a thread-hosted daemon keeps the
     # default behavior.
     try:
@@ -1617,7 +1617,12 @@ def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     bound = False
     try:
-        listener.bind(os.fspath(socket_path))
+        # Restrict access from the instant the unauthenticated socket exists.
+        previous_umask = os.umask(0o077)
+        try:
+            listener.bind(os.fspath(socket_path))
+        finally:
+            os.umask(previous_umask)
         bound = True
         os.chmod(socket_path, 0o600)
         listener.listen(16)

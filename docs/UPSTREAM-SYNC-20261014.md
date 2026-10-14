@@ -13,9 +13,9 @@ Comparison since the previous analysis: `33bd2fe5..4acf7eb0`, not the old
 fork's much larger merge-base delta. The old analysis is historical:
 [`UPSTREAM-DELTA-20261009.md`](UPSTREAM-DELTA-20261009.md).
 
-Sources below marked **upstream** refer to the exact 4acf7eb0 tree, so their
-line numbers do not drift when fork patches add lines. Sources marked **client**
-refer to the read-only agent-infra checkout used for this investigation.
+Sources below marked **upstream** refer to the
+[exact 4acf7eb0 tree](https://github.com/microsoft/nvx/tree/4acf7eb0bb73b88cfb5a01bb6043592af1e96c61),
+so their line numbers do not drift when fork patches add lines.
 Disposition was checked against upstream log and code, using `git log`,
 `git show`, and `git diff`; an absent equivalent means none was found in
 the inspected upstream tree, not that every issue was searched.
@@ -24,12 +24,12 @@ the inspected upstream tree, not that every issue was searched.
 
 | Original SHA | Patch | Decision | Evidence and implementation |
 | --- | --- | --- | --- |
-| ec38aa01 | Hybrid affinity / NVX_CPU_CLASS | Rewrite | Keep placement policy (1e5ba273), not the old compatibility claim. Upstream CPU profiles (16237e29, 00f8884d, PRs #394/#435) supersede the measured cross-class rejection on this host: both auto and intel.host.v1 restored across P/E successfully. |
+| ec38aa01 | Hybrid affinity / NVX_CPU_CLASS | Rewrite | Placement is opt-in for ordinary commands (`performance` or `efficiency`), preserving SMT siblings; the default applies no affinity. Benchmark pinning is for latency measurement. Upstream CPU profiles (16237e29, 00f8884d, PRs #394/#435) supersede the historical cross-class rejection: both auto and intel.host.v1 restored across P/E successfully. |
 | a4811e5e | Provenance fixture isolation | Keep | Pristine fixture commits hit this host's protected-main policy; retained as 6d890682. |
 | ac82a417 | setup-submodule | Keep | Upstream release installs a binary into the uninitialized submodule directory; no preservation helper there. Retained as 5f0fd1a0; usage added in cc53b463. |
 | fa60c840 | Wait for async process-tree kills in tests | Drop | Upstream df532ce2 (fixes microsoft/nvx #320) waits for killed descendants and repairs the same oracles. |
-| 5363c84e | Production roadmap | Keep | Fork-specific plan, no upstream equivalent; a8f7b2a9. Historical planning, not validation of this sync. |
-| 141159c9 | One-shot operational facts | Keep | Fork campaign receipt, no upstream equivalent; 6f0503b9. Historical measurements. |
+| 5363c84e | Production roadmap | Drop | Planning document removed. Neutral technical observations remain in PRODUCTION-NOTES.md. |
+| 141159c9 | One-shot operational facts | Keep | Historical technical observations, no upstream equivalent; 6f0503b9. |
 | 3af39256 | Doubled CR marker fix | Keep | Upstream `contains_output_line` removed only one CR; retained rstrip correction as fa97deab. |
 | 041c67a7 | Warm pool | Rewrite | Upstream has snapshot primitives but no fork pool CLI. Adapted capture signature as 34a0a8ef. Pool entries remain bare snapshots, not managed state directories. |
 | 84306756 | SLO / warm-pool evidence | Keep | Fork-specific historical evidence; 7b61da8d. Not a fresh performance receipt. |
@@ -53,17 +53,17 @@ The seven PR #2 commits are consolidated into a reviewed rewrite rather than
 cherry-picked over incompatible schemas. Old fork snapshot-format-3 configs
 must be reprovisioned; they are not interchangeable with upstream owner-format-3.
 
-## What a gateway client notices since 10-09
+## What a CLI or control client notices since 10-09
 
 ### CLI and lifecycle
 
-- The Python entry point remains `scripts/nvx.py`. The gateway drives its flat
-  `sandbox OPERATION` parser (**client** `gateway/src/gateway/nvx_upstream.py:237-286`);
+- The Python entry point remains `scripts/nvx.py`, with a flat
+  `sandbox OPERATION` parser;
   no migration to the new Rust API is required merely to launch it.
 - Upstream `ed60febb` serializes lifecycle transitions. Provision, start, stop,
   and deprovision now use lifecycle locks and a timeout; busy transitions can
   fail rather than race. **Upstream** `scripts/nvx_tools/sandbox_lifecycle.py:979-982`
-  shows start holding the lock. The gateway already invokes CLI timeouts; direct
+  shows start holding the lock. CLI callers can set timeouts; direct
   Python callers must supply the new `provision(..., timeout=...)` argument.
 - Upstream `d4f88afc` bounds managed control writes by the operation deadline.
   A partially transferred record closes the session
@@ -80,9 +80,7 @@ must be reprovisioned; they are not interchangeable with upstream owner-format-3
 - Fork-only commands remain `warmpool`, `setup-submodule`, and `sandbox execd`.
   The stacked rewrite adds sandbox `--processors`, `--snapshot-destination`,
   and `--restore-snapshot`. These are not on pristine upstream's sandbox parser.
-  The inspected gateway does not pass processors or snapshot flags
-  (**client** `gateway/src/gateway/nvx_upstream.py:288-297`); it keeps the existing
-  one-vCPU default until it explicitly opts in.
+  Existing callers keep the one-vCPU default until they explicitly opt in.
 
 ### Wire and control protocol
 
@@ -92,15 +90,15 @@ outer `NVXS` version 1 and application `NVXC` version 1, with
 **Upstream** `scripts/nvx_tools/control_session.py:20-31`, `:448-489`, `:491-517`.
 The changes since 10-09 harden transfer deadlines and session closure, rather
 than introducing a new frame magic. Extended exec carries cwd/environment;
-the existing gateway fast path does not expose those fields.
+clients must explicitly supply those fields to use them.
 
 The fork execd wire contract is unchanged:
 `{"cmd":[...],"timeout_ms":N}` -> `{"rc":N,"out":"...","err":"...","b64":BOOL}`,
-or a daemon error object. **Client**
-`gateway/src/gateway/execd_client.py:43-103` implements that contract.
+or a daemon error object. See
+[`exec_daemon`](../scripts/nvx_tools/sandbox_lifecycle.py) for the implementation.
 Transport/daemon errors are not guest exit statuses. An execd client timeout
 must not trigger an overlapping cold exec while the command might still run
-(**client** `execd_client.py:29-40`).
+and violate command serialization.
 
 ### Snapshots
 
@@ -126,8 +124,7 @@ must not trigger an overlapping cold exec while the command might still run
   vCPUs while preserving full mount metadata.
 - Instance checkpoints have resume/claim semantics. A bare benchmark pool
   snapshot is not automatically a provisioned managed sandbox, and must not be
-  advertised as such. The gateway currently deliberately cold-creates when
-  a pool is configured (**client** `nvx_upstream.py:29-36`, `:673-682`).
+  advertised as such. Integrations must provision managed state separately.
 
 ### Layer format
 
@@ -141,10 +138,9 @@ The OpenVMM snapshot contract still validates layer identity and paired scratch.
 
 ## Verification receipt
 
-Detailed commands, logs, binary provenance, measured latency and PR links:
-`task-runs/20261014-nvx-sync/W1-RECEIPT.md` in the task workspace.
-
-Final unit checks:
+Historical checks from the initial sync head `39a987c7` are summarized below.
+The current review-repair checks are recorded in
+[PR #6](https://github.com/agent-next/nvx/pull/6).
 
 ```text
 Pristine 4acf7eb0, all scripts: 2 failed, 1089 passed, 20 skipped
@@ -177,7 +173,8 @@ The host falls back to `intel.host.v1`, with a measured 24.7-ms CPU fingerprint
 step in the one-shot log. Time ABI work and shared-host load also differ from
 the old campaign; causal attribution is unverified. Two restore attempts were
 remeasured by upstream's harness because peak RSS was missed at the marker.
-Raw samples and that policy are recorded in the receipt JSON.
+These figures are historical measurements, not a fresh performance check of
+the review repairs.
 
 One-shot, managed exec, and three requests on one persistent execd session
 passed on KVM, including a guest exit 7 with stderr followed by a successful

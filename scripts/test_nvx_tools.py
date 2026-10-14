@@ -3549,7 +3549,7 @@ class CiConfigurationTests(unittest.TestCase):
                     )
                     return result.stdout.strip()
 
-                git("init", "--quiet")
+                git("init", "--quiet", "-b", "fixture")
                 git("config", "user.name", "Reproduction")
                 git("config", "user.email", "repro@example.invalid")
                 git("config", "commit.gpgsign", "false")
@@ -16847,6 +16847,8 @@ class SandboxTests(unittest.TestCase):
     def _execd_request(
         self, socket_path: Path, request: bytes
     ) -> dict[str, Any]:
+        if os.name == "nt":
+            self.skipTest("execd requires Unix sockets")
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             client.connect(os.fspath(socket_path))
@@ -22645,7 +22647,7 @@ class EnsureOpenvmmSourceTests(unittest.TestCase):
                 "\turl = https://github.com/nanvix/openvmm.git\n",
                 encoding="ascii",
             )
-            binary = root / "openvmm" / "target" / "release" / "openvmm"
+            binary = root / "openvmm" / "target" / "release" / release.openvmm_binary_path().name
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"release-binary")
 
@@ -22656,7 +22658,7 @@ class EnsureOpenvmmSourceTests(unittest.TestCase):
                     (root / "openvmm" / "Cargo.toml").write_text(
                         "[package]\n", encoding="ascii"
                     )
-                    return None
+                    return subprocess.CompletedProcess(command, 0, b"", b"")
                 return cast(
                     subprocess.CompletedProcess[bytes], original_run(command, **kwargs)
                 )
@@ -22810,10 +22812,9 @@ class WarmpoolTests(unittest.TestCase):
 
     def test_prune_removes_only_stale_claims(self) -> None:
         pool = self.make_pool(entries=2)
-        stale, fresh = warmpool.acquire_entries(pool, 2)
-        old = time.time() - 3600
-        os.utime(stale, (old, old))
-        removed = warmpool.prune_claims(pool, ttl_s=60)
+        with patch.object(warmpool.time, "time_ns", side_effect=(0, 3_600_000_000_000)):
+            stale, fresh = warmpool.acquire_entries(pool, 2)
+        removed = warmpool.prune_claims(pool, ttl_s=60, now=3601)
         self.assertEqual(removed, 1)
         self.assertTrue(fresh.is_dir())
         self.assertFalse(stale.exists())
@@ -22826,12 +22827,11 @@ class WarmpoolTests(unittest.TestCase):
 
     def test_pool_class_tag_guard(self) -> None:
         pool = self.make_pool(entries=1)
-        real_affinity = os.sched_getaffinity(0)
         classes = {6_000_000: {0}, 5_700_000: {2}, 4_200_000: {16, 17}}
         with (
             patch.object(warmpool, "cpu_frequency_classes", return_value=classes),
             patch.object(
-                os, "sched_getaffinity", return_value=real_affinity & {0, 2}
+                warmpool, "_process_affinity", return_value={0, 2}
             ),
         ):
             warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": [5_700_000]})

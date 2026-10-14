@@ -1592,30 +1592,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def apply_hybrid_process_affinity() -> None:
-    """Pin this process (and inherited children) to one CPU class on hybrid parts.
+def apply_hybrid_process_affinity(command: str = "") -> None:
+    """Apply opt-in CPU-class placement without dropping SMT siblings.
 
-    KVM exposes core-type-dependent CPUID leaves on hybrid CPUs, so an
-    OpenVMM snapshot captured on one core type fails the destination CPU
-    contract check when restored on another. On a hybrid Linux host without
-    an explicit affinity, bind this process tree to the performance cores so
-    ``run``, ``test-microvm``, and ``sandbox`` stay snapshot-portable.
-    ``NVX_CPU_CLASS=efficiency`` or ``all`` selects the other class or
-    disables the binding. Subcommands that manage affinity themselves
-    (``benchmark``) are skipped because they set affinity per process.
+    ``NVX_CPU_CLASS=performance`` or ``efficiency`` selects a class on hybrid
+    hosts. Otherwise preserve the caller's affinity, as upstream does.
+    This is a placement preference, not a snapshot compatibility requirement.
+    ``benchmark`` manages its own per-process latency-measurement affinity.
     """
-    command = sys.argv[1] if len(sys.argv) > 1 else ""
-    if command == "benchmark" or os.environ.get("NVX_CPU_CLASS", "").lower() == "all":
+    preference = os.environ.get("NVX_CPU_CLASS", "").strip().lower()
+    if (
+        sys.platform != "linux"
+        or command == "benchmark"
+        or preference not in ("performance", "efficiency")
+    ):
         return
     try:
-        from nvx_tools.benchmark import (
-            apply_hybrid_cpu_filter,
-            physical_cpu_representatives,
-        )
+        from nvx_tools.benchmark import apply_hybrid_cpu_filter
 
-        selected = apply_hybrid_cpu_filter(physical_cpu_representatives())
         current = os.sched_getaffinity(0)
-        restricted = current & selected
+        restricted = apply_hybrid_cpu_filter(current)
         if restricted and restricted != current:
             os.sched_setaffinity(0, restricted)
     except (OSError, ImportError, AttributeError):
@@ -1624,7 +1620,7 @@ def apply_hybrid_process_affinity() -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    apply_hybrid_process_affinity()
+    apply_hybrid_process_affinity(args.command)
     try:
         result = args.handler(args)
     except KeyboardInterrupt:

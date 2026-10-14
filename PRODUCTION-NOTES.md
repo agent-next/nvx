@@ -1,12 +1,18 @@
 # Production notes: NVX on hybrid desktop parts
 
-Findings from a full evaluation (2026-10-02) of NVX 0.1.0
+Historical findings from an evaluation (2026-10-02) of NVX 0.1.0
 (`v0.1.0-dev.38e511648019`) on:
 
 - bare-metal Intel i9-14900K (8 P-cores + 16 E-cores, Linux 6.14, KVM)
-- DigitalOcean droplet, Xeon Platinum 8358, nested KVM
+- cloud VM, Xeon Platinum 8358, nested KVM
 
-## 1. Snapshot restores fail on hybrid CPUs without core-type pinning (fixed here)
+## 1. Historical hybrid-CPU restore failure, superseded by upstream CPU profiles
+
+The failure below applies to the 10-02 binary, not the current sync target.
+Upstream CPU profiles ([#394](https://github.com/microsoft/nvx/pull/394),
+[#435](https://github.com/microsoft/nvx/pull/435)) supersede this workaround:
+same- and cross-class restore succeeded on the i9-14900K in the 10-14 evaluation.
+OpenVMM's CPU contract, not core frequency alone, determines compatibility.
 
 **Repro.** `test-microvm --backend kvm` aborts at the first restore scenario and every
 benchmark snapshot stage fails with:
@@ -23,25 +29,28 @@ validation (correctly) rejects the restore. The default benchmark affinity set
 ("one logical CPU per physical core") spans both core types, and `test-microvm` applies no
 affinity at all.
 
-**Fix in this branch.** Hybrid-aware CPU selection:
+**Current placement policy.** Hybrid-aware CPU selection is optional:
 
-- `cpu_frequency_classes()` groups logical CPUs by `cpuinfo_max_freq`, merging frequencies
+- `cpu_frequency_classes()` groups logical CPUs by `cpuinfo_max_freq`; shared clustering merges frequencies
   within 10% (turbo-favored cores of one type report slightly different maxima and must not
   split a class).
 - `apply_hybrid_cpu_filter()` restricts the benchmark default affinity set to the
   performance class on hybrid parts. `NVX_CPU_CLASS=efficiency` selects the E-core class,
   `NVX_CPU_CLASS=all` restores the old behavior.
 - `nvx.py` binds its own process (inherited by children) to the selected class for
-  `run` / `test-microvm` / `sandbox`, except for `benchmark`, which manages per-process
-  affinity itself.
+  non-benchmark commands only when `NVX_CPU_CLASS=performance` or `efficiency`
+  is explicitly set. It keeps all available logical CPUs in that class, including
+  SMT siblings. By default it preserves the caller's affinity, as upstream does.
+  `benchmark` manages per-process affinity separately for latency measurement.
 
-**Verified by execution** on the i9-14900K: `test-microvm` (all 26 scenarios) and the e2e
+**Historical verification** on the i9-14900K: `test-microvm` (all 26 scenarios) and the e2e
 benchmark pass with no external `taskset`/`--cpus`. Homogeneous hosts are unaffected (the
 filter is a no-op with a single frequency class).
 
-**Fleet implication.** Snapshot pools are portable only within one core type. Restore
-workers must be pinned to the capture core type; a snapshot taken on a P core cannot be
-restored on an E core even with this fix (that is OpenVMM's contract, not a bug).
+**Pool placement.** Single-class captures retain conservative frequency tags.
+Unpinned captures spanning classes have no single-class tag. These tags express
+placement preferences, not a cross-class restore prohibition. Recapture snapshots
+when changing the target binary or its CPU contract.
 
 ## 2. `nvx.py download` install blocks later `git submodule update --init`
 
@@ -49,13 +58,14 @@ restored on an E core even with this fix (that is OpenVMM's contract, not a bug)
 `openvmm/` non-empty. A later `git submodule update --init openvmm` then fails with
 "destination path already exists and is not an empty directory", and every
 `benchmark --skip-build` run errors on the missing `openvmm/Cargo.toml` (the submodule's
-existence is used as the source-present gate). Workaround: move `openvmm/target` aside,
-init the submodule, move the binary back. The installer should either leave the binary
-outside the submodule path or the submodule init should tolerate the installed tree.
+existence is used as the source-present gate). Use `nvx.py setup-submodule` after
+download: it preserves the platform-specific release binary while recursively
+initializing the pinned source and nested submodules, then restores the binary
+even if initialization fails.
 
 ## 3. Measured numbers (128 MiB guest, 1 vCPU, Alpine, p50 of 5)
 
-| metric | i9-14900K bare metal (P-pinned) | DO nested KVM (Xeon 8358) |
+| metric | i9-14900K bare metal (P-pinned) | nested KVM (Xeon 8358) |
 |---|---|---|
 | cold start | 119 ms | 480-578 ms |
 | snapshot restore | 7.0-8.3 ms | 53-61 ms |
@@ -80,7 +90,7 @@ guest status, which is good honest failure.
 
 ## 5. One-shot sandbox operational facts (found driving real workloads)
 
-Verified on the dedicated droplet with a debian:bookworm EROFS layer (python3, git, curl,
+Verified on a cloud VM with a debian:bookworm EROFS layer (python3, git, curl,
 chromium, blender) running four real workload classes end-to-end:
 
 - **`sandbox run` does not pass host environment variables into the workload** (documented
@@ -124,13 +134,16 @@ drops the control endpoint before the auth handshake/ping completes (capability
 stdin write, attach, or first ping all surface as `BrokenPipeError` /
 `ConnectionResetError` or an endpoint-closed `ConnectionError`).
 
-**Fix in this branch.** `sandbox start` retries through
-`_with_control_retry` — 3 attempts with 0.5s/1.0s backoff — on `ConnectionError`
-(which covers `BrokenPipeError` and `ConnectionResetError`; `provision` never
+**Current behavior.** `sandbox start` retries through
+`_with_control_retry`, with 3 attempts and 0.5s/1.0s backoff, only on
+`BrokenPipeError` and `ConnectionResetError` (`provision` never
 touches the control pipe, so it has no retry wrapper). Each start attempt tears
 down the failed OpenVMM process and respawns it, so a retry is a clean boot. Retries
 log `sandbox start attempt N failed: ...` to stderr. `sandbox exec` is deliberately
-not retried: a managed exec failure stays honest.
+not retried: a managed exec failure stays honest. Intentional endpoint closure
+and startup failures reported as `ScriptError`, including an already-exited
+OpenVMM process, are not retried. The historical process-exit boot-storm case
+above is therefore not a claim of current retry coverage.
 
 **Boot-tail variant (fixed here).** A rarer start failure (measured 0.2-0.46%
 of starts, ~30s each, occasionally a hard fail) is the endpoint never accepting:
@@ -144,7 +157,7 @@ post-connect readiness ping still gets the full timeout). On the endpoint-unavai
 other start failure (runtime/capability/socket state unlinked, process
 terminated), then one retry boots a fresh process with the full timeout; a
 second endpoint timeout propagates honestly. The inner retry sits inside
-`_with_control_retry`, so pipe-class `ConnectionError` retries still compose —
+`_with_control_retry`, so `BrokenPipeError` / `ConnectionResetError` retries still compose —
 each outer attempt is one short probe plus at most one full-timeout boot, and a
 single start call never runs more than one live OpenVMM process. Other
 `TimeoutError`s (e.g. `managed control response timed out` after the endpoint
@@ -155,7 +168,8 @@ accepted) are not in this class and still propagate without a retry.
 `sandbox exec` pays a full Python cold start (~200 ms floor at low load) because it
 re-imports the toolchain and re-opens a control session per call. `sandbox execd
 --state-dir D --socket PATH` is a long-lived single-operator daemon that holds one
-`ControlSession` and serves a one-line JSON protocol over a unix socket (mode 0600,
+`ControlSession` and serves a one-line JSON protocol over a unix socket (bound with
+umask 077, then set to mode 0600,
 no auth — same trust boundary as `control.capability`):
 
 - request: `{"cmd": ["/bin/sh","-c","..."], "timeout_ms": 30000}` (`timeout_ms`
