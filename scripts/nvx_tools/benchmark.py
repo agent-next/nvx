@@ -674,6 +674,19 @@ def _cpu_number(name: str) -> int:
     return int(digits) if digits.isdigit() else -1
 
 
+def cpu_frequency_clusters(classes: dict[int, set[int]]) -> list[set[int]]:
+    """Merge nearby maximum frequencies into CPU sets, lowest frequency first."""
+    clusters: list[set[int]] = []
+    previous: int | None = None
+    for frequency in sorted(classes):
+        if previous is not None and frequency <= previous * 1.10:
+            clusters[-1].update(classes[frequency])
+        else:
+            clusters.append(set(classes[frequency]))
+        previous = frequency
+    return clusters
+
+
 def apply_hybrid_cpu_filter(representatives: set[int]) -> set[int]:
     """Restrict representatives to one frequency class on hybrid parts.
 
@@ -685,18 +698,10 @@ def apply_hybrid_cpu_filter(representatives: set[int]) -> set[int]:
     physical type report slightly higher maxima and must not split it.
     """
     preference = os.environ.get("NVX_CPU_CLASS", "performance").strip().lower()
-    classes = cpu_frequency_classes()
-    if len(classes) < 2 or preference == "all":
+    clusters = cpu_frequency_clusters(cpu_frequency_classes())
+    if len(clusters) < 2 or preference == "all":
         return representatives
-    ordered = sorted(classes)
-    clusters: list[list[int]] = [[ordered[0]]]
-    for frequency in ordered[1:]:
-        if frequency <= clusters[-1][-1] * 1.10:
-            clusters[-1].append(frequency)
-        else:
-            clusters.append([frequency])
-    cluster = clusters[0] if preference == "efficiency" else clusters[-1]
-    allowed = {cpu for f in cluster for cpu in classes[f]}
+    allowed = clusters[0] if preference == "efficiency" else clusters[-1]
     selected = {cpu for cpu in representatives if cpu in allowed}
     return selected or representatives
 

@@ -54,6 +54,8 @@ from .common import (
     openvmm_binary_path,
     openvmm_git_state,
     require_file,
+    require_success,
+    run_capture,
     sha256_file,
     verify_sha256_sums,
     write_sha256_sums,
@@ -687,6 +689,11 @@ def _install_release_archive(archive_path: Path) -> None:
             _replace_runtime_file(source, artifact_path(name))
 
 
+def _run(command: list[str], *, cwd: Path) -> None:
+    print(f">> {' '.join(command)}")
+    require_success(run_capture(command, cwd=cwd), "OpenVMM submodule initialization")
+
+
 def ensure_openvmm_source(repo_root: Path) -> None:
     """Initialize the openvmm submodule without losing a release-installed binary.
 
@@ -700,7 +707,7 @@ def ensure_openvmm_source(repo_root: Path) -> None:
     no-op.
     """
     openvmm_dir = repo_root / "openvmm"
-    binary = openvmm_dir / "target" / "release" / "openvmm"
+    binary = openvmm_dir / "target" / "release" / openvmm_binary_path().name
     if (openvmm_dir / "Cargo.toml").exists():
         return
     staged: Path | None = None
@@ -719,22 +726,22 @@ def ensure_openvmm_source(repo_root: Path) -> None:
                 "openvmm/ is not empty and holds no installed binary; "
                 "clean it or init the submodule manually"
             )
-        subprocess.run(
+        _run(
             [
                 "git",
                 "submodule",
                 "update",
                 "--init",
+                "--recursive",
                 "--depth",
                 "1",
                 "openvmm",
             ],
             cwd=repo_root,
-            check=True,
         )
     finally:
         if staged is not None:
-            destination = openvmm_dir / "target" / "release" / "openvmm"
+            destination = binary
             destination.parent.mkdir(parents=True, exist_ok=True)
             staged.rename(destination)
 

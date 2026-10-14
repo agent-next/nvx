@@ -35,6 +35,7 @@ from .benchmark import (
     GuestFailureReported,
     contains_output_line,
     cpu_frequency_classes,
+    cpu_frequency_clusters,
     measure_once,
     parse_snapshot_profile_line,
     physical_cpu_representatives,
@@ -5740,27 +5741,12 @@ def _expect_process_failure(
 def _frequency_class_representatives() -> tuple[set[int], set[int]] | None:
     """Return (performance, efficiency) representative CPU sets, or None when
     the host exposes only one frequency class (matrix trivially passes)."""
-    classes = cpu_frequency_classes()
-    if len(classes) < 2:
+    clusters = cpu_frequency_clusters(cpu_frequency_classes())
+    if len(clusters) < 2:
         return None
-    ordered = sorted(classes)
-    clusters: list[list[int]] = [[ordered[0]]]
-    for frequency in ordered[1:]:
-        if frequency <= clusters[-1][-1] * 1.10:
-            clusters[-1].append(frequency)
-        else:
-            clusters.append([frequency])
     representatives = physical_cpu_representatives()
-    performance = {
-        cpu for cpu in representatives if cpu in {
-            cpu for frequency in clusters[-1] for cpu in classes[frequency]
-        }
-    }
-    efficiency = {
-        cpu for cpu in representatives if cpu in {
-            cpu for frequency in clusters[0] for cpu in classes[frequency]
-        }
-    }
+    performance = representatives & clusters[-1]
+    efficiency = representatives & clusters[0]
     if not performance or not efficiency:
         return None
     return performance, efficiency

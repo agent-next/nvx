@@ -5,8 +5,8 @@ A pool is a directory of pre-captured snapshots (``entry-*``) plus a
 Serving a sandbox then skips capture entirely: ``acquire`` atomically
 claims an entry (``os.rename``), the caller restores it with
 ``nvx.py run --restore-snapshot <entry>`` (snapshots are not consumed by
-restore, so ``release`` returns the entry for reuse), and crashed
-claimers are recovered by ``prune --ttl-s``.
+restore, so ``release`` returns the entry for reuse). ``prune --ttl-s``
+deletes expired claims; it does not return their snapshots to the pool.
 
 ``bench`` is the fleet oracle: workers loop acquire -> restore -> release
 for a fixed duration and report the sustained restore rate, latency
@@ -33,6 +33,7 @@ from nvx_tools.benchmark import (
     benchmark,
     capture_snapshot,
     cpu_frequency_classes,
+    cpu_frequency_clusters,
     snapshot_restore_command,
     workload_boot_command,
 )
@@ -74,10 +75,18 @@ def read_manifest(pool_dir: Path) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
+def _process_affinity() -> set[int]:
+    if sys.platform != "linux":
+        raise ScriptError("warmpool requires Linux CPU affinity support")
+    return os.sched_getaffinity(0)
+
+
 def pool_class_frequencies() -> list[int]:
-    """Max-frequency (kHz) signature of the CPU class this process runs on."""
+    """Tag single-class placement; unpinned multi-class captures have no tag."""
     classes = cpu_frequency_classes()
-    affinity = os.sched_getaffinity(0)
+    affinity = _process_affinity()
+    if sum(bool(cpus & affinity) for cpus in cpu_frequency_clusters(classes)) > 1:
+        return []
     return sorted({frequency for frequency, cpus in classes.items() if cpus & affinity})
 
 
@@ -109,31 +118,43 @@ def validate_pool_class(pool_dir: Path) -> None:
         # same 10% merge as apply_hybrid_cpu_filter: turbo-favored cores of
         # one physical type stay one class, two classes must not mix
         raise ScriptError(f"pool CPU class tag spans multiple classes: {tag}")
-    if not tagged_cpus & os.sched_getaffinity(0):
+    if not tagged_cpus & _process_affinity():
         raise ScriptError("pool CPU class cpus are outside this process affinity")
 
 
 def acquire_entries(pool_dir: Path, count: int) -> list[Path]:
-    """Atomically claim up to ``count`` entries by renaming them aside."""
+    """Claim exactly ``count`` entries, returning partial claims on failure."""
     claimed: list[Path] = []
-    for _ in range(count):
-        for entry in pool_entry_paths(pool_dir):
-            claimed_path = pool_dir / f"{CLAIMED_PREFIX}{time.time_ns()}-{uuid.uuid4().hex[:8]}"
-            try:
-                os.rename(entry, claimed_path)
-            except OSError:
-                continue  # raced with another claimer; try the next entry
-            claimed.append(claimed_path)
-            break
-        else:
-            raise ScriptError(
-                f"pool exhausted: requested {count}, acquired {len(claimed)}, "
-                f"{len(pool_entry_paths(pool_dir))} entries remain"
-            )
+    try:
+        for _ in range(count):
+            for entry in pool_entry_paths(pool_dir):
+                claimed_path = pool_dir / f"{CLAIMED_PREFIX}{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+                try:
+                    os.rename(entry, claimed_path)
+                except OSError:
+                    continue  # raced with another claimer; try the next entry
+                claimed.append(claimed_path)
+                break
+            else:
+                raise ScriptError(
+                    f"pool exhausted: requested {count}, acquired {len(claimed)}, "
+                    f"{len(pool_entry_paths(pool_dir))} entries remain"
+                )
+    except BaseException:
+        for path in claimed:
+            release_entry(pool_dir, path)
+        raise
     return claimed
 
 
 def release_entry(pool_dir: Path, claimed: Path) -> Path:
+    if (
+        claimed.parent.resolve() != pool_dir.resolve()
+        or not claimed.name.startswith(CLAIMED_PREFIX)
+        or claimed.is_symlink()
+        or not claimed.is_dir()
+    ):
+        raise ScriptError("release requires a claimed-* directory directly inside the pool")
     entry = pool_dir / f"{ENTRY_PREFIX}{uuid.uuid4().hex[:8]}"
     os.rename(claimed, entry)
     return entry
@@ -144,9 +165,16 @@ def prune_claims(pool_dir: Path, ttl_s: float, *, now: float | None = None) -> i
     now = time.time() if now is None else now
     removed = 0
     for claimed in pool_claimed_paths(pool_dir):
-        age = now - claimed.stat().st_mtime
+        try:
+            claimed_at_ns = int(claimed.name.removeprefix(CLAIMED_PREFIX).split("-", 1)[0])
+        except ValueError:
+            continue  # Unknown claim formats have no reliable expiration time.
+        age = now - claimed_at_ns / 1_000_000_000
         if age >= ttl_s:
-            shutil.rmtree(claimed)
+            try:
+                shutil.rmtree(claimed)
+            except FileNotFoundError:
+                continue  # Released or pruned concurrently.
             removed += 1
     return removed
 
@@ -191,7 +219,7 @@ def command_fill(args: argparse.Namespace) -> int:
         args.pool_dir,
         {
             "version": 1,
-            "cpu_affinity": sorted(os.sched_getaffinity(0)),
+            "cpu_affinity": sorted(_process_affinity()),
             "cpu_class_frequencies_khz": pool_class_frequencies(),
             "memory_mib": args.memory_mib,
             "processors": args.processors,
@@ -279,7 +307,8 @@ def command_bench(args: argparse.Namespace) -> int:
                 with lock:
                     samples_ms.append(float(result["p50_ms"]))
             except Exception as error:
-                failures += 1
+                with lock:
+                    failures += 1
                 print(f"restore failed: {error!r}", file=sys.stderr, flush=True)
             finally:
                 release_entry(args.pool_dir, claimed)
