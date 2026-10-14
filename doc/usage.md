@@ -23,6 +23,7 @@ python3 scripts/nvx.py performance gate --help
 | Command | Description |
 | --- | --- |
 | `init` | Initialize the OpenVMM submodule and its nested submodules. |
+| `setup-submodule` | Initialize OpenVMM source alongside a release install. |
 | `build-guest` | Build the Linux kernel and selected guest artifacts. |
 | `build-kernel` | Build the pinned and patched Linux kernel natively. |
 | `build-initramfs` | Build the selected Alpine, Ubuntu, or Azure Linux initramfs. |
@@ -44,6 +45,7 @@ python3 scripts/nvx.py performance gate --help
 | `download` | Install the selected platform package built from this checkout or a released first-parent ancestor. |
 | `run` | Run an OpenVMM microVM. |
 | `sandbox` | Run or manage workloads over EROFS layers and private ext4 scratch. |
+| `warmpool` | Manage a pool of pre-captured snapshots. |
 | `benchmark` | Run the OpenVMM-native benchmark coordinator. |
 | `performance` | Collect, gate, and persist CI performance results, and check benchmark hosts. |
 | `collect-sources` | Materialize verified Linux, Alpine, and Ubuntu release sources. |
@@ -63,6 +65,14 @@ python3 scripts/nvx.py init
 ```
 
 Initializes and recursively updates the OpenVMM Git submodule.
+
+### `setup-submodule`
+
+```console
+python3 scripts/nvx.py setup-submodule
+```
+
+Initializes the pinned OpenVMM source without replacing downloaded artifacts.
 
 ### `verify`
 
@@ -552,10 +562,11 @@ error itself names `--cpu-profile host`.
 
 ```text
 python3 scripts/nvx.py sandbox
-    [{run,provision,start,exec,stop,deprovision}]
+    [{run,provision,start,exec,execd,stop,deprovision}]
     [--layer ROLE,PATH,EROFS_UUID]...
     [--scratch PATH]
     [--state-dir PATH]
+    [--socket PATH]
     [--entrypoint PATH]
     [--arg VALUE]...
     [--hostname NAME]
@@ -595,10 +606,11 @@ launches.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `{run,provision,start,exec,stop,deprovision}` | `run` | Select a one-shot run or a managed lifecycle operation. |
+| `{run,provision,start,exec,execd,stop,deprovision}` | `run` | Select a one-shot run or a managed lifecycle operation. |
 | `--layer ROLE,PATH,EROFS_UUID` | required for `run` and `provision` | Attach a `distro`, `runtime`, or `custom` EROFS layer. Repeat once per distinct role. |
 | `--scratch PATH` | required for `run` and `provision` | Attach a preformatted ext4 scratch image as the writable overlay. |
 | `--state-dir PATH` | required for managed operations | Select persistent sandbox state. One-shot `run` rejects this option. |
+| `--socket PATH` | none | Private Unix socket for the persistent `execd` daemon. Required for `execd`. |
 | `--entrypoint PATH` | `/bin/sh` | Select an absolute workload entrypoint without whitespace. |
 | `--arg VALUE` | none | Append one whitespace-free entrypoint argument. Repeat to pass multiple arguments. |
 | `--hostname NAME` | `nvx-sandbox` | Set the workload UTS hostname. |
@@ -1033,3 +1045,59 @@ Validates the staged distribution against its `SHA256SUMS`, snapshots the
 accepted inventory, and creates a deterministic archive at the destination.
 The destination must be outside the source directory and end in `.tar.gz` or
 `.zip`.
+
+## Snapshot pool
+
+### `warmpool`
+
+Snapshots in this pool are bare benchmark snapshots, not provisioned managed sandboxes.
+
+#### `warmpool fill`
+
+```text
+python3 scripts/nvx.py warmpool fill [-h] --pool-dir POOL_DIR
+                            [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+                            [--size SIZE] [--memory-mib MEMORY_MIB]
+                            [--processors {1,2,4,8}] [--backend {kvm,mshv}]
+                            [--timeout TIMEOUT]
+```
+
+#### `warmpool status`
+
+```text
+python3 scripts/nvx.py warmpool status [-h] --pool-dir POOL_DIR
+                              [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+```
+
+#### `warmpool acquire`
+
+```text
+python3 scripts/nvx.py warmpool acquire [-h] --pool-dir POOL_DIR
+                               [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+                               [--count COUNT]
+```
+
+#### `warmpool release`
+
+```text
+python3 scripts/nvx.py warmpool release [-h] --pool-dir POOL_DIR
+                               [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+                               --entry ENTRY
+```
+
+#### `warmpool prune`
+
+```text
+python3 scripts/nvx.py warmpool prune [-h] --pool-dir POOL_DIR
+                             [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+                             --ttl-s TTL_S
+```
+
+#### `warmpool bench`
+
+```text
+python3 scripts/nvx.py warmpool bench [-h] --pool-dir POOL_DIR
+                             [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+                             [--duration-s DURATION_S] [--workers WORKERS]
+                             [--timeout TIMEOUT]
+```

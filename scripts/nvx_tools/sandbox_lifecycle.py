@@ -113,10 +113,9 @@ def _with_control_retry(operation: str, action: Callable[[], None]) -> None:
         try:
             action()
             return
-        # BrokenPipeError and ConnectionResetError are ConnectionError
-        # subclasses; the base also covers the endpoint-closed error raised
-        # when the peer drops the control socket mid-handshake.
-        except ConnectionError as error:
+        # A closed managed endpoint can be an intentional guest rejection.
+        # Retry transport failures, not the protocol's terminal close signal.
+        except (BrokenPipeError, ConnectionResetError) as error:
             if attempt == len(CONTROL_RETRY_BACKOFF_S):
                 raise
             delay = CONTROL_RETRY_BACKOFF_S[attempt]

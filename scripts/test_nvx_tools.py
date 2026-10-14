@@ -16739,6 +16739,7 @@ class SandboxTests(unittest.TestCase):
                 network_proxy=None,
                 host_loopback_forward=(),
                 cmdline="quiet",
+                timeout=10,
             )
             runtime_at_spawn: list[bool] = []
             processes: list[MagicMock] = []
@@ -16778,6 +16779,9 @@ class SandboxTests(unittest.TestCase):
                 ),
                 patch.object(
                     sandbox_lifecycle.subprocess, "Popen", side_effect=spawn
+                ),
+                patch.object(
+                    sandbox_lifecycle, "_process_start_time", return_value=456
                 ),
                 patch.object(
                     sandbox_lifecycle.ControlSession, "connect", connects
