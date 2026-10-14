@@ -1396,12 +1396,13 @@ def _execd_parse_request(raw: bytes) -> tuple[tuple[str, ...], int]:
         raise ScriptError("sandbox execd request is not valid JSON") from error
     if not isinstance(request, dict):
         raise ScriptError("sandbox execd request must be a JSON object")
-    command = request.get("cmd")
-    timeout_ms = request.get("timeout_ms", 0)
+    typed = cast(dict[str, object], request)
+    command = typed.get("cmd")
+    timeout_ms = typed.get("timeout_ms", 0)
     if (
         not isinstance(command, list)
         or not command
-        or not all(isinstance(argument, str) for argument in command)
+        or not all(isinstance(argument, str) for argument in cast(list[object], command))
     ):
         raise ScriptError("sandbox execd request requires a non-empty cmd list")
     if (
@@ -1410,7 +1411,7 @@ def _execd_parse_request(raw: bytes) -> tuple[tuple[str, ...], int]:
         or timeout_ms < 0
     ):
         raise ScriptError("sandbox execd request has an invalid timeout_ms")
-    return tuple(command), timeout_ms
+    return tuple(cast(list[str], command)), timeout_ms
 
 
 def _execd_send(connection: socket.socket, payload: dict[str, Any]) -> None:
@@ -1461,6 +1462,10 @@ def _execd_serve_connection(
     _execd_send(connection, _execd_result_payload(result))
 
 
+def _execd_shutdown(_signum: int, _frame: object) -> None:
+    sys.exit(0)
+
+
 def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
     """Serve single-operator exec requests on one persistent control session.
 
@@ -1478,7 +1483,7 @@ def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
     # main thread (ValueError otherwise) -- a thread-hosted daemon keeps the
     # default behavior.
     try:
-        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        signal.signal(signal.SIGTERM, _execd_shutdown)
     except ValueError:
         pass
     state_dir = _prepare_state_directory(state_path, create=False)
