@@ -1223,6 +1223,10 @@ def _cleanup_snapshot_endpoint(endpoint: Path, owner: object, identity: object) 
     except FileNotFoundError:
         return
     current = _socket_identity(endpoint)
+    if path_exists(endpoint) and (current is None or current != identity):
+        # An interrupted start may not have recorded the bound inode yet.
+        # Keep its reservation with the unverified socket for manual recovery.
+        return
     if current is not None and current == identity:
         endpoint.unlink(missing_ok=True)
     reservation.unlink(missing_ok=True)
@@ -1321,10 +1325,14 @@ def _start(
     net = config.get("net")
     network_profile = config.get("network_profile")
     if net is not None and restore_snapshot is None:
-        command.extend(["--net", str(net), "--network-profile", str(network_profile)])
+        command.extend(["--net", str(net)])
+    # OpenVMM reconstructs the endpoint and validates this policy against the
+    # checkpoint digest. Only the per-instance address comes from the snapshot.
+    if network_profile is not None:
+        command.extend(["--network-profile", str(network_profile)])
     for name in ("network_egress", "network_ingress", "host_loopback"):
         value = config.get(name)
-        if value is not None and restore_snapshot is None:
+        if value is not None:
             command.extend([f"--{name.replace('_', '-')}", str(value)])
     for name in (
         "network_egress_allow",
@@ -1334,12 +1342,10 @@ def _start(
         values = config.get(name, [])
         if not isinstance(values, list):
             raise ScriptError("sandbox configuration is malformed")
-        if restore_snapshot is not None:
-            continue
         for value in cast(list[object], values):
             command.extend([f"--{name.replace('_', '-')}", str(value)])
     network_proxy = config.get("network_proxy")
-    if network_proxy is not None and restore_snapshot is None:
+    if network_proxy is not None:
         command.extend(["--network-proxy", str(network_proxy)])
 
     capability_path = state_dir / CAPABILITY_NAME
@@ -1375,6 +1381,30 @@ def _start(
             )
         finally:
             os.close(capability_input)
+        # Record capture processes too, before waiting for checkpoint publication.
+        try:
+            start_time = _process_start_time(process.pid)
+        except (OSError, ValueError) as error:
+            raise ScriptError(
+                f"cannot identify the OpenVMM process: {error}"
+            ) from error
+        if start_time is None:
+            raise ScriptError(
+                "OpenVMM exited during startup"
+                if process.poll() is not None
+                else "cannot identify the OpenVMM process"
+            )
+        runtime: dict[str, Any] = {
+            "format": STATE_FORMAT,
+            "pid": process.pid,
+            "start_time": start_time,
+            "control_endpoint": endpoint_value,
+        }
+        if endpoint_owner is not None:
+            runtime["control_endpoint_owner"] = endpoint_owner
+            socket_identity = _socket_identity(Path(endpoint_value))
+            runtime["control_socket_identity"] = socket_identity
+        _write_json(state_dir / RUNTIME_NAME, runtime)
         if snapshot_destination is not None:
             try:
                 status = process.wait(timeout=timeout)
@@ -1398,30 +1428,8 @@ def _start(
                 _socket_identity(Path(endpoint_value)),
             )
             capability_path.unlink(missing_ok=True)
+            (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
             return
-        # Until this process reaps the child or closes its handle, no other process
-        # can reuse its ID, so this identifies OpenVMM itself.
-        try:
-            start_time = _process_start_time(process.pid)
-        except (OSError, ValueError) as error:
-            raise ScriptError(
-                f"cannot identify the OpenVMM process: {error}"
-            ) from error
-        if start_time is None:
-            raise ScriptError(
-                "OpenVMM exited during startup"
-                if process.poll() is not None
-                else "cannot identify the OpenVMM process"
-            )
-        runtime: dict[str, Any] = {
-            "format": STATE_FORMAT,
-            "pid": process.pid,
-            "start_time": start_time,
-            "control_endpoint": endpoint_value,
-        }
-        if endpoint_owner is not None:
-            runtime["control_endpoint_owner"] = endpoint_owner
-        _write_json(state_dir / RUNTIME_NAME, runtime)
         with ControlSession.connect(
             Path(endpoint_value),
             capability,
@@ -1466,7 +1474,9 @@ def _start(
         if (
             status is not None
             and isinstance(error, Exception)
-            and not isinstance(error, ScriptError)
+            and not (
+                snapshot_destination is not None and isinstance(error, ScriptError)
+            )
             and not (snapshot_destination is not None and status == 0)
         ):
             raise ScriptError(_startup_exit_message(outcome_path, status)) from error
@@ -1687,7 +1697,9 @@ def deprovision(state_path: Path, timeout: float) -> None:
                 "sandbox has runtime files but no runtime record, so its OpenVMM "
                 "process may still run: end any OpenVMM process whose arguments "
                 f"name the state directory, then remove {CAPABILITY_NAME} and "
-                f"{CONTROL_SOCKET_NAME}"
+                f"{CONTROL_SOCKET_NAME}; for a managed checkpoint, also verify "
+                "and remove its external <snapshot>.control.sock and "
+                "<snapshot>.control.sock.lock"
             )
         for name in (
             RUNTIME_NAME,

@@ -668,6 +668,34 @@ def _run_openvmm(
 
 def command_sandbox(args: argparse.Namespace) -> None:
     operation = args.sandbox_operation
+    restore_owned = (
+        "memory_mib",
+        "processors",
+        "cmdline",
+        "entrypoint",
+        "sandbox_arg",
+        "hostname",
+        "memory_max",
+        "pids_max",
+        "workload_user",
+        "scratch",
+    )
+    restore_overrides = [
+        "--arg" if name == "sandbox_arg" else "--" + name.replace("_", "-")
+        for name in restore_owned
+        if getattr(args, name) is not None
+    ]
+    # Preserve explicit default-valued options until restore admission is checked.
+    for name, default in (
+        ("entrypoint", "/bin/sh"),
+        ("sandbox_arg", list[str]()),
+        ("hostname", "nvx-sandbox"),
+        ("workload_user", (65534, 65534)),
+        ("memory_mib", 256),
+        ("cmdline", ""),
+    ):
+        if getattr(args, name) is None:
+            setattr(args, name, default)
     exec_environment: tuple[str, ...] | None = None
     if args.dry_run and operation != "run":
         raise ScriptError("--dry-run is only valid for sandbox run")
@@ -769,23 +797,20 @@ def command_sandbox(args: argparse.Namespace) -> None:
             ),
         }
     )
-    if restore_snapshot is not None and (
-        any(value is not None for value in network_options)
-        or args.network_egress_allow
-        or args.network_egress_deny
-        or args.host_loopback_forward
-    ):
+    if restore_snapshot is not None and args.net is not None:
         raise ScriptError(
-            "a snapshot restore takes its network configuration from the snapshot"
+            "a snapshot restore takes its network address from the snapshot; "
+            "omit --net and re-pass the original network profile and policy"
         )
-    if restore_snapshot is not None and args.sandbox_restore_overrides:
+    if restore_snapshot is not None and restore_overrides:
         raise ScriptError(
             "a snapshot restore takes its workload and machine configuration "
-            "from the snapshot; incompatible options: "
-            + ", ".join(args.sandbox_restore_overrides)
+            "from the snapshot; incompatible options: " + ", ".join(restore_overrides)
         )
     if operation in ("run", "provision"):
-        if (args.net is None) != (args.network_profile is None):
+        if restore_snapshot is None and (
+            (args.net is None) != (args.network_profile is None)
+        ):
             raise ScriptError("--net and --network-profile must be specified together")
         if not args.layer or (args.scratch is None and restore_snapshot is None):
             raise ScriptError(f"sandbox {operation} requires --layer and --scratch")
@@ -1352,19 +1377,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="unix socket path for the persistent exec daemon (execd)",
     )
-    sandbox.add_argument("--entrypoint", default="/bin/sh")
-    sandbox.add_argument("--arg", action="append", default=[], dest="sandbox_arg")
-    sandbox.add_argument("--hostname", default="nvx-sandbox")
+    sandbox.add_argument("--entrypoint")
+    sandbox.add_argument("--arg", action="append", dest="sandbox_arg")
+    sandbox.add_argument("--hostname")
     sandbox.add_argument(
         "--workload-user",
         type=sandbox_identity,
-        default=parse_workload_identity("65534:65534"),
         metavar="UID:GID",
         help="fixed non-root workload identity (default: 65534:65534)",
     )
     sandbox.add_argument("--memory-max", type=int)
     sandbox.add_argument("--pids-max", type=int)
-    sandbox.add_argument("--memory-mib", type=int, default=256)
+    sandbox.add_argument("--memory-mib", type=int)
     sandbox.add_argument("--processors", type=int, choices=(1, 2, 4, 8))
     sandbox.add_argument("--snapshot-destination", type=Path, metavar="DIR")
     sandbox.add_argument("--restore-snapshot", type=Path, metavar="DIR")
@@ -1496,7 +1520,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="write a bounded local JSON outcome report for run or exec",
     )
-    sandbox.add_argument("--cmdline", default="")
+    sandbox.add_argument("--cmdline")
     sandbox.add_argument(
         "--dry-run",
         action="store_true",
@@ -1570,26 +1594,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     verify = subparsers.add_parser("verify", help="verify source and submodule inputs")
     verify.set_defaults(handler=command_verify)
-    args = parser.parse_args(argv)
-    if args.command == "sandbox":
-        restore_owned = {
-            "--memory-mib",
-            "--processors",
-            "--cmdline",
-            "--entrypoint",
-            "--arg",
-            "--hostname",
-            "--memory-max",
-            "--pids-max",
-            "--workload-user",
-            "--scratch",
-        }
-        args.sandbox_restore_overrides = [
-            token.split("=", 1)[0]
-            for token in (sys.argv[1:] if argv is None else argv)
-            if token.split("=", 1)[0] in restore_owned
-        ]
-    return args
+    return parser.parse_args(argv)
 
 
 def apply_hybrid_process_affinity(command: str = "") -> None:

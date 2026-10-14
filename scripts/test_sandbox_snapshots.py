@@ -97,13 +97,12 @@ class SandboxSnapshotTests(unittest.TestCase):
         self.assertEqual(decoded.processors, 2)
 
     @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
-    def test_capture_arms_pre_handoff_trigger_and_instance_tier(self):
+    def test_capture_arms_pre_handoff_trigger(self):
         destination = self.root / "snapshot"
         config = self.config(snapshot_destination=destination)
         self.assertEqual(config["format"], 7)
         launch = lifecycle._deserialize_launch(config)
         self.assertIn("sandboxsnap", launch.kernel_command_line())
-        self.assertEqual(lifecycle.SNAPSHOT_CAPTURE_TIER, "instance-checkpoint")
 
     @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
     def test_restore_does_not_redeclare_paired_scratch_or_identity(self):
@@ -179,10 +178,18 @@ class SandboxSnapshotTests(unittest.TestCase):
             timeout=10,
             snapshot_destination=destination,
         )
-        process = MagicMock()
+        process = MagicMock(pid=os.getpid())
         process.poll.return_value = 0
 
         def captured(timeout: float) -> int:
+            runtime = json.loads((state / lifecycle.RUNTIME_NAME).read_text())
+            self.assertEqual(runtime["pid"], process.pid)
+            self.assertEqual(
+                runtime["start_time"], lifecycle._process_start_time(process.pid)
+            )
+            self.assertEqual(
+                runtime["control_endpoint"], str(self.root / "snap.control.sock")
+            )
             destination.mkdir()
             for name in ("manifest.bin", "state.bin", "memory.bin", "scratch.img"):
                 (destination / name).touch()
@@ -227,6 +234,10 @@ class SandboxSnapshotTests(unittest.TestCase):
         ):
             lifecycle.start(state, 10)
         command = popen.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--restore-snapshot") + 1], str(snapshot)
+        )
+        self.assertEqual(command[command.index("--machine") + 1], "microvm")
         for forbidden in (
             "--cmdline",
             "--kernel",
@@ -242,6 +253,64 @@ class SandboxSnapshotTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
+    def test_restore_repasses_network_contract_without_instance_address(self):
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir()
+        state = self.root / "state"
+        args = nvx.parse_args(
+            [
+                "sandbox",
+                "provision",
+                "--state-dir",
+                str(state),
+                "--layer",
+                f"distro,{self.layer},11111111-1111-1111-1111-111111111111",
+                "--restore-snapshot",
+                str(snapshot),
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-ingress",
+                "deny",
+                "--network-egress-allow",
+                "192.0.2.0/24:tcp:443",
+                "--network-egress-deny",
+                "192.0.2.1:tcp:443",
+                "--host-loopback",
+                "allow",
+                "--network-proxy",
+                "192.168.127.1:3128",
+                "--host-loopback-forward",
+                "tcp:18080:80",
+            ]
+        )
+        nvx.command_sandbox(args)
+        process = MagicMock(pid=123)
+        with (
+            patch.object(lifecycle, "require_file", side_effect=self.require),
+            patch.object(lifecycle.subprocess, "Popen", return_value=process) as popen,
+            patch.object(lifecycle, "_process_start_time", return_value=456),
+            patch.object(lifecycle.ControlSession, "connect"),
+        ):
+            lifecycle.start(state, 10)
+        command = popen.call_args.args[0]
+        for option, value in (
+            ("--restore-snapshot", str(snapshot)),
+            ("--machine", "microvm"),
+            ("--network-profile", "portable"),
+            ("--network-egress", "deny"),
+            ("--network-ingress", "deny"),
+            ("--network-egress-allow", "192.0.2.0/24:tcp:443"),
+            ("--network-egress-deny", "192.0.2.1:tcp:443"),
+            ("--host-loopback", "allow"),
+            ("--network-proxy", "192.168.127.1:3128"),
+            ("--host-loopback-forward", "tcp:18080:80"),
+        ):
+            self.assertEqual(command[command.index(option) + 1], value)
+        self.assertNotIn("--net", command)
+
+    @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
     def test_empty_capture_publication_is_not_success(self):
         destination = self.root / "snap"
         state = self.root / "state"
@@ -252,7 +321,7 @@ class SandboxSnapshotTests(unittest.TestCase):
             timeout=10,
             snapshot_destination=destination,
         )
-        process = MagicMock()
+        process = MagicMock(pid=os.getpid())
         process.poll.return_value = 0
 
         def empty_capture(timeout: float) -> int:
@@ -337,6 +406,51 @@ class SandboxSnapshotTests(unittest.TestCase):
         launch = dataclasses.replace(self.launch, processors=8)
         self.assertNotIn("--processors", launch.openvmm_arguments(restore=True))
 
+    @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
+    def test_restore_rejects_only_network_address(self):
+        snapshot = self.root / "snap"
+        snapshot.mkdir()
+        with self.assertRaisesRegex(ScriptError, "network address"):
+            nvx.command_sandbox(
+                nvx.parse_args(
+                    [
+                        "sandbox",
+                        "provision",
+                        "--restore-snapshot",
+                        str(snapshot),
+                        "--net",
+                        "10.0.0.2/24",
+                        "--network-profile",
+                        "portable",
+                    ]
+                )
+            )
+
+    @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
+    def test_restore_accepts_option_like_argument_values(self):
+        snapshot = self.root / "snap"
+        snapshot.mkdir()
+        # Option-like text inside a value is not a workload override.
+        layer = self.root / "--memory-max"
+        layer.touch()
+        args = nvx.parse_args(
+            [
+                "sandbox",
+                "provision",
+                "--restore-snapshot",
+                str(snapshot),
+                "--layer",
+                f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                "--state-dir",
+                str(self.root / "state"),
+                "--hypervisor",
+                "kvm",
+            ]
+        )
+        with patch.object(lifecycle, "provision") as provision:
+            nvx.command_sandbox(args)
+        provision.assert_called_once()
+
     def test_snapshot_trigger_token_is_reserved(self):
         with self.assertRaisesRegex(ScriptError, "owned by the sandbox profile"):
             self.launch.kernel_command_line("quiet sandboxsnap")
@@ -373,7 +487,7 @@ class SandboxSnapshotTests(unittest.TestCase):
             timeout=10,
             snapshot_destination=self.root / "snap",
         )
-        process = MagicMock()
+        process = MagicMock(pid=os.getpid())
         process.poll.return_value = 0
         process.wait.side_effect = subprocess.TimeoutExpired("openvmm", 10)
         with (
@@ -385,6 +499,45 @@ class SandboxSnapshotTests(unittest.TestCase):
             lifecycle.start(state, 10)
         self.assertFalse((state / lifecycle.CAPABILITY_NAME).exists())
 
+    def test_cold_start_script_error_retains_outcome_diagnostics(self):
+        state = self.root / "state"
+        lifecycle.provision(state, self.launch, **self.options, timeout=10)
+        process = MagicMock(pid=123)
+        process.poll.return_value = 97
+        with (
+            patch.object(lifecycle, "require_file", side_effect=self.require),
+            patch.object(lifecycle.subprocess, "Popen", return_value=process),
+            patch.object(lifecycle, "_process_start_time", return_value=None),
+            patch.object(lifecycle, "_end_failed_start", return_value=97),
+            patch.object(
+                lifecycle,
+                "_read_openvmm_outcome",
+                return_value={
+                    "outcome": {"category": "guest_error", "status_code": 125},
+                },
+            ),
+            self.assertRaisesRegex(
+                ScriptError, "^OpenVMM exited during startup: guest_error status 125$"
+            ),
+        ):
+            lifecycle.start(state, 10)
+
+    @unittest.skipUnless(os.name == "posix", "Unix control socket ownership")
+    def test_missing_socket_identity_keeps_reservation_for_recovery(self):
+        endpoint = self.root / "snap.control.sock"
+        owner = lifecycle._reserve_snapshot_endpoint(endpoint)
+        listener = self.unix_socket()
+        self.addCleanup(listener.close)
+        listener.bind(str(endpoint))
+        lifecycle._cleanup_snapshot_endpoint(endpoint, owner, None)
+        self.assertTrue(endpoint.exists())
+        self.assertEqual(Path(f"{endpoint}.lock").read_text(), owner)
+        lifecycle._cleanup_snapshot_endpoint(
+            endpoint, owner, lifecycle._socket_identity(endpoint)
+        )
+        self.assertFalse(endpoint.exists())
+        self.assertFalse(Path(f"{endpoint}.lock").exists())
+
     @unittest.skipUnless(os.name == "posix", "Unix control socket namespace")
     def test_sibling_snapshots_have_independent_sockets_and_cleanup(self):
         states: list[Path] = []
@@ -393,10 +546,8 @@ class SandboxSnapshotTests(unittest.TestCase):
         process.pid = 123
 
         def launch(command: list[str], **_options: Any) -> MagicMock:
-            if os.name != "posix":
-                self.skipTest("Unix control sockets require POSIX")
             endpoint = Path(command[command.index("--microvm-control-console") + 1][7:])
-            listener = socket.socket(socket.AF_UNIX)
+            listener = self.unix_socket()
             self.addCleanup(listener.close)
             listener.bind(str(endpoint))
             endpoints.append(endpoint)
@@ -438,8 +589,6 @@ class SandboxSnapshotTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "Unix control socket namespace")
     def test_endpoint_collision_is_rejected_before_process_launch(self):
-        if os.name != "posix":
-            self.skipTest("Unix control sockets require POSIX")
         for kind in ("socket", "reservation"):
             state = self.root / f"state-{kind}"
             snapshot = self.root / kind
@@ -453,7 +602,7 @@ class SandboxSnapshotTests(unittest.TestCase):
             )
             endpoint = self.root / f"{kind}.control.sock"
             if kind == "socket":
-                listener = socket.socket(socket.AF_UNIX)
+                listener = self.unix_socket()
                 self.addCleanup(listener.close)
                 listener.bind(str(endpoint))
             else:
@@ -469,8 +618,6 @@ class SandboxSnapshotTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "Unix control socket ownership")
     def test_stale_deprovision_preserves_replaced_socket_or_regular_file(self):
-        if os.name != "posix":
-            self.skipTest("Unix control sockets require POSIX")
         for replacement in ("socket", "file", "owner"):
             with self.subTest(replacement=replacement):
                 snapshot = self.root / replacement
@@ -484,7 +631,7 @@ class SandboxSnapshotTests(unittest.TestCase):
                     restore_snapshot=snapshot,
                 )
                 endpoint = self.root / f"{replacement}.control.sock"
-                listener = socket.socket(socket.AF_UNIX)
+                listener = self.unix_socket()
                 self.addCleanup(listener.close)
                 process = MagicMock(pid=123)
 
@@ -510,7 +657,7 @@ class SandboxSnapshotTests(unittest.TestCase):
                 else:
                     endpoint.unlink()
                     if replacement == "socket":
-                        newer = socket.socket(socket.AF_UNIX)
+                        newer = self.unix_socket()
                         self.addCleanup(newer.close)
                         newer.bind(str(endpoint))
                     else:
@@ -571,6 +718,12 @@ class SandboxSnapshotTests(unittest.TestCase):
             source.index("failed to assemble the container overlay"), capture
         )
         self.assertLess(capture, source.index('if [ "$workload_lifecycle" = managed ]'))
+
+    @staticmethod
+    def unix_socket() -> socket.socket:
+        if os.name != "posix":
+            raise RuntimeError("Unix control sockets require POSIX")
+        return socket.socket(socket.AF_UNIX)
 
     @staticmethod
     def require(path: Path, _description: str) -> Path:
