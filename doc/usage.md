@@ -567,6 +567,9 @@ python3 scripts/nvx.py sandbox
     [--scratch PATH]
     [--state-dir PATH]
     [--socket PATH]
+    [--processors {1,2,4,8}]
+    [--snapshot-destination DIR]
+    [--restore-snapshot DIR]
     [--entrypoint PATH]
     [--arg VALUE]...
     [--hostname NAME]
@@ -611,6 +614,9 @@ launches.
 | `--scratch PATH` | required for `run` and `provision` | Attach a preformatted ext4 scratch image as the writable overlay. |
 | `--state-dir PATH` | required for managed operations | Select persistent sandbox state. One-shot `run` rejects this option. |
 | `--socket PATH` | none | Private Unix socket for the persistent `execd` daemon. Required for `execd`. |
+| `--processors {1,2,4,8}` | `1` | Guest vCPU count for `run` or `provision`. |
+| `--snapshot-destination DIR` | none | Capture before workload handoff using the instance-checkpoint tier. Valid for `run` or `provision`; its parent must be private (0700 on Linux). Managed `start` returns after capture, with no running VM. |
+| `--restore-snapshot DIR` | none | Restore an instance checkpoint, valid only for `provision`. The snapshot fixes the guest and network contract and supplies its paired scratch. Mutually exclusive with capture. |
 | `--entrypoint PATH` | `/bin/sh` | Select an absolute workload entrypoint without whitespace. |
 | `--arg VALUE` | none | Append one whitespace-free entrypoint argument. Repeat to pass multiple arguments. |
 | `--hostname NAME` | `nvx-sandbox` | Set the workload UTS hostname. |

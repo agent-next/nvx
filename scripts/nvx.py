@@ -749,6 +749,30 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError("--mount is only valid for sandbox run or provision")
     if args.socket is not None and operation != "execd":
         raise ScriptError("--socket is only valid for sandbox execd")
+    if args.restore_snapshot is not None and operation != "provision":
+        raise ScriptError("--restore-snapshot is only valid for sandbox provision")
+    if args.snapshot_destination is not None and operation not in ("run", "provision"):
+        raise ScriptError("--snapshot-destination is only valid for sandbox run or provision")
+    if args.processors is not None and operation not in ("run", "provision"):
+        raise ScriptError("--processors is only valid for sandbox run or provision")
+    snapshot_destination, restore_snapshot = sandbox_lifecycle._snapshot_paths(
+        {
+            "snapshot_destination": (
+                None if args.snapshot_destination is None
+                else os.fspath(args.snapshot_destination.absolute())
+            ),
+            "restore_snapshot": (
+                None if args.restore_snapshot is None
+                else os.fspath(args.restore_snapshot.absolute())
+            ),
+        }
+    )
+    if restore_snapshot is not None and (
+        any(value is not None for value in network_options)
+        or args.network_egress_allow or args.network_egress_deny
+        or args.host_loopback_forward
+    ):
+        raise ScriptError("a snapshot restore takes its network configuration from the snapshot")
     if operation in ("run", "provision"):
         if (args.net is None) != (args.network_profile is None):
             raise ScriptError("--net and --network-profile must be specified together")
@@ -765,6 +789,8 @@ def command_sandbox(args: argparse.Namespace) -> None:
             memory_max=args.memory_max,
             pids_max=args.pids_max,
             mounts=_sandbox_mounts(args),
+            processors=1 if args.processors is None else args.processors,
+            snapshot_capture=snapshot_destination is not None,
         ).validated()
         _validate_sandbox_systemd_policy(launch)
     else:
@@ -792,6 +818,8 @@ def command_sandbox(args: argparse.Namespace) -> None:
             host_loopback_forward=tuple(args.host_loopback_forward),
             cmdline=args.cmdline,
             timeout=args.timeout,
+            snapshot_destination=snapshot_destination,
+            restore_snapshot=restore_snapshot,
         )
         return
     if operation == "start":
@@ -870,6 +898,11 @@ def command_sandbox(args: argparse.Namespace) -> None:
         "--cmdline",
         launch.kernel_command_line(args.cmdline),
     ]
+    if snapshot_destination is not None:
+        command.extend([
+            "--snapshot-destination", os.fspath(snapshot_destination),
+            "--snapshot-tier", sandbox_lifecycle.SNAPSHOT_CAPTURE_TIER,
+        ])
     _extend_network_arguments(
         command,
         args,
@@ -1324,6 +1357,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument("--memory-max", type=int)
     sandbox.add_argument("--pids-max", type=int)
     sandbox.add_argument("--memory-mib", type=int, default=256)
+    sandbox.add_argument("--processors", type=int, choices=(1, 2, 4, 8))
+    sandbox.add_argument("--snapshot-destination", type=Path, metavar="DIR")
+    sandbox.add_argument("--restore-snapshot", type=Path, metavar="DIR")
     sandbox.add_argument(
         "--timeout",
         type=positive_float,

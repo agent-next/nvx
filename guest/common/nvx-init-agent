@@ -549,6 +549,12 @@ mount_live_shares
 workload_machine_id=$(tr -d - </proc/sys/kernel/random/uuid)
 printf '%s\n' "$workload_machine_id" >"$runtime/workload-machine-id"
 
+# Capture after assembling the rootfs, before any workload consumes scratch.
+# Instance checkpoints bind the layers and pair the writable scratch image.
+case " $cmdline " in
+    *" sandboxsnap "*) /sbin/nvx-snapshot --tier instance-checkpoint ;;
+esac
+
 if [ "$workload_lifecycle" = managed ]; then
     echo "NVX-SANDBOX-READY: managed layers=$layer_count"
     # The agent returns after a stop request, so managed sandboxes share the
