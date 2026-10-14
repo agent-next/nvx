@@ -1,6 +1,8 @@
 # pyright: reportPrivateUsage=false
 
 import argparse
+import contextlib
+import io
 import os
 import shutil
 import socket
@@ -94,6 +96,101 @@ class WarmpoolRegressionTests(unittest.TestCase):
         ):
             self.assertEqual(warmpool.pool_class_frequencies(), [])
 
+    def test_bench_all_failed_restores_reports_failures_and_checks_leaks(self) -> None:
+        for leaked in (False, True):
+            with self.subTest(leaked=leaked):
+                pool = self.make_pool(1)
+                warmpool.write_manifest(pool, {"processors": 1, "backend": "kvm"})
+                args = argparse.Namespace(
+                    pool_dir=pool,
+                    nvx_dir=pool,
+                    openvmm_dir=pool,
+                    duration_s=1,
+                    workers=1,
+                    timeout=1,
+                )
+                output = io.StringIO()
+                with (
+                    patch.object(warmpool, "validate_pool_class"),
+                    patch.object(
+                        warmpool, "_require_artifacts", return_value=(pool, pool, pool)
+                    ),
+                    patch.object(
+                        warmpool.time, "monotonic", side_effect=[0, 0, 0, 2, 3]
+                    ),
+                    patch.object(
+                        warmpool,
+                        "benchmark",
+                        side_effect=common.ScriptError("restore rejected"),
+                    ),
+                    patch.object(
+                        warmpool,
+                        "pool_claimed_paths",
+                        return_value=[pool / "claimed-leak"] if leaked else [],
+                    ) as check_leaks,
+                    contextlib.redirect_stdout(output),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    if leaked:
+                        with self.assertRaisesRegex(
+                            common.ScriptError, "leak detected"
+                        ):
+                            warmpool.command_bench(args)
+                    else:
+                        self.assertEqual(warmpool.command_bench(args), 1)
+                    check_leaks.assert_called_once_with(pool)
+                self.assertIn("restores=0 failures=1", output.getvalue())
+                self.assertIn("p50=nan ms p95=nan ms max=nan ms", output.getvalue())
+                self.assertIn("pool: 1 -> 1 entries", output.getvalue())
+                self.assertEqual(len(warmpool.pool_entry_paths(pool)), 1)
+                self.assertEqual(warmpool.pool_claimed_paths(pool), [])
+
+    def test_fill_captures_entries_and_records_manifest(self) -> None:
+        pool = self.make_pool(0)
+        args = argparse.Namespace(
+            pool_dir=pool,
+            nvx_dir=pool,
+            openvmm_dir=pool,
+            size=2,
+            backend="kvm",
+            memory_mib=128,
+            processors=2,
+            timeout=10,
+        )
+
+        def capture(
+            _command: list[str], entry: Path, *, timeout: float, processors: int
+        ) -> None:
+            self.assertEqual(timeout, 10)
+            self.assertEqual(processors, 2)
+            entry.mkdir()
+
+        with (
+            patch.object(
+                warmpool, "_require_artifacts", return_value=(pool, pool, pool)
+            ),
+            patch.object(warmpool, "workload_boot_command", return_value=["openvmm"]),
+            patch.object(warmpool, "capture_snapshot", side_effect=capture) as captures,
+            patch.object(warmpool, "_process_affinity", return_value={0, 1}),
+            patch.object(warmpool, "pool_class_frequencies", return_value=[4_000_000]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(warmpool.command_fill(args), 0)
+        self.assertEqual(captures.call_count, 2)
+        self.assertEqual(len(warmpool.pool_entry_paths(pool)), 2)
+        self.assertEqual(
+            warmpool.read_manifest(pool),
+            {
+                "version": 1,
+                "backend": "kvm",
+                "processors": 2,
+                "memory_mib": 128,
+                "cpu_affinity": [0, 1],
+                "cpu_class_frequencies_khz": [4_000_000],
+                "entries": 2,
+            },
+        )
+
 
 @unittest.skipUnless(sys.platform == "linux", "requires Linux CPU affinity")
 class ProcessAffinityRegressionTests(unittest.TestCase):
@@ -151,6 +248,27 @@ class ProcessAffinityRegressionTests(unittest.TestCase):
 
 
 class FrequencyClusterTests(unittest.TestCase):
+    def test_frequency_steps_cannot_chain_beyond_ten_percent(self) -> None:
+        classes = {4_000_000: {0}, 4_400_000: {1}, 4_840_000: {2}}
+        self.assertEqual(benchmark.cpu_frequency_clusters(classes), [{0, 1}, {2}])
+
+    def test_generated_pool_tags_pass_validation(self) -> None:
+        classes = {4_000_000: {0}, 4_400_000: {1}, 4_840_000: {2}}
+        with tempfile.TemporaryDirectory() as temporary:
+            pool = Path(temporary)
+            for affinity in ({0, 1}, {2}, {0, 1, 2}):
+                with (
+                    self.subTest(affinity=affinity),
+                    patch.object(
+                        warmpool, "cpu_frequency_classes", return_value=classes
+                    ),
+                    patch.object(warmpool, "_process_affinity", return_value=affinity),
+                ):
+                    tag = warmpool.pool_class_frequencies()
+                    self.assertEqual(bool(tag), affinity != {0, 1, 2})
+                    warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": tag})
+                    warmpool.validate_pool_class(pool)
+
     def test_nearby_frequencies_share_a_cluster_without_mutating_input(self) -> None:
         classes = {6_000_000: {0, 1}, 5_700_000: {2, 3}, 4_200_000: {4, 5}}
         self.assertEqual(
@@ -263,6 +381,74 @@ class ExecdPermissionsRegressionTests(unittest.TestCase):
 
 
 class SetupSubmoduleRegressionTests(unittest.TestCase):
+    def test_unexpected_contents_are_preserved_and_reported(self) -> None:
+        for relative in ("target/release/other", "target/cache/data", "notes.txt"):
+            with (
+                self.subTest(relative=relative),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                binary = root / "openvmm" / "target" / "release" / "openvmm"
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b"release")
+                extra = root / "openvmm" / relative
+                extra.parent.mkdir(parents=True, exist_ok=True)
+                extra.write_bytes(b"keep")
+                with (
+                    patch.object(release, "openvmm_binary_path", return_value=binary),
+                    patch.object(release.subprocess, "run") as run,
+                    self.assertRaisesRegex(common.ScriptError, "unexpected contents"),
+                ):
+                    release.ensure_openvmm_source(root)
+                run.assert_not_called()
+                self.assertEqual(extra.read_bytes(), b"keep")
+                self.assertEqual(binary.read_bytes(), b"release")
+
+    def test_interrupted_staging_is_recovered_even_with_initialized_source(
+        self,
+    ) -> None:
+        for initialized in (False, True):
+            with (
+                self.subTest(initialized=initialized),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                staged = root / "build" / "openvmm-release-binary"
+                staged.parent.mkdir()
+                staged.write_bytes(b"saved-release")
+                binary = root / "openvmm" / "target" / "release" / "openvmm"
+                if initialized:
+                    binary.parents[2].mkdir()
+                    (binary.parents[2] / "Cargo.toml").write_text("[package]\n")
+                with (
+                    patch.object(release, "openvmm_binary_path", return_value=binary),
+                    patch.object(
+                        release.subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess([], 0, b"", b""),
+                    ),
+                ):
+                    release.ensure_openvmm_source(root)
+                self.assertEqual(binary.read_bytes(), b"saved-release")
+                self.assertFalse(staged.exists())
+
+    def test_staged_binary_collision_preserves_both_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staged = root / "build" / "openvmm-release-binary"
+            staged.parent.mkdir()
+            staged.write_bytes(b"saved-release")
+            binary = root / "openvmm" / "target" / "release" / "openvmm"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"current-release")
+            with (
+                patch.object(release, "openvmm_binary_path", return_value=binary),
+                self.assertRaisesRegex(common.ScriptError, "both.*binary"),
+            ):
+                release.ensure_openvmm_source(root)
+            self.assertEqual(staged.read_bytes(), b"saved-release")
+            self.assertEqual(binary.read_bytes(), b"current-release")
+
     def test_submodule_init_includes_nested_submodules(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

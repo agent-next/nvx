@@ -1021,9 +1021,7 @@ def _start_first_wait_s() -> float:
     try:
         value = float(raw)
     except ValueError as error:
-        raise ScriptError(
-            f"NVX_START_FIRST_WAIT_S is not a number: {raw!r}"
-        ) from error
+        raise ScriptError(f"NVX_START_FIRST_WAIT_S is not a number: {raw!r}") from error
     if not 0 < value < float("inf"):
         raise ScriptError(f"NVX_START_FIRST_WAIT_S must be positive: {raw!r}")
     return value
@@ -1031,9 +1029,7 @@ def _start_first_wait_s() -> float:
 
 def _start_with_endpoint_retry(state_path: Path, timeout: float) -> None:
     try:
-        _start_once(
-            state_path, timeout, endpoint_wait_s=_start_first_wait_s()
-        )
+        _start_once(state_path, timeout, endpoint_wait_s=_start_first_wait_s())
     except TimeoutError as error:
         if "did not become available" not in str(error):
             raise
@@ -1278,9 +1274,7 @@ def _execd_read_request(connection: socket.socket) -> bytes:
         chunk = connection.recv(65_536)
         if not chunk:
             if not data:
-                raise ScriptError(
-                    "sandbox execd connection closed without a request"
-                )
+                raise ScriptError("sandbox execd connection closed without a request")
             return bytes(data)
         data.extend(chunk)
 
@@ -1298,7 +1292,9 @@ def _execd_parse_request(raw: bytes) -> tuple[tuple[str, ...], int]:
     if (
         not isinstance(command, list)
         or not command
-        or not all(isinstance(argument, str) for argument in cast(list[object], command))
+        or not all(
+            isinstance(argument, str) for argument in cast(list[object], command)
+        )
     ):
         raise ScriptError("sandbox execd request requires a non-empty cmd list")
     if (
@@ -1329,13 +1325,9 @@ def _execd_result_payload(result: ManagedExecResult) -> dict[str, Any]:
     return {"rc": result.returncode, "out": stdout, "err": stderr, "b64": encoded}
 
 
-def _execd_serve_connection(
-    connection: socket.socket, session: ControlSession
-) -> None:
+def _execd_serve_connection(connection: socket.socket, session: ControlSession) -> None:
     try:
-        command, timeout_ms = _execd_parse_request(
-            _execd_read_request(connection)
-        )
+        command, timeout_ms = _execd_parse_request(_execd_read_request(connection))
     except (ScriptError, OSError) as error:
         _execd_send(connection, {"error": str(error)})
         return
@@ -1398,9 +1390,7 @@ def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
         os.chmod(socket_path, 0o600)
         listener.listen(16)
         listener.settimeout(EXECD_POLL_S)
-        with ControlSession.connect(
-            _endpoint(runtime), capability, timeout
-        ) as session:
+        with ControlSession.connect(_endpoint(runtime), capability, timeout) as session:
             while True:
                 if not _process_running(pid, start_time):
                     raise ScriptError(

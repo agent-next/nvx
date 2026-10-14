@@ -53,11 +53,17 @@ CLAIMED_PREFIX = "claimed-"
 
 
 def pool_entry_paths(pool_dir: Path) -> list[Path]:
-    return sorted(p for p in pool_dir.iterdir() if p.is_dir() and p.name.startswith(ENTRY_PREFIX))
+    return sorted(
+        p for p in pool_dir.iterdir() if p.is_dir() and p.name.startswith(ENTRY_PREFIX)
+    )
 
 
 def pool_claimed_paths(pool_dir: Path) -> list[Path]:
-    return sorted(p for p in pool_dir.iterdir() if p.is_dir() and p.name.startswith(CLAIMED_PREFIX))
+    return sorted(
+        p
+        for p in pool_dir.iterdir()
+        if p.is_dir() and p.name.startswith(CLAIMED_PREFIX)
+    )
 
 
 def write_manifest(pool_dir: Path, fields: dict[str, object]) -> None:
@@ -113,10 +119,12 @@ def validate_pool_class(pool_dir: Path) -> None:
                 f"(classes: {sorted(classes)})"
             )
         tagged_cpus |= classes[frequency]
-    ordered = sorted(tag)
-    if ordered[-1] > ordered[0] * 1.10:
-        # same 10% merge as apply_hybrid_cpu_filter: turbo-favored cores of
-        # one physical type stay one class, two classes must not mix
+    if (
+        len(
+            cpu_frequency_clusters({frequency: classes[frequency] for frequency in tag})
+        )
+        > 1
+    ):
         raise ScriptError(f"pool CPU class tag spans multiple classes: {tag}")
     if not tagged_cpus & _process_affinity():
         raise ScriptError("pool CPU class cpus are outside this process affinity")
@@ -128,7 +136,10 @@ def acquire_entries(pool_dir: Path, count: int) -> list[Path]:
     try:
         for _ in range(count):
             for entry in pool_entry_paths(pool_dir):
-                claimed_path = pool_dir / f"{CLAIMED_PREFIX}{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+                claimed_path = (
+                    pool_dir
+                    / f"{CLAIMED_PREFIX}{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+                )
                 try:
                     os.rename(entry, claimed_path)
                 except OSError:
@@ -154,7 +165,9 @@ def release_entry(pool_dir: Path, claimed: Path) -> Path:
         or claimed.is_symlink()
         or not claimed.is_dir()
     ):
-        raise ScriptError("release requires a claimed-* directory directly inside the pool")
+        raise ScriptError(
+            "release requires a claimed-* directory directly inside the pool"
+        )
     entry = pool_dir / f"{ENTRY_PREFIX}{uuid.uuid4().hex[:8]}"
     os.rename(claimed, entry)
     return entry
@@ -166,7 +179,9 @@ def prune_claims(pool_dir: Path, ttl_s: float, *, now: float | None = None) -> i
     removed = 0
     for claimed in pool_claimed_paths(pool_dir):
         try:
-            claimed_at_ns = int(claimed.name.removeprefix(CLAIMED_PREFIX).split("-", 1)[0])
+            claimed_at_ns = int(
+                claimed.name.removeprefix(CLAIMED_PREFIX).split("-", 1)[0]
+            )
         except ValueError:
             continue  # Unknown claim formats have no reliable expiration time.
         age = now - claimed_at_ns / 1_000_000_000
@@ -319,16 +334,19 @@ def command_bench(args: argparse.Namespace) -> int:
     elapsed = time.monotonic() - started
 
     samples_ms.sort()
+    p50 = samples_ms[len(samples_ms) // 2] if samples_ms else float("nan")
     p95 = samples_ms[int(0.95 * (len(samples_ms) - 1))] if samples_ms else float("nan")
     print(
         f"restores={len(samples_ms)} failures={failures} exhaust_waits={exhaust_waits} "
         f"rate={len(samples_ms) / elapsed:.1f}/s over {elapsed:.1f}s "
-        f"p50={samples_ms[len(samples_ms) // 2]:.3f} ms p95={p95:.3f} ms "
+        f"p50={p50:.3f} ms p95={p95:.3f} ms "
         f"max={samples_ms[-1] if samples_ms else float('nan'):.3f} ms"
     )
     claimed_after = pool_claimed_paths(args.pool_dir)
     pool_after = len(pool_entry_paths(args.pool_dir))
-    print(f"pool: {pool_before} -> {pool_after} entries, {len(claimed_after)} leaked claims")
+    print(
+        f"pool: {pool_before} -> {pool_after} entries, {len(claimed_after)} leaked claims"
+    )
     if claimed_after or pool_after != pool_before:
         raise ScriptError("warm-pool leak detected after bench churn")
     return 0 if failures == 0 else 1
@@ -360,7 +378,9 @@ def configure_parser(parser: argparse.ArgumentParser, repo_root: Path) -> None:
     acquire.add_argument("--count", type=int, default=1)
     acquire.set_defaults(handler=command_acquire)
 
-    release = subparsers.add_parser("release", help="return a claimed entry to the pool")
+    release = subparsers.add_parser(
+        "release", help="return a claimed entry to the pool"
+    )
     shared(release)
     release.add_argument("--entry", type=Path, required=True)
     release.set_defaults(handler=command_release)
@@ -370,7 +390,9 @@ def configure_parser(parser: argparse.ArgumentParser, repo_root: Path) -> None:
     prune.add_argument("--ttl-s", type=float, required=True)
     prune.set_defaults(handler=command_prune)
 
-    bench = subparsers.add_parser("bench", help="sustained acquire/restore/release oracle")
+    bench = subparsers.add_parser(
+        "bench", help="sustained acquire/restore/release oracle"
+    )
     shared(bench)
     bench.add_argument("--duration-s", type=float, default=60.0)
     bench.add_argument("--workers", type=int, default=4)

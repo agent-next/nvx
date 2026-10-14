@@ -25,7 +25,7 @@ the inspected upstream tree, not that every issue was searched.
 | Original SHA | Patch | Decision | Evidence and implementation |
 | --- | --- | --- | --- |
 | ec38aa01 | Hybrid affinity / NVX_CPU_CLASS | Rewrite | Placement is opt-in for ordinary commands (`performance` or `efficiency`), preserving SMT siblings; the default applies no affinity. Benchmark pinning is for latency measurement. Upstream CPU profiles (16237e29, 00f8884d, PRs #394/#435) supersede the historical cross-class rejection: both auto and intel.host.v1 restored across P/E successfully. |
-| a4811e5e | Provenance fixture isolation | Keep | Pristine fixture commits hit this host's protected-main policy; retained as 6d890682. |
+| a4811e5e | Provenance fixture isolation | Keep | Fixture repositories use an explicit nondefault branch for reproducible commits; retained as 6d890682. |
 | ac82a417 | setup-submodule | Keep | Upstream release installs a binary into the uninitialized submodule directory; no preservation helper there. Retained as 5f0fd1a0; usage added in cc53b463. |
 | fa60c840 | Wait for async process-tree kills in tests | Drop | Upstream df532ce2 (fixes microsoft/nvx #320) waits for killed descendants and repairs the same oracles. |
 | 5363c84e | Production roadmap | Drop | Planning document removed. Neutral technical observations remain in PRODUCTION-NOTES.md. |
@@ -41,16 +41,17 @@ the inspected upstream tree, not that every issue was searched.
 | e96fa381 | Correct analysis figures | Keep | Historical factual correction, 1ffa07cd. |
 | 05203da5 | Correct analysis citations | Keep | Historical factual correction, 7c5f9e96. |
 | 293a31ed | Merge fork PR #5 | Drop merge | No additional patch beyond the three analysis commits. |
-| ced8288b | Snapshot / processors | Rewrite | fe073da7 adds format 7, not old fork format 3; upstream already owns formats 3-6. |
-| 1f67500f | Snapshot config live share | Rewrite | Format 7 uses upstream's full `mounts` representation, including owners, policies, and file kind. Eleven snapshot regression oracles added. |
-| 82e93566 | Snapshot console namespace | Rewrite | Managed control endpoint lives beside the snapshot, with collision rejection and external-endpoint cleanup. |
-| 80d21fd9 | Private snapshot parent | Rewrite | Validate plain parent, current owner and mode 0700 on POSIX; reject symbolic links, missing restore directories and existing capture destinations. |
-| 9fba310a | Capture before consuming scratch | Rewrite | Guest trigger runs after layer/rootfs/share assembly, before managed agent or one-shot workload handoff. Successful managed capture returns with no live runtime record. |
-| 1b98bf53 | Instance-checkpoint tier | Rewrite | Reuse upstream `nvx-snapshot --tier instance-checkpoint`; platform/workload-start have different admission rules. |
-| c9dc6828 | Paired scratch restore | Rewrite | Omit scratch and workload-identity redeclarations on restore; preserve read-only layer and live-share attachments. 5929a0ba removes obsolete `--restore-entropy` (upstream 5a92c86f). 80da9e6d allows absent original scratch and checks complete capture publication. |
+| ced8288b | Snapshot / processors | Separate PR | [Snapshot/processors PR #7](https://github.com/agent-next/nvx/pull/7) adds format 7, not old fork format 3; upstream already owns formats 3-6. Not implemented in this branch. |
+| 1f67500f | Snapshot config live share | Separate PR | PR #7's format 7 uses upstream's full `mounts` representation, including owners, policies, and file kind. Eleven snapshot regression oracles added there. |
+| 82e93566 | Snapshot console namespace | Separate PR | In PR #7 the managed control endpoint lives beside the snapshot, with collision rejection and external-endpoint cleanup. |
+| 80d21fd9 | Private snapshot parent | Separate PR | PR #7 validates plain parent, current owner and mode 0700 on POSIX; rejects symbolic links, missing restore directories and existing capture destinations. |
+| 9fba310a | Capture before consuming scratch | Separate PR | In PR #7 the guest trigger runs after layer/rootfs/share assembly, before managed agent or one-shot workload handoff. Successful managed capture returns with no live runtime record. |
+| 1b98bf53 | Instance-checkpoint tier | Separate PR | PR #7 reuses upstream `nvx-snapshot --tier instance-checkpoint`; platform/workload-start have different admission rules. |
+| c9dc6828 | Paired scratch restore | Separate PR | [Snapshot/processors PR #7](https://github.com/agent-next/nvx/pull/7) omits scratch and workload-identity redeclarations on restore, preserves layers and live shares, removes obsolete `--restore-entropy` (upstream 5a92c86f), and validates complete capture publication without the original scratch. Not implemented in this branch. |
 
-The seven PR #2 commits are consolidated into a reviewed rewrite rather than
-cherry-picked over incompatible schemas. Old fork snapshot-format-3 configs
+The seven PR #2 commits are consolidated in the separate
+[PR #7](https://github.com/agent-next/nvx/pull/7), rather than cherry-picked over
+incompatible schemas in this branch. Old fork snapshot-format-3 configs
 must be reprovisioned; they are not interchangeable with upstream owner-format-3.
 
 ## What a CLI or control client notices since 10-09
@@ -148,12 +149,11 @@ Product, all scripts: 1 failed, 1113 passed, 20 skipped
 Rewritten stack, all scripts: 1 failed, 1124 passed, 20 skipped
 ```
 
-The remaining rewritten-stack failure,
-`test_ci_change_detector_classifies_real_git_paths`, also fails on pristine:
-the host refuses a fixture commit on its default `main` branch. The second
+The historical `test_ci_change_detector_classifies_real_git_paths` failure
+was corrected by giving its fixture an explicit nondefault branch. The second
 pristine failure is fixed by the retained provenance-fixture isolation.
-No policy guard was disabled.
-Full-tree Ruff and strict Pyright pass. Final static checking also corrected
+Ruff lint and strict Pyright passed at the initial sync head; these results
+did not include Ruff's formatting gate. Final static checking also corrected
 retained warm-pool/test typing without changing the execd wire contract.
 The retained `guest_exit_prequeued` benchmark argument is already upstream
 (`scripts/nvx_tools/benchmark.py:1850`); the real warm-pool restore check exercises it.

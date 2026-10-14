@@ -649,6 +649,42 @@ launches.
 See [Run](run.md) for artifact preparation, the security boundary, and current
 snapshot/configuration limitations.
 
+#### Persistent execution with `sandbox execd`
+
+On a running managed sandbox, start the foreground daemon with:
+
+```text
+python3 scripts/nvx.py sandbox execd --state-dir STATE --socket SOCKET
+```
+
+The Unix socket is private (bound with umask 077, then mode 0600). It has no
+additional authentication; access has the same trust boundary as the sandbox's
+control capability. Each connection sends one newline-terminated JSON request:
+
+```json
+{"cmd":["/bin/sh","-c","printf hello"],"timeout_ms":30000}
+```
+
+`cmd` is a nonempty list of strings. `timeout_ms` is optional; zero disables
+the guest workload deadline. The response is one JSON line:
+
+```json
+{"rc":0,"out":"hello","err":"","b64":false}
+```
+
+If either output stream is not UTF-8, both `out` and `err` are base64-encoded
+and `b64` is true. Malformed requests and guest rejections return
+`{"error":"description"}` instead of a guest exit status. Connections are
+served serially over one persistent control session. A client timeout does
+not prove the guest command stopped; do not launch an overlapping fallback exec.
+
+The daemon requires a running sandbox and exits nonzero if the VM dies.
+While it holds the control channel, external operations such as `sandbox stop`
+time out. Stop the daemon first by sending SIGTERM to its recorded PID, then
+stop the sandbox. Normal exit and SIGTERM remove the socket. SIGKILL bypasses
+cleanup; after confirming that daemon PID has exited, remove the stale socket
+before restarting. `execd` is unsupported on Windows.
+
 ## CPU profiles
 
 Every microVM presents a CPU profile to its guest: the complete CPUID surface

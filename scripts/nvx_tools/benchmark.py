@@ -675,15 +675,15 @@ def _cpu_number(name: str) -> int:
 
 
 def cpu_frequency_clusters(classes: dict[int, set[int]]) -> list[set[int]]:
-    """Merge nearby maximum frequencies into CPU sets, lowest frequency first."""
+    """Group frequencies within 10% of each cluster's minimum, lowest first."""
     clusters: list[set[int]] = []
-    previous: int | None = None
+    minimum: int | None = None
     for frequency in sorted(classes):
-        if previous is not None and frequency <= previous * 1.10:
+        if minimum is not None and frequency <= minimum * 1.10:
             clusters[-1].update(classes[frequency])
         else:
             clusters.append(set(classes[frequency]))
-        previous = frequency
+            minimum = frequency
     return clusters
 
 

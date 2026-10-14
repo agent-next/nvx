@@ -16515,9 +16515,7 @@ class SandboxTests(unittest.TestCase):
     def test_managed_start_retries_a_broken_control_pipe(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "state"
-            attempts = MagicMock(
-                side_effect=(BrokenPipeError(32, "broken pipe"), None)
-            )
+            attempts = MagicMock(side_effect=(BrokenPipeError(32, "broken pipe"), None))
             stderr = io.StringIO()
             with (
                 patch.object(sandbox_lifecycle, "_start_once", attempts),
@@ -16606,8 +16604,7 @@ class SandboxTests(unittest.TestCase):
             state = Path(temporary) / "state"
             attempts = MagicMock(
                 side_effect=TimeoutError(
-                    "managed control endpoint did not become available: "
-                    "control.sock"
+                    "managed control endpoint did not become available: control.sock"
                 )
             )
             stderr = io.StringIO()
@@ -16701,9 +16698,7 @@ class SandboxTests(unittest.TestCase):
         for raw in ("abc", "0", "-1"):
             with (
                 patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": raw}),
-                self.assertRaisesRegex(
-                    common.ScriptError, "NVX_START_FIRST_WAIT_S"
-                ),
+                self.assertRaisesRegex(common.ScriptError, "NVX_START_FIRST_WAIT_S"),
             ):
                 sandbox_lifecycle._start_first_wait_s()
 
@@ -16774,18 +16769,12 @@ class SandboxTests(unittest.TestCase):
 
             stderr = io.StringIO()
             with (
-                patch.object(
-                    sandbox_lifecycle, "require_file", side_effect=require
-                ),
-                patch.object(
-                    sandbox_lifecycle.subprocess, "Popen", side_effect=spawn
-                ),
+                patch.object(sandbox_lifecycle, "require_file", side_effect=require),
+                patch.object(sandbox_lifecycle.subprocess, "Popen", side_effect=spawn),
                 patch.object(
                     sandbox_lifecycle, "_process_start_time", return_value=456
                 ),
-                patch.object(
-                    sandbox_lifecycle.ControlSession, "connect", connects
-                ),
+                patch.object(sandbox_lifecycle.ControlSession, "connect", connects),
                 patch.object(sys, "stderr", stderr),
             ):
                 sandbox_lifecycle.start(state, 10)
@@ -16844,9 +16833,7 @@ class SandboxTests(unittest.TestCase):
         )
         (state / sandbox_lifecycle.CAPABILITY_NAME).write_bytes(b"x" * 32)
 
-    def _execd_request(
-        self, socket_path: Path, request: bytes
-    ) -> dict[str, Any]:
+    def _execd_request(self, socket_path: Path, request: bytes) -> dict[str, Any]:
         if os.name == "nt":
             self.skipTest("execd requires Unix sockets")
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -16930,12 +16917,11 @@ class SandboxTests(unittest.TestCase):
                     json.dumps({"cmd": ["/bin/cat"]}).encode("utf-8"),
                 )
                 self.assertEqual(
-                    response["rc"], 1,
+                    response["rc"],
+                    1,
                 )
                 self.assertTrue(response["b64"])
-                self.assertEqual(
-                    base64.b64decode(response["out"]), b"\xff"
-                )
+                self.assertEqual(base64.b64decode(response["out"]), b"\xff")
 
                 response = self._execd_request(socket_path, b"not json")
                 self.assertIn("error", response)
@@ -16996,17 +16982,13 @@ class SandboxTests(unittest.TestCase):
         )
         self.assertEqual(args.sandbox_operation, "execd")
         self.assertEqual(args.socket, Path("execd.sock"))
-        with patch.object(
-            sandbox_lifecycle, "exec_daemon"
-        ) as exec_daemon:
+        with patch.object(sandbox_lifecycle, "exec_daemon") as exec_daemon:
             nvx.command_sandbox(args)
         exec_daemon.assert_called_once_with(
             Path("state"), Path("execd.sock"), timeout=60.0
         )
 
-        missing_socket = nvx.parse_args(
-            ["sandbox", "execd", "--state-dir", "state"]
-        )
+        missing_socket = nvx.parse_args(["sandbox", "execd", "--state-dir", "state"])
         with self.assertRaisesRegex(common.ScriptError, "requires --socket"):
             nvx.command_sandbox(missing_socket)
         missing_state = nvx.parse_args(["sandbox", "execd", "--socket", "s"])
@@ -22642,12 +22624,18 @@ class EnsureOpenvmmSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / ".gitmodules").write_text(
-                "[submodule \"openvmm\"]\n"
+                '[submodule "openvmm"]\n'
                 "\tpath = openvmm\n"
                 "\turl = https://github.com/nanvix/openvmm.git\n",
                 encoding="ascii",
             )
-            binary = root / "openvmm" / "target" / "release" / release.openvmm_binary_path().name
+            binary = (
+                root
+                / "openvmm"
+                / "target"
+                / "release"
+                / release.openvmm_binary_path().name
+            )
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"release-binary")
 
@@ -22663,9 +22651,7 @@ class EnsureOpenvmmSourceTests(unittest.TestCase):
                     subprocess.CompletedProcess[bytes], original_run(command, **kwargs)
                 )
 
-            with patch.object(
-                release.subprocess, "run", side_effect=fake_run
-            ):
+            with patch.object(release.subprocess, "run", side_effect=fake_run):
                 release.ensure_openvmm_source(root)
 
             self.assertTrue((root / "openvmm" / "Cargo.toml").exists())
@@ -22830,9 +22816,7 @@ class WarmpoolTests(unittest.TestCase):
         classes = {6_000_000: {0}, 5_700_000: {2}, 4_200_000: {16, 17}}
         with (
             patch.object(warmpool, "cpu_frequency_classes", return_value=classes),
-            patch.object(
-                warmpool, "_process_affinity", return_value={0, 2}
-            ),
+            patch.object(warmpool, "_process_affinity", return_value={0, 2}),
         ):
             warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": [5_700_000]})
             warmpool.validate_pool_class(pool)  # tagged class present, in affinity
@@ -22843,7 +22827,9 @@ class WarmpoolTests(unittest.TestCase):
             warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": [9_999_999]})
             with self.assertRaises(nvx.ScriptError):
                 warmpool.validate_pool_class(pool)  # class absent on host
-            warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": [5_700_000, 4_200_000]})
+            warmpool.write_manifest(
+                pool, {"cpu_class_frequencies_khz": [5_700_000, 4_200_000]}
+            )
             with self.assertRaises(nvx.ScriptError):
                 warmpool.validate_pool_class(pool)  # spans two classes
             warmpool.write_manifest(pool, {})

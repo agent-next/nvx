@@ -825,9 +825,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
             raise ScriptError("sandbox execd requires --state-dir")
         if args.socket is None:
             raise ScriptError("sandbox execd requires --socket")
-        sandbox_lifecycle.exec_daemon(
-            args.state_dir, args.socket, timeout=args.timeout
-        )
+        sandbox_lifecycle.exec_daemon(args.state_dir, args.socket, timeout=args.timeout)
         return
     if operation == "stop":
         if args.state_dir is None:
@@ -1292,9 +1290,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument(
         "sandbox_operation",
         nargs="?",
-        choices=(
-            "run", "provision", "start", "exec", "execd", "stop", "deprovision"
-        ),
+        choices=("run", "provision", "start", "exec", "execd", "stop", "deprovision"),
         default="run",
     )
     sandbox.add_argument(
