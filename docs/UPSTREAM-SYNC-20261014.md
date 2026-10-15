@@ -5,9 +5,9 @@
 Runtime target: microsoft/nvx `dev` at **4acf7eb0bb73b88cfb5a01bb6043592af1e96c61**,
 release `v0.1.0-dev.4acf7eb0bb73`, OpenVMM gitlink
 `7f225e2cd635bbd1e1839e587e659996433396c8`.
-The resumed product branch also includes upstream's data-only child
+This sync also includes upstream's data-only child
 `c073ebcd`, which updates performance CSVs without changing runtime inputs.
-No fork history was rewritten. Both sync branches are additive.
+No fork history was rewritten.
 
 Comparison since the previous analysis: `33bd2fe5..4acf7eb0`, not the old
 fork's much larger merge-base delta. The old analysis is historical:
@@ -24,33 +24,33 @@ the inspected upstream tree, not that every issue was searched.
 
 | Original SHA | Patch | Decision | Evidence and implementation |
 | --- | --- | --- | --- |
-| ec38aa01 | Hybrid affinity / NVX_CPU_CLASS | Rewrite | Placement is opt-in for ordinary commands (`performance` or `efficiency`), preserving SMT siblings; the default applies no affinity. Benchmark pinning is for latency measurement. Upstream CPU profiles (16237e29, 00f8884d, PRs #394/#435) supersede the historical cross-class rejection: both auto and intel.host.v1 restored across P/E successfully. |
-| a4811e5e | Provenance fixture isolation | Keep | Pristine fixture commits hit this host's protected-main policy; retained as 6d890682. |
+| ec38aa01 | Hybrid affinity / NVX_CPU_CLASS | Rewrite | CPU-class placement is opt-in (`performance` or `efficiency`); unset, empty, or `all` preserves the default in both ordinary commands and benchmarks. Ordinary commands preserve SMT siblings; explicit benchmark `--cpus` overrides class selection. Upstream CPU profiles (16237e29, 00f8884d, PRs #394/#435) supersede the historical cross-class rejection: both auto and intel.host.v1 restored across P/E successfully. |
+| a4811e5e | Provenance fixture isolation | Keep | Fixture repositories use an explicit nondefault branch for reproducible commits; retained as 6d890682. |
 | ac82a417 | setup-submodule | Keep | Upstream release installs a binary into the uninitialized submodule directory; no preservation helper there. Retained as 5f0fd1a0; usage added in cc53b463. |
 | fa60c840 | Wait for async process-tree kills in tests | Drop | Upstream df532ce2 (fixes microsoft/nvx #320) waits for killed descendants and repairs the same oracles. |
-| 5363c84e | Production roadmap | Drop | Planning document removed. Neutral technical observations remain in PRODUCTION-NOTES.md. |
+| 5363c84e | Operational notes | Drop | Only neutral technical observations retained in PRODUCTION-NOTES.md. |
 | 141159c9 | One-shot operational facts | Keep | Historical technical observations, no upstream equivalent; 6f0503b9. |
 | 3af39256 | Doubled CR marker fix | Keep | Upstream `contains_output_line` removed only one CR; retained rstrip correction as fa97deab. |
 | 041c67a7 | Warm pool | Rewrite | Upstream has snapshot primitives but no fork pool CLI. Adapted capture signature as 34a0a8ef. Pool entries remain bare snapshots, not managed state directories. |
 | 84306756 | SLO / warm-pool evidence | Keep | Fork-specific historical evidence; 7b61da8d. Not a fresh performance receipt. |
 | 05695641 | CPU-class matrix / pool tags | Rewrite | Adapted capture API as 667f4adf. Replaced obsolete cross-class-refusal oracle with same- and cross-class readiness checks using the host profile; real KVM proves both succeed. Pool frequency tagging remains conservative placement metadata. |
-| a065aa3c | execd / EPIPE retry, fork PR #1 | Rewrite | c1da7eb8 retains daemon and transport retries, reuses upstream `ManagedExecRefused`, capability pipe, PID/start-time identity, and lifecycle lock. cc53b463 excludes intentional endpoint closure from retries. |
+| a065aa3c | Persistent exec daemon, fork PR #1 | Rewrite | Retains the daemon, reusing upstream `ManagedExecRefused`, capability pipe, PID/start-time identity, and lifecycle lock. The fork adds no pipe-error retry wrapper; upstream transport handling is unchanged. |
 | 9f9277af | Boot-tail retry | Rewrite | 1fafd679 retains unavailable-endpoint retry and threads its bound into upstream startup. Upstream start at :979-982 has no such retry; bb2ba395 supplies safe teardown, not retry. |
 | 07adc613 | Merge fork PR #3 | Drop merge | No additional patch beyond 9f9277af. |
 | 7cf6608e | 10-09 upstream analysis | Keep | Historical document, b108ad0a; this document supplies the newer delta. |
 | e96fa381 | Correct analysis figures | Keep | Historical factual correction, 1ffa07cd. |
 | 05203da5 | Correct analysis citations | Keep | Historical factual correction, 7c5f9e96. |
 | 293a31ed | Merge fork PR #5 | Drop merge | No additional patch beyond the three analysis commits. |
-| ced8288b | Snapshot / processors | Rewrite | fe073da7 adds format 7, not old fork format 3; upstream already owns formats 3-6. |
-| 1f67500f | Snapshot config live share | Rewrite | Format 7 uses upstream's full `mounts` representation, including owners, policies, and file kind. Eleven snapshot regression oracles added. |
-| 82e93566 | Snapshot console namespace | Rewrite | Managed control endpoint lives beside the snapshot, with collision rejection and external-endpoint cleanup. |
-| 80d21fd9 | Private snapshot parent | Rewrite | Validate plain parent, current owner and mode 0700 on POSIX; reject symbolic links, missing restore directories and existing capture destinations. |
-| 9fba310a | Capture before consuming scratch | Rewrite | Guest trigger runs after layer/rootfs/share assembly, before managed agent or one-shot workload handoff. Successful managed capture returns with no live runtime record. |
-| 1b98bf53 | Instance-checkpoint tier | Rewrite | Reuse upstream `nvx-snapshot --tier instance-checkpoint`; platform/workload-start have different admission rules. |
-| c9dc6828 | Paired scratch restore | Rewrite | Omit scratch and workload-identity redeclarations on restore; preserve read-only layer and live-share attachments. 5929a0ba removes obsolete `--restore-entropy` (upstream 5a92c86f). 80da9e6d allows absent original scratch and checks complete capture publication. |
+| ced8288b | Snapshot / processors | Separate PR | Not implemented in this branch; see the stacked follow-up note below. |
+| 1f67500f | Snapshot config live share | Separate PR | Not implemented in this branch. |
+| 82e93566 | Snapshot console namespace | Separate PR | Not implemented in this branch. |
+| 80d21fd9 | Private snapshot parent | Separate PR | Not implemented in this branch. |
+| 9fba310a | Capture before consuming scratch | Separate PR | Not implemented in this branch. |
+| 1b98bf53 | Instance-checkpoint tier | Separate PR | Not implemented in this branch. |
+| c9dc6828 | Paired scratch restore | Separate PR | Not implemented in this branch. |
 
-The seven PR #2 commits are consolidated into a reviewed rewrite rather than
-cherry-picked over incompatible schemas. Old fork snapshot-format-3 configs
+The seven PR #2 commits are excluded rather than cherry-picked over incompatible
+schemas in this branch. Old fork snapshot-format-3 configs
 must be reprovisioned; they are not interchangeable with upstream owner-format-3.
 
 ## What a CLI or control client notices since 10-09
@@ -78,9 +78,8 @@ must be reprovisioned; they are not interchangeable with upstream owner-format-3
   rejects forwards sharing a guest port and `5cfba311` rejects an unusable /30
   guest network in nvx-rs. These are not a general guest DNS/files API.
 - Fork-only commands remain `warmpool`, `setup-submodule`, and `sandbox execd`.
-  The stacked rewrite adds sandbox `--processors`, `--snapshot-destination`,
-  and `--restore-snapshot`. These are not on pristine upstream's sandbox parser.
-  Existing callers keep the one-vCPU default until they explicitly opt in.
+  This branch's managed sandbox parser remains one-vCPU and does not expose
+  `--processors`, `--snapshot-destination`, or `--restore-snapshot`.
 
 ### Wire and control protocol
 
@@ -116,12 +115,11 @@ and violate command serialization.
   The old PR #2 restore flag `--restore-entropy` is therefore obsolete, not
   a new 10-14 requirement. Upstream removal: `5a92c86f`.
 - Upstream's guest helper already supports instance checkpoints
-  (**upstream** `guest/common/nvx-snapshot:4-23`). The fork adds a sandbox
-  pre-handoff trigger, not a second snapshot engine.
+  (**upstream** `guest/common/nvx-snapshot:4-23`). This branch adds no managed
+  sandbox capture or restore path.
 - The fork config file is distinct from the OpenVMM snapshot manifest.
   **Upstream** `scripts/nvx_tools/sandbox_lifecycle.py:59-87` reserves mount
-  formats 2-6. The stacked branch adds config format 7 for snapshots or nondefault
-  vCPUs while preserving full mount metadata.
+  formats 2-6, unchanged in this branch.
 - Instance checkpoints have resume/claim semantics. A bare benchmark pool
   snapshot is not automatically a provisioned managed sandbox, and must not be
   advertised as such. Integrations must provision managed state separately.
@@ -145,18 +143,16 @@ The current review-repair checks are recorded in
 ```text
 Pristine 4acf7eb0, all scripts: 2 failed, 1089 passed, 20 skipped
 Product, all scripts: 1 failed, 1113 passed, 20 skipped
-Rewritten stack, all scripts: 1 failed, 1124 passed, 20 skipped
 ```
 
-The remaining rewritten-stack failure,
-`test_ci_change_detector_classifies_real_git_paths`, also fails on pristine:
-the host refuses a fixture commit on its default `main` branch. The second
+The historical `test_ci_change_detector_classifies_real_git_paths` failure
+was corrected by giving its fixture an explicit nondefault branch. The second
 pristine failure is fixed by the retained provenance-fixture isolation.
-No policy guard was disabled.
-Full-tree Ruff and strict Pyright pass. Final static checking also corrected
+Ruff lint and strict Pyright passed at the initial sync head; these results
+did not include Ruff's formatting gate. Final static checking also corrected
 retained warm-pool/test typing without changing the execd wire contract.
 The retained `guest_exit_prequeued` benchmark argument is already upstream
-(`scripts/nvx_tools/benchmark.py:1850`); the real warm-pool restore check exercises it.
+(**upstream** `scripts/nvx_tools/benchmark.py:1850`); the real warm-pool restore check exercises it.
 
 Real KVM, matching release, i9-14900K, 128 MiB / 1 vCPU, CPU 0 (P core),
 two excluded warmups and 20 retained samples per series:
@@ -171,7 +167,7 @@ The cold p50 is 45% above the historical baseline, but pristine is nearly
 identical on the same current host. This is not evidence of a fork regression.
 The host falls back to `intel.host.v1`, with a measured 24.7-ms CPU fingerprint
 step in the one-shot log. Time ABI work and shared-host load also differ from
-the old campaign; causal attribution is unverified. Two restore attempts were
+the earlier evaluation; causal attribution is unverified. Two restore attempts were
 remeasured by upstream's harness because peak RSS was missed at the marker.
 These figures are historical measurements, not a fresh performance check of
 the review repairs.
@@ -183,16 +179,14 @@ affinity 0,2,4,6,8,10,12,14. Pinning the SMP suite to CPU 0 alone was invalid;
 pristine reproduces that failure. The corrected CPU matrix also verifies
 successful cross-class restore rather than the fork's obsolete rejection oracle.
 
-The stacked branch additionally passed real two-vCPU instance-checkpoint
-capture, deletion of the original scratch, paired-scratch restore without
-`--scratch`, managed exec, and three requests on the same persistent execd.
-Capture publication requires manifest, state, memory, and paired scratch.
-The fork init-agent was repacked into the matching release initramfs with
-upstream's packer, preserving executable and root-directory permissions.
-Five affected default KVM scenarios passed again with that guest.
 Warm-pool fill and restore churn also passed with zero leaked claims.
 
 This verifies runtime against a digest-checked matching OpenVMM release, not an
 OpenVMM source build. Windows and opt-in-only correctness scenarios were not run.
-Fork-only PRs: [product #6](https://github.com/agent-next/nvx/pull/6) and
-[stacked snapshot/processors #7](https://github.com/agent-next/nvx/pull/7).
+Fork-only PR: [product #6](https://github.com/agent-next/nvx/pull/6).
+
+## Stacked follow-up, not included in this branch
+
+[PR #7](https://github.com/agent-next/nvx/pull/7) tracks the seven excluded
+snapshot/processors commits. Its implementation and verification belong to that
+PR, not this branch.

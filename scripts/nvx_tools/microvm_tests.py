@@ -5778,6 +5778,11 @@ def run_snapshot_class_matrix(
         return
     performance, efficiency = classes
     capture_cpus = os.sched_getaffinity(0)
+    performance &= capture_cpus
+    efficiency &= capture_cpus
+    if not performance or not efficiency:
+        print("snapshot-class-matrix: skipped (caller affinity excludes a CPU class)")
+        return
     os.sched_setaffinity(0, performance)
     try:
         with tempfile.TemporaryDirectory(prefix="nvx-class-matrix-") as temporary:

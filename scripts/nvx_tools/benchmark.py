@@ -282,10 +282,6 @@ def configure_parser(
     parser: argparse.ArgumentParser,
     repository_dir: Path,
 ) -> None:
-    default_cpus = ",".join(
-        str(cpu)
-        for cpu in sorted(apply_hybrid_cpu_filter(physical_cpu_representatives()))
-    )
     parser.description = (
         "Build and benchmark OpenVMM microVM boot or the host-side phase 2 "
         "snapshot foundations. No NVX VMM binary is built or run."
@@ -435,8 +431,11 @@ def configure_parser(
     )
     parser.add_argument(
         "--cpus",
-        default=default_cpus,
-        help=f"logical CPUs used for affinity, in taskset syntax (default: {default_cpus})",
+        default=None,
+        help=(
+            "logical CPUs used for affinity, in taskset syntax "
+            "(default: one per physical core; NVX_CPU_CLASS optionally selects a class)"
+        ),
     )
     parser.add_argument(
         "--host-cpu-reserve",
@@ -675,35 +674,49 @@ def _cpu_number(name: str) -> int:
 
 
 def cpu_frequency_clusters(classes: dict[int, set[int]]) -> list[set[int]]:
-    """Merge nearby maximum frequencies into CPU sets, lowest frequency first."""
+    """Group frequencies within 10% of each cluster's minimum, lowest first."""
     clusters: list[set[int]] = []
-    previous: int | None = None
+    minimum: int | None = None
     for frequency in sorted(classes):
-        if previous is not None and frequency <= previous * 1.10:
+        if minimum is not None and frequency <= minimum * 1.10:
             clusters[-1].update(classes[frequency])
         else:
             clusters.append(set(classes[frequency]))
-        previous = frequency
+            minimum = frequency
     return clusters
+
+
+def cpu_class_preference() -> str:
+    preference = os.environ.get("NVX_CPU_CLASS", "").strip().lower()
+    if preference not in ("", "all", "performance", "efficiency"):
+        raise common.ScriptError(
+            "NVX_CPU_CLASS must be all, performance, or efficiency "
+            f"(or unset), got {preference!r}"
+        )
+    return preference
 
 
 def apply_hybrid_cpu_filter(representatives: set[int]) -> set[int]:
     """Restrict representatives to one frequency class on hybrid parts.
 
-    Selects the highest-frequency (performance) class by default for consistent
-    benchmark placement. OpenVMM, not the frequency class, admits snapshots.
-    ``NVX_CPU_CLASS=all`` disables the filter; ``NVX_CPU_CLASS=efficiency``
-    selects the lowest-frequency class instead. Frequencies within 10% of
+    Unset, empty, or ``NVX_CPU_CLASS=all`` preserves all representatives.
+    ``performance`` selects the highest-frequency class; ``efficiency``
+    selects the lowest. OpenVMM, not this placement policy, admits snapshots.
+    Frequencies within 10% of
     each other are treated as one class: turbo-favored cores of the same
     physical type report slightly higher maxima and must not split it.
     """
-    preference = os.environ.get("NVX_CPU_CLASS", "performance").strip().lower()
+    preference = cpu_class_preference()
+    if preference in ("", "all"):
+        return representatives
     clusters = cpu_frequency_clusters(cpu_frequency_classes())
-    if len(clusters) < 2 or preference == "all":
+    if len(clusters) < 2:
         return representatives
     allowed = clusters[0] if preference == "efficiency" else clusters[-1]
     selected = {cpu for cpu in representatives if cpu in allowed}
-    return selected or representatives
+    if not selected:
+        raise common.ScriptError(f"NVX_CPU_CLASS={preference} selects no candidate CPU")
+    return selected
 
 
 def windows_physical_cpu_representatives() -> set[int]:

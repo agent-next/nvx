@@ -16,7 +16,6 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -99,9 +98,6 @@ MOUNTS_CONFIG_FORMATS = (
     SNAPSHOT_CONFIG_FORMAT,
 )
 OUTCOME_SCHEMA_VERSION = 1
-# A control pipe that breaks while an OpenVMM process is starting is transient
-# under boot storms: the next attempt spawns a fresh process and endpoint.
-CONTROL_RETRY_BACKOFF_S = (0.5, 1.0)
 # A managed boot that never opens its control endpoint almost never recovers,
 # but the endpoint wait otherwise costs a full timeout: the first start attempt
 # bounds that wait so a stalled boot is torn down and retried once with the
@@ -112,25 +108,6 @@ EXECD_POLL_S = 0.5
 EXECD_REQUEST_TIMEOUT_S = 30.0
 EXECD_RESPONSE_MARGIN_S = 30.0
 EXECD_UNBOUNDED_RESPONSE_S = 3_660.0
-
-
-def _with_control_retry(operation: str, action: Callable[[], None]) -> None:
-    for attempt in range(len(CONTROL_RETRY_BACKOFF_S) + 1):
-        try:
-            action()
-            return
-        # A closed managed endpoint can be an intentional guest rejection.
-        # Retry transport failures, not the protocol's terminal close signal.
-        except (BrokenPipeError, ConnectionResetError) as error:
-            if attempt == len(CONTROL_RETRY_BACKOFF_S):
-                raise
-            delay = CONTROL_RETRY_BACKOFF_S[attempt]
-            print(
-                f"sandbox {operation} attempt {attempt + 1} failed: {error}; "
-                f"retrying in {delay}s",
-                file=sys.stderr,
-            )
-            time.sleep(delay)
 
 
 def _write_json(path: Path, value: dict[str, Any], mode: int = 0o600) -> None:
@@ -1127,10 +1104,11 @@ def _start_first_wait_s() -> float:
 
 
 def _start_with_endpoint_retry(state_path: Path, timeout: float) -> None:
+    first_wait_s = min(timeout, _start_first_wait_s())
     try:
-        _start_once(state_path, timeout, endpoint_wait_s=_start_first_wait_s())
+        _start_once(state_path, timeout, endpoint_wait_s=first_wait_s)
     except TimeoutError as error:
-        if "did not become available" not in str(error):
+        if first_wait_s >= timeout or "did not become available" not in str(error):
             raise
         print(
             f"sandbox start attempt 1 failed: {error}; "
@@ -1151,9 +1129,7 @@ def start(state_path: Path, timeout: float) -> None:
         # Instance checkpoints are claimed by the first attempt, even if it fails.
         _start_once(state_path, timeout)
         return
-    _with_control_retry(
-        "start", lambda: _start_with_endpoint_retry(state_path, timeout)
-    )
+    _start_with_endpoint_retry(state_path, timeout)
 
 
 def _start_once(
@@ -1433,7 +1409,8 @@ def _start(
         with ControlSession.connect(
             Path(endpoint_value),
             capability,
-            timeout if endpoint_wait_s is None else endpoint_wait_s,
+            timeout,
+            endpoint_timeout=endpoint_wait_s,
         ) as session:
             if endpoint_owner is not None:
                 socket_identity = _socket_identity(Path(endpoint_value))
@@ -1514,11 +1491,12 @@ def _execd_read_request(connection: socket.socket) -> bytes:
     data = bytearray()
     while True:
         newline = data.find(b"\n")
+        request_size = newline if newline >= 0 else len(data)
+        if request_size > EXECD_MAX_REQUEST_BYTES:
+            raise ScriptError("sandbox execd request exceeds the 1 MiB limit")
         if newline >= 0:
             return bytes(data[:newline])
-        if len(data) > EXECD_MAX_REQUEST_BYTES:
-            raise ScriptError("sandbox execd request exceeds the 1 MiB limit")
-        chunk = connection.recv(65_536)
+        chunk = connection.recv(min(65_536, EXECD_MAX_REQUEST_BYTES + 1 - len(data)))
         if not chunk:
             if not data:
                 raise ScriptError("sandbox execd connection closed without a request")
@@ -1529,7 +1507,7 @@ def _execd_read_request(connection: socket.socket) -> bytes:
 def _execd_parse_request(raw: bytes) -> tuple[tuple[str, ...], int]:
     try:
         request = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeError, ValueError, RecursionError) as error:
         raise ScriptError("sandbox execd request is not valid JSON") from error
     if not isinstance(request, dict):
         raise ScriptError("sandbox execd request must be a JSON object")
@@ -1547,7 +1525,7 @@ def _execd_parse_request(raw: bytes) -> tuple[tuple[str, ...], int]:
     if (
         not isinstance(timeout_ms, int)
         or isinstance(timeout_ms, bool)
-        or timeout_ms < 0
+        or not 0 <= timeout_ms <= 0xFFFFFFFF
     ):
         raise ScriptError("sandbox execd request has an invalid timeout_ms")
     return tuple(cast(list[str], command)), timeout_ms
@@ -1617,10 +1595,23 @@ def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
     # cleanup happens. signal.signal only works from the
     # main thread (ValueError otherwise) -- a thread-hosted daemon keeps the
     # default behavior.
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    installed = False
     try:
         signal.signal(signal.SIGTERM, _execd_shutdown)
+        installed = True
     except ValueError:
         pass
+    try:
+        _exec_daemon(state_path, socket_path, timeout=timeout)
+    finally:
+        if installed:
+            signal.signal(signal.SIGTERM, previous_handler)
+
+
+def _exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
+    if os.name == "nt":
+        raise ScriptError("sandbox execd is unsupported on Windows")
     state_dir = _prepare_state_directory(state_path, create=False)
     runtime, capability = _load_running(state_dir)
     pid, start_time = _runtime_process(runtime)
