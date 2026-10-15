@@ -1,7 +1,4 @@
-# Upstream delta: agent-next/nvx `prod/hybrid-cpu-affinity` vs microsoft/nvx — 2026-10-09
-
-Analysis only; no rebase was performed and no code was changed upstream or here beyond
-this document.
+# Upstream delta: agent-next/nvx vs microsoft/nvx, 2026-10-09
 
 This is a historical comparison. The
 [10-14 sync](UPSTREAM-SYNC-20261014.md) supersedes its open compatibility questions:
@@ -11,10 +8,10 @@ Current ordinary commands apply CPU-class affinity only when explicitly requeste
 **Method.** Upstream remote added as `upstream` (https://github.com/microsoft/nvx.git) and
 fetched 2026-10-09. microsoft/nvx has **no `main`/`master` branch**; its default branch is
 `dev`, so `upstream/dev` is the comparison line throughout. Merge-base of
-`prod/hybrid-cpu-affinity` and `upstream/dev`:
+the historical fork tip and `upstream/dev`:
 
 - merge-base: `fc6fea5c0d6a4627c40b11174b47f18e04542d3a` ("Merge pull request #311 from
-  microsoft/code-documentation/benchmark-warmups-default-20261002-…", 2026-10-02)
+  the benchmark-warmups change", 2026-10-02)
 - upstream ahead: **537 commits** (446 non-merge + **91 merges**: 89 PR merges, PRs
   #66–#442, plus 2 non-PR "Merge NVX dev with…" syncs), tip `33bd2fe5` =
   `v0.1.0-dev.60b22d98647d-1-g33bd2fe5`, 55 dev-release tags since the fork point
@@ -172,13 +169,6 @@ start now report `ScriptError` (`87406b00`, #399); nvx-exit 32-bit wrap pinned
   management RPC lives in the OpenVMM submodule and cannot restore snapshots
   containing sandbox blocks (`doc/design/current-limits.md:22`) (unverified beyond
   the repo-side docs).
-- Unmerged branches signal more format churn coming:
-  `esaurez/streamed-snapshot-preprofile-20261006` (immutable streamed distro
-  snapshot attachments; filesystem-only workload restores without process identity),
-  `esaurez/nvx-snapshot-image-slots-20261007` (merges generation-bound storage with
-  microVM image slots), `esaurez/nvx-image-slots-20261005` (bind-once image slots,
-  "ABI 3"), `esaurez/microvm-state-control`, `esaurez/snapshot-restore-dev-20261007`
-  — none merged into `dev` as of 2026-10-09.
 
 ### 1.6 Sandbox one-shot path
 
@@ -200,7 +190,7 @@ start now report `ScriptError` (`87406b00`, #399); nvx-exit 32-bit wrap pinned
 
 ### 1.7 nvxhost / edge backend (#418)
 
-PR #418 (merge `c90c60b2`, branch `esaurez/nvxhost-edge-backend`, merged 2026-10-08,
+PR #418 (merge `c90c60b2`, merged 2026-10-08,
 +7526/−299, 5 commits): `82d944ab` (OpenVMM submodule pin for RAM-backed overlays),
 `e8030bfb` (Linux process runs until its last thread exits: `src/openvmm/platform/linux.rs`,
 `src/openvmm/process.rs`), `28ecbb5a` (data model moved to a new `aci_edge_sandboxes/model/`
@@ -257,11 +247,8 @@ immutable proxy env. An MXC `StatefulSandboxBackend` mapping is documented
 (`aci_edge_sandboxes/README.md:739`) with a proof-of-concept `nvx_backend` adapter not
 yet wired into MXC's wire contract.
 
-**Sibling `esaurez/*nvxhost*` branches** (`edge-nvxhost-proxy`/`nvxhost-edge-proxy`,
-`*-fsnet`, `*-denied-aliases`, `*-pre-time-abi`, `nvxhost-edge-host-cpu-profile`) look
-pending but their content was folded into #418 — verified via `log -S` on the README
-sections; they are history, not pending work. Actually-open next work:
-`esaurez/microvm-state-control`, the image-slot and streamed-snapshot branches (§1.5).
+The proxy, filesystem/network, denied-alias and host-profile documentation
+is included in #418, verified via `log -S` on the README sections.
 
 ### 1.8 Breaking changes (caller-facing)
 
@@ -298,20 +285,20 @@ sections; they are history, not pending work. Actually-open next work:
 
 ---
 
-## 2. Our patches on `prod/hybrid-cpu-affinity` vs upstream
+## 2. Historical fork patches vs upstream
 
-Our 13 commits (fork → tip `07adc613`):
+The branch contains 13 commits after the fork point (tip `07adc613`):
 
 | Commit | What it does | Upstream status of the same problem |
 |---|---|---|
 | `ec38aa01` fix(affinity) | Pin the nvx process tree to one CPU class (P-cores) on hybrid parts; `NVX_CPU_CLASS=efficiency\|all` override; fixes OpenVMM destination-CPU-contract failures when a vCPU migrates between P and E cores between capture and restore (`scripts/nvx.py:1004` `apply_hybrid_process_affinity`). | **Not fixed the same way.** Upstream's parallel answer is CPU *profiles*: Alder Lake profile pin `16237e29` (#394), host profiles (#404/#412), fingerprint checks `c2e166fb` (#411), `auto`→host fallback `00f8884d` (#435). Upstream stabilizes what CPUID the guest sees but has no process/class affinity pinning (`sched_setaffinity` appears only in `scripts/nvx_tools/host_time_probe.rs:45` for the probe itself). Whether profiles alone prevent the hybrid capture/restore mismatch on an i9-14900K is (unverified). |
 | `a4811e5e` test(provenance) | Isolate provenance fixture repos from host default-branch policy. | No direct equivalent found; upstream reworked provenance fixtures in #114 (`7407c3bd` aligns fixture with the current OpenVMM gitlink). (unverified) that it covers the same failure. |
 | `ac82a417` feat(setup) | `setup-submodule`: stage the installed release binary, `git submodule update --init openvmm`, restore — works around "download leaves `openvmm/` non-empty → submodule init fails" (PRODUCTION-NOTES §2). | **Still broken upstream as of `33bd2fe5`**: no commit touches the install-vs-submodule collision (searched `log -S'openvmm/target/release'`; nearest are #428 `2257313d` — release *selection order* — and `20fe103c` removing undeclared guest artifacts). Our workaround remains fork-only. |
-| `fa60c840` test(tree-kill) | Wait for async process-tree kills in contained-runner oracles (`scripts/test_adversarial.py`). | **Fixed upstream, more deeply**: PR #323 (`554fc45b`) `df532ce2` "wait for killed descendants in Linux process-tree cleanup" fixes the *oracle* (`scripts/nvx_tools/adversarial_oracles.py`) as well as the test. Upstream supersedes ours; drop ours on rebase. |
-| `5363c84e`, `141159c9`, `8430675` docs | Fork roadmap, one-shot operational facts, restore-under-load SLO + concurrency bug notes. | Documentation of our private measurements; no upstream equivalent. |
-| `3af39256` fix(benchmark) | `contains_output_line`: `rstrip(b"\r")` so `\r\r\n` console lines don't hide markers (~1/2000 false restore failures). | **Still broken upstream**: `upstream/dev:scripts/nvx_tools/benchmark.py:1294` still `removesuffix(b"\r")`. Candidate to upstream. |
+| `fa60c840` test(tree-kill) | Wait for async process-tree kills in contained-runner oracles (`scripts/test_adversarial.py`). | **Fixed upstream, more deeply**: PR #323 (`554fc45b`) `df532ce2` "wait for killed descendants in Linux process-tree cleanup" fixes the *oracle* (`scripts/nvx_tools/adversarial_oracles.py`) as well as the test, superseding this patch. |
+| `5363c84e`, `141159c9`, `8430675` docs | Historical documentation of one-shot behavior, restore-under-load measurements and concurrency failures. | No upstream equivalent found for the measurements. |
+| `3af39256` fix(benchmark) | `contains_output_line`: `rstrip(b"\r")` so `\r\r\n` console lines don't hide markers (~1/2000 false restore failures). | **Still broken upstream**: `upstream/dev:scripts/nvx_tools/benchmark.py:1294` still `removesuffix(b"\r")`. |
 | `041c67a7` feat(warmpool) | Pre-captured snapshot pool manager (`scripts/nvx_tools/warmpool.py`, 313 lines) + `05695641` CPU-class portability matrix and pool class tags. | **No upstream equivalent** (no warm-pool/pool-manager code in `upstream/dev`); upstream #117 "pooled benchmark retry" is CI-side only. Fork-only feature. |
-| `a065aa3c` feat(sandbox) | EPIPE retry on provision/start + persistent exec daemon (`execd`, `scripts/nvx_tools/sandbox_lifecycle.py`). | **Partially overlapping, not equivalent**: upstream suppresses SIGPIPE at a barrier (`ea0abfbf`, #288), retries transient *Windows* pipe reconnects (`aa1f8ca4`, #67), stops output readers before closing descriptors (`d816655d`, #330). None is a provision/start EPIPE retry and there is no persistent exec daemon upstream; `7f1eff12` (#363) reaps direct-mode execs but per-exec, not via a daemon. |
+| `a065aa3c` feat(sandbox) | Persistent exec daemon (`execd`, `scripts/nvx_tools/sandbox_lifecycle.py`). | Upstream has no persistent exec daemon; `7f1eff12` (#363) reaps direct-mode execs but per-exec, not via a daemon. The current branch reuses upstream control transport handling unchanged. |
 | `9f9277af` fix(sandbox) | Retry `sandbox start` once with the full timeout when the managed control endpoint stalls (bounded first wait `NVX_START_FIRST_WAIT_S`=8 s; measured 0.2–0.46 % of starts). | **Different mitigation upstream for the same symptom family**: #441 `8513233b` fixes a capability-pipe start race and #439 `bb2ba395` makes failed starts publish an outcome report. Neither bounds/retries the endpoint-stall hang; whether #441 eliminates our 0.2–0.46 % stall is (unverified). |
 | `07adc613` | Merge #3 (boot-tail retry). | — |
 
@@ -411,9 +398,8 @@ only p50 is tracked — no p95):
 | `openvmm_snapshot_generation` | 1.3 | 4.8 | 1114.1 | — |
 
 Even the fastest upstream CI restore (MSHV 36.4 ms) is ~4–5× our bare-metal 7–9 ms,
-consistent with upstream's own nested-virt CI context; our warm-pool work targets
-exactly the bare-metal tier upstream does not track. `restore-under-load` as a concept
-exists only in our fork (`git grep` for under-load/contention over upstream `doc/`,
+consistent with upstream's own nested-virt CI context. `restore-under-load` measurements
+were found only in the fork (`git grep` for under-load/contention over upstream `doc/`,
 `scripts/`, `.github/` finds nothing).
 
 **Movement since the fork point** (merge-base block vs `60b22d98` block):
@@ -449,15 +435,11 @@ attempts" (`dc059809`).
 
 ---
 
-## 5. Takeaways for the fork
+## 5. Technical overlap
 
-1. Rebase is *not* trivial: #325 (time ABI), #394/#435 (CPU profiles) and #418 (edge
-   backend) each touch the same files as our affinity/warmpool/execd work
-   (`scripts/nvx.py`, `sandbox_lifecycle.py`, `benchmark.py`).
-2. Drop `fa60c840` in favor of upstream #323 on any rebase.
-3. `3af39256` (CR-stripping) is a clean upstream contribution candidate; nothing in
-   the task authorizes sending it today.
-4. Upstream has no warm pool and no persistent exec daemon — our two biggest
-   latency-oriented features remain differentiators.
-5. Watch the unmerged `esaurez/nvx-image-slots-*` and `streamed-snapshot-preprofile`
-   branches: they will reshape the snapshot layout our warmpool depends on.
+The time ABI (#325), CPU profiles (#394/#435), and edge backend (#418) overlap
+with the affinity, warm-pool, and execd changes in `scripts/nvx.py`,
+`sandbox_lifecycle.py`, and `benchmark.py`. Upstream #323 supersedes the
+process-tree cleanup test patch. At the inspected upstream revision there is
+no warm-pool manager or persistent exec daemon. Unmerged experiments are
+outside the scope of this comparison of the inspected `dev` tree.

@@ -219,8 +219,12 @@ mismatched lifecycle/workload metadata and duplicate topology rows.
 
 Use a fixed affinity set containing one logical processor per physical core
 and at least `N+2` processors for an `N`-vCPU guest. The additional processors
-cover VMM and device work. The default selector follows this policy; an
-explicit undersized `--cpus` set is rejected before measurement.
+cover VMM and device work. By default the selector uses one logical CPU per
+physical core without CPU-class filtering. `NVX_CPU_CLASS=performance` or
+`efficiency` optionally filters that default on hybrid hosts; unset, empty,
+or `all` leaves it unchanged. An explicit `--cpus` overrides class selection.
+Unknown class values are rejected. Any undersized set, including a filtered
+default, is rejected before measurement.
 
 The virtual-machine CI runners expose four cores as eight sibling logical
 CPUs. Their virtual-machine series deliberately use the fixed `0-7` set with
