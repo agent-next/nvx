@@ -1014,6 +1014,8 @@ def provision(
             "restore_snapshot": (
                 None if restore_snapshot is None else os.fspath(restore_snapshot)
             ),
+            "network_ingress": network_ingress,
+            "host_loopback_forward": host_loopback_forward,
         }
     )
     state_dir = _prepare_state_directory(state_path, create=True)
@@ -1046,12 +1048,20 @@ def provision(
 
 def snapshot_paths(config: dict[str, Any]) -> tuple[Path | None, Path | None]:
     """Validate capture/restore paths and their private device namespace."""
-    if os.name == "nt" and any(
+    has_snapshot = any(
         config.get(key) is not None
         for key in ("snapshot_destination", "restore_snapshot")
-    ):
+    )
+    if os.name == "nt" and has_snapshot:
         raise ScriptError(
             "--snapshot-destination and --restore-snapshot are unsupported on Windows"
+        )
+    if has_snapshot and (
+        config.get("host_loopback_forward") or config.get("network_ingress") == "allow"
+    ):
+        raise ScriptError(
+            "sandbox snapshots do not support --host-loopback-forward "
+            "or --network-ingress allow"
         )
     paths: list[Path | None] = []
     for key in ("snapshot_destination", "restore_snapshot"):
@@ -1059,11 +1069,12 @@ def snapshot_paths(config: dict[str, Any]) -> tuple[Path | None, Path | None]:
         if value is None:
             paths.append(None)
             continue
-        if not isinstance(value, str) or not value:
+        if not isinstance(value, str) or not value or "\0" in value:
             raise ScriptError(f"sandbox configuration has an invalid {key}")
         path = Path(value)
         if not path.is_absolute():
             raise ScriptError("sandbox snapshot path must be absolute")
+        path = Path(os.path.abspath(path))
         parent = path.parent
         try:
             metadata = parent.lstat()
@@ -1079,6 +1090,14 @@ def snapshot_paths(config: dict[str, Any]) -> tuple[Path | None, Path | None]:
             )
         if path.is_symlink():
             raise ScriptError("sandbox snapshot must not be a symbolic link")
+        path = parent.resolve() / path.name
+        endpoint = path.with_name(f"{path.name}.control.sock")
+        # Linux has 108 bytes including NUL; other supported Unix hosts have 104.
+        limit = 107 if sys.platform.startswith("linux") else 103
+        if len(os.fsencode(endpoint)) > limit:
+            raise ScriptError(
+                f"sandbox snapshot control socket path exceeds {limit} bytes"
+            )
         if key == "restore_snapshot":
             if not path.is_dir():
                 raise ScriptError("sandbox restore snapshot is not a plain directory")
@@ -1106,7 +1125,7 @@ def _start_first_wait_s() -> float:
 def _start_with_endpoint_retry(state_path: Path, timeout: float) -> None:
     first_wait_s = min(timeout, _start_first_wait_s())
     try:
-        _start_once(state_path, timeout, endpoint_wait_s=first_wait_s)
+        _start(state_path, timeout, endpoint_wait_s=first_wait_s)
     except TimeoutError as error:
         if first_wait_s >= timeout or "did not become available" not in str(error):
             raise
@@ -1115,31 +1134,22 @@ def _start_with_endpoint_retry(state_path: Path, timeout: float) -> None:
             "retrying once with the full timeout",
             file=sys.stderr,
         )
-        _start_once(state_path, timeout)
+        _start(state_path, timeout)
 
 
 def start(state_path: Path, timeout: float) -> None:
-    config_path = state_path / CONFIG_NAME
-    config = (
-        _read_json(config_path, "sandbox configuration", version=CONFIG_FORMATS)
-        if config_path.is_file()
-        else {}
-    )
-    if config.get("restore_snapshot") is not None:
-        # Instance checkpoints are claimed by the first attempt, even if it fails.
-        _start_once(state_path, timeout)
-        return
-    _start_with_endpoint_retry(state_path, timeout)
-
-
-def _start_once(
-    state_path: Path,
-    timeout: float,
-    endpoint_wait_s: float | None = None,
-) -> None:
     state_dir = _prepare_state_directory(state_path, create=False)
     with _LifecycleLock(state_dir, timeout):
-        _start(state_dir, timeout, endpoint_wait_s=endpoint_wait_s)
+        config = _read_json(
+            require_file(state_dir / CONFIG_NAME, "sandbox configuration"),
+            "sandbox configuration",
+            version=CONFIG_FORMATS,
+        )
+        if config.get("restore_snapshot") is not None:
+            # Instance checkpoints are claimed by the first attempt, even if it fails.
+            _start(state_dir, timeout)
+        else:
+            _start_with_endpoint_retry(state_dir, timeout)
 
 
 def _create_capability(path: Path, capability: bytes) -> None:
@@ -1241,12 +1251,6 @@ def _start(
     snapshot_destination, restore_snapshot = snapshot_paths(config)
     snapshot = restore_snapshot or snapshot_destination
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
-    kernel = require_file(
-        artifact_path(KernelBuildConstants.BINARY_NAME), "Linux direct kernel"
-    )
-    initrd = require_file(
-        artifact_path(AlpineBuildConstants.INITRAMFS_NAME), "initramfs"
-    )
     capability = secrets.token_bytes(32)
     if capability == bytes(32):
         raise AssertionError("secrets.token_bytes returned an all-zero capability")
@@ -1275,6 +1279,12 @@ def _start(
     if restore_snapshot is not None:
         command.extend(["--restore-snapshot", os.fspath(restore_snapshot)])
     else:
+        kernel = require_file(
+            artifact_path(KernelBuildConstants.BINARY_NAME), "Linux direct kernel"
+        )
+        initrd = require_file(
+            artifact_path(AlpineBuildConstants.INITRAMFS_NAME), "initramfs"
+        )
         command.extend(
             [
                 "--microvm-lifecycle",
@@ -1382,8 +1392,23 @@ def _start(
             runtime["control_socket_identity"] = socket_identity
         _write_json(state_dir / RUNTIME_NAME, runtime)
         if snapshot_destination is not None:
+            deadline = time.monotonic() + timeout
             try:
-                status = process.wait(timeout=timeout)
+                while True:
+                    if socket_identity is None and process.poll() is None:
+                        socket_identity = _socket_identity(Path(endpoint_value))
+                        if socket_identity is not None:
+                            runtime["control_socket_identity"] = socket_identity
+                            _write_json(state_dir / RUNTIME_NAME, runtime)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    try:
+                        status = process.wait(timeout=min(0.05, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if time.monotonic() >= deadline:
+                            raise
             except subprocess.TimeoutExpired as error:
                 raise ScriptError(
                     f"sandbox capture timed out after {timeout:g} seconds; "
@@ -1401,7 +1426,7 @@ def _start(
             _cleanup_snapshot_endpoint(
                 Path(endpoint_value),
                 endpoint_owner,
-                _socket_identity(Path(endpoint_value)),
+                socket_identity,
             )
             capability_path.unlink(missing_ok=True)
             (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
@@ -1422,8 +1447,6 @@ def _start(
         ended = process is None
         try:
             if process is not None:
-                if endpoint_owner is not None and socket_identity is None:
-                    socket_identity = _socket_identity(Path(endpoint_value))
                 # OpenVMM closes the control endpoint as it tears the VM down,
                 # before it publishes its outcome report and exits, so only a
                 # closed endpoint warrants waiting for it.

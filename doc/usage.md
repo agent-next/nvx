@@ -616,14 +616,16 @@ python3 scripts/nvx.py sandbox
 Network policy and live-share options configure only the `run` and `provision`
 launches.
 
-Managed checkpoints must retain their original absolute path, including the
-snapshot name and parent directory. Capture and restore use
+Capture and restore use
 `<snapshot-name>.control.sock` beside the checkpoint, reserved atomically by
 `<snapshot-name>.control.sock.lock`; different snapshots in the same private
 parent can run independently. Cleanup removes only the recorded owner's socket
 and reservation. After an interrupted start, stale reservations are kept rather
 than risking another VM's endpoint. Verify the owning OpenVMM has exited before
 removing a stale reservation manually.
+Restore may use a copy at a new private path; each restore generation gets its
+own endpoint and reservation. The immutable layers and live shares must still
+satisfy OpenVMM's checkpoint validation.
 
 An instance checkpoint is consumed by the first restore attempt, including a
 failed attempt. Restore is never retried automatically. After a restored sandbox
@@ -635,7 +637,9 @@ the initramfs containing the `sandboxsnap` pre-handoff trigger in
 `nvx-init-agent`. The stock `4acf7eb0` release initramfs does not contain that
 trigger: it enters managed handoff instead of capturing, and the host eventually
 reports a capture timeout. Increasing the timeout does not fix mismatched guest
-artifacts.
+artifacts. Managed restore also requires the patched OpenVMM built by
+`build-openvmm` and this tree's guest control-tty lifetime fix; older artifacts
+can fail the control handshake with `invalid control-session magic`.
 
 For a networked restore, re-pass the original `--network-profile` and complete
 egress/ingress policy, including allow/deny rules (or their policy file),
@@ -648,7 +652,11 @@ For example, a capture provisioned with `--net 10.0.0.2/24
 restore provision. Explicit localhost forwards and ingress `allow` listeners
 are process-local attachments and cannot be captured/restored. See the
 [network snapshot contract](design/machine-and-device-abi.md#bounded-state-snapshots-and-restore)
-and the restore example in `scripts/nvx_tools/microvm_tests.py` (lines 7302-7315).
+and the restore example in
+`scripts/nvx_tools/microvm_tests.py::_run_snapshot_tier`.
+Provision rejects these process-local listeners for both capture and restore.
+Snapshot paths are normalized, and provision rejects control socket paths that
+exceed the host's Unix socket path limit.
 
 | Option | Default | Description |
 | --- | --- | --- |

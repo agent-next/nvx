@@ -787,13 +787,15 @@ def command_sandbox(args: argparse.Namespace) -> None:
             "snapshot_destination": (
                 None
                 if args.snapshot_destination is None
-                else os.fspath(args.snapshot_destination.absolute())
+                else os.path.abspath(args.snapshot_destination)
             ),
             "restore_snapshot": (
                 None
                 if args.restore_snapshot is None
-                else os.fspath(args.restore_snapshot.absolute())
+                else os.path.abspath(args.restore_snapshot)
             ),
+            "network_ingress": args.network_ingress,
+            "host_loopback_forward": args.host_loopback_forward,
         }
     )
     if restore_snapshot is not None and args.net is not None:
@@ -1340,7 +1342,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     sandbox = subparsers.add_parser(
         "sandbox",
-        allow_abbrev=False,
         help="run or manage workloads over EROFS layers and private ext4 scratch",
     )
 

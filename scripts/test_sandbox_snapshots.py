@@ -281,8 +281,6 @@ class SandboxSnapshotTests(unittest.TestCase):
                 "allow",
                 "--network-proxy",
                 "192.168.127.1:3128",
-                "--host-loopback-forward",
-                "tcp:18080:80",
             ]
         )
         nvx.command_sandbox(args)
@@ -305,7 +303,6 @@ class SandboxSnapshotTests(unittest.TestCase):
             ("--network-egress-deny", "192.0.2.1:tcp:443"),
             ("--host-loopback", "allow"),
             ("--network-proxy", "192.168.127.1:3128"),
-            ("--host-loopback-forward", "tcp:18080:80"),
         ):
             self.assertEqual(command[command.index(option) + 1], value)
         self.assertNotIn("--net", command)
@@ -538,7 +535,7 @@ class SandboxSnapshotTests(unittest.TestCase):
             ConnectionResetError("first restore failure"),
         ):
             with (
-                patch.object(lifecycle, "_start_once", side_effect=error) as start,
+                patch.object(lifecycle, "_start", side_effect=error) as start,
                 self.assertRaises(type(error)),
             ):
                 lifecycle.start(state, 10)
@@ -563,10 +560,190 @@ class SandboxSnapshotTests(unittest.TestCase):
             patch.object(lifecycle, "require_file", side_effect=self.require),
             patch.object(lifecycle.subprocess, "Popen", return_value=process),
             patch.object(lifecycle, "_end_failed_start", return_value=0),
-            self.assertRaisesRegex(ScriptError, "capture.*timed out.*10"),
+            self.assertRaisesRegex(ScriptError, "capture.*timed out.*0.01"),
+        ):
+            lifecycle.start(state, 0.01)
+        self.assertFalse((state / lifecycle.CAPABILITY_NAME).exists())
+
+    @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
+    def test_capture_nonzero_exit_reports_real_process_outcome(self):
+        executable = self.root / "capture-failure"
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import json, pathlib, sys, time\n"
+            "time.sleep(0.1)\n"
+            "path = pathlib.Path(sys.argv[sys.argv.index('--microvm-report') + 1])\n"
+            "path.write_text(json.dumps({'schema_version': 1,"
+            "'outcome': {'category': 'guest_error', 'status_code': 125},"
+            "'network_policy': {}, 'teardown': {}}))\n"
+            "sys.exit(97)\n"
+        )
+        executable.chmod(0o700)
+        state = self.root / "state"
+        lifecycle.provision(
+            state,
+            self.launch,
+            **self.options,
+            timeout=10,
+            snapshot_destination=self.root / "snap",
+        )
+        with (
+            patch.object(lifecycle, "openvmm_binary_path", return_value=executable),
+            patch.object(lifecycle, "artifact_path", return_value=self.layer),
+            self.assertRaisesRegex(
+                ScriptError, "^OpenVMM exited during startup: guest_error status 125$"
+            ),
         ):
             lifecycle.start(state, 10)
+        self.assertFalse((state / lifecycle.RUNTIME_NAME).exists())
         self.assertFalse((state / lifecycle.CAPABILITY_NAME).exists())
+        self.assertFalse((self.root / "snap.control.sock.lock").exists())
+
+    @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
+    def test_capture_preserves_socket_replaced_after_recording_identity(self):
+        state = self.root / "state"
+        destination = self.root / "snap"
+        endpoint = self.root / "snap.control.sock"
+        lifecycle.provision(
+            state,
+            self.launch,
+            **self.options,
+            timeout=10,
+            snapshot_destination=destination,
+        )
+        original = self.unix_socket()
+        replacement = self.unix_socket()
+        self.addCleanup(original.close)
+        self.addCleanup(replacement.close)
+        process = MagicMock(pid=os.getpid())
+        process.poll.return_value = None
+
+        def launch(*_args: Any, **_kwargs: Any) -> MagicMock:
+            original.bind(str(endpoint))
+            return process
+
+        def captured(timeout: float) -> int:
+            runtime = json.loads((state / lifecycle.RUNTIME_NAME).read_text())
+            self.assertEqual(
+                runtime["control_socket_identity"], lifecycle._socket_identity(endpoint)
+            )
+            endpoint.unlink()
+            replacement.bind(str(endpoint))
+            destination.mkdir()
+            for name in ("manifest.bin", "state.bin", "memory.bin", "scratch.img"):
+                (destination / name).touch()
+            return 0
+
+        process.wait.side_effect = captured
+        with (
+            patch.object(lifecycle, "require_file", side_effect=self.require),
+            patch.object(lifecycle.subprocess, "Popen", side_effect=launch),
+        ):
+            lifecycle.start(state, 10)
+        self.assertTrue(endpoint.exists())
+        self.assertTrue(Path(f"{endpoint}.lock").exists())
+
+    @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
+    def test_snapshot_listeners_are_rejected_before_provision(self):
+        restore = self.root / "restore"
+        restore.mkdir()
+        for snapshot_option, path in (
+            ("--snapshot-destination", self.root / "capture"),
+            ("--restore-snapshot", restore),
+        ):
+            for option, value in (
+                ("--host-loopback-forward", "tcp:18080:80"),
+                ("--network-ingress", "allow"),
+            ):
+                with self.subTest(snapshot=snapshot_option, option=option):
+                    state = self.root / "state"
+                    args = nvx.parse_args(
+                        [
+                            "sandbox",
+                            "provision",
+                            "--state-dir",
+                            str(state),
+                            "--layer",
+                            f"distro,{self.layer},11111111-1111-1111-1111-111111111111",
+                            snapshot_option,
+                            str(path),
+                            option,
+                            value,
+                        ]
+                    )
+                    with self.assertRaisesRegex(ScriptError, "do not support"):
+                        nvx.command_sandbox(args)
+                    self.assertFalse(state.exists())
+                    options: dict[str, Any] = {
+                        **self.options,
+                        option[2:].replace("-", "_"): (
+                            (value,) if option == "--host-loopback-forward" else value
+                        ),
+                    }
+                    with self.assertRaisesRegex(ScriptError, "do not support"):
+                        lifecycle.provision(
+                            state,
+                            self.launch,
+                            **options,
+                            timeout=10,
+                            snapshot_destination=(
+                                path
+                                if snapshot_option == "--snapshot-destination"
+                                else None
+                            ),
+                            restore_snapshot=(
+                                path
+                                if snapshot_option == "--restore-snapshot"
+                                else None
+                            ),
+                        )
+                    self.assertFalse(state.exists())
+
+    @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
+    def test_snapshot_paths_normalize_and_bound_encoded_endpoint_length(self):
+        nested = self.root / "nested"
+        nested.mkdir()
+        path = nested / ".." / "snap"
+        normalized, _ = lifecycle.snapshot_paths({"snapshot_destination": str(path)})
+        self.assertEqual(normalized, self.root / "snap")
+        for name in ("x" * 108, "\N{SNOWMAN}" * 40):
+            with self.assertRaisesRegex(ScriptError, "socket path exceeds"):
+                lifecycle.snapshot_paths(
+                    {"snapshot_destination": str(self.root / name)}
+                )
+        with self.assertRaisesRegex(ScriptError, "invalid"):
+            lifecycle.snapshot_paths({"snapshot_destination": str(self.root / "bad\0")})
+
+    def test_sandbox_preserves_unambiguous_option_abbreviations(self):
+        args = nvx.parse_args(["sandbox", "start", "--state", str(self.root / "state")])
+        self.assertEqual(args.state_dir, self.root / "state")
+
+    def test_start_validates_state_before_reading_configuration(self):
+        with (
+            patch.object(lifecycle, "_read_json") as read,
+            self.assertRaisesRegex(ScriptError, "not a plain directory"),
+        ):
+            lifecycle.start(self.root / "missing", 10)
+        read.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
+    def test_restore_does_not_require_cold_boot_artifacts(self):
+        snapshot = self.root / "snap"
+        snapshot.mkdir()
+        state = self.root / "state"
+        lifecycle.provision(
+            state, self.launch, **self.options, timeout=10, restore_snapshot=snapshot
+        )
+        process = MagicMock(pid=123)
+        with (
+            patch.object(lifecycle, "openvmm_binary_path", return_value=self.layer),
+            patch.object(lifecycle, "artifact_path") as artifacts,
+            patch.object(lifecycle.subprocess, "Popen", return_value=process),
+            patch.object(lifecycle, "_process_start_time", return_value=456),
+            patch.object(lifecycle.ControlSession, "connect"),
+        ):
+            lifecycle.start(state, 10)
+        artifacts.assert_not_called()
 
     def test_cold_start_script_error_retains_outcome_diagnostics(self):
         state = self.root / "state"

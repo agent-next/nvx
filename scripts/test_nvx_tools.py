@@ -16532,11 +16532,11 @@ class SandboxTests(unittest.TestCase):
                 side_effect=common.ScriptError("sandbox is already running")
             )
             with (
-                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle, "_start", attempts),
                 patch.object(sandbox_lifecycle.time, "sleep") as sleep,
                 self.assertRaisesRegex(common.ScriptError, "already running"),
             ):
-                sandbox_lifecycle.start(state, 10)
+                sandbox_lifecycle._start_with_endpoint_retry(state, 10)
 
             attempts.assert_called_once()
             sleep.assert_not_called()
@@ -16555,11 +16555,11 @@ class SandboxTests(unittest.TestCase):
             )
             stderr = io.StringIO()
             with (
-                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle, "_start", attempts),
                 patch.object(sandbox_lifecycle.time, "sleep") as sleep,
                 patch.object(sys, "stderr", stderr),
             ):
-                sandbox_lifecycle.start(state, 10)
+                sandbox_lifecycle._start_with_endpoint_retry(state, 10)
 
             self.assertEqual(
                 attempts.call_args_list,
@@ -16583,12 +16583,12 @@ class SandboxTests(unittest.TestCase):
             )
             stderr = io.StringIO()
             with (
-                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle, "_start", attempts),
                 patch.object(sandbox_lifecycle.time, "sleep") as sleep,
                 patch.object(sys, "stderr", stderr),
                 self.assertRaisesRegex(TimeoutError, "did not become available"),
             ):
-                sandbox_lifecycle.start(state, 10)
+                sandbox_lifecycle._start_with_endpoint_retry(state, 10)
 
             self.assertEqual(attempts.call_count, 2)
             sleep.assert_not_called()
@@ -16600,11 +16600,11 @@ class SandboxTests(unittest.TestCase):
                 side_effect=TimeoutError("managed control response timed out")
             )
             with (
-                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle, "_start", attempts),
                 patch.object(sandbox_lifecycle.time, "sleep") as sleep,
                 self.assertRaisesRegex(TimeoutError, "response timed out"),
             ):
-                sandbox_lifecycle.start(state, 10)
+                sandbox_lifecycle._start_with_endpoint_retry(state, 10)
 
             attempts.assert_called_once()
             sleep.assert_not_called()
@@ -16623,11 +16623,11 @@ class SandboxTests(unittest.TestCase):
             )
             with (
                 patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": "3"}),
-                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle, "_start", attempts),
                 patch.object(sandbox_lifecycle.time, "sleep"),
                 patch.object(sys, "stderr", io.StringIO()),
             ):
-                sandbox_lifecycle.start(state, 10)
+                sandbox_lifecycle._start_with_endpoint_retry(state, 10)
 
             self.assertEqual(
                 attempts.call_args_list[0],
