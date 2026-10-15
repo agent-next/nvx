@@ -1476,7 +1476,9 @@ def _start(
             # that shows OpenVMM gone rather than runtime files that deprovision
             # cannot vouch for.
             if ended:
-                if os.name != "nt":
+                if os.name == "nt":
+                    (state_dir / CONTROL_SOCKET_NAME).unlink(missing_ok=True)
+                else:
                     if endpoint_owner is not None:
                         _cleanup_snapshot_endpoint(
                             Path(endpoint_value), endpoint_owner, socket_identity
