@@ -560,10 +560,98 @@ class SandboxSnapshotTests(unittest.TestCase):
             patch.object(lifecycle, "require_file", side_effect=self.require),
             patch.object(lifecycle.subprocess, "Popen", return_value=process),
             patch.object(lifecycle, "_end_failed_start", return_value=0),
-            self.assertRaisesRegex(ScriptError, "capture.*timed out.*0.01"),
+            self.assertRaisesRegex(
+                ScriptError,
+                "capture.*timed out.*0.01.*initramfs.*sandboxsnap.*artifacts match.*--timeout",
+            ),
         ):
             lifecycle.start(state, 0.01)
         self.assertFalse((state / lifecycle.CAPABILITY_NAME).exists())
+
+    @unittest.skipUnless(os.name == "posix", "Unix socket capture")
+    def test_capture_cleans_socket_bound_and_exited_between_polls(self):
+        state = self.root / "state"
+        destination = self.root / "snap"
+        endpoint = self.root / "snap.control.sock"
+        release = self.root / "release-capture"
+        executable = self.root / "capture"
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib, socket, sys, time\n"
+            f"release = pathlib.Path({str(release)!r})\n"
+            "deadline = time.monotonic() + 5\n"
+            "while not release.exists():\n"
+            "    if time.monotonic() >= deadline:\n"
+            "        sys.exit(98)\n"
+            "    time.sleep(0.005)\n"
+            "endpoint = sys.argv[sys.argv.index('--microvm-control-console') + 1][7:]\n"
+            "listener = socket.socket(socket.AF_UNIX)\n"
+            "listener.bind(endpoint)\n"
+            "path = pathlib.Path(sys.argv[sys.argv.index('--snapshot-destination') + 1])\n"
+            "path.mkdir()\n"
+            "for name in ('manifest.bin', 'state.bin', 'memory.bin', 'scratch.img'):\n"
+            "    (path / name).touch()\n"
+        )
+        executable.chmod(0o700)
+        lifecycle.provision(
+            state,
+            self.launch,
+            **self.options,
+            timeout=10,
+            snapshot_destination=destination,
+        )
+        popen = subprocess.Popen[bytes]
+        children: list[subprocess.Popen[bytes]] = []
+
+        def spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            child = popen(*args, **kwargs)
+            children.append(child)
+            self.addCleanup(child.wait, timeout=10)
+            return child
+
+        identity = lifecycle._socket_identity
+
+        def observe(path: Path) -> list[int] | None:
+            # Deterministically model polling that misses the entire bind/exit.
+            if children and children[0].poll() is None:
+                release.touch()
+                return None
+            return identity(path)
+
+        with (
+            patch.object(lifecycle, "openvmm_binary_path", return_value=executable),
+            patch.object(lifecycle, "artifact_path", return_value=self.layer),
+            patch.object(lifecycle.subprocess, "Popen", side_effect=spawn),
+            patch.object(lifecycle, "_socket_identity", side_effect=observe),
+        ):
+            lifecycle.start(state, 10)
+        self.assertEqual(children[0].returncode, 0)
+        self.assertTrue((destination / "manifest.bin").is_file())
+        self.assertFalse(endpoint.exists())
+        self.assertFalse(Path(f"{endpoint}.lock").exists())
+        self.assertFalse((state / lifecycle.RUNTIME_NAME).exists())
+        self.assertFalse((state / lifecycle.CAPABILITY_NAME).exists())
+        # Restore's endpoint reservation can now be acquired without manual cleanup.
+        owner = lifecycle._reserve_snapshot_endpoint(endpoint)
+        lifecycle._cleanup_snapshot_endpoint(endpoint, owner, None)
+
+    @unittest.skipUnless(os.name == "posix", "Unix socket ownership")
+    def test_exited_capture_cleanup_preserves_foreign_owner_and_non_socket(self):
+        endpoint = self.root / "snap.control.sock"
+        owner = lifecycle._reserve_snapshot_endpoint(endpoint)
+        listener = self.unix_socket()
+        self.addCleanup(listener.close)
+        listener.bind(str(endpoint))
+        lifecycle._cleanup_snapshot_endpoint(
+            endpoint, "foreign", None, capture_exited=True
+        )
+        self.assertTrue(endpoint.exists())
+        self.assertEqual(Path(f"{endpoint}.lock").read_text(), owner)
+        endpoint.unlink()
+        endpoint.write_text("not a socket")
+        lifecycle._cleanup_snapshot_endpoint(endpoint, owner, None, capture_exited=True)
+        self.assertEqual(endpoint.read_text(), "not a socket")
+        self.assertEqual(Path(f"{endpoint}.lock").read_text(), owner)
 
     @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
     def test_capture_nonzero_exit_reports_real_process_outcome(self):
