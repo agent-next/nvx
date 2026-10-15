@@ -16871,8 +16871,14 @@ class SandboxTests(unittest.TestCase):
                 sandbox_lifecycle.ManagedExecResult(0, "exit", b"hello", b"warn"),
                 sandbox_lifecycle.ManagedExecResult(1, "exit", b"\xff", b""),
             )
+            ready = threading.Event()
+
+            def attached() -> MagicMock:
+                ready.set()
+                return session
+
             context = MagicMock()
-            context.__enter__.return_value = session
+            context.__enter__.side_effect = attached
             running = [True]
             failure: list[BaseException] = []
 
@@ -16900,10 +16906,7 @@ class SandboxTests(unittest.TestCase):
                 worker = threading.Thread(target=serve)
                 worker.start()
                 try:
-                    deadline = time.monotonic() + 5
-                    while not socket_path.exists():
-                        self.assertLess(time.monotonic(), deadline)
-                        time.sleep(0.01)
+                    self.assertTrue(ready.wait(5), "daemon did not attach")
                     self.assertEqual(os.stat(socket_path).st_mode & 0o777, 0o600)
 
                     response = self._execd_request(

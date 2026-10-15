@@ -656,6 +656,12 @@ class PoolInputValidationTests(PoolFixture):
                 warmpool.prune_claims(pool, value)
         self.assertEqual(len(warmpool.pool_entry_paths(pool)), 1)
 
+    def test_extreme_positive_counts_fail_without_float_overflow(self) -> None:
+        pool = self.make_pool(1)
+        with self.assertRaises(common.ScriptError):
+            warmpool.acquire_entries(pool, 10**1000)
+        self.assertEqual(len(warmpool.pool_entry_paths(pool)), 1)
+
     def test_refill_preserves_existing_pool_shape_and_claims(self) -> None:
         pool = self.make_pool(1)
         manifest = {"processors": 1, "memory_mib": 128, "backend": "kvm"}

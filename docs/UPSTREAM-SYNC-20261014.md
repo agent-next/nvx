@@ -28,7 +28,7 @@ the inspected upstream tree, not that every issue was searched.
 | a4811e5e | Provenance fixture isolation | Keep | Fixture repositories use an explicit nondefault branch for reproducible commits; retained as 6d890682. |
 | ac82a417 | setup-submodule | Keep | Upstream release installs a binary into the uninitialized submodule directory; no preservation helper there. Retained as 5f0fd1a0; usage added in cc53b463. |
 | fa60c840 | Wait for async process-tree kills in tests | Drop | Upstream df532ce2 (fixes microsoft/nvx #320) waits for killed descendants and repairs the same oracles. |
-| 5363c84e | Production roadmap | Drop | Planning document removed. Neutral technical observations remain in PRODUCTION-NOTES.md. |
+| 5363c84e | Operational notes | Drop | Only neutral technical observations retained in PRODUCTION-NOTES.md. |
 | 141159c9 | One-shot operational facts | Keep | Historical technical observations, no upstream equivalent; 6f0503b9. |
 | 3af39256 | Doubled CR marker fix | Keep | Upstream `contains_output_line` removed only one CR; retained rstrip correction as fa97deab. |
 | 041c67a7 | Warm pool | Rewrite | Upstream has snapshot primitives but no fork pool CLI. Adapted capture signature as 34a0a8ef. Pool entries remain bare snapshots, not managed state directories. |
@@ -171,7 +171,7 @@ The cold p50 is 45% above the historical baseline, but pristine is nearly
 identical on the same current host. This is not evidence of a fork regression.
 The host falls back to `intel.host.v1`, with a measured 24.7-ms CPU fingerprint
 step in the one-shot log. Time ABI work and shared-host load also differ from
-the old campaign; causal attribution is unverified. Two restore attempts were
+the earlier evaluation; causal attribution is unverified. Two restore attempts were
 remeasured by upstream's harness because peak RSS was missed at the marker.
 These figures are historical measurements, not a fresh performance check of
 the review repairs.

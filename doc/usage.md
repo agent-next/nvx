@@ -74,7 +74,8 @@ python3 scripts/nvx.py setup-submodule
 
 Initializes the pinned OpenVMM source and nested submodules recursively.
 Preserves the downloaded `openvmm` binary (`openvmm.exe` on Windows), including
-when initialization fails.
+when initialization fails. Like `init`, this obtains full source history rather
+than a shallow checkout.
 
 ### `verify`
 

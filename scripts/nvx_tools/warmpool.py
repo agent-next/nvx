@@ -60,7 +60,11 @@ class PoolExhausted(ScriptError):
 
 
 def _require_positive(name: str, value: float) -> None:
-    if not math.isfinite(value) or value <= 0:
+    try:
+        valid = math.isfinite(value) and value > 0
+    except OverflowError:
+        valid = False
+    if not valid:
         raise ScriptError(f"{name} must be finite and greater than zero")
 
 
@@ -344,7 +348,7 @@ def command_bench(args: argparse.Namespace) -> int:
     _, _, executable = _require_artifacts(args.nvx_dir, args.openvmm_dir)
     pool_before = len(pool_entry_paths(args.pool_dir))
     if pool_before == 0:
-        raise ScriptError("pool is empty; run `warmpool fill` first")
+        raise ScriptError("pool is empty; fill a new --pool-dir first")
 
     lock = threading.Lock()
     samples_ms: list[float] = []
