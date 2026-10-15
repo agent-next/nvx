@@ -172,23 +172,131 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
    kernel logs; do not claim the host recovered or resume GPU workloads.
 
 VFIO guests cannot save/restore or hot-plug devices according to
-[the upstream limitations, lines 328-332][vfio-limitations]. Sharing the OpenVMM executable
-therefore does not imply sharing NVX's microVM lifecycle or snapshot contract.
+[the upstream limitations, lines 328-332][vfio-limitations]. Sharing the
+OpenVMM executable therefore does not imply sharing NVX's microVM lifecycle
+or snapshot contract.
 
 ## Measured cloud prerequisite failure
 
 A dedicated Lambda on-demand A10 VM, running Ubuntu kernel
-`6.8.0-60-generic`, produced:
+`6.8.0-60-generic`, was probed on 2026-10-15. The following selected commands
+and captured output come from the W19 evidence: `probe.sh`,
+`remote-probe.log` and `remote-vfio-bind.log`. They ran as root **inside the
+cloud VM**, not inside an OpenVMM guest. Commands from the two probe passes
+are grouped here for readability; output values are not synthesized.
+
+The KVM program is reproduced verbatim from `probe.sh`:
+
+```bash
+systemd-detect-virt
+python3 - <<'PY'
+import os, fcntl, json
+try:
+    fd=os.open("/dev/kvm",os.O_RDWR)
+    version=fcntl.ioctl(fd,0xae00,0)
+    vm=fcntl.ioctl(fd,0xae01,0)
+    print(json.dumps({"KVM_GET_API_VERSION":version,"KVM_CREATE_VM":"PASS"}))
+    os.close(vm)
+    os.close(fd)
+except OSError as exc:
+    print(json.dumps({"KVM_CREATE_VM":"FAIL","errno":exc.errno,"error":str(exc)}))
+PY
+find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 -type d | wc -l
+```
+
+Captured stdout:
 
 ```text
-$ systemd-detect-virt
 kvm
-$ # KVM_GET_API_VERSION and KVM_CREATE_VM ioctls
 {"KVM_GET_API_VERSION": 12, "KVM_CREATE_VM": "PASS"}
-$ find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 -type d | wc -l
 0
-$ lspci -Dnn -s 0000:06:00.0
-0000:06:00.0 3D controller [0302]: NVIDIA Corporation GA102GL [A10] [10de:2236] (rev a1)
+```
+
+For the bind diagnostic, the idle GPU originally used `nvidia`; its compute
+process query returned no rows. The probe loaded `vfio-pci` and
+`vfio_iommu_type1`, stopped `nvidia-persistenced`, and disabled persistence:
+
+```bash
+modprobe vfio-pci
+modprobe vfio_iommu_type1
+grep . /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader
+systemctl stop nvidia-persistenced
+nvidia-smi --persistence-mode=0
+```
+
+Captured stdout (the module loads, process query and service stop were silent):
+
+```text
+N
+Persistence mode is already Disabled for GPU 00000000:06:00.0.
+All done.
+```
+
+The original bind program's body was not retained in the raw log. This
+equivalent Python harness makes its recorded sysfs writes reproducible,
+including errors on close; the JSON below is the **original captured output**,
+not output invented by or rerun for this documentation update. This was a
+deliberate negative diagnostic on a disposable VM. The normal recipe above
+must stop when the IOMMU group is absent, rather than repeat this unbind:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+dev = Path("/sys/bus/pci/devices/0000:06:00.0")
+bdf = dev.name
+assert dev.joinpath("vendor").read_text().strip() == "0x10de"
+assert dev.joinpath("device").read_text().strip() == "0x2236"
+assert dev.joinpath("driver").resolve().name == "nvidia"
+for path, value in (
+    (dev / "driver/unbind", bdf),
+    (dev / "driver_override", "vfio-pci"),
+    (Path("/sys/bus/pci/drivers/vfio-pci/bind"), bdf),
+):
+    result = {"write": str(path), "value": value}
+    try:
+        with path.open("w") as stream:
+            stream.write(value)
+        result["result"] = "SUCCESS"
+    except OSError as exc:
+        result.update(result="FAIL", errno=exc.errno, error=str(exc))
+    print(json.dumps(result))
+print(json.dumps({
+    "driver_symlink_exists": dev.joinpath("driver").is_symlink(),
+    "driver": str(dev.joinpath("driver").resolve())
+              if dev.joinpath("driver").exists() else None,
+    "iommu_group_exists": dev.joinpath("iommu_group").exists(),
+}))
+PY
+```
+
+```text
+{"write": "/sys/bus/pci/devices/0000:06:00.0/driver/unbind", "value": "0000:06:00.0", "result": "SUCCESS"}
+{"write": "/sys/bus/pci/devices/0000:06:00.0/driver_override", "value": "vfio-pci", "result": "SUCCESS"}
+{"write": "/sys/bus/pci/drivers/vfio-pci/bind", "value": "0000:06:00.0", "result": "FAIL", "errno": 22, "error": "[Errno 22] Invalid argument"}
+{"driver_symlink_exists": false, "driver": null, "iommu_group_exists": false}
+```
+
+Kernel corroboration, with the full filtered output captured in the bind log:
+
+```text
+$ dmesg | grep -Ei 'vfio|06:00.0|DMAR|IOMMU' | tail -30
+[    2.768956] pci 0000:06:00.0: [10de:2236] type 00 class 0x030200 PCIe Endpoint
+[    3.685338] pci 0000:06:00.0: BAR 0 [mem 0xfc000000-0xfcffffff]
+[    3.685904] pci 0000:06:00.0: BAR 1 [mem 0x4000000000-0x47ffffffff 64bit pref]
+[    3.686835] pci 0000:06:00.0: BAR 3 [mem 0x4800000000-0x4801ffffff 64bit pref]
+[    3.688246] pci 0000:06:00.0: Max Payload Size set to 128 (was 256, max 256)
+[    3.688993] pci 0000:06:00.0: Enabling HDA controller
+[    3.689942] pci 0000:06:00.0: PME# supported from D0 D3hot
+[    3.690951] pci 0000:06:00.0: 32.000 Gb/s available PCIe bandwidth, limited by 2.5 GT/s PCIe x16 link at 0000:00:02.5 (capable of 252.048 Gb/s with 16.0 GT/s PCIe x16 link)
+[    3.763920] iommu: Default domain type: Translated
+[    3.764523] iommu: DMA domain TLB invalidation policy: lazy mode
+[    7.311947] [drm] Initialized nvidia-drm 0.0.0 20160202 for 0000:06:00.0 on minor 1
+[   28.199952] VFIO - User Level meta-driver version: 0.3
+[   52.122000] vfio-pci: probe of 0000:06:00.0 failed with error -22
+[   52.122048] vfio-pci: probe of 0000:06:00.0 failed with error -22
 ```
 
 The cloud VM's kernel had `CONFIG_INTEL_IOMMU=y` and `CONFIG_VFIO_PCI=m`,
@@ -198,8 +306,9 @@ binding it to `vfio-pci` failed with `EINVAL` (errno 22), and the kernel
 reported `vfio-pci: probe of 0000:06:00.0 failed with error -22`.
 
 This is a negative result for that VM as provisioned, not for OpenVMM on
-IOMMU-capable hardware. No nested OpenVMM guest was built or booted, so
-guest NVIDIA enumeration, driver initialization and CUDA remain unverified.
+IOMMU-capable hardware. The disposable VM was terminated after this failure;
+restoration was not tested there. No nested OpenVMM guest was built or booted,
+so guest NVIDIA enumeration, driver initialization and CUDA remain unverified.
 
 [machine-profiles]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/openvmm/openvmm_entry/src/cli_args/microvm.rs#L21-L28
 [standard-default]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/openvmm/openvmm_entry/src/cli_args.rs#L153-L156
