@@ -108,9 +108,8 @@ class OpenVmmBuildConfig:
             else OpenVMMBuildConstants.BINARY_NAME
         )
         target_directory = Path(
-            os.environ.get(
-                "CARGO_TARGET_DIR", OpenVMMBuildConstants.TARGET_DIRECTORY_NAME
-            )
+            os.environ.get("CARGO_TARGET_DIR")
+            or OpenVMMBuildConstants.TARGET_DIRECTORY_NAME
         )
         if not target_directory.is_absolute():
             target_directory = self.directory / target_directory

@@ -412,9 +412,16 @@ def patched_openvmm(config: OpenVmmBuildConfig) -> Generator[None, None, None]:
         yield
         return
     _revision, clean = openvmm_git_state(config.directory)
+    recovery = (
+        "Save any local work first, then remove leftover patches with "
+        f"{shlex.join(['git', '-C', os.fspath(config.directory), 'checkout', '.'])}"
+    )
     if not clean:
-        raise ScriptError("OpenVMM patches require a clean pinned submodule")
+        raise ScriptError(
+            f"OpenVMM patches require a clean pinned submodule. {recovery}"
+        )
     applied: list[Path] = []
+    operation_failed = False
     try:
         for path in patches:
             result = run_capture(
@@ -425,12 +432,24 @@ def patched_openvmm(config: OpenVmmBuildConfig) -> Generator[None, None, None]:
             require_success(result, f"OpenVMM patch application ({path.name})")
             applied.append(path)
         yield
+    except BaseException:
+        operation_failed = True
+        raise
     finally:
+        cleanup_errors: list[str] = []
         for path in reversed(applied):
-            result = run_capture(
-                ["git", "apply", "--reverse", path], cwd=config.directory
-            )
-            require_success(result, f"OpenVMM patch cleanup ({path.name})")
+            try:
+                result = run_capture(
+                    ["git", "apply", "--reverse", path], cwd=config.directory
+                )
+                require_success(result, f"OpenVMM patch cleanup ({path.name})")
+            except Exception as error:
+                cleanup_errors.append(str(error))
+        if cleanup_errors:
+            message = f"{'; '.join(cleanup_errors)}. {recovery}"
+            if not operation_failed:
+                raise ScriptError(message)
+            print(f"OpenVMM patch cleanup failed: {message}", file=sys.stderr)
 
 
 def record_openvmm_provenance(config: OpenVmmBuildConfig) -> None:

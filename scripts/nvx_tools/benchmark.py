@@ -35,6 +35,8 @@ from typing import IO, Literal, Protocol, TextIO, TypedDict, cast
 
 from . import benchmark_host, common, host_telemetry
 from .adversarial_oracles import ProcessTreeContainment
+from .build import patched_openvmm
+from .build_config import OpenVmmBuildConfig
 from .build_constants import (
     AlpineBuildConstants,
     BuildConstants,
@@ -5667,12 +5669,14 @@ def windows_to_wsl(path: Path) -> str:
 
 
 def build_whp(openvmm_dir: Path) -> Path:
-    run_checked(
-        ["cargo", "build", "--release", "-p", "openvmm", "--bin", "openvmm"],
-        cwd=openvmm_dir,
-    )
+    config = OpenVmmBuildConfig(directory=openvmm_dir)
+    with patched_openvmm(config):
+        run_checked(
+            ["cargo", "build", "--release", "-p", "openvmm", "--bin", "openvmm"],
+            cwd=openvmm_dir,
+        )
     return require_file(
-        openvmm_dir / "target" / "release" / OpenVMMBuildConstants.WINDOWS_BINARY_NAME,
+        config.openvmm_target_output("windows-msvc"),
         "native OpenVMM release binary",
     )
 
@@ -5680,18 +5684,19 @@ def build_whp(openvmm_dir: Path) -> Path:
 def build_kvm(openvmm_dir: Path) -> Path:
     openvmm_wsl = windows_to_wsl(openvmm_dir)
     script_wsl = windows_to_wsl(BENCHMARK_SCRIPTS_DIR / "build-openvmm-kvm.sh")
-    run_checked(
-        [
-            "wsl.exe",
-            "--cd",
-            openvmm_wsl,
-            "--exec",
-            "sh",
-            # A login shell is required because rustup exports cargo from the profile.
-            "-l",
-            script_wsl,
-        ]
-    )
+    with patched_openvmm(OpenVmmBuildConfig(directory=openvmm_dir)):
+        run_checked(
+            [
+                "wsl.exe",
+                "--cd",
+                openvmm_wsl,
+                "--exec",
+                "sh",
+                # A login shell is required because rustup exports cargo from the profile.
+                "-l",
+                script_wsl,
+            ]
+        )
     return require_file(
         openvmm_dir / "target" / "bench-linux" / "release" / "openvmm",
         "Linux OpenVMM release binary",
@@ -5699,20 +5704,22 @@ def build_kvm(openvmm_dir: Path) -> Path:
 
 
 def build_kvm_native(openvmm_dir: Path) -> Path:
-    run_checked(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "-p",
-            "openvmm",
-            "--bin",
-            "openvmm",
-        ],
-        cwd=openvmm_dir,
-    )
+    config = OpenVmmBuildConfig(directory=openvmm_dir)
+    with patched_openvmm(config):
+        run_checked(
+            [
+                "cargo",
+                "build",
+                "--release",
+                "-p",
+                "openvmm",
+                "--bin",
+                "openvmm",
+            ],
+            cwd=openvmm_dir,
+        )
     return require_file(
-        openvmm_dir / "target" / "release" / "openvmm",
+        config.openvmm_target_output("linux-gnu"),
         "Linux OpenVMM release binary",
     )
 

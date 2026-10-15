@@ -12,6 +12,14 @@
   gitlink-only unless the task explicitly requires coordinated NVX changes.
 - Preserve dirty state in both repositories. Do not reset, clean, switch, update,
   or synchronize the submodule over uncommitted work.
+- NVX carries an ordered public patch series in `openvmm-patches/`. Its build,
+  benchmark and OpenVMM test commands temporarily apply that series and require
+  the clean pinned submodule. For coordinated source edits, develop and run
+  package-scoped Cargo checks in a separate OpenVMM checkout with the series
+  applied, then export the changes into the series. Do not leave edits in the
+  pinned submodule or build the bare pin for NVX artifacts. See
+  [the patch workflow](../openvmm-patches/README.md). If a cancelled build leaves
+  patches behind, save any local work before `git -C openvmm checkout .`.
 
 ## Validation
 
@@ -61,7 +69,8 @@
   lists the failed step IDs from that workflow.
 - The session ends 59 minutes after it starts, setup included, on 4 vCPUs. Run the
   narrowest affected check first. Rebuild OpenVMM, which takes about 5 minutes and
-  4 GB, only when the `openvmm` gitlink changed or the cached binary is missing,
+  4 GB, only when the `openvmm` gitlink or patch series changed or the cached
+  binary is missing,
   and guest artifacts only when their inputs changed. Leave `test-openvmm-unit`,
   `test-openvmm`, `build-guest --guest all`, `verify-guest-determinism`, and
   `benchmark` to CI.
