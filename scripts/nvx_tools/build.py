@@ -10,6 +10,8 @@ import shutil
 import ssl
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict
 
@@ -387,6 +389,50 @@ def initramfs_provenance_inputs() -> dict[str, object]:
     }
 
 
+def _openvmm_patch_files() -> tuple[Path, ...]:
+    return tuple(sorted((BuildConstants.REPO_ROOT / "openvmm-patches").glob("*.patch")))
+
+
+def openvmm_patch_inputs() -> list[dict[str, str]]:
+    """Identify the public patch series applied to the pinned OpenVMM source."""
+    return [
+        {
+            "path": path.relative_to(BuildConstants.REPO_ROOT).as_posix(),
+            "sha256": sha256_file(path),
+        }
+        for path in _openvmm_patch_files()
+    ]
+
+
+@contextmanager
+def patched_openvmm(config: OpenVmmBuildConfig) -> Iterator[None]:
+    """Temporarily apply the public patch series to a clean pinned checkout."""
+    patches = _openvmm_patch_files()
+    if not patches:
+        yield
+        return
+    _revision, clean = openvmm_git_state(config.directory)
+    if not clean:
+        raise ScriptError("OpenVMM patches require a clean pinned submodule")
+    applied: list[Path] = []
+    try:
+        for path in patches:
+            result = run_capture(
+                ["git", "apply", "--check", path], cwd=config.directory
+            )
+            require_success(result, f"OpenVMM patch check ({path.name})")
+            result = run_capture(["git", "apply", path], cwd=config.directory)
+            require_success(result, f"OpenVMM patch application ({path.name})")
+            applied.append(path)
+        yield
+    finally:
+        for path in reversed(applied):
+            result = run_capture(
+                ["git", "apply", "--reverse", path], cwd=config.directory
+            )
+            require_success(result, f"OpenVMM patch cleanup ({path.name})")
+
+
 def record_openvmm_provenance(config: OpenVmmBuildConfig) -> None:
     """Bind an OpenVMM executable to the checked-out submodule revision."""
     source_revision, source_clean = openvmm_git_state(config.directory)
@@ -395,6 +441,7 @@ def record_openvmm_provenance(config: OpenVmmBuildConfig) -> None:
         "format": OpenVMMBuildConstants.PROVENANCE_FORMAT,
         "source_revision": source_revision,
         "source_clean": source_clean,
+        "patches": openvmm_patch_inputs(),
         "executable_sha256": sha256_file(executable),
     }
     path = config.build_directory / OpenVMMBuildConstants.PROVENANCE_NAME
@@ -475,22 +522,26 @@ def build_openvmm(
     )
     selected = platform or detect_openvmm_platform(config.backend)
     mode = config.openvmm_build_mode(selected)
-    _restore_openvmm_packages(config)
-    if mode == "musl":
-        _build_openvmm_musl(config, selected)
-    else:
-        _run_openvmm_command(
-            [
-                "cargo",
-                "build",
-                "--release",
-                "-p",
-                OpenVMMBuildConstants.PACKAGE_NAME,
-                "--bin",
-                OpenVMMBuildConstants.BINARY_NAME,
-            ],
-            cwd=config.directory,
-        )
+    patch_inputs = openvmm_patch_inputs()
+    with patched_openvmm(config):
+        _restore_openvmm_packages(config)
+        if mode == "musl":
+            _build_openvmm_musl(config, selected)
+        else:
+            _run_openvmm_command(
+                [
+                    "cargo",
+                    "build",
+                    "--release",
+                    "-p",
+                    OpenVMMBuildConstants.PACKAGE_NAME,
+                    "--bin",
+                    OpenVMMBuildConstants.BINARY_NAME,
+                ],
+                cwd=config.directory,
+            )
+    if patch_inputs != openvmm_patch_inputs():
+        raise ScriptError("OpenVMM patches changed during the build")
     source = require_file(
         config.openvmm_target_output(selected),
         f"OpenVMM {config.openvmm_target(selected)} release binary",

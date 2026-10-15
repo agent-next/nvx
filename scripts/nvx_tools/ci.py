@@ -10,6 +10,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .build import patched_openvmm
+from .build_config import OpenVmmBuildConfig
 from .build_constants import (
     AlpineBuildConstants,
     KernelBuildConstants,
@@ -110,7 +112,7 @@ CI_DOCUMENTATION_PATHS = re.compile(r"^(doc/|.*\.md$)", re.IGNORECASE)
 # tests boot, the Rust crates that test-aci-edge-sandboxes runs, the CLI and
 # workflows that drive the suites, and the runners.
 CI_TEST_INPUT_PATHS = re.compile(
-    r"^(openvmm($|/)|aci_edge_sandboxes/|nvx-rs/|azurelinux/|"
+    r"^(openvmm($|/)|openvmm-patches/|aci_edge_sandboxes/|nvx-rs/|azurelinux/|"
     r"\.github/workflows/"
     r"(ci|build-openvmm-binary|run-nvx-microvm-tests|run-platform)\.yml$|"
     r"\.github/actions/(build-guest-artifacts|build-openvmm|checkout-openvmm|"
@@ -122,21 +124,22 @@ CI_TEST_INPUT_PATHS = re.compile(
 # Inputs of the OpenVMM unit and documentation tests: the pinned revision, the
 # Rust release, the runner setup, and the code and workflow that run them.
 OPENVMM_UNIT_TEST_INPUT_PATHS = re.compile(
-    r"^(openvmm($|/)|rust-toolchain\.toml$|scripts/setup/|"
+    r"^(openvmm($|/)|openvmm-patches/|rust-toolchain\.toml$|scripts/setup/|"
     r"\.github/workflows/ci\.yml$|"
     r"\.github/actions/(checkout-openvmm|sccache|setup-curl|validate-runner)/|"
-    r"scripts/nvx\.py$|scripts/nvx_tools/(__init__|build_constants|ci|common)\.py$)"
+    r"scripts/nvx\.py$|scripts/nvx_tools/"
+    r"(__init__|build|build_config|build_constants|ci|common|guests|ubuntu)\.py$)"
 )
 # The OpenVMM VMM tests also boot the NVX kernel and Alpine initramfs, so they
 # add the inputs of those artifacts' cache keys and of the job that builds them.
 OPENVMM_VMM_TEST_INPUT_PATHS = re.compile(
-    r"^(openvmm($|/)|rust-toolchain\.toml$|scripts/setup/|"
+    r"^(openvmm($|/)|openvmm-patches/|rust-toolchain\.toml$|scripts/setup/|"
     r"\.github/workflows/ci\.yml$|"
     r"\.github/actions/(build-guest-artifacts|checkout-openvmm|sccache|"
     r"setup-curl|validate-runner)/|"
     r"scripts/nvx\.py$|"
     r"scripts/nvx_tools/"
-    r"(__init__|build|build_config|build_constants|ci|common|guests)\.py$|"
+    r"(__init__|build|build_config|build_constants|ci|common|guests|ubuntu)\.py$|"
     r"SOURCE-MANIFEST\.json$|docker/Dockerfile$|kernel/|guest/(alpine|common)/)"
 )
 
@@ -556,6 +559,11 @@ def _prepare_openvmm_test_environment(
 
 
 def run_openvmm_unit_tests() -> None:
+    with patched_openvmm(OpenVmmBuildConfig(directory=OpenVMMBuildConstants.DIRECTORY)):
+        _run_openvmm_unit_tests()
+
+
+def _run_openvmm_unit_tests() -> None:
     require_file(
         OpenVMMBuildConstants.DIRECTORY / "Cargo.toml", "initialized OpenVMM submodule"
     )
@@ -605,6 +613,11 @@ def run_openvmm_unit_tests() -> None:
 
 
 def run_openvmm_tests(backend: str) -> None:
+    with patched_openvmm(OpenVmmBuildConfig(directory=OpenVMMBuildConstants.DIRECTORY)):
+        _run_openvmm_tests(backend)
+
+
+def _run_openvmm_tests(backend: str) -> None:
     validate_openvmm_test_backend(backend)
 
     require_file(

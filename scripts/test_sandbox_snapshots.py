@@ -371,7 +371,6 @@ class SandboxSnapshotTests(unittest.TestCase):
         snapshot.mkdir()
         for option, value in (
             ("--memory-mib", "256"),
-            ("--processors", "1"),
             ("--cmdline", ""),
             ("--entrypoint", "/bin/sh"),
             ("--arg", "hello"),
@@ -402,9 +401,35 @@ class SandboxSnapshotTests(unittest.TestCase):
                     )
                 )
 
-    def test_restore_never_redeclares_processors(self):
+    def test_restore_passes_expected_snapshot_processor_capacity(self):
         launch = dataclasses.replace(self.launch, processors=8)
-        self.assertNotIn("--processors", launch.openvmm_arguments(restore=True))
+        arguments = launch.openvmm_arguments(restore=True)
+        self.assertEqual(arguments[arguments.index("--processors") + 1], "8")
+
+    @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
+    def test_restore_accepts_processor_capacity_for_vmm_validation(self):
+        snapshot = self.root / "snap"
+        snapshot.mkdir()
+        state = self.root / "state"
+        nvx.command_sandbox(
+            nvx.parse_args(
+                [
+                    "sandbox",
+                    "provision",
+                    "--state-dir",
+                    str(state),
+                    "--layer",
+                    f"distro,{self.layer},11111111-1111-1111-1111-111111111111",
+                    "--restore-snapshot",
+                    str(snapshot),
+                    "--processors",
+                    "2",
+                ]
+            )
+        )
+        self.assertEqual(
+            json.loads((state / lifecycle.CONFIG_NAME).read_text())["processors"], 2
+        )
 
     @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
     def test_restore_rejects_only_network_address(self):
@@ -733,6 +758,45 @@ class SandboxSnapshotTests(unittest.TestCase):
         self.assertFalse(reservation.exists())
 
     @unittest.skipUnless(os.name == "posix", "shell guest trigger")
+    def test_managed_capture_keeps_a_raw_control_tty_open(self):
+        import pty
+
+        source = (
+            Path(__file__).parent.parent / "guest/common/nvx-init-agent"
+        ).read_text()
+        preparation = source.split("mount_live_shares\n", 1)[1].split(
+            "# Capture after assembling", 1
+        )[0]
+        master, slave = pty.openpty()
+        try:
+            script = (
+                "workload_lifecycle=managed\ncontrol_tty=$1\nruntime=$2\n"
+                'fatal() { echo "$*" >&2; exit 1; }\n'
+                + preparation
+                + '\nexec "$3" -c \'import os, termios; '
+                "s = termios.tcgetattr(9); "
+                "assert not s[3] & (termios.ECHO | termios.ICANON); "
+                "assert os.isatty(9)'\n"
+            )
+            subprocess.run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    script,
+                    "prepare",
+                    os.ttyname(slave).removeprefix("/dev/"),
+                    str(self.root),
+                    sys.executable,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    @unittest.skipUnless(os.name == "posix", "shell guest trigger")
     def test_guest_trigger_runs_exact_token_before_managed_handoff(self):
         source = (
             Path(__file__).parent.parent / "guest/common/nvx-init-agent"
@@ -761,7 +825,7 @@ class SandboxSnapshotTests(unittest.TestCase):
         self.assertLess(
             source.index("failed to assemble the container overlay"), capture
         )
-        self.assertLess(capture, source.index('if [ "$workload_lifecycle" = managed ]'))
+        self.assertLess(capture, source.index("NVX-SANDBOX-READY: managed"))
 
     @staticmethod
     def unix_socket() -> socket.socket:

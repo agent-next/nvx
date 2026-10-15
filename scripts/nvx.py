@@ -670,7 +670,6 @@ def command_sandbox(args: argparse.Namespace) -> None:
     operation = args.sandbox_operation
     restore_owned = (
         "memory_mib",
-        "processors",
         "cmdline",
         "entrypoint",
         "sandbox_arg",

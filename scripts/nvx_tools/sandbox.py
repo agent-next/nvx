@@ -576,7 +576,7 @@ class SandboxLaunch:
 
     def openvmm_arguments(self, *, restore: bool = False) -> list[str]:
         arguments = ["--machine", "microvm"]
-        if self.processors != 1 and not restore:
+        if self.processors != 1:
             arguments.extend(("--processors", str(self.processors)))
         for layer in self.ordered_layers():
             arguments.extend(
