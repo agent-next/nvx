@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -106,7 +107,13 @@ class OpenVmmBuildConfig:
             if platform == "windows-msvc"
             else OpenVMMBuildConstants.BINARY_NAME
         )
-        target_directory = self.directory / OpenVMMBuildConstants.TARGET_DIRECTORY_NAME
+        target_directory = Path(
+            os.environ.get(
+                "CARGO_TARGET_DIR", OpenVMMBuildConstants.TARGET_DIRECTORY_NAME
+            )
+        )
+        if not target_directory.is_absolute():
+            target_directory = self.directory / target_directory
         if self.openvmm_build_mode(platform) == "musl":
             target_directory /= self.openvmm_target(platform)
         return target_directory / OpenVMMBuildConstants.BUILD_PROFILE / executable

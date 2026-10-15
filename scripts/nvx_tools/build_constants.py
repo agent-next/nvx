@@ -411,6 +411,7 @@ class ReleaseBuildConstants:
         "data/windows-whp-virtual-machine.csv",
         "docker",
         "kernel",
+        "openvmm-patches",
         "scripts",
         ".dockerignore",
         ".gitattributes",

@@ -2453,6 +2453,11 @@ class CliTests(unittest.TestCase):
 
 
 class CiTests(unittest.TestCase):
+    def setUp(self):
+        patches = patch.object(build, "_openvmm_patch_files", return_value=())
+        patches.start()
+        self.addCleanup(patches.stop)
+
     def test_openvmm_unit_tests_run_nextest_and_doctests(self):
         with tempfile.TemporaryDirectory() as temporary:
             openvmm = Path(temporary) / "openvmm"
@@ -3235,6 +3240,7 @@ class CiConfigurationTests(unittest.TestCase):
             ((), (False, True, False, False)),
             (("doc/ci.md", "README.md", "DOC/Guide.MD"), (False, False, False, False)),
             (("openvmm",), (True, True, True, True)),
+            (("openvmm-patches/0001-fix.patch",), (True, True, True, True)),
             (("rust-toolchain.toml",), (True, True, True, True)),
             (("scripts/setup/setup-windows-whp.ps1",), (True, True, True, True)),
             (("scripts/setup/README.md",), (True, False, True, True)),
@@ -3245,8 +3251,8 @@ class CiConfigurationTests(unittest.TestCase):
             (("scripts/nvx.py",), (True, True, True, True)),
             (("scripts/nvx_tools/ci.py",), (True, True, True, True)),
             (("scripts/nvx_tools/common.py",), (True, True, True, True)),
-            (("scripts/nvx_tools/build.py",), (True, True, False, True)),
-            (("scripts/nvx_tools/guests.py",), (True, True, False, True)),
+            (("scripts/nvx_tools/build.py",), (True, True, True, True)),
+            (("scripts/nvx_tools/guests.py",), (True, True, True, True)),
             (("kernel/config-microvm",), (True, True, False, True)),
             (("kernel/patches/0001-example.patch",), (True, True, False, True)),
             (("guest/common/init",), (True, True, False, True)),
@@ -4046,7 +4052,8 @@ python3() {
             platform_workflow,
         ):
             self.assertNotIn("path: .", configuration)
-        self.assertIn("openvmm-binary-v6-${{ inputs.backend }}-", build_action)
+        self.assertIn("openvmm-binary-v7-${{ inputs.backend }}-", build_action)
+        self.assertIn("'openvmm-patches/*.patch'", build_action)
         self.assertNotIn("openvmm-binary-v5-", build_action)
         self.assertNotIn("inputs.target", build_action)
         self.assertNotIn("inputs.build-mode", build_action)
@@ -5254,7 +5261,8 @@ Write-Output (Get-ActionsRunnerLabels)
         )
         self.assertEqual(
             build_action.count(
-                "${{ hashFiles('rust-toolchain.toml') }}-${{ steps.openvmm.outputs.sha }}"
+                "${{ hashFiles('rust-toolchain.toml', 'openvmm-patches/*.patch', "
+                "'scripts/nvx_tools/build.py') }}-${{ steps.openvmm.outputs.sha }}"
             ),
             4,
         )
@@ -7019,6 +7027,11 @@ class AlpineSourceCollectionTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    def setUp(self):
+        patches = patch.object(build, "_openvmm_patch_files", return_value=())
+        patches.start()
+        self.addCleanup(patches.stop)
+
     def test_build_config_owns_standard_runtime_paths(self):
         config = build_config.BuildConfig()
         alpine = config.initramfs_config("alpine")

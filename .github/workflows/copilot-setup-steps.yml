@@ -219,7 +219,7 @@ jobs:
           path: |
             build/openvmm.provenance.json
             openvmm/target/release/openvmm
-          key: openvmm-binary-v6-kvm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ steps.openvmm-cache.outputs.sha }}
+          key: openvmm-binary-v7-kvm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'openvmm-patches/*.patch', 'scripts/nvx_tools/build.py') }}-${{ steps.openvmm-cache.outputs.sha }}
 
       # Native guest builds are the in-session way to rebuild guest artifacts.
       # Install the Debian/Ubuntu prerequisites listed in doc/setup.md. Alpine's

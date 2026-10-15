@@ -30,6 +30,7 @@ from .build import (
     build_docker_linux_source,
     initramfs_provenance_inputs,
     kernel_provenance_inputs,
+    openvmm_patch_inputs,
 )
 from .build_config import DockerBuildConfig
 from .build_constants import (
@@ -1086,6 +1087,7 @@ def _validate_openvmm_provenance(
         or provenance.get("source_revision") != revision
         or provenance.get("source_clean") is not True
         or not source_clean
+        or provenance.get("patches", []) != openvmm_patch_inputs()
         or provenance.get("executable_sha256") != sha256_file(binary)
     ):
         raise ScriptError(
@@ -1215,6 +1217,7 @@ def _packaged_source_manifest(
     ubuntu_section = cast(dict[str, object], ubuntu)
     distribution_section["version"] = release_version
     openvmm_section["source_revision"] = openvmm_provenance["source_revision"]
+    openvmm_section["patches"] = openvmm_provenance.get("patches", [])
     openvmm_section["executable_sha256"] = sha256_file(
         release_root / "bin" / binary_name
     )
