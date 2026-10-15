@@ -451,6 +451,50 @@ class SandboxSnapshotTests(unittest.TestCase):
             nvx.command_sandbox(args)
         provision.assert_called_once()
 
+    @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
+    def test_restore_persists_lowered_policy_without_parser_private_state(self):
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir()
+        policy = self.root / "policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "allow": [{"to": [{"cidr": "192.0.2.0/24"}]}],
+                    "deny": [{"to": [{"cidr": "192.0.2.1/32"}]}],
+                }
+            )
+        )
+        state = self.root / "state"
+        args = nvx.parse_args(
+            [
+                "sandbox",
+                "provision",
+                "--state-dir",
+                str(state),
+                "--layer",
+                f"distro,{self.layer},11111111-1111-1111-1111-111111111111",
+                "--restore-snapshot",
+                str(snapshot),
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-egress-policy-file",
+                str(policy),
+            ]
+        )
+        # command_sandbox must also work for callers constructing a Namespace,
+        # without any attribute synthesized by parse_args' old argv scanner.
+        vars(args).pop("sandbox_restore_overrides", None)
+        nvx.command_sandbox(args)
+        policy.unlink()
+        config = json.loads((state / lifecycle.CONFIG_NAME).read_text())
+        self.assertEqual(config["network_profile"], "portable")
+        self.assertEqual(config["network_egress"], "deny")
+        self.assertEqual(config["network_egress_allow"], ["192.0.2.0/24"])
+        self.assertEqual(config["network_egress_deny"], ["192.0.2.1/32"])
+        self.assertIsNone(config["net"])
+
     def test_snapshot_trigger_token_is_reserved(self):
         with self.assertRaisesRegex(ScriptError, "owned by the sandbox profile"):
             self.launch.kernel_command_line("quiet sandboxsnap")
