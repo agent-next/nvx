@@ -55,7 +55,10 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
    Follow `Guide/src/user_guide/openvmm/vfio.md:63-97`. No-IOMMU mode
    is unsupported. Do not weaken interrupt remapping as an automatic fix.
 
-3. Build the `openvmm` binary using its documented Linux build prerequisites.
+3. With the documented Linux build prerequisites installed, run
+   `cargo xflowey restore-packages` then `cargo build -p openvmm --release`
+   from the submodule directory. See
+   `Guide/src/dev_guide/getting_started/build_openvmm.md:14-38`.
    Use a separate general-purpose x86-64 guest kernel/initramfs with ACPI,
    PCI/PCIe, PCI MSI, PCI MMCONFIG, serial console and initramfs support.
    For `nvidia-smi`, include matching NVIDIA kernel modules, firmware and
@@ -80,3 +83,29 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
 VFIO guests cannot save/restore or hot-plug devices according to
 `Guide/src/user_guide/openvmm/vfio.md:328-332`. Sharing the OpenVMM executable
 therefore does not imply sharing NVX's microVM lifecycle or snapshot contract.
+
+## Measured cloud prerequisite failure
+
+A dedicated Lambda on-demand A10 VM, running Ubuntu kernel
+`6.8.0-60-generic`, produced:
+
+```text
+$ systemd-detect-virt
+kvm
+$ # KVM_GET_API_VERSION and KVM_CREATE_VM ioctls
+{"KVM_GET_API_VERSION": 12, "KVM_CREATE_VM": "PASS"}
+$ find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 -type d | wc -l
+0
+$ lspci -Dnn -s 0000:06:00.0
+0000:06:00.0 3D controller [0302]: NVIDIA Corporation GA102GL [A10] [10de:2236] (rev a1)
+```
+
+The guest-host kernel had `CONFIG_INTEL_IOMMU=y` and `CONFIG_VFIO_PCI=m`,
+but no ACPI DMAR/IVRS tables or GPU `iommu_group` link. With unsafe
+no-IOMMU mode disabled, detaching the idle GPU from `nvidia` succeeded;
+binding it to `vfio-pci` failed with `EINVAL` (errno 22), and the kernel
+reported `vfio-pci: probe of 0000:06:00.0 failed with error -22`.
+
+This is a negative result for that VM as provisioned, not for OpenVMM on
+IOMMU-capable hardware. No nested OpenVMM guest was built or booted, so
+guest NVIDIA enumeration, driver initialization and CUDA remain unverified.
