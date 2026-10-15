@@ -619,9 +619,11 @@ launches.
 Capture and restore use
 `<snapshot-name>.control.sock` beside the checkpoint, reserved atomically by
 `<snapshot-name>.control.sock.lock`; different snapshots in the same private
-parent can run independently. Cleanup removes only the recorded owner's socket
-and reservation. After an interrupted start, stale reservations are kept rather
-than risking another VM's endpoint. Verify the owning OpenVMM has exited before
+parent can run independently. Cleanup checks the reservation owner and recorded
+socket identity. A successful capture that exits between socket polls can also
+remove its unobserved socket after the process exits. After an interrupted start,
+stale reservations are kept rather than risking another VM's endpoint.
+Verify the owning OpenVMM has exited before
 removing a stale reservation manually.
 Restore may use a copy at a new private path; each restore generation gets its
 own endpoint and reservation. The immutable layers and live shares must still
@@ -667,7 +669,7 @@ exceed the host's Unix socket path limit.
 | `--socket PATH` | none | Private Unix socket for the persistent `execd` daemon. Required for `execd`. |
 | `--processors {1,2,4,8}` | `1` | Guest vCPU count for `run` or `provision`. |
 | `--snapshot-destination DIR` | none | Capture before workload handoff using the instance-checkpoint tier. Valid only for managed `provision` on POSIX; its parent must be owned by the current user with mode 0700. Managed `start` returns after capture, with no running VM. Unsupported on Windows and for one-shot `run`. |
-| `--restore-snapshot DIR` | none | Restore a single-use instance checkpoint, valid only for `provision` on POSIX. The snapshot fixes the workload and guest contract and supplies its paired scratch and network address. Re-pass the source `--processors` count (default `1`) for OpenVMM's mandatory capacity equality check, and the original network profile and policy for digest validation; do not pass `--net`. The processor count is an assertion, not a resize operation. Explicit `--scratch`, `--memory-mib`, `--cmdline`, `--entrypoint`, `--arg`, `--hostname`, `--memory-max`, `--pids-max` and `--workload-user` overrides are rejected. Mutually exclusive with capture; unsupported on Windows. |
+| `--restore-snapshot DIR` | none | Restore a single-use instance checkpoint, valid only for `provision` on POSIX; its parent must be owned by the current user with mode 0700. The snapshot fixes the workload and guest contract and supplies its paired scratch and network address. Re-pass the source `--processors` count (default `1`) for OpenVMM's mandatory capacity equality check, and the original network profile and policy for digest validation; do not pass `--net`. The processor count is an assertion, not a resize operation. Explicit `--scratch`, `--memory-mib`, `--cmdline`, `--entrypoint`, `--arg`, `--hostname`, `--memory-max`, `--pids-max` and `--workload-user` overrides are rejected. Mutually exclusive with capture; unsupported on Windows. |
 | `--entrypoint PATH` | `/bin/sh` | Select an absolute workload entrypoint without whitespace. |
 | `--arg VALUE` | none | Append one whitespace-free entrypoint argument. Repeat to pass multiple arguments. |
 | `--hostname NAME` | `nvx-sandbox` | Set the workload UTS hostname. |

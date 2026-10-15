@@ -1198,7 +1198,13 @@ def _reserve_snapshot_endpoint(endpoint: Path) -> str:
     return owner
 
 
-def _cleanup_snapshot_endpoint(endpoint: Path, owner: object, identity: object) -> None:
+def _cleanup_snapshot_endpoint(
+    endpoint: Path,
+    owner: object,
+    identity: object,
+    *,
+    capture_exited: bool = False,
+) -> None:
     # Old runtime records and stale owners cannot vouch for an external socket.
     if not isinstance(owner, str):
         return
@@ -1209,6 +1215,10 @@ def _cleanup_snapshot_endpoint(endpoint: Path, owner: object, identity: object) 
     except FileNotFoundError:
         return
     current = _socket_identity(endpoint)
+    if identity is None and capture_exited:
+        # The reserved endpoint was absent before launch, and capture has exited.
+        # Its bind/exit may have happened entirely between polling intervals.
+        identity = current
     if path_exists(endpoint) and (current is None or current != identity):
         # An interrupted start may not have recorded the bound inode yet.
         # Keep its reservation with the unverified socket for manual recovery.
@@ -1413,7 +1423,9 @@ def _start(
             except subprocess.TimeoutExpired as error:
                 raise ScriptError(
                     f"sandbox capture timed out after {timeout:g} seconds; "
-                    "increase --timeout to cover boot, layer hashing and capture"
+                    "verify the guest initramfs includes the sandboxsnap trigger; "
+                    "if artifacts match, increase --timeout to cover boot, "
+                    "layer hashing and capture"
                 ) from error
             if status != 0:
                 raise ScriptError(_startup_exit_message(outcome_path, status))
@@ -1428,6 +1440,7 @@ def _start(
                 Path(endpoint_value),
                 endpoint_owner,
                 socket_identity,
+                capture_exited=True,
             )
             capability_path.unlink(missing_ok=True)
             (state_dir / RUNTIME_NAME).unlink(missing_ok=True)
@@ -1463,7 +1476,9 @@ def _start(
             # that shows OpenVMM gone rather than runtime files that deprovision
             # cannot vouch for.
             if ended:
-                if os.name != "nt":
+                if os.name == "nt":
+                    (state_dir / CONTROL_SOCKET_NAME).unlink(missing_ok=True)
+                else:
                     if endpoint_owner is not None:
                         _cleanup_snapshot_endpoint(
                             Path(endpoint_value), endpoint_owner, socket_identity
