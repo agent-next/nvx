@@ -714,7 +714,9 @@ def apply_hybrid_cpu_filter(representatives: set[int]) -> set[int]:
         return representatives
     allowed = clusters[0] if preference == "efficiency" else clusters[-1]
     selected = {cpu for cpu in representatives if cpu in allowed}
-    return selected or representatives
+    if not selected:
+        raise common.ScriptError(f"NVX_CPU_CLASS={preference} selects no candidate CPU")
+    return selected
 
 
 def windows_physical_cpu_representatives() -> set[int]:

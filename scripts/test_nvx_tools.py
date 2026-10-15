@@ -16512,45 +16512,6 @@ class SandboxTests(unittest.TestCase):
                     scratch=scratch,
                 ).validated()
 
-    def test_managed_start_retries_a_broken_control_pipe(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            state = Path(temporary) / "state"
-            attempts = MagicMock(side_effect=(BrokenPipeError(32, "broken pipe"), None))
-            stderr = io.StringIO()
-            with (
-                patch.object(sandbox_lifecycle, "_start_once", attempts),
-                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
-                patch.object(sys, "stderr", stderr),
-            ):
-                sandbox_lifecycle.start(state, 10)
-
-            self.assertEqual(attempts.call_count, 2)
-            sleep.assert_called_once_with(0.5)
-            self.assertIn("start attempt 1 failed", stderr.getvalue())
-            self.assertIn("Errno 32", stderr.getvalue())
-
-    def test_managed_start_gives_up_after_bounded_pipe_retries(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            state = Path(temporary) / "state"
-            attempts = MagicMock(
-                side_effect=ConnectionResetError(104, "connection reset")
-            )
-            stderr = io.StringIO()
-            with (
-                patch.object(sandbox_lifecycle, "_start_once", attempts),
-                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
-                patch.object(sys, "stderr", stderr),
-                self.assertRaises(ConnectionResetError),
-            ):
-                sandbox_lifecycle.start(state, 10)
-
-            self.assertEqual(attempts.call_count, 3)
-            self.assertEqual(
-                [call.args[0] for call in sleep.call_args_list], [0.5, 1.0]
-            )
-            self.assertIn("attempt 1 failed", stderr.getvalue())
-            self.assertIn("attempt 2 failed", stderr.getvalue())
-
     def test_managed_start_does_not_retry_honest_failures(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "state"
@@ -16618,40 +16579,6 @@ class SandboxTests(unittest.TestCase):
 
             self.assertEqual(attempts.call_count, 2)
             sleep.assert_not_called()
-
-    def test_managed_start_composes_endpoint_and_pipe_retries(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            state = Path(temporary) / "state"
-            attempts = MagicMock(
-                side_effect=(
-                    BrokenPipeError(32, "broken pipe"),
-                    TimeoutError(
-                        "managed control endpoint did not become available: "
-                        "control.sock"
-                    ),
-                    None,
-                )
-            )
-            stderr = io.StringIO()
-            with (
-                patch.object(sandbox_lifecycle, "_start_once", attempts),
-                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
-                patch.object(sys, "stderr", stderr),
-            ):
-                sandbox_lifecycle.start(state, 10)
-
-            self.assertEqual(
-                attempts.call_args_list,
-                [
-                    call(state, 10, endpoint_wait_s=8.0),
-                    call(state, 10, endpoint_wait_s=8.0),
-                    call(state, 10),
-                ],
-            )
-            sleep.assert_called_once_with(0.5)
-            output = stderr.getvalue()
-            self.assertIn("retrying in 0.5s", output)
-            self.assertIn("retrying once with the full timeout", output)
 
     def test_managed_start_does_not_retry_other_timeouts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -16814,10 +16741,10 @@ class SandboxTests(unittest.TestCase):
                 patch.object(
                     sandbox_lifecycle.ControlSession,
                     "connect",
-                    side_effect=BrokenPipeError(32, "broken pipe"),
+                    side_effect=sandbox_lifecycle.ControlEndpointClosed("closed"),
                 ) as connect,
                 patch.object(sandbox_lifecycle.time, "sleep") as sleep,
-                self.assertRaises(BrokenPipeError),
+                self.assertRaises(sandbox_lifecycle.ControlEndpointClosed),
             ):
                 sandbox_lifecycle.exec_workload(
                     state,
@@ -22795,7 +22722,7 @@ class WarmpoolTests(unittest.TestCase):
         for _ in range(entries):
             entry = root / f"entry-{uuid.uuid4().hex[:8]}"
             entry.mkdir()
-            for name in warmpool.SNAPSHOT_FILENAMES:
+            for name in benchmark.SNAPSHOT_FILENAMES:
                 (entry / name).write_bytes(b"0" * 16)
         warmpool.write_manifest(root, {"version": 1, "memory_mib": 128})
         return root

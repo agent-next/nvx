@@ -37,7 +37,9 @@ affinity at all.
 - `apply_hybrid_cpu_filter()` leaves the benchmark default affinity unchanged
   unless `NVX_CPU_CLASS=performance` or `efficiency` explicitly selects a class.
   Unset, empty, or `all` means no filtering. Explicit `--cpus` takes precedence,
-  and unknown class values are rejected. Frequency files are read only when
+  and unknown class values are rejected. Selecting a hybrid class with no
+  candidate CPUs raises an error rather than falling back to mixed classes.
+  Frequency files are read only when
   class selection is used, never while building the argument parser.
 - `nvx.py` binds its own process (inherited by children) to the selected class for
   non-benchmark commands only when `NVX_CPU_CLASS=performance` or `efficiency`
@@ -113,10 +115,9 @@ chromium, blender) running four real workload classes end-to-end:
   export` → extract → `mkfs.erofs -z lz4hc -U <uuid>` → use as any layer role. A 975 MiB
   debian+blender+chromium layer boots and runs all four classes.
 
-## 6. Latent benchmark bugs found at concurrency (fixed here)
+## 6. Historical benchmark bugs found at concurrency
 
-Both surfaced only when restoring in a tight multi-worker loop (warm-pool bench), never
-in the sequential suites:
+These observations came from a tight multi-worker restore loop (warm-pool bench):
 
 - **`guest_exit_prequeued` omission aborts OpenVMM.** Calling the restore path without
   `guest_exit_prequeued=True` makes the harness write `guest-exit.sh` into the guest
@@ -129,26 +130,9 @@ in the sequential suites:
   marker line was missed (~1/2000) and a successful restore reported as a failure.
   Fixed with `rstrip(b"\r")` + regression test.
 
-## 7. Boot-storm EPIPE on the managed control pipe (fixed here)
+## 7. Bounded first endpoint wait
 
-A 128-simultaneous-boot thundering herd broke ~13% of `sandbox start` calls with
-`error: [Errno 32] Broken pipe` at ~3.8s: the freshly spawned OpenVMM process dies or
-drops the control endpoint before the auth handshake/ping completes (capability
-stdin write, attach, or first ping all surface as `BrokenPipeError` /
-`ConnectionResetError` or an endpoint-closed `ConnectionError`).
-
-**Current behavior.** `sandbox start` retries through
-`_with_control_retry`, with 3 attempts and 0.5s/1.0s backoff, only on
-`BrokenPipeError` and `ConnectionResetError` (`provision` never
-touches the control pipe, so it has no retry wrapper). Each start attempt tears
-down the failed OpenVMM process and respawns it, so a retry is a clean boot. Retries
-log `sandbox start attempt N failed: ...` to stderr. `sandbox exec` is deliberately
-not retried: a managed exec failure stays honest. Intentional endpoint closure
-and startup failures reported as `ScriptError`, including an already-exited
-OpenVMM process, are not retried. The historical process-exit boot-storm case
-above is therefore not a claim of current retry coverage.
-
-**Boot-tail variant (fixed here).** A rarer start failure (measured 0.2-0.46%
+A historical start failure (measured 0.2-0.46%
 of starts, ~30s each, occasionally a hard fail) is the endpoint never accepting:
 `TimeoutError: managed control endpoint did not become available`. Waiting the
 full `--timeout` (default 60s) for a boot that is already stalled wastes the
@@ -158,15 +142,15 @@ endpoint-availability wait to the smaller of `--timeout` and
 post-connect readiness ping each retain the full caller timeout. On the endpoint-unavailable
 `TimeoutError` the failed process is torn down by the same cleanup path as any
 other start failure (runtime/capability/socket state unlinked, process
-terminated), then one retry boots a fresh process with the full timeout; a
-second endpoint timeout propagates honestly. The inner retry sits inside
-`_with_control_retry`, so `BrokenPipeError` / `ConnectionResetError` retries still compose —
-each outer attempt is one short probe plus at most one full-timeout boot, and a
-single start call never runs more than one live OpenVMM process. Other
+terminated), then one retry boots a fresh process with the full timeout only
+when that timeout exceeds the first endpoint wait. When the first window already
+uses the full timeout, there is no redundant retry. A second endpoint timeout
+propagates honestly. A single start call never runs more than one live OpenVMM
+process. Other
 `TimeoutError`s (e.g. `managed control response timed out` after the endpoint
 accepted) are not in this class and still propagate without a retry.
 `--timeout` is a per-stage timeout, not an overall wall-clock deadline:
-each outer attempt may include a short endpoint probe and a full-timeout retry,
+a start may include a short endpoint probe and a full-timeout retry,
 plus attach, ping, lifecycle-lock waiting and failed-process cleanup.
 
 ## 8. Persistent exec daemon (`sandbox execd`)

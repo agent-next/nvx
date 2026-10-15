@@ -38,6 +38,23 @@ class PoolFixture(unittest.TestCase):
 
 
 class WarmpoolRegressionTests(PoolFixture):
+    def test_non_linux_fill_does_not_create_pool_directory(self) -> None:
+        pool = self.make_pool(0) / "new-pool"
+        args = argparse.Namespace(
+            pool_dir=pool,
+            nvx_dir=pool.parent,
+            openvmm_dir=pool.parent,
+            size=1,
+            memory_mib=128,
+            timeout=1,
+        )
+        with (
+            patch.object(warmpool.sys, "platform", "win32"),
+            self.assertRaisesRegex(common.ScriptError, "Linux CPU affinity"),
+        ):
+            warmpool.command_fill(args)
+        self.assertFalse(pool.exists())
+
     def test_new_claim_of_old_snapshot_survives_prune(self) -> None:
         pool = self.make_pool(1)
         os.utime(pool / "entry-0", (100, 100))
@@ -199,7 +216,6 @@ class WarmpoolRegressionTests(PoolFixture):
                 "backend": "kvm",
                 "processors": 2,
                 "memory_mib": 128,
-                "cpu_affinity": [0, 1],
                 "cpu_class_frequencies_khz": [4_000_000],
                 "entries": 2,
             },
@@ -395,6 +411,36 @@ class ExecdPermissionsRegressionTests(unittest.TestCase):
 
 
 class SetupSubmoduleRegressionTests(unittest.TestCase):
+    def test_ready_source_message_does_not_claim_a_binary_exists(self) -> None:
+        for has_binary in (False, True):
+            with (
+                self.subTest(has_binary=has_binary),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                source = root / "openvmm"
+                source.mkdir()
+                (source / "Cargo.toml").write_text("[package]\n")
+                binary = source / "target" / "release" / "openvmm"
+                if has_binary:
+                    binary.parent.mkdir(parents=True)
+                    binary.write_bytes(b"release")
+                with (
+                    patch.object(nvx.BuildConstants, "REPO_ROOT", root),
+                    patch.object(release, "openvmm_binary_path", return_value=binary),
+                    patch.object(release.subprocess, "run") as run,
+                    contextlib.redirect_stdout(io.StringIO()) as output,
+                ):
+                    nvx.command_setup_submodule(argparse.Namespace())
+                run.assert_not_called()
+                self.assertEqual(
+                    output.getvalue(),
+                    "openvmm source is ready; any existing release binary was preserved\n",
+                )
+                self.assertEqual(binary.exists(), has_binary)
+                if has_binary:
+                    self.assertEqual(binary.read_bytes(), b"release")
+
     def test_unexpected_contents_are_preserved_and_reported(self) -> None:
         for relative in ("target/release/other", "target/cache/data", "notes.txt"):
             with (
@@ -516,6 +562,25 @@ class SetupSubmoduleRegressionTests(unittest.TestCase):
 
 
 class CpuSelectionValidationTests(unittest.TestCase):
+    def test_requested_class_without_candidate_cpus_is_rejected(self) -> None:
+        for preference, candidates in (
+            ("performance", {2, 3}),
+            ("efficiency", {0, 1}),
+        ):
+            with (
+                self.subTest(preference=preference),
+                patch.dict(os.environ, {"NVX_CPU_CLASS": preference}),
+                patch.object(
+                    benchmark,
+                    "cpu_frequency_classes",
+                    return_value={6_000_000: {0, 1}, 4_200_000: {2, 3}},
+                ),
+                self.assertRaisesRegex(
+                    common.ScriptError, f"NVX_CPU_CLASS={preference}.*no.*CPU"
+                ),
+            ):
+                benchmark.apply_hybrid_cpu_filter(candidates)
+
     def test_unset_default_keeps_i9_eight_vcpu_benchmark_valid(self) -> None:
         representatives = set(range(0, 16, 2)) | set(range(16, 32))
         with (
@@ -579,6 +644,27 @@ class CpuSelectionValidationTests(unittest.TestCase):
 
 
 class StartupTimeoutValidationTests(unittest.TestCase):
+    def test_full_first_window_is_not_retried(self) -> None:
+        for timeout in (1, 5, 8):
+            with (
+                self.subTest(timeout=timeout),
+                patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": "8"}),
+                patch.object(
+                    sandbox_lifecycle,
+                    "_start_once",
+                    side_effect=TimeoutError(
+                        "managed control endpoint did not become available"
+                    ),
+                ) as start,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaisesRegex(TimeoutError, "did not become available"),
+            ):
+                sandbox_lifecycle.start(Path("state"), timeout)
+            start.assert_called_once_with(
+                Path("state"), timeout, endpoint_wait_s=timeout
+            )
+            self.assertEqual(stderr.getvalue(), "")
+
     def test_first_endpoint_wait_is_capped_by_caller_timeout(self) -> None:
         with (
             patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": "8"}),

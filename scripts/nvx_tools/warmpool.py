@@ -40,13 +40,11 @@ from nvx_tools.benchmark import (
     snapshot_restore_command,
     workload_boot_command,
 )
-from nvx_tools.benchmark import (
-    SNAPSHOT_FILENAMES as SNAPSHOT_FILENAMES,
-)
 from nvx_tools.build_constants import (
     AlpineBuildConstants,
     BuildConstants,
     KernelBuildConstants,
+    OpenVMMBuildConstants,
 )
 from nvx_tools.common import ScriptError
 
@@ -246,7 +244,12 @@ def _require_artifacts(nvx_dir: Path, openvmm_dir: Path) -> tuple[Path, Path, Pa
     build = nvx_dir.resolve() / "build"
     kernel = build / KernelBuildConstants.BINARY_NAME
     initrd = build / AlpineBuildConstants.INITRAMFS_NAME
-    executable = openvmm_dir.resolve() / "target" / "release" / "openvmm"
+    executable = (
+        openvmm_dir.resolve()
+        / OpenVMMBuildConstants.TARGET_DIRECTORY_NAME
+        / OpenVMMBuildConstants.BUILD_PROFILE
+        / OpenVMMBuildConstants.BINARY_NAME
+    )
     for path, label in (
         (kernel, "NVX Linux direct kernel"),
         (initrd, "NVX initramfs"),
@@ -260,14 +263,14 @@ def _require_artifacts(nvx_dir: Path, openvmm_dir: Path) -> tuple[Path, Path, Pa
 def command_fill(args: argparse.Namespace) -> int:
     for name in ("size", "memory_mib", "timeout"):
         _require_positive(name, getattr(args, name))
+    frequencies = pool_class_frequencies()
     kernel, initrd, executable = _require_artifacts(args.nvx_dir, args.openvmm_dir)
     args.pool_dir.mkdir(parents=True, exist_ok=True)
     if any(args.pool_dir.iterdir()):
         raise ScriptError("fill requires an empty pool directory; use a new --pool-dir")
     manifest: dict[str, object] = {
         "version": 1,
-        "cpu_affinity": sorted(_process_affinity()),
-        "cpu_class_frequencies_khz": pool_class_frequencies(),
+        "cpu_class_frequencies_khz": frequencies,
         "memory_mib": args.memory_mib,
         "processors": args.processors,
         "backend": args.backend,

@@ -16,7 +16,6 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -93,9 +92,6 @@ MOUNTS_CONFIG_FORMATS = (
     FILE_MOUNT_CONFIG_FORMAT,
 )
 OUTCOME_SCHEMA_VERSION = 1
-# A control pipe that breaks while an OpenVMM process is starting is transient
-# under boot storms: the next attempt spawns a fresh process and endpoint.
-CONTROL_RETRY_BACKOFF_S = (0.5, 1.0)
 # A managed boot that never opens its control endpoint almost never recovers,
 # but the endpoint wait otherwise costs a full timeout: the first start attempt
 # bounds that wait so a stalled boot is torn down and retried once with the
@@ -106,25 +102,6 @@ EXECD_POLL_S = 0.5
 EXECD_REQUEST_TIMEOUT_S = 30.0
 EXECD_RESPONSE_MARGIN_S = 30.0
 EXECD_UNBOUNDED_RESPONSE_S = 3_660.0
-
-
-def _with_control_retry(operation: str, action: Callable[[], None]) -> None:
-    for attempt in range(len(CONTROL_RETRY_BACKOFF_S) + 1):
-        try:
-            action()
-            return
-        # A closed managed endpoint can be an intentional guest rejection.
-        # Retry transport failures, not the protocol's terminal close signal.
-        except (BrokenPipeError, ConnectionResetError) as error:
-            if attempt == len(CONTROL_RETRY_BACKOFF_S):
-                raise
-            delay = CONTROL_RETRY_BACKOFF_S[attempt]
-            print(
-                f"sandbox {operation} attempt {attempt + 1} failed: {error}; "
-                f"retrying in {delay}s",
-                file=sys.stderr,
-            )
-            time.sleep(delay)
 
 
 def _write_json(path: Path, value: dict[str, Any], mode: int = 0o600) -> None:
@@ -1027,13 +1004,12 @@ def _start_first_wait_s() -> float:
     return value
 
 
-def _start_with_endpoint_retry(state_path: Path, timeout: float) -> None:
+def start(state_path: Path, timeout: float) -> None:
+    first_wait_s = min(timeout, _start_first_wait_s())
     try:
-        _start_once(
-            state_path, timeout, endpoint_wait_s=min(timeout, _start_first_wait_s())
-        )
+        _start_once(state_path, timeout, endpoint_wait_s=first_wait_s)
     except TimeoutError as error:
-        if "did not become available" not in str(error):
+        if first_wait_s >= timeout or "did not become available" not in str(error):
             raise
         print(
             f"sandbox start attempt 1 failed: {error}; "
@@ -1041,12 +1017,6 @@ def _start_with_endpoint_retry(state_path: Path, timeout: float) -> None:
             file=sys.stderr,
         )
         _start_once(state_path, timeout)
-
-
-def start(state_path: Path, timeout: float) -> None:
-    _with_control_retry(
-        "start", lambda: _start_with_endpoint_retry(state_path, timeout)
-    )
 
 
 def _start_once(

@@ -707,7 +707,12 @@ def ensure_openvmm_source(repo_root: Path) -> None:
     no-op.
     """
     openvmm_dir = repo_root / "openvmm"
-    binary = openvmm_dir / "target" / "release" / openvmm_binary_path().name
+    binary = (
+        openvmm_dir
+        / OpenVMMBuildConstants.TARGET_DIRECTORY_NAME
+        / OpenVMMBuildConstants.BUILD_PROFILE
+        / openvmm_binary_path().name
+    )
     staging_path = repo_root / "build" / "openvmm-release-binary"
     if staging_path.exists():
         if binary.exists():

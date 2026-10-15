@@ -444,7 +444,7 @@ def command_download(args: argparse.Namespace) -> None:
 
 def command_setup_submodule(args: argparse.Namespace) -> None:
     ensure_openvmm_source(BuildConstants.REPO_ROOT)
-    print("openvmm source initialized; release binary preserved")
+    print("openvmm source is ready; any existing release binary was preserved")
 
 
 def _format_command(command: list[str]) -> str:

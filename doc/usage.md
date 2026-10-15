@@ -831,7 +831,9 @@ With `NVX_CPU_CLASS` unset, empty, or `all`, the default `--cpus` selects
 one logical CPU per physical core without class filtering.
 `NVX_CPU_CLASS=performance` or `efficiency` opts into filtering that default
 to the selected frequency class. An explicit `--cpus` takes precedence.
-Unknown `NVX_CPU_CLASS` values are rejected. Every selected set, including
+Unknown `NVX_CPU_CLASS` values are rejected. A hybrid-class selection with no
+candidate CPUs raises an error instead of falling back to mixed classes.
+Every selected set, including
 an opt-in filtered default, must satisfy the vCPU count plus host reserve.
 
 Measured counts must be at least 1; warmups may be zero, and timeouts must be greater than zero.
