@@ -10,7 +10,7 @@ import shutil
 import ssl
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict
@@ -405,7 +405,7 @@ def openvmm_patch_inputs() -> list[dict[str, str]]:
 
 
 @contextmanager
-def patched_openvmm(config: OpenVmmBuildConfig) -> Iterator[None]:
+def patched_openvmm(config: OpenVmmBuildConfig) -> Generator[None, None, None]:
     """Temporarily apply the public patch series to a clean pinned checkout."""
     patches = _openvmm_patch_files()
     if not patches:

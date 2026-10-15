@@ -759,6 +759,8 @@ class SandboxSnapshotTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "shell guest trigger")
     def test_managed_capture_keeps_a_raw_control_tty_open(self):
+        if sys.platform == "win32":
+            self.skipTest("Unix control tty")
         import pty
 
         source = (

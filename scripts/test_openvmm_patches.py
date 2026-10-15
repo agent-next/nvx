@@ -112,7 +112,14 @@ class OpenVmmPatchTests(unittest.TestCase):
                     skip_restore=True, directory=source, output=output
                 )
 
-                def command(*args, input_file=input_file, fail=fail, **kwargs):
+                def command(
+                    _args: list[str | os.PathLike[str]],
+                    *,
+                    cwd: Path | None = None,
+                    env: dict[str, str] | None = None,
+                    input_file: Path = input_file,
+                    fail: bool = fail,
+                ) -> None:
                     self.assertEqual(input_file.read_text(), "after\n")
                     if fail:
                         raise ScriptError("intentional cargo failure")
