@@ -1375,9 +1375,10 @@ def _start(
                 f"cannot identify the OpenVMM process: {error}"
             ) from error
         if start_time is None:
+            status = process.poll()
             raise ScriptError(
-                "OpenVMM exited during startup"
-                if process.poll() is not None
+                _startup_exit_message(outcome_path, status)
+                if status is not None
                 else "cannot identify the OpenVMM process"
             )
         runtime: dict[str, Any] = {

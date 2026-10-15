@@ -579,25 +579,59 @@ class SandboxSnapshotTests(unittest.TestCase):
             "sys.exit(97)\n"
         )
         executable.chmod(0o700)
-        state = self.root / "state"
-        lifecycle.provision(
-            state,
-            self.launch,
-            **self.options,
-            timeout=10,
-            snapshot_destination=self.root / "snap",
-        )
-        with (
-            patch.object(lifecycle, "openvmm_binary_path", return_value=executable),
-            patch.object(lifecycle, "artifact_path", return_value=self.layer),
-            self.assertRaisesRegex(
-                ScriptError, "^OpenVMM exited during startup: guest_error status 125$"
-            ),
-        ):
-            lifecycle.start(state, 10)
-        self.assertFalse((state / lifecycle.RUNTIME_NAME).exists())
-        self.assertFalse((state / lifecycle.CAPABILITY_NAME).exists())
-        self.assertFalse((self.root / "snap.control.sock.lock").exists())
+        popen = subprocess.Popen[bytes]
+        identify = lifecycle._process_start_time
+        for early_exit in (False, True):
+            with self.subTest(early_exit=early_exit):
+                state = self.root / f"state-{early_exit}"
+                lifecycle.provision(
+                    state,
+                    self.launch,
+                    **self.options,
+                    timeout=10,
+                    snapshot_destination=self.root / "snap",
+                )
+                children: list[subprocess.Popen[bytes]] = []
+
+                def spawn(
+                    *args: Any,
+                    children: list[subprocess.Popen[bytes]] = children,
+                    **kwargs: Any,
+                ) -> subprocess.Popen[bytes]:
+                    child = popen(*args, **kwargs)
+                    children.append(child)
+                    return child
+
+                def start_time(
+                    pid: int,
+                    *,
+                    early_exit: bool = early_exit,
+                    children: list[subprocess.Popen[bytes]] = children,
+                ) -> int | None:
+                    if early_exit:
+                        self.assertEqual(children[0].wait(timeout=10), 97)
+                        return None
+                    return identify(pid)
+
+                with (
+                    patch.object(
+                        lifecycle, "openvmm_binary_path", return_value=executable
+                    ),
+                    patch.object(lifecycle, "artifact_path", return_value=self.layer),
+                    patch.object(lifecycle.subprocess, "Popen", side_effect=spawn),
+                    patch.object(
+                        lifecycle, "_process_start_time", side_effect=start_time
+                    ),
+                    self.assertRaisesRegex(
+                        ScriptError,
+                        "^OpenVMM exited during startup: guest_error status 125$",
+                    ),
+                ):
+                    lifecycle.start(state, 10)
+                self.assertEqual(children[0].returncode, 97)
+                self.assertFalse((state / lifecycle.RUNTIME_NAME).exists())
+                self.assertFalse((state / lifecycle.CAPABILITY_NAME).exists())
+                self.assertFalse((self.root / "snap.control.sock.lock").exists())
 
     @unittest.skipUnless(os.name == "posix", "managed snapshots require POSIX")
     def test_capture_preserves_socket_replaced_after_recording_identity(self):
