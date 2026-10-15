@@ -576,6 +576,9 @@ python3 scripts/nvx.py sandbox
     [--scratch PATH]
     [--state-dir PATH]
     [--socket PATH]
+    [--processors {1,2,4,8}]
+    [--snapshot-destination DIR]
+    [--restore-snapshot DIR]
     [--entrypoint PATH]
     [--arg VALUE]...
     [--hostname NAME]
@@ -613,13 +616,58 @@ python3 scripts/nvx.py sandbox
 Network policy and live-share options configure only the `run` and `provision`
 launches.
 
+Capture and restore use
+`<snapshot-name>.control.sock` beside the checkpoint, reserved atomically by
+`<snapshot-name>.control.sock.lock`; different snapshots in the same private
+parent can run independently. Cleanup removes only the recorded owner's socket
+and reservation. After an interrupted start, stale reservations are kept rather
+than risking another VM's endpoint. Verify the owning OpenVMM has exited before
+removing a stale reservation manually.
+Restore may use a copy at a new private path; each restore generation gets its
+own endpoint and reservation. The immutable layers and live shares must still
+satisfy OpenVMM's checkpoint validation.
+
+An instance checkpoint is consumed by the first restore attempt, including a
+failed attempt. Restore is never retried automatically. After a restored sandbox
+is stopped, it cannot be started from that checkpoint again; provision a fresh
+checkpoint instead.
+
+Managed capture requires guest artifacts built from this source tree, including
+the initramfs containing the `sandboxsnap` pre-handoff trigger in
+`nvx-init-agent`. The stock `4acf7eb0` release initramfs does not contain that
+trigger: it enters managed handoff instead of capturing, and the host eventually
+reports a capture timeout. Increasing the timeout does not fix mismatched guest
+artifacts. Managed restore also requires the patched OpenVMM built by
+`build-openvmm` and this tree's guest control-tty lifetime fix; older artifacts
+can fail the control handshake with `invalid control-session magic`.
+
+For a networked restore, re-pass the original `--network-profile` and complete
+egress/ingress policy, including allow/deny rules (or their policy file),
+host-loopback policy and proxy settings. Provision persists the lowered rules;
+OpenVMM checks the supplied policy against the checkpoint's digest and rejects
+a mismatch. Omit only `--net`, since the checkpoint supplies the guest address.
+For example, a capture provisioned with `--net 10.0.0.2/24
+--network-profile portable --network-egress deny --network-ingress deny` needs
+`--network-profile portable --network-egress deny --network-ingress deny` on
+restore provision. Explicit localhost forwards and ingress `allow` listeners
+are process-local attachments and cannot be captured/restored. See the
+[network snapshot contract](design/machine-and-device-abi.md#bounded-state-snapshots-and-restore)
+and the restore example in
+`scripts/nvx_tools/microvm_tests.py::_run_snapshot_tier`.
+Provision rejects these process-local listeners for both capture and restore.
+Snapshot paths are normalized, and provision rejects control socket paths that
+exceed the host's Unix socket path limit.
+
 | Option | Default | Description |
 | --- | --- | --- |
 | `{run,provision,start,exec,execd,stop,deprovision}` | `run` | Select a one-shot run or a managed lifecycle operation. |
 | `--layer ROLE,PATH,EROFS_UUID` | required for `run` and `provision` | Attach a `distro`, `runtime`, or `custom` EROFS layer. Repeat once per distinct role. |
-| `--scratch PATH` | required for `run` and `provision` | Attach a preformatted ext4 scratch image as the writable overlay. |
+| `--scratch PATH` | required for cold `run` and `provision` | Attach a preformatted ext4 scratch image. A snapshot restore uses its paired scratch and does not require the original image or this option. |
 | `--state-dir PATH` | required for managed operations | Select persistent sandbox state. One-shot `run` rejects this option. |
 | `--socket PATH` | none | Private Unix socket for the persistent `execd` daemon. Required for `execd`. |
+| `--processors {1,2,4,8}` | `1` | Guest vCPU count for `run` or `provision`. |
+| `--snapshot-destination DIR` | none | Capture before workload handoff using the instance-checkpoint tier. Valid only for managed `provision` on POSIX; its parent must be owned by the current user with mode 0700. Managed `start` returns after capture, with no running VM. Unsupported on Windows and for one-shot `run`. |
+| `--restore-snapshot DIR` | none | Restore a single-use instance checkpoint, valid only for `provision` on POSIX. The snapshot fixes the workload and guest contract and supplies its paired scratch and network address. Re-pass the source `--processors` count (default `1`) for OpenVMM's mandatory capacity equality check, and the original network profile and policy for digest validation; do not pass `--net`. The processor count is an assertion, not a resize operation. Explicit `--scratch`, `--memory-mib`, `--cmdline`, `--entrypoint`, `--arg`, `--hostname`, `--memory-max`, `--pids-max` and `--workload-user` overrides are rejected. Mutually exclusive with capture; unsupported on Windows. |
 | `--entrypoint PATH` | `/bin/sh` | Select an absolute workload entrypoint without whitespace. |
 | `--arg VALUE` | none | Append one whitespace-free entrypoint argument. Repeat to pass multiple arguments. |
 | `--hostname NAME` | `nvx-sandbox` | Set the workload UTS hostname. |
@@ -627,7 +675,7 @@ launches.
 | `--memory-max BYTES` | none | Set the workload cgroup memory limit. |
 | `--pids-max COUNT` | none | Set the workload cgroup process limit. |
 | `--memory-mib MIB` | `256` | Set guest memory in MiB. |
-| `--timeout SECONDS` | `60` | Set the timeout for each managed control request and its response in `start`, `exec`, and `stop`, and the longest time that `provision`, `start`, `stop`, and `deprovision` wait for another lifecycle transition of the sandbox. It must be finite and greater than 0. |
+| `--timeout SECONDS` | `60` | Set the timeout for each managed control request and its response in `start`, `exec`, and `stop`, and the longest time that `provision`, `start`, `stop`, and `deprovision` wait for another lifecycle transition of the sandbox. For capture, it also covers the complete boot, layer hashing and checkpoint publication; increase it for large layers or snapshots. It must be finite and greater than 0. |
 | `--exec-timeout-ms MILLISECONDS` | `0` | Set the managed `exec` guest workload timeout in the unsigned 32-bit range `0..4294967295`; zero disables the workload deadline. This is separate from the finite host `--timeout` control deadline. |
 | `--cwd GUEST_PATH` | `/` | Set an absolute working directory inside the workload root for managed `exec`. It is resolved after the workload identity and root are applied; missing, inaccessible, or non-directory paths fail the workload launch. Default and layered environments point `PWD` at this directory; an exact replacement environment controls `PWD` itself. |
 | `--environment KEY=VALUE` | omitted | Set the exact managed `exec` environment. Repeat for multiple entries. Empty values, spaces, additional equals signs, and UTF-8 are preserved. Inline values are visible in the invoking host process arguments; use `--environment-file` for sensitive values. |
@@ -640,7 +688,7 @@ launches.
 | `--mount-write HOST_PATH` | none | Make one existing file or directory one of the only writable parts of an `rw` share; the workload's writes anywhere else in the share fail with `EROFS`. Relative paths are resolved inside the share; with several shares, it applies to the `--mount` before it, which must be `rw`. Repeat to declare multiple writable paths. `provision` persists the denied, allowed, and writable paths. |
 | `--mount-owner {vmm,caller}` | `vmm` | Select the host identity of the shares' file operations for `run` or `provision`. `vmm` performs them as OpenVMM; `caller` performs them as the workload's UID and GID, squashes guest root to the owner of each shared host directory or file, and fails them with `EPERM` when OpenVMM cannot assume that identity. `caller` requires a Linux host and is persisted by `provision`. See [File ownership](run.md#file-ownership). |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with a static guest address. The guest also gets the IPv6 address that embeds it in `fd00::/96`. |
-| `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
+| `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net` for cold launches, and without `--net` for networked restores. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy for `run` or `provision`. |
 | `--network-ingress {allow,deny}` | `deny` | Set the host ingress policy for `run` or `provision`. `allow` publishes every TCP and UDP port on which the workload listens to clients on the host's private networks, and to the host itself only with `--host-loopback allow`; see [Private-network ingress](run.md#private-network-ingress). |
 | `--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]` | none | Allow matching guest egress; repeat to add rules. Requires explicit `--network-egress`. `CIDR` is an IPv4 or IPv6 address or network, and a rule matches only its own family. `PROTOCOL` is `tcp`, `udp`, or `icmp` and matches every port when `PORT` is omitted; only `tcp` and `udp` take a `PORT` or an inclusive `PORT-PORT` range, such as `8000-8010`. |

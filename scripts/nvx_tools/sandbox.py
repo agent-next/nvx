@@ -518,10 +518,14 @@ class SandboxLaunch:
     memory_max: int | None = None
     pids_max: int | None = None
     mounts: tuple[SandboxMount, ...] = ()
+    processors: int = 1
+    snapshot_capture: bool = False
 
     def __post_init__(self) -> None:
         if not 1 <= len(self.layers) <= len(LAYER_ROLES):
             raise ScriptError("a sandbox requires one to three read-only layers")
+        if type(self.processors) is not int or self.processors not in (1, 2, 4, 8):
+            raise ScriptError("--processors must be one of 1, 2, 4, 8")
         roles = [layer.role for layer in self.layers]
         duplicates = sorted({role for role in roles if roles.count(role) > 1})
         if duplicates:
@@ -554,11 +558,12 @@ class SandboxLaunch:
                 raise ScriptError(f"--{name} must be positive")
         validate_mounts(self.mounts)
 
-    def validated(self) -> SandboxLaunch:
+    def validated(self, *, restore: bool = False) -> SandboxLaunch:
         for layer in self.layers:
             require_file(layer.path, f"{layer.role} EROFS layer")
             _reject_disk_path(layer.path)
-        require_file(self.scratch, "ext4 scratch image")
+        if not restore:
+            require_file(self.scratch, "ext4 scratch image")
         _reject_disk_path(self.scratch)
         for mount in self.mounts:
             mount.validated()
@@ -569,8 +574,10 @@ class SandboxLaunch:
         by_role = {layer.role: layer for layer in self.layers}
         return tuple(by_role[role] for role in LAYER_ROLES if role in by_role)
 
-    def openvmm_arguments(self) -> list[str]:
+    def openvmm_arguments(self, *, restore: bool = False) -> list[str]:
         arguments = ["--machine", "microvm"]
+        if self.processors != 1:
+            arguments.extend(("--processors", str(self.processors)))
         for layer in self.ordered_layers():
             arguments.extend(
                 (
@@ -578,14 +585,15 @@ class SandboxLaunch:
                     f"{layer.role}:file:{os.fspath(layer.path)},ro",
                 )
             )
-        arguments.extend(
-            (
-                "--microvm-sandbox-block",
-                f"scratch:file:{os.fspath(self.scratch)}",
-                "--microvm-workload-identity",
-                f"{self.workload_identity[0]}:{self.workload_identity[1]}",
+        if not restore:
+            arguments.extend(
+                (
+                    "--microvm-sandbox-block",
+                    f"scratch:file:{os.fspath(self.scratch)}",
+                    "--microvm-workload-identity",
+                    f"{self.workload_identity[0]}:{self.workload_identity[1]}",
+                )
             )
-        )
         arguments.extend(mounts_openvmm_arguments(self.mounts))
         return arguments
 
@@ -593,7 +601,7 @@ class SandboxLaunch:
         if "\0" in user_command_line:
             raise ScriptError("kernel command line contains an embedded NUL")
         for token in user_command_line.split():
-            if token.startswith("nvx_"):
+            if token.startswith("nvx_") or token == "sandboxsnap":
                 raise ScriptError(
                     f"{token.split('=', 1)[0]} is owned by the sandbox profile"
                 )
@@ -602,6 +610,8 @@ class SandboxLaunch:
                     f"{token.split('=', 1)[0]} is owned by the sandbox --mount option"
                 )
         tokens = [user_command_line.strip(), "nvx_sandbox=1"]
+        if self.snapshot_capture:
+            tokens.append("sandboxsnap")
         for layer in self.ordered_layers():
             tokens.append(
                 "nvx_layer="

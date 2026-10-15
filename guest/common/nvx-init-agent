@@ -550,14 +550,28 @@ workload_machine_id=$(tr -d - </proc/sys/kernel/random/uuid)
 printf '%s\n' "$workload_machine_id" >"$runtime/workload-machine-id"
 
 if [ "$workload_lifecycle" = managed ]; then
+    # RESET can arrive immediately on restore, before the agent opens the tty.
+    # Keep it open across capture so closing stty cannot reset its line discipline.
+    exec 9<>"/dev/$control_tty" || fatal "failed to open the control tty"
+    stty raw -echo <&9 || fatal "failed to configure the control tty"
+fi
+
+# Capture after assembling the rootfs, before any workload consumes scratch.
+# Instance checkpoints bind the layers and pair the writable scratch image.
+case " $cmdline " in
+    *" sandboxsnap "*) /sbin/nvx-snapshot --tier instance-checkpoint ;;
+esac
+
+if [ "$workload_lifecycle" = managed ]; then
     echo "NVX-SANDBOX-READY: managed layers=$layer_count"
     # The agent returns after a stop request, so managed sandboxes share the
     # one-shot teardown instead of powering off with their mounts in place.
     status=0
     /sbin/nvx-managed-agent \
         "/dev/$control_tty" "$rootfs" "$hostname_value" \
-        "$workload_uid" "$workload_gid" "$workload_name" "$workload_home" ||
+        "$workload_uid" "$workload_gid" "$workload_name" "$workload_home" 9>&- ||
         status=$?
+    exec 9>&-
     teardown "$status"
 fi
 

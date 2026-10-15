@@ -1,0 +1,108 @@
+diff --git a/vm/devices/virtio/virtio_console/src/control_session_broker.rs b/vm/devices/virtio/virtio_console/src/control_session_broker.rs
+index a22fc47..974900e 100644
+--- a/vm/devices/virtio/virtio_console/src/control_session_broker.rs
++++ b/vm/devices/virtio/virtio_console/src/control_session_broker.rs
+@@ -739,15 +739,22 @@ pub fn snapshot(&self) -> BrokerSnapshot {
+         }
+     }
+ 
+-    /// Restores only physical guest alignment state, then starts a fresh
+-    /// instance at epoch one and queues RESET.
++    /// Starts a fresh protocol session (new instance at epoch one, RESET
++    /// queued, foreign records drained) while keeping the partially-emitted
++    /// guest output leg.
++    ///
++    /// The saved guest parser state is deliberately discarded: the restored
++    /// guest always re-attaches from a fresh agent (bootstrap GUEST_ATTACH,
++    /// then ACK of the queued RESET), so a partial record captured at
++    /// snapshot time can never be completed. Restoring that mid-record state
++    /// would misparse the fresh attach as the old record's tail and corrupt
++    /// everything after it.
+     pub fn restore(
+         snapshot: BrokerSnapshot,
+         new_instance_id: [u8; 16],
+         new_capability: [u8; 32],
+     ) -> Result<Self, BrokerError> {
+         Self::validate_restore(&snapshot, new_instance_id)?;
+-        let guest_parser = Parser::restore(snapshot.guest_parser)?;
+         let mut saved_guest_output = OutputLeg::restore(snapshot.guest_output)?;
+         let _saved_host_output = OutputLeg::restore(snapshot.host_output)?;
+ 
+@@ -763,7 +770,6 @@ pub fn restore(
+ 
+         let mut broker = Self::new(new_instance_id, new_capability);
+         broker.state = BrokerState::ResetPending;
+-        broker.guest_parser = guest_parser;
+         broker.guest_output = saved_guest_output;
+         broker.drain_foreign_instance_records = true;
+         broker.counters = snapshot.counters;
+@@ -1970,7 +1976,7 @@ fn sequence_overflow_discards_enqueued_output() -> Result<(), BrokerError> {
+     }
+ 
+     #[test]
+-    fn restore_preserves_only_partial_guest_physical_records() -> Result<(), BrokerError> {
++    fn restore_discards_partial_guest_input_and_reattaches_fresh() -> Result<(), BrokerError> {
+         let mut broker = make_active()?;
+         feed_host(
+             &mut broker,
+@@ -1995,8 +2001,17 @@ fn restore_preserves_only_partial_guest_physical_records() -> Result<(), BrokerE
+         assert_eq!(restored.instance_id(), new_instance);
+         assert!(!restored.host_is_authenticated());
+ 
+-        let progress = restored.accept_guest_input(&old_bytes[split..])?;
++        // The restored guest opens a fresh session: a bootstrap attach whose
++        // bytes must be parsed (and drained as foreign) as-is, not consumed
++        // as the tail of the pre-snapshot partial record.
++        let attach = control_session_protocol::encode(&Record::bootstrap(
++            RecordType::GuestAttach,
++            Vec::new(),
++        ))?;
++        let progress = restored.accept_guest_input(&attach)?;
+         assert_eq!(progress.status, InputStatus::RecordAccepted);
++        assert_eq!(progress.consumed, attach.len());
++
+         let remainder = restored
+             .peek_output(OutputLegId::Guest, usize::MAX)
+             .ok_or(BrokerError::InvalidOutputProgress)?
+diff --git a/vm/devices/virtio/virtio_console/src/control_session_protocol.rs b/vm/devices/virtio/virtio_console/src/control_session_protocol.rs
+index d04ab00..7fd521f 100644
+--- a/vm/devices/virtio/virtio_console/src/control_session_protocol.rs
++++ b/vm/devices/virtio/virtio_console/src/control_session_protocol.rs
+@@ -330,6 +330,7 @@ pub fn validate_snapshot(snapshot: &ParserSnapshot) -> Result<(), ProtocolError>
+     }
+ 
+     /// Restores parser state after validating all bounds before allocation.
++    #[cfg_attr(not(test), expect(dead_code, reason = "used by protocol tests"))]
+     pub fn restore(snapshot: ParserSnapshot) -> Result<Self, ProtocolError> {
+         Self::validate_snapshot(&snapshot)?;
+ 
+diff --git a/vm/devices/virtio/virtio_console/src/tests/broker.rs b/vm/devices/virtio/virtio_console/src/tests/broker.rs
+index 50f0ae9..31f11e6 100644
+--- a/vm/devices/virtio/virtio_console/src/tests/broker.rs
++++ b/vm/devices/virtio/virtio_console/src/tests/broker.rs
+@@ -618,7 +618,7 @@ async fn broker_fragmentation_partial_host_writes_and_backpressure(driver: Defau
+ }
+ 
+ #[async_test]
+-async fn broker_restore_finishes_old_output_then_uses_fresh_identity(driver: DefaultDriver) {
++async fn broker_restore_finishes_old_output_then_reattaches_guest(driver: DefaultDriver) {
+     let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+     harness.enable().await;
+     activate_broker(&mut harness).await;
+@@ -703,7 +703,15 @@ async fn broker_restore_finishes_old_output_then_uses_fresh_identity(driver: Def
+         (RecordType::Wait, NEW_INSTANCE, 1)
+     );
+ 
+-    harness.send_guest_bytes(3, &old_guest_data[19..]).await;
++    // The restored guest never completes the pre-snapshot partial input
++    // record: it opens a fresh session with a bootstrap attach (drained as a
++    // foreign record while RESET is pending) and then ACKs the RESET.
++    harness
++        .send_guest_bytes(
++            3,
++            &encode(&Record::bootstrap(RecordType::GuestAttach, Vec::new())),
++        )
++        .await;
+     harness
+         .send_guest_bytes(4, &encode(&ack(NEW_INSTANCE, 1)))
+         .await;

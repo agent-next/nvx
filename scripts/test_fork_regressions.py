@@ -670,7 +670,7 @@ class StartupTimeoutValidationTests(unittest.TestCase):
                 patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": "8"}),
                 patch.object(
                     sandbox_lifecycle,
-                    "_start_once",
+                    "_start",
                     side_effect=TimeoutError(
                         "managed control endpoint did not become available"
                     ),
@@ -678,7 +678,7 @@ class StartupTimeoutValidationTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as stderr,
                 self.assertRaisesRegex(TimeoutError, "did not become available"),
             ):
-                sandbox_lifecycle.start(Path("state"), timeout)
+                sandbox_lifecycle._start_with_endpoint_retry(Path("state"), timeout)
             start.assert_called_once_with(
                 Path("state"), timeout, endpoint_wait_s=timeout
             )
@@ -687,9 +687,9 @@ class StartupTimeoutValidationTests(unittest.TestCase):
     def test_first_endpoint_wait_is_capped_by_caller_timeout(self) -> None:
         with (
             patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": "8"}),
-            patch.object(sandbox_lifecycle, "_start_once") as start,
+            patch.object(sandbox_lifecycle, "_start") as start,
         ):
-            sandbox_lifecycle.start(Path("state"), 5)
+            sandbox_lifecycle._start_with_endpoint_retry(Path("state"), 5)
             start.assert_called_once_with(Path("state"), 5, endpoint_wait_s=5)
 
     def test_attach_keeps_full_timeout_after_short_endpoint_wait(self) -> None:
