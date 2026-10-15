@@ -387,13 +387,18 @@ class ControlSession:
         endpoint: Path,
         capability: bytes,
         timeout: float,
+        *,
+        endpoint_timeout: float | None = None,
     ) -> ControlSession:
         if len(capability) != 32 or capability == bytes(32):
             raise ValueError("control capability must be 32 nonzero bytes")
+        connect_timeout = (
+            timeout if endpoint_timeout is None else min(timeout, endpoint_timeout)
+        )
         stream = (
-            _NamedPipeStream.connect(endpoint, timeout)
+            _NamedPipeStream.connect(endpoint, connect_timeout)
             if os.name == "nt"
-            else _SocketStream.connect(endpoint, timeout)
+            else _SocketStream.connect(endpoint, connect_timeout)
         )
         session = cls(stream)
         try:

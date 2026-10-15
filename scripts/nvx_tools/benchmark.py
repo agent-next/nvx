@@ -282,7 +282,6 @@ def configure_parser(
     parser: argparse.ArgumentParser,
     repository_dir: Path,
 ) -> None:
-    default_cpus = ",".join(str(cpu) for cpu in sorted(physical_cpu_representatives()))
     parser.description = (
         "Build and benchmark OpenVMM microVM boot or the host-side phase 2 "
         "snapshot foundations. No NVX VMM binary is built or run."
@@ -432,8 +431,11 @@ def configure_parser(
     )
     parser.add_argument(
         "--cpus",
-        default=default_cpus,
-        help=f"logical CPUs used for affinity, in taskset syntax (default: {default_cpus})",
+        default=None,
+        help=(
+            "logical CPUs used for affinity, in taskset syntax "
+            "(default: one per physical core; NVX_CPU_CLASS optionally selects a class)"
+        ),
     )
     parser.add_argument(
         "--host-cpu-reserve",
@@ -641,6 +643,80 @@ def physical_cpu_representatives() -> set[int]:
         if representatives:
             return representatives
     return set(range(os.cpu_count() or 1))
+
+
+def cpu_frequency_classes() -> dict[int, set[int]]:
+    """Group logical CPUs by their cpuinfo_max_freq cluster.
+
+    Hybrid parts (Intel P+E cores, AMD hybrid) expose distinct per-CPU
+    maximum frequencies; homogeneous parts collapse to a single class.
+    CPUs without cpufreq information are ignored. This remains a conservative
+    placement policy, not a snapshot compatibility classifier: current OpenVMM
+    profiles normalize the guest CPU contract across this host's P/E cores.
+    """
+    classes: dict[int, set[int]] = {}
+    for entry in sorted(
+        Path("/sys/devices/system/cpu").glob("cpu[0-9]*"),
+        key=lambda entry: _cpu_number(entry.name),
+    ):
+        freq_path = entry / "cpufreq" / "cpuinfo_max_freq"
+        try:
+            frequency = int(freq_path.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            continue
+        classes.setdefault(frequency, set()).add(_cpu_number(entry.name))
+    return classes
+
+
+def _cpu_number(name: str) -> int:
+    digits = name.removeprefix("cpu")
+    return int(digits) if digits.isdigit() else -1
+
+
+def cpu_frequency_clusters(classes: dict[int, set[int]]) -> list[set[int]]:
+    """Group frequencies within 10% of each cluster's minimum, lowest first."""
+    clusters: list[set[int]] = []
+    minimum: int | None = None
+    for frequency in sorted(classes):
+        if minimum is not None and frequency <= minimum * 1.10:
+            clusters[-1].update(classes[frequency])
+        else:
+            clusters.append(set(classes[frequency]))
+            minimum = frequency
+    return clusters
+
+
+def cpu_class_preference() -> str:
+    preference = os.environ.get("NVX_CPU_CLASS", "").strip().lower()
+    if preference not in ("", "all", "performance", "efficiency"):
+        raise common.ScriptError(
+            "NVX_CPU_CLASS must be all, performance, or efficiency "
+            f"(or unset), got {preference!r}"
+        )
+    return preference
+
+
+def apply_hybrid_cpu_filter(representatives: set[int]) -> set[int]:
+    """Restrict representatives to one frequency class on hybrid parts.
+
+    Unset, empty, or ``NVX_CPU_CLASS=all`` preserves all representatives.
+    ``performance`` selects the highest-frequency class; ``efficiency``
+    selects the lowest. OpenVMM, not this placement policy, admits snapshots.
+    Frequencies within 10% of
+    each other are treated as one class: turbo-favored cores of the same
+    physical type report slightly higher maxima and must not split it.
+    """
+    preference = cpu_class_preference()
+    if preference in ("", "all"):
+        return representatives
+    clusters = cpu_frequency_clusters(cpu_frequency_classes())
+    if len(clusters) < 2:
+        return representatives
+    allowed = clusters[0] if preference == "efficiency" else clusters[-1]
+    selected = {cpu for cpu in representatives if cpu in allowed}
+    if not selected:
+        raise common.ScriptError(f"NVX_CPU_CLASS={preference} selects no candidate CPU")
+    return selected
 
 
 def windows_physical_cpu_representatives() -> set[int]:
@@ -1361,7 +1437,10 @@ def exit_status_after_eof(
 
 
 def contains_output_line(output: bytes | bytearray, marker: bytes) -> bool:
-    return any(line.removesuffix(b"\r") == marker for line in output.split(b"\n"))
+    # rstrip, not removesuffix: the guest console occasionally emits a
+    # doubled carriage return before the newline, which would otherwise
+    # hide a marker line the workload did print
+    return any(line.rstrip(b"\r") == marker for line in output.split(b"\n"))
 
 
 def completed_output_line_with_prefix(

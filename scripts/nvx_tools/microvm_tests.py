@@ -34,8 +34,11 @@ from .benchmark import (
     GuestCommandResult,
     GuestFailureReported,
     contains_output_line,
+    cpu_frequency_classes,
+    cpu_frequency_clusters,
     measure_once,
     parse_snapshot_profile_line,
+    physical_cpu_representatives,
     positive_float,
     positive_int,
     record_adversarial_openvmm_pid,
@@ -121,6 +124,7 @@ MICROVM_TEST_SCENARIOS = (
     "scratch-snapshot",
     "smp",
     "smp-snapshot",
+    "snapshot-class-matrix",
     "snapshot-core",
     "snapshot-tiers",
     "structured-outcome",
@@ -5734,6 +5738,105 @@ def _expect_process_failure(
         raise RuntimeError("invalid restore entered the guest before failing")
 
 
+def _frequency_class_representatives() -> tuple[set[int], set[int]] | None:
+    """Return (performance, efficiency) representative CPU sets, or None when
+    the host exposes only one frequency class (matrix trivially passes)."""
+    clusters = cpu_frequency_clusters(cpu_frequency_classes())
+    if len(clusters) < 2:
+        return None
+    representatives = physical_cpu_representatives()
+    performance = representatives & clusters[-1]
+    efficiency = representatives & clusters[0]
+    if not performance or not efficiency:
+        return None
+    return performance, efficiency
+
+
+def run_snapshot_class_matrix(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Check same- and cross-class restores under the current CPU contract.
+
+    Current OpenVMM profiles normalize guest CPUID, including the host-profile
+    contract on this hybrid host. Core frequency alone no longer implies an
+    incompatible destination. Exercise both classes with real guest readiness.
+    Hosts with a single frequency class skip.
+    """
+    if sys.platform != "linux":
+        print("snapshot-class-matrix: skipped (Linux-only CPU class detection)")
+        return
+    classes = _frequency_class_representatives()
+    if classes is None:
+        print("snapshot-class-matrix: skipped (single CPU frequency class)")
+        return
+    performance, efficiency = classes
+    capture_cpus = os.sched_getaffinity(0)
+    performance &= capture_cpus
+    efficiency &= capture_cpus
+    if not performance or not efficiency:
+        print("snapshot-class-matrix: skipped (caller affinity excludes a CPU class)")
+        return
+    os.sched_setaffinity(0, performance)
+    try:
+        with tempfile.TemporaryDirectory(prefix="nvx-class-matrix-") as temporary:
+            snapshot_path = Path(temporary) / "snapshot"
+            capture_snapshot(
+                [
+                    *workload_boot_command(
+                        executable,
+                        backend,
+                        kernel,
+                        initrd,
+                        memory_mib,
+                        "quiet loglevel=0",
+                    ),
+                    "--cpu-profile",
+                    "host",
+                    "--snapshot-destination",
+                    str(snapshot_path),
+                ],
+                snapshot_path,
+                timeout=timeout,
+                log_path=output_dir / "snapshot-class-matrix-capture.log",
+            )
+            restore_command = snapshot_restore_command(
+                executable,
+                backend,
+                snapshot_path,
+            )
+            restore_command.extend(["--cpu-profile", "host"])
+            with OpenvmmProcess(
+                restore_command,
+                output_dir / "snapshot-class-matrix-restore-same.log",
+            ) as process:
+                process.wait_for(RESTORE_MARKER, timeout)
+                same_result = process.wait(timeout)
+            if same_result.returncode != 0:
+                raise RuntimeError(
+                    f"same-class restore exited with {same_result.returncode}"
+                )
+            os.sched_setaffinity(0, efficiency)
+            with OpenvmmProcess(
+                restore_command,
+                output_dir / "snapshot-class-matrix-restore-cross.log",
+            ) as process:
+                process.wait_for(RESTORE_MARKER, timeout)
+                cross_result = process.wait(timeout)
+            if cross_result.returncode != 0:
+                raise RuntimeError(
+                    f"cross-class restore exited with {cross_result.returncode}"
+                )
+    finally:
+        os.sched_setaffinity(0, capture_cpus)
+
+
 def run_filesystem_snapshot(
     executable: Path,
     kernel: Path,
@@ -7848,6 +7951,19 @@ def run(args: argparse.Namespace) -> int:
     if "snapshot-core" in scenarios:
         print(f"Running microVM snapshot-core correctness on OpenVMM/{args.backend}")
         run_snapshot_core(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "snapshot-class-matrix" in scenarios:
+        print(
+            f"Running microVM snapshot CPU-class portability matrix on OpenVMM/{args.backend}"
+        )
+        run_snapshot_class_matrix(
             executable,
             kernel,
             initrd,

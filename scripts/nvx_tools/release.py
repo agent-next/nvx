@@ -54,6 +54,8 @@ from .common import (
     openvmm_binary_path,
     openvmm_git_state,
     require_file,
+    require_success,
+    run_capture,
     sha256_file,
     verify_sha256_sums,
     write_sha256_sums,
@@ -685,6 +687,73 @@ def _install_release_archive(archive_path: Path) -> None:
                 artifact_path(name).unlink(missing_ok=True)
         for name, source in provenance_sources.items():
             _replace_runtime_file(source, artifact_path(name))
+
+
+def _run(command: list[str], *, cwd: Path) -> None:
+    print(f">> {' '.join(command)}")
+    require_success(run_capture(command, cwd=cwd), "OpenVMM submodule initialization")
+
+
+def ensure_openvmm_source(repo_root: Path) -> None:
+    """Initialize the openvmm submodule without losing a release-installed binary.
+
+    ``download`` installs the packaged OpenVMM binary under
+    ``openvmm/target/release/``, which leaves ``openvmm/`` non-empty and makes
+    ``git submodule update --init openvmm`` fail with "destination path already
+    exists and is not an empty directory" — every later ``benchmark
+    --skip-build`` then errors on the missing ``openvmm/Cargo.toml``. Preserve
+    the installed binary across the submodule init by moving it aside and
+    restoring it afterwards. With the submodule already initialized this is a
+    no-op.
+    """
+    openvmm_dir = repo_root / "openvmm"
+    binary = (
+        openvmm_dir
+        / OpenVMMBuildConstants.TARGET_DIRECTORY_NAME
+        / OpenVMMBuildConstants.BUILD_PROFILE
+        / openvmm_binary_path().name
+    )
+    staging_path = repo_root / "build" / "openvmm-release-binary"
+    if staging_path.exists():
+        if binary.exists():
+            raise ScriptError(
+                "both the installed binary and a staged release binary exist; "
+                "resolve the conflict before initializing openvmm/"
+            )
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        staging_path.rename(binary)
+    if (openvmm_dir / "Cargo.toml").exists():
+        return
+    staged: Path | None = None
+    try:
+        if binary.exists():
+            staging_path.parent.mkdir(parents=True, exist_ok=True)
+            binary.rename(staging_path)
+            staged = staging_path
+            for directory in (binary.parent, binary.parent.parent):
+                if directory.is_dir() and not any(directory.iterdir()):
+                    directory.rmdir()
+        if openvmm_dir.exists() and any(openvmm_dir.iterdir()):
+            raise ScriptError(
+                "openvmm/ contains unexpected contents beyond the installed binary; "
+                "preserve or relocate them before initializing the submodule"
+            )
+        _run(
+            [
+                "git",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+                "openvmm",
+            ],
+            cwd=repo_root,
+        )
+    finally:
+        if staged is not None:
+            destination = binary
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            staged.rename(destination)
 
 
 def download_checkout_release(repository: str, platform: str) -> None:

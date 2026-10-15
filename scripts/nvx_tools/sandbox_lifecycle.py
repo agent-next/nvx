@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import errno
 import json
 import math
 import os
 import secrets
+import signal
+import socket
 import stat
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -30,6 +34,7 @@ from .control_session import (
     MANAGED_EXIT_CATEGORIES,
     ControlEndpointClosed,
     ControlSession,
+    ManagedExecRefused,
     ManagedExecResult,
     capability_pipe,
 )
@@ -87,6 +92,16 @@ MOUNTS_CONFIG_FORMATS = (
     FILE_MOUNT_CONFIG_FORMAT,
 )
 OUTCOME_SCHEMA_VERSION = 1
+# A managed boot that never opens its control endpoint almost never recovers,
+# but the endpoint wait otherwise costs a full timeout: the first start attempt
+# bounds that wait so a stalled boot is torn down and retried once with the
+# full timeout instead of sitting on the tail of the distribution.
+START_FIRST_WAIT_S = 8.0
+EXECD_MAX_REQUEST_BYTES = 1_048_576
+EXECD_POLL_S = 0.5
+EXECD_REQUEST_TIMEOUT_S = 30.0
+EXECD_RESPONSE_MARGIN_S = 30.0
+EXECD_UNBOUNDED_RESPONSE_S = 3_660.0
 
 
 def _write_json(path: Path, value: dict[str, Any], mode: int = 0o600) -> None:
@@ -976,10 +991,42 @@ def provision(
         )
 
 
+def _start_first_wait_s() -> float:
+    raw = os.environ.get("NVX_START_FIRST_WAIT_S")
+    if raw is None:
+        return START_FIRST_WAIT_S
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ScriptError(f"NVX_START_FIRST_WAIT_S is not a number: {raw!r}") from error
+    if not 0 < value < float("inf"):
+        raise ScriptError(f"NVX_START_FIRST_WAIT_S must be positive: {raw!r}")
+    return value
+
+
 def start(state_path: Path, timeout: float) -> None:
+    first_wait_s = min(timeout, _start_first_wait_s())
+    try:
+        _start_once(state_path, timeout, endpoint_wait_s=first_wait_s)
+    except TimeoutError as error:
+        if first_wait_s >= timeout or "did not become available" not in str(error):
+            raise
+        print(
+            f"sandbox start attempt 1 failed: {error}; "
+            "retrying once with the full timeout",
+            file=sys.stderr,
+        )
+        _start_once(state_path, timeout)
+
+
+def _start_once(
+    state_path: Path,
+    timeout: float,
+    endpoint_wait_s: float | None = None,
+) -> None:
     state_dir = _prepare_state_directory(state_path, create=False)
     with _LifecycleLock(state_dir, timeout):
-        _start(state_dir, timeout)
+        _start(state_dir, timeout, endpoint_wait_s=endpoint_wait_s)
 
 
 def _create_capability(path: Path, capability: bytes) -> None:
@@ -999,7 +1046,9 @@ def _create_capability(path: Path, capability: bytes) -> None:
         raise
 
 
-def _start(state_dir: Path, timeout: float) -> None:
+def _start(
+    state_dir: Path, timeout: float, endpoint_wait_s: float | None = None
+) -> None:
     config = _read_json(
         require_file(state_dir / CONFIG_NAME, "sandbox configuration"),
         "sandbox configuration",
@@ -1126,7 +1175,10 @@ def _start(state_dir: Path, timeout: float) -> None:
             },
         )
         with ControlSession.connect(
-            Path(endpoint_value), capability, timeout
+            Path(endpoint_value),
+            capability,
+            timeout,
+            endpoint_timeout=endpoint_wait_s,
         ) as session:
             session.ping(timeout)
     except BaseException as error:
@@ -1182,6 +1234,166 @@ def exec_workload(
             environment=environment,
             inherit_default_environment=inherit_default_environment,
         )
+
+
+def _execd_read_request(connection: socket.socket) -> bytes:
+    data = bytearray()
+    while True:
+        newline = data.find(b"\n")
+        request_size = newline if newline >= 0 else len(data)
+        if request_size > EXECD_MAX_REQUEST_BYTES:
+            raise ScriptError("sandbox execd request exceeds the 1 MiB limit")
+        if newline >= 0:
+            return bytes(data[:newline])
+        chunk = connection.recv(min(65_536, EXECD_MAX_REQUEST_BYTES + 1 - len(data)))
+        if not chunk:
+            if not data:
+                raise ScriptError("sandbox execd connection closed without a request")
+            return bytes(data)
+        data.extend(chunk)
+
+
+def _execd_parse_request(raw: bytes) -> tuple[tuple[str, ...], int]:
+    try:
+        request = json.loads(raw)
+    except (UnicodeError, ValueError, RecursionError) as error:
+        raise ScriptError("sandbox execd request is not valid JSON") from error
+    if not isinstance(request, dict):
+        raise ScriptError("sandbox execd request must be a JSON object")
+    typed = cast(dict[str, object], request)
+    command = typed.get("cmd")
+    timeout_ms = typed.get("timeout_ms", 0)
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(
+            isinstance(argument, str) for argument in cast(list[object], command)
+        )
+    ):
+        raise ScriptError("sandbox execd request requires a non-empty cmd list")
+    if (
+        not isinstance(timeout_ms, int)
+        or isinstance(timeout_ms, bool)
+        or not 0 <= timeout_ms <= 0xFFFFFFFF
+    ):
+        raise ScriptError("sandbox execd request has an invalid timeout_ms")
+    return tuple(cast(list[str], command)), timeout_ms
+
+
+def _execd_send(connection: socket.socket, payload: dict[str, Any]) -> None:
+    try:
+        connection.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+    except OSError as error:
+        print(f"sandbox execd failed to answer a client: {error}", file=sys.stderr)
+
+
+def _execd_result_payload(result: ManagedExecResult) -> dict[str, Any]:
+    try:
+        stdout = result.stdout.decode("utf-8")
+        stderr = result.stderr.decode("utf-8")
+        encoded = False
+    except UnicodeDecodeError:
+        stdout = base64.b64encode(result.stdout).decode("ascii")
+        stderr = base64.b64encode(result.stderr).decode("ascii")
+        encoded = True
+    return {"rc": result.returncode, "out": stdout, "err": stderr, "b64": encoded}
+
+
+def _execd_serve_connection(connection: socket.socket, session: ControlSession) -> None:
+    try:
+        command, timeout_ms = _execd_parse_request(_execd_read_request(connection))
+    except (ScriptError, OSError) as error:
+        _execd_send(connection, {"error": str(error)})
+        return
+    response_timeout = (
+        timeout_ms / 1000.0 + EXECD_RESPONSE_MARGIN_S
+        if timeout_ms
+        else EXECD_UNBOUNDED_RESPONSE_S
+    )
+    try:
+        result = session.exec(
+            command,
+            timeout_ms=timeout_ms,
+            response_timeout=response_timeout,
+        )
+    except (ManagedExecRefused, ValueError) as error:
+        # The session stays in sync after a guest rejection or a rejected
+        # request; connection and framing failures are fatal to the daemon.
+        _execd_send(connection, {"error": str(error)})
+        return
+    _execd_send(connection, _execd_result_payload(result))
+
+
+def _execd_shutdown(_signum: int, _frame: object) -> None:
+    sys.exit(0)
+
+
+def exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
+    """Serve single-operator exec requests on one persistent control session.
+
+    Each connection sends one JSON line {"cmd": [...], "timeout_ms": N} and
+    receives one JSON line {"rc": int, "out": str, "err": str, "b64": bool}
+    (``out``/``err`` are base64 when ``b64`` is true). The unix socket is not
+    authenticated and is created mode 0600; the daemon exits non-zero once the
+    sandbox VM is gone so clients know to re-provision.
+    """
+    if os.name == "nt":
+        raise ScriptError("sandbox execd is unsupported on Windows")
+    # Default SIGTERM kills the process without running the finally below,
+    # leaving the socket file behind; exit through an exception instead so
+    # cleanup happens. signal.signal only works from the
+    # main thread (ValueError otherwise) -- a thread-hosted daemon keeps the
+    # default behavior.
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    installed = False
+    try:
+        signal.signal(signal.SIGTERM, _execd_shutdown)
+        installed = True
+    except ValueError:
+        pass
+    try:
+        _exec_daemon(state_path, socket_path, timeout=timeout)
+    finally:
+        if installed:
+            signal.signal(signal.SIGTERM, previous_handler)
+
+
+def _exec_daemon(state_path: Path, socket_path: Path, *, timeout: float) -> None:
+    if os.name == "nt":
+        raise ScriptError("sandbox execd is unsupported on Windows")
+    state_dir = _prepare_state_directory(state_path, create=False)
+    runtime, capability = _load_running(state_dir)
+    pid, start_time = _runtime_process(runtime)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    bound = False
+    try:
+        # Restrict access from the instant the unauthenticated socket exists.
+        previous_umask = os.umask(0o077)
+        try:
+            listener.bind(os.fspath(socket_path))
+        finally:
+            os.umask(previous_umask)
+        bound = True
+        os.chmod(socket_path, 0o600)
+        listener.listen(16)
+        listener.settimeout(EXECD_POLL_S)
+        with ControlSession.connect(_endpoint(runtime), capability, timeout) as session:
+            while True:
+                if not _process_running(pid, start_time):
+                    raise ScriptError(
+                        "sandbox VM exited; sandbox execd is shutting down"
+                    )
+                try:
+                    connection, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                with connection:
+                    connection.settimeout(EXECD_REQUEST_TIMEOUT_S)
+                    _execd_serve_connection(connection, session)
+    finally:
+        listener.close()
+        if bound:
+            socket_path.unlink(missing_ok=True)
 
 
 def stop(state_path: Path, timeout: float) -> dict[str, Any]:

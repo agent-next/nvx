@@ -3,6 +3,7 @@
 
 import argparse
 import ast
+import base64
 import contextlib
 import errno
 import hashlib
@@ -18,6 +19,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -54,6 +56,7 @@ from nvx_tools import (  # noqa: E402
     sandbox,
     sandbox_lifecycle,
     ubuntu,
+    warmpool,
 )
 from nvx_tools.build_constants import (  # noqa: E402
     AlpineBuildConstants,
@@ -3546,7 +3549,7 @@ class CiConfigurationTests(unittest.TestCase):
                     )
                     return result.stdout.strip()
 
-                git("init", "--quiet")
+                git("init", "--quiet", "-b", "fixture")
                 git("config", "user.name", "Reproduction")
                 git("config", "user.email", "repro@example.invalid")
                 git("config", "commit.gpgsign", "false")
@@ -7601,7 +7604,7 @@ class BuildTests(unittest.TestCase):
                 encoding="ascii",
             )
             subprocess.run(
-                ["git", "init", "-q"],
+                ["git", "init", "-q", "-b", "fixture"],
                 cwd=root,
                 env=git_environment,
                 check=True,
@@ -16509,6 +16512,444 @@ class SandboxTests(unittest.TestCase):
                     scratch=scratch,
                 ).validated()
 
+    def test_managed_start_does_not_retry_honest_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=common.ScriptError("sandbox is already running")
+            )
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                self.assertRaisesRegex(common.ScriptError, "already running"),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            attempts.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_managed_start_retries_an_unavailable_endpoint_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=(
+                    TimeoutError(
+                        "managed control endpoint did not become available: "
+                        "control.sock"
+                    ),
+                    None,
+                )
+            )
+            stderr = io.StringIO()
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                patch.object(sys, "stderr", stderr),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(
+                attempts.call_args_list,
+                [
+                    call(state, 10, endpoint_wait_s=8.0),
+                    call(state, 10),
+                ],
+            )
+            sleep.assert_not_called()
+            self.assertIn("start attempt 1 failed", stderr.getvalue())
+            self.assertIn("did not become available", stderr.getvalue())
+            self.assertIn("full timeout", stderr.getvalue())
+
+    def test_managed_start_endpoint_timeout_retry_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=TimeoutError(
+                    "managed control endpoint did not become available: control.sock"
+                )
+            )
+            stderr = io.StringIO()
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                patch.object(sys, "stderr", stderr),
+                self.assertRaisesRegex(TimeoutError, "did not become available"),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(attempts.call_count, 2)
+            sleep.assert_not_called()
+
+    def test_managed_start_does_not_retry_other_timeouts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=TimeoutError("managed control response timed out")
+            )
+            with (
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                self.assertRaisesRegex(TimeoutError, "response timed out"),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            attempts.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_managed_start_first_wait_env_override(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            attempts = MagicMock(
+                side_effect=(
+                    TimeoutError(
+                        "managed control endpoint did not become available: "
+                        "control.sock"
+                    ),
+                    None,
+                )
+            )
+            with (
+                patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": "3"}),
+                patch.object(sandbox_lifecycle, "_start_once", attempts),
+                patch.object(sandbox_lifecycle.time, "sleep"),
+                patch.object(sys, "stderr", io.StringIO()),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(
+                attempts.call_args_list[0],
+                call(state, 10, endpoint_wait_s=3.0),
+            )
+            self.assertEqual(attempts.call_args_list[1], call(state, 10))
+
+        for raw in ("abc", "0", "-1"):
+            with (
+                patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": raw}),
+                self.assertRaisesRegex(common.ScriptError, "NVX_START_FIRST_WAIT_S"),
+            ):
+                sandbox_lifecycle._start_first_wait_s()
+
+    def test_managed_start_endpoint_retry_tears_down_before_reboot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            layer_path = root / "distro.erofs"
+            scratch_path = root / "scratch.ext4"
+            layer_path.write_bytes(b"layer")
+            scratch_path.write_bytes(b"scratch")
+            state = root / "state"
+            sandbox_lifecycle.provision(
+                state,
+                sandbox.SandboxLaunch(
+                    layers=(
+                        sandbox.SandboxLayer(
+                            role="distro",
+                            path=layer_path,
+                            uuid="11111111-1111-1111-1111-111111111111",
+                        ),
+                    ),
+                    scratch=scratch_path,
+                ),
+                hypervisor="whp",
+                memory_mib=256,
+                net=None,
+                network_profile=None,
+                network_egress=None,
+                network_ingress=None,
+                network_egress_allow=(),
+                network_egress_deny=(),
+                host_loopback=None,
+                network_proxy=None,
+                host_loopback_forward=(),
+                cmdline="quiet",
+                timeout=10,
+            )
+            runtime_at_spawn: list[bool] = []
+            processes: list[MagicMock] = []
+
+            def spawn(*args: object, **kwargs: object) -> MagicMock:
+                runtime_at_spawn.append(
+                    (state / sandbox_lifecycle.RUNTIME_NAME).exists()
+                )
+                process = MagicMock()
+                process.pid = 100 + len(processes)
+                process.stdin = io.BytesIO()
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                processes.append(process)
+                return process
+
+            session = MagicMock()
+            context = MagicMock()
+            context.__enter__.return_value = session
+            connects = MagicMock(
+                side_effect=(
+                    TimeoutError(
+                        "managed control endpoint did not become available: "
+                        "control.sock"
+                    ),
+                    context,
+                )
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            stderr = io.StringIO()
+            with (
+                patch.object(sandbox_lifecycle, "require_file", side_effect=require),
+                patch.object(sandbox_lifecycle.subprocess, "Popen", side_effect=spawn),
+                patch.object(
+                    sandbox_lifecycle, "_process_start_time", return_value=456
+                ),
+                patch.object(sandbox_lifecycle.ControlSession, "connect", connects),
+                patch.object(sys, "stderr", stderr),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            self.assertEqual(runtime_at_spawn, [False, False])
+            processes[0].terminate.assert_called_once_with()
+            processes[0].wait.assert_called_once_with(timeout=5)
+            processes[1].terminate.assert_not_called()
+            self.assertEqual(
+                [connect.args[2] for connect in connects.call_args_list],
+                [10, 10],
+            )
+            self.assertEqual(
+                [
+                    connect.kwargs["endpoint_timeout"]
+                    for connect in connects.call_args_list
+                ],
+                [8.0, None],
+            )
+            session.ping.assert_called_once_with(10)
+            self.assertIn("full timeout", stderr.getvalue())
+            self.assertTrue((state / sandbox_lifecycle.RUNTIME_NAME).exists())
+
+    def test_managed_exec_stays_honest_without_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            sandbox_lifecycle._write_json(
+                state / sandbox_lifecycle.RUNTIME_NAME,
+                {
+                    "format": sandbox_lifecycle.STATE_FORMAT,
+                    "pid": os.getpid(),
+                    "control_endpoint": "control.sock",
+                },
+            )
+            (state / sandbox_lifecycle.CAPABILITY_NAME).write_bytes(b"x" * 32)
+            with (
+                patch.object(
+                    sandbox_lifecycle.ControlSession,
+                    "connect",
+                    side_effect=sandbox_lifecycle.ControlEndpointClosed("closed"),
+                ) as connect,
+                patch.object(sandbox_lifecycle.time, "sleep") as sleep,
+                self.assertRaises(sandbox_lifecycle.ControlEndpointClosed),
+            ):
+                sandbox_lifecycle.exec_workload(
+                    state,
+                    ("/bin/true",),
+                    timeout_ms=0,
+                    response_timeout=5,
+                )
+
+            connect.assert_called_once()
+            sleep.assert_not_called()
+
+    def _execd_state(self, state: Path) -> None:
+        sandbox_lifecycle._write_json(
+            state / sandbox_lifecycle.RUNTIME_NAME,
+            {
+                "format": sandbox_lifecycle.STATE_FORMAT,
+                "pid": os.getpid(),
+                "control_endpoint": "control.sock",
+            },
+        )
+        (state / sandbox_lifecycle.CAPABILITY_NAME).write_bytes(b"x" * 32)
+
+    def _execd_request(self, socket_path: Path, request: bytes) -> dict[str, Any]:
+        if os.name == "nt":
+            self.skipTest("execd requires Unix sockets")
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.settimeout(5)
+            client.connect(os.fspath(socket_path))
+            client.sendall(request + b"\n")
+            response = bytearray()
+            while b"\n" not in response:
+                chunk = client.recv(65_536)
+                if not chunk:
+                    break
+                response.extend(chunk)
+            return cast(dict[str, Any], json.loads(bytes(response).split(b"\n", 1)[0]))
+        finally:
+            client.close()
+
+    @unittest.skipIf(os.name == "nt", "execd requires Unix sockets")
+    def test_execd_serves_requests_on_one_session_until_vm_dies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            socket_path = root / "execd.sock"
+            state.mkdir()
+            self._execd_state(state)
+            session = MagicMock()
+            session.exec.side_effect = (
+                sandbox_lifecycle.ManagedExecResult(0, "exit", b"hello", b"warn"),
+                sandbox_lifecycle.ManagedExecResult(1, "exit", b"\xff", b""),
+            )
+            ready = threading.Event()
+
+            def attached() -> MagicMock:
+                ready.set()
+                return session
+
+            context = MagicMock()
+            context.__enter__.side_effect = attached
+            running = [True]
+            failure: list[BaseException] = []
+
+            def serve() -> None:
+                try:
+                    sandbox_lifecycle.exec_daemon(state, socket_path, timeout=5)
+                except BaseException as error:
+                    failure.append(error)
+
+            def process_running(_pid: int, _start_time: int | None) -> bool:
+                return running[0]
+
+            with (
+                patch.object(
+                    sandbox_lifecycle,
+                    "_process_running",
+                    process_running,
+                ),
+                patch.object(
+                    sandbox_lifecycle.ControlSession,
+                    "connect",
+                    return_value=context,
+                ),
+            ):
+                worker = threading.Thread(target=serve)
+                worker.start()
+                try:
+                    self.assertTrue(ready.wait(5), "daemon did not attach")
+                    self.assertEqual(os.stat(socket_path).st_mode & 0o777, 0o600)
+
+                    response = self._execd_request(
+                        socket_path,
+                        json.dumps(
+                            {"cmd": ["/bin/sh", "-c", "echo hi"], "timeout_ms": 30000}
+                        ).encode("utf-8"),
+                    )
+                    self.assertEqual(
+                        response,
+                        {"rc": 0, "out": "hello", "err": "warn", "b64": False},
+                    )
+                    session.exec.assert_called_once_with(
+                        ("/bin/sh", "-c", "echo hi"),
+                        timeout_ms=30000,
+                        response_timeout=60.0,
+                    )
+
+                    response = self._execd_request(
+                        socket_path,
+                        json.dumps({"cmd": ["/bin/cat"]}).encode("utf-8"),
+                    )
+                    self.assertEqual(response["rc"], 1)
+                    self.assertTrue(response["b64"])
+                    self.assertEqual(base64.b64decode(response["out"]), b"\xff")
+
+                    response = self._execd_request(socket_path, b"not json")
+                    self.assertIn("error", response)
+                finally:
+                    running[0] = False
+                    worker.join(timeout=10)
+
+            self.assertEqual(len(failure), 1)
+            self.assertIsInstance(failure[0], common.ScriptError)
+            self.assertIn("VM exited", str(failure[0]))
+            self.assertFalse(socket_path.exists())
+            self.assertFalse(worker.is_alive())
+
+    @unittest.skipIf(os.name == "nt", "execd requires Unix sockets")
+    def test_execd_refuses_to_start_when_sandbox_is_not_running(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            socket_path = root / "execd.sock"
+            state = root / "state"
+            state.mkdir()
+            with (
+                patch.object(sandbox_lifecycle.signal, "signal"),
+                self.assertRaisesRegex(common.ScriptError, "not running"),
+            ):
+                sandbox_lifecycle.exec_daemon(state, socket_path, timeout=5)
+            self.assertFalse(socket_path.exists())
+
+    @unittest.skipIf(os.name == "nt", "execd requires Unix sockets")
+    def test_execd_exits_when_the_vm_is_already_gone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            socket_path = root / "execd.sock"
+            state.mkdir()
+            self._execd_state(state)
+            context = MagicMock()
+            with (
+                patch.object(sandbox_lifecycle.signal, "signal"),
+                patch.object(
+                    sandbox_lifecycle,
+                    "_process_running",
+                    side_effect=(True, False, False),
+                ),
+                patch.object(
+                    sandbox_lifecycle.ControlSession,
+                    "connect",
+                    return_value=context,
+                ),
+                self.assertRaisesRegex(common.ScriptError, "VM exited"),
+            ):
+                sandbox_lifecycle.exec_daemon(state, socket_path, timeout=5)
+            self.assertFalse(socket_path.exists())
+
+    def test_sandbox_execd_cli_contract(self):
+        args = nvx.parse_args(
+            [
+                "sandbox",
+                "execd",
+                "--state-dir",
+                "state",
+                "--socket",
+                "execd.sock",
+            ]
+        )
+        self.assertEqual(args.sandbox_operation, "execd")
+        self.assertEqual(args.socket, Path("execd.sock"))
+        with patch.object(sandbox_lifecycle, "exec_daemon") as exec_daemon:
+            nvx.command_sandbox(args)
+        exec_daemon.assert_called_once_with(
+            Path("state"), Path("execd.sock"), timeout=60.0
+        )
+
+        missing_socket = nvx.parse_args(["sandbox", "execd", "--state-dir", "state"])
+        with self.assertRaisesRegex(common.ScriptError, "requires --socket"):
+            nvx.command_sandbox(missing_socket)
+        missing_state = nvx.parse_args(["sandbox", "execd", "--socket", "s"])
+        with self.assertRaisesRegex(common.ScriptError, "requires --state-dir"):
+            nvx.command_sandbox(missing_state)
+        wrong_operation = nvx.parse_args(
+            [
+                "sandbox",
+                "exec",
+                "--state-dir",
+                "state",
+                "--socket",
+                "s",
+            ]
+        )
+        with self.assertRaisesRegex(common.ScriptError, "only valid"):
+            nvx.command_sandbox(wrong_operation)
+
 
 class BenchmarkTests(unittest.TestCase):
     def test_kvm_worker_result_decoding(self):
@@ -18584,6 +19025,13 @@ class BenchmarkTests(unittest.TestCase):
                 b"OPENVMM-SNAPSHOT-RESTORE-OK\r\n",
                 marker,
             )
+        )
+        self.assertTrue(
+            benchmark.contains_output_line(
+                b"OPENVMM-SNAPSHOT-RESTORE-OK\r\r\n",
+                marker,
+            ),
+            "a doubled carriage return before the newline must not hide the marker",
         )
 
     def test_device_restore_marker_and_trace_parsers(self):
@@ -22114,6 +22562,66 @@ class SharedFileTests(unittest.TestCase):
             self.assertTrue(all(member.uid == member.gid == 0 for member in members))
 
 
+class EnsureOpenvmmSourceTests(unittest.TestCase):
+    def test_preserves_release_binary_across_submodule_init(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".gitmodules").write_text(
+                '[submodule "openvmm"]\n'
+                "\tpath = openvmm\n"
+                "\turl = https://github.com/nanvix/openvmm.git\n",
+                encoding="ascii",
+            )
+            binary = (
+                root
+                / "openvmm"
+                / "target"
+                / "release"
+                / release.openvmm_binary_path().name
+            )
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"release-binary")
+
+            original_run = release.subprocess.run
+
+            def fake_run(command: list[str], **kwargs: Any) -> Any:
+                if "submodule" in command:
+                    (root / "openvmm" / "Cargo.toml").write_text(
+                        "[package]\n", encoding="ascii"
+                    )
+                    return subprocess.CompletedProcess(command, 0, b"", b"")
+                return cast(
+                    subprocess.CompletedProcess[bytes], original_run(command, **kwargs)
+                )
+
+            with patch.object(release.subprocess, "run", side_effect=fake_run):
+                release.ensure_openvmm_source(root)
+
+            self.assertTrue((root / "openvmm" / "Cargo.toml").exists())
+            self.assertEqual(binary.read_bytes(), b"release-binary")
+            staged = root / "build" / "openvmm-release-binary"
+            self.assertFalse(staged.exists())
+
+    def test_rejects_unexpected_openvmm_content_without_binary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stray = root / "openvmm" / "stray.txt"
+            stray.parent.mkdir(parents=True)
+            stray.write_text("not a release install\n", encoding="ascii")
+            with self.assertRaises(release.ScriptError):
+                release.ensure_openvmm_source(root)
+
+    def test_noop_when_submodule_initialized(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "openvmm").mkdir()
+            (root / "openvmm" / "Cargo.toml").write_text(
+                "[package]\n", encoding="ascii"
+            )
+            release.ensure_openvmm_source(root)
+            self.assertTrue((root / "openvmm" / "Cargo.toml").exists())
+
+
 class DownloadTests(unittest.TestCase):
     def test_rejects_nonpositive_attempts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -22205,6 +22713,78 @@ class DownloadTests(unittest.TestCase):
                 )
 
             self.assertEqual(destination.read_bytes(), payload)
+
+
+class WarmpoolTests(unittest.TestCase):
+    def make_pool(self, entries: int = 2) -> Path:
+        root = Path(tempfile.mkdtemp(prefix="warmpool-test-"))
+        self.addCleanup(shutil.rmtree, root)
+        for _ in range(entries):
+            entry = root / f"entry-{uuid.uuid4().hex[:8]}"
+            entry.mkdir()
+            for name in benchmark.SNAPSHOT_FILENAMES:
+                (entry / name).write_bytes(b"0" * 16)
+        warmpool.write_manifest(root, {"version": 1, "memory_mib": 128})
+        return root
+
+    def test_acquire_release_roundtrip(self) -> None:
+        pool = self.make_pool(entries=2)
+        claimed = warmpool.acquire_entries(pool, 2)
+        self.assertEqual(len(claimed), 2)
+        self.assertEqual(len(warmpool.pool_entry_paths(pool)), 0)
+        with self.assertRaises(nvx.ScriptError):
+            warmpool.acquire_entries(pool, 1)
+        for path in claimed:
+            warmpool.release_entry(pool, path)
+        self.assertEqual(len(warmpool.pool_entry_paths(pool)), 2)
+        self.assertEqual(len(warmpool.pool_claimed_paths(pool)), 0)
+
+    def test_prune_removes_only_stale_claims(self) -> None:
+        pool = self.make_pool(entries=2)
+        with patch.object(warmpool.time, "time_ns", side_effect=(0, 3_600_000_000_000)):
+            stale, fresh = warmpool.acquire_entries(pool, 2)
+        removed = warmpool.prune_claims(pool, ttl_s=60, now=3601)
+        self.assertEqual(removed, 1)
+        self.assertTrue(fresh.is_dir())
+        self.assertFalse(stale.exists())
+
+    def test_manifest_required(self) -> None:
+        empty = Path(tempfile.mkdtemp(prefix="warmpool-empty-"))
+        self.addCleanup(shutil.rmtree, empty)
+        with self.assertRaises(nvx.ScriptError):
+            warmpool.read_manifest(empty)
+
+    def test_pool_class_tag_guard(self) -> None:
+        pool = self.make_pool(entries=1)
+        classes = {6_000_000: {0}, 5_700_000: {2}, 4_200_000: {16, 17}}
+        with (
+            patch.object(warmpool, "cpu_frequency_classes", return_value=classes),
+            patch.object(warmpool, "_process_affinity", return_value={0, 2}),
+        ):
+            warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": [5_700_000]})
+            warmpool.validate_pool_class(pool)  # tagged class present, in affinity
+            warmpool.write_manifest(
+                pool, {"cpu_class_frequencies_khz": [5_700_000, 6_000_000]}
+            )
+            warmpool.validate_pool_class(pool)  # one merged (turbo) cluster
+            warmpool.write_manifest(pool, {"cpu_class_frequencies_khz": [9_999_999]})
+            with self.assertRaises(nvx.ScriptError):
+                warmpool.validate_pool_class(pool)  # class absent on host
+            warmpool.write_manifest(
+                pool, {"cpu_class_frequencies_khz": [5_700_000, 4_200_000]}
+            )
+            with self.assertRaises(nvx.ScriptError):
+                warmpool.validate_pool_class(pool)  # spans two classes
+            warmpool.write_manifest(pool, {})
+            warmpool.validate_pool_class(pool)  # untagged legacy pool serves
+
+    def test_cli_registration(self) -> None:
+        parser = nvx.parse_args(
+            ["warmpool", "acquire", "--pool-dir", "/tmp/pool", "--count", "2"]
+        )
+        self.assertEqual(parser.warmpool_operation, "acquire")
+        self.assertEqual(parser.count, 2)
+        self.assertTrue(callable(parser.handler))
 
 
 if __name__ == "__main__":

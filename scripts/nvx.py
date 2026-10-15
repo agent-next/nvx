@@ -86,6 +86,7 @@ from nvx_tools.release import (
     collect_release_sources,
     create_release_archive,
     download_checkout_release,
+    ensure_openvmm_source,
     package_release,
     verify_source_tree,
 )
@@ -112,6 +113,7 @@ from nvx_tools.time_abi import (
     host_cpu_profile_guidance,
     openvmm_cpu_generations,
 )
+from nvx_tools.warmpool import configure_parser as configure_warmpool_parser
 
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
@@ -440,6 +442,11 @@ def command_download(args: argparse.Namespace) -> None:
     download_checkout_release(args.repository, _release_platform(args.hypervisor))
 
 
+def command_setup_submodule(args: argparse.Namespace) -> None:
+    ensure_openvmm_source(BuildConstants.REPO_ROOT)
+    print("openvmm source is ready; any existing release binary was preserved")
+
+
 def _format_command(command: list[str]) -> str:
     return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
 
@@ -740,6 +747,8 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError("--mount-owner requires --mount")
     if args.mount and operation not in ("run", "provision"):
         raise ScriptError("--mount is only valid for sandbox run or provision")
+    if args.socket is not None and operation != "execd":
+        raise ScriptError("--socket is only valid for sandbox execd")
     if operation in ("run", "provision"):
         if (args.net is None) != (args.network_profile is None):
             raise ScriptError("--net and --network-profile must be specified together")
@@ -811,6 +820,13 @@ def command_sandbox(args: argparse.Namespace) -> None:
         if args.outcome_report is not None:
             sandbox_lifecycle.write_exec_outcome(args.outcome_report, result)
         raise SystemExit(result.returncode)
+    if operation == "execd":
+        if args.state_dir is None:
+            raise ScriptError("sandbox execd requires --state-dir")
+        if args.socket is None:
+            raise ScriptError("sandbox execd requires --socket")
+        sandbox_lifecycle.exec_daemon(args.state_dir, args.socket, timeout=args.timeout)
+        return
     if operation == "stop":
         if args.state_dir is None:
             raise ScriptError("sandbox stop requires --state-dir")
@@ -1135,6 +1151,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     download.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
     download.set_defaults(handler=command_download)
 
+    setup_submodule = subparsers.add_parser(
+        "setup-submodule",
+        help="init the openvmm submodule, preserving a release-installed binary",
+    )
+    setup_submodule.set_defaults(handler=command_setup_submodule)
+
     run = subparsers.add_parser("run", help="run an OpenVMM microVM")
     run.add_argument("--guest", choices=GUEST_NAMES, default="alpine")
     run.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
@@ -1268,7 +1290,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument(
         "sandbox_operation",
         nargs="?",
-        choices=("run", "provision", "start", "exec", "stop", "deprovision"),
+        choices=("run", "provision", "start", "exec", "execd", "stop", "deprovision"),
         default="run",
     )
     sandbox.add_argument(
@@ -1280,6 +1302,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     sandbox.add_argument("--scratch", type=Path)
     sandbox.add_argument("--state-dir", type=Path)
+    sandbox.add_argument(
+        "--socket",
+        type=Path,
+        help="unix socket path for the persistent exec daemon (execd)",
+    )
     sandbox.add_argument("--entrypoint", default="/bin/sh")
     sandbox.add_argument("--arg", action="append", default=[], dest="sandbox_arg")
     sandbox.add_argument("--hostname", default="nvx-sandbox")
@@ -1436,6 +1463,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     configure_benchmark_parser(benchmark, BuildConstants.REPO_ROOT)
     benchmark.set_defaults(handler=command_benchmark)
 
+    warmpool = subparsers.add_parser(
+        "warmpool",
+        help="manage pre-captured snapshot pools for fast sandbox starts",
+    )
+    configure_warmpool_parser(warmpool, BuildConstants.REPO_ROOT)
+
     performance = subparsers.add_parser(
         "performance",
         help="collect, persist, and gate CI performance results",
@@ -1489,12 +1522,55 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     verify = subparsers.add_parser("verify", help="verify source and submodule inputs")
     verify.set_defaults(handler=command_verify)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command == "benchmark":
+        from nvx_tools.benchmark import (
+            apply_hybrid_cpu_filter,
+            cpu_class_preference,
+            physical_cpu_representatives,
+        )
+
+        cpu_class_preference()
+        if args.cpus is None:
+            args.cpus = ",".join(
+                str(cpu)
+                for cpu in sorted(
+                    apply_hybrid_cpu_filter(physical_cpu_representatives())
+                )
+            )
+    return args
+
+
+def apply_hybrid_process_affinity(command: str = "") -> None:
+    """Apply opt-in CPU-class placement without dropping SMT siblings.
+
+    ``NVX_CPU_CLASS=performance`` or ``efficiency`` selects a class on hybrid
+    hosts. Otherwise preserve the caller's affinity, as upstream does.
+    This is a placement preference, not a snapshot compatibility requirement.
+    ``benchmark`` manages its own per-process latency-measurement affinity.
+    """
+    from nvx_tools.benchmark import apply_hybrid_cpu_filter, cpu_class_preference
+
+    preference = cpu_class_preference()
+    if (
+        sys.platform != "linux"
+        or command == "benchmark"
+        or preference not in ("performance", "efficiency")
+    ):
+        return
+    try:
+        current = os.sched_getaffinity(0)
+        restricted = apply_hybrid_cpu_filter(current)
+        if restricted and restricted != current:
+            os.sched_setaffinity(0, restricted)
+    except (OSError, ImportError, AttributeError):
+        return
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
     try:
+        args = parse_args(argv)
+        apply_hybrid_process_affinity(args.command)
         result = args.handler(args)
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)

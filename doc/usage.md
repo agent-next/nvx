@@ -23,6 +23,7 @@ python3 scripts/nvx.py performance gate --help
 | Command | Description |
 | --- | --- |
 | `init` | Initialize the OpenVMM submodule and its nested submodules. |
+| `setup-submodule` | Initialize OpenVMM source alongside a release install. |
 | `build-guest` | Build the Linux kernel and selected guest artifacts. |
 | `build-kernel` | Build the pinned and patched Linux kernel natively. |
 | `build-initramfs` | Build the selected Alpine, Ubuntu, or Azure Linux initramfs. |
@@ -44,6 +45,7 @@ python3 scripts/nvx.py performance gate --help
 | `download` | Install the selected platform package built from this checkout or a released first-parent ancestor. |
 | `run` | Run an OpenVMM microVM. |
 | `sandbox` | Run or manage workloads over EROFS layers and private ext4 scratch. |
+| `warmpool` | Manage a pool of pre-captured snapshots. |
 | `benchmark` | Run the OpenVMM-native benchmark coordinator. |
 | `performance` | Collect, gate, and persist CI performance results, and check benchmark hosts. |
 | `collect-sources` | Materialize verified Linux, Alpine, and Ubuntu release sources. |
@@ -63,6 +65,17 @@ python3 scripts/nvx.py init
 ```
 
 Initializes and recursively updates the OpenVMM Git submodule.
+
+### `setup-submodule`
+
+```console
+python3 scripts/nvx.py setup-submodule
+```
+
+Initializes the pinned OpenVMM source and nested submodules recursively.
+Preserves the downloaded `openvmm` binary (`openvmm.exe` on Windows), including
+when initialization fails. Like `init`, this obtains full source history rather
+than a shallow checkout.
 
 ### `verify`
 
@@ -301,6 +314,12 @@ profile. The command
 requires `build/vmlinux` (with `--debug-kernel`, `build/vmlinux-debug` and its
 `build/vmlinux-debug.config`), the selected initramfs, and
 `openvmm/target/release/openvmm[.exe]`.
+
+The default `snapshot-class-matrix` scenario checks same- and cross-class
+restores using the host CPU profile on Linux hybrid hosts. It temporarily
+restricts the process to each class within the caller's original CPU affinity
+and restores that affinity even after failure. It skips on other platforms,
+single-class hosts, or when the caller's affinity excludes either class.
 
 ### `doctor`
 
@@ -552,10 +571,11 @@ error itself names `--cpu-profile host`.
 
 ```text
 python3 scripts/nvx.py sandbox
-    [{run,provision,start,exec,stop,deprovision}]
+    [{run,provision,start,exec,execd,stop,deprovision}]
     [--layer ROLE,PATH,EROFS_UUID]...
     [--scratch PATH]
     [--state-dir PATH]
+    [--socket PATH]
     [--entrypoint PATH]
     [--arg VALUE]...
     [--hostname NAME]
@@ -595,10 +615,11 @@ launches.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `{run,provision,start,exec,stop,deprovision}` | `run` | Select a one-shot run or a managed lifecycle operation. |
+| `{run,provision,start,exec,execd,stop,deprovision}` | `run` | Select a one-shot run or a managed lifecycle operation. |
 | `--layer ROLE,PATH,EROFS_UUID` | required for `run` and `provision` | Attach a `distro`, `runtime`, or `custom` EROFS layer. Repeat once per distinct role. |
 | `--scratch PATH` | required for `run` and `provision` | Attach a preformatted ext4 scratch image as the writable overlay. |
 | `--state-dir PATH` | required for managed operations | Select persistent sandbox state. One-shot `run` rejects this option. |
+| `--socket PATH` | none | Private Unix socket for the persistent `execd` daemon. Required for `execd`. |
 | `--entrypoint PATH` | `/bin/sh` | Select an absolute workload entrypoint without whitespace. |
 | `--arg VALUE` | none | Append one whitespace-free entrypoint argument. Repeat to pass multiple arguments. |
 | `--hostname NAME` | `nvx-sandbox` | Set the workload UTS hostname. |
@@ -634,6 +655,45 @@ launches.
 
 See [Run](run.md) for artifact preparation, the security boundary, and current
 snapshot/configuration limitations.
+
+#### Persistent execution with `sandbox execd`
+
+On a running managed sandbox, start the foreground daemon with:
+
+```text
+python3 scripts/nvx.py sandbox execd --state-dir STATE --socket SOCKET
+```
+
+The Unix socket is private (bound with umask 077, then mode 0600). It has no
+additional authentication; access has the same trust boundary as the sandbox's
+control capability. Each connection sends one newline-terminated JSON request:
+
+```json
+{"cmd":["/bin/sh","-c","printf hello"],"timeout_ms":30000}
+```
+
+`cmd` is a nonempty list of strings. `timeout_ms` is optional; zero disables
+the guest workload deadline. The response is one JSON line:
+
+```json
+{"rc":0,"out":"hello","err":"","b64":false}
+```
+
+If either output stream is not UTF-8, both `out` and `err` are base64-encoded
+and `b64` is true. Malformed requests and guest rejections return
+`{"error":"description"}` instead of a guest exit status. Connections are
+served serially over one persistent control session. A client timeout does
+not prove the guest command stopped; do not launch an overlapping fallback exec.
+
+The daemon requires a running sandbox and exits nonzero if the VM dies.
+While it holds the control channel, external operations such as `sandbox stop`
+time out. Stop the daemon first by sending SIGTERM to the PID your process
+supervisor recorded when launching it (or use Ctrl+C in its foreground terminal), then
+stop the sandbox. Normal exit and SIGTERM remove the socket. SIGKILL bypasses
+cleanup; after confirming that daemon PID has exited, remove the stale socket
+before restarting. `execd` is unsupported on Windows.
+The daemon does not write a PID file. Requests are limited to 1 MiB before
+the newline; `timeout_ms` must be an integer from 0 through 4294967295.
 
 ## CPU profiles
 
@@ -766,6 +826,15 @@ python3 scripts/nvx.py benchmark [OPTIONS]
 | `--output-dir PATH` | none | Write canonical workload logs to a directory. |
 | `--scratch-dir PATH` | system temporary directory | Select an existing directory for temporary snapshots, guest RAM backing, and workload files. |
 | `--keep-kvm-stage` | off | Keep temporary staged KVM benchmark binaries. |
+
+With `NVX_CPU_CLASS` unset, empty, or `all`, the default `--cpus` selects
+one logical CPU per physical core without class filtering.
+`NVX_CPU_CLASS=performance` or `efficiency` opts into filtering that default
+to the selected frequency class. An explicit `--cpus` takes precedence.
+Unknown `NVX_CPU_CLASS` values are rejected. A hybrid-class selection with no
+candidate CPUs raises an error instead of falling back to mixed classes.
+Every selected set, including an opt-in filtered default, must satisfy the
+vCPU count plus host reserve.
 
 Measured counts must be at least 1; warmups may be zero, and timeouts must be greater than zero.
 Every suite but `phase2`, which boots no microVM, refuses a host before it
@@ -1033,3 +1102,105 @@ Validates the staged distribution against its `SHA256SUMS`, snapshots the
 accepted inventory, and creates a deterministic archive at the destination.
 The destination must be outside the source directory and end in `.tar.gz` or
 `.zip`.
+
+## Snapshot pool
+
+### `warmpool`
+
+Snapshots in this pool are bare benchmark snapshots, not provisioned managed sandboxes.
+Fill and placement validation require Linux CPU-affinity support.
+An available snapshot is an `entry-*` directory. Acquire renames it to
+`claimed-<unix-time-nanoseconds>-<id>` so concurrent callers cannot claim the
+same entry. Restore does not consume the snapshot; release returns it for reuse.
+
+Ordinary commands preserve the caller's CPU affinity by default.
+`NVX_CPU_CLASS=performance` or `efficiency` opts into single-class placement,
+including available SMT siblings. Benchmark pinning remains separate for
+latency measurement. Single-class pools record a frequency-based placement
+tag; acquire and bench reject tags absent from the host or outside the caller's
+affinity, or tags spanning classes. Unpinned multi-class captures have no
+single-class tag. OpenVMM's CPU contract still decides restore compatibility,
+including cross-class restore.
+
+#### `warmpool fill`
+
+```text
+python3 scripts/nvx.py warmpool fill [-h] --pool-dir POOL_DIR
+                            [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+                            [--size SIZE] [--memory-mib MEMORY_MIB]
+                            [--processors {1,2,4,8}] [--backend {kvm,mshv}]
+                            [--timeout TIMEOUT]
+```
+
+Captures `--size` snapshots and writes `pool.json` with the guest shape,
+backend and placement metadata. Kernel, initramfs and OpenVMM artifacts must
+already exist. Fill requires a new or empty directory and never overwrites
+an existing pool, even if its entries are all claimed or expired. Use a new
+pool directory to change shape or replenish capacity. Only completed captures
+become available entries; a failed fill keeps its manifest and completed entries.
+Keep the pool on a filesystem supporting atomic directory rename.
+Size, memory, count, workers, durations, TTLs and timeouts must be positive;
+floating-point durations, TTLs and timeouts must also be finite.
+
+#### `warmpool status`
+
+```text
+python3 scripts/nvx.py warmpool status [-h] --pool-dir POOL_DIR
+                              [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+```
+
+Prints the fill-time manifest and current available/claimed directory counts.
+
+#### `warmpool acquire`
+
+```text
+python3 scripts/nvx.py warmpool acquire [-h] --pool-dir POOL_DIR
+                               [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+                               [--count COUNT]
+```
+
+Prints exactly `--count` claim paths, one per line. Each rename is atomic;
+the batch is not a single transaction. If the batch cannot complete, it releases
+all partial claims before failing. Callers must release each claim after restore
+finishes, including when restore fails.
+
+#### `warmpool release`
+
+```text
+python3 scripts/nvx.py warmpool release [-h] --pool-dir POOL_DIR
+                               [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+                               --entry ENTRY
+```
+
+Accepts only a plain `claimed-*` directory directly inside the specified pool,
+not an arbitrary directory or a symbolic link. Prints its new available path.
+
+#### `warmpool prune`
+
+```text
+python3 scripts/nvx.py warmpool prune [-h] --pool-dir POOL_DIR
+                             [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+                             --ttl-s TTL_S
+```
+
+Deletes claims whose claim-name timestamp is at least `--ttl-s` seconds old,
+not snapshots whose capture-time directory mtime is old. Unknown timestamp
+formats are left untouched. This is destructive expiration, not automatic
+recovery to the available pool. It does not check whether a caller is alive or
+renew leases: choose a TTL longer than the longest restore/use period, and do
+not prune claims still in use. Replace an exhausted pool by filling a new directory.
+
+#### `warmpool bench`
+
+```text
+python3 scripts/nvx.py warmpool bench [-h] --pool-dir POOL_DIR
+                             [--openvmm-dir OPENVMM_DIR] [--nvx-dir NVX_DIR]
+                             [--duration-s DURATION_S] [--workers WORKERS]
+                             [--timeout TIMEOUT]
+```
+
+Workers repeatedly acquire, restore and release for the requested duration.
+The command reports latency, failures, pool-exhaustion waits and leaked claims.
+It fails if acquisition, restore, or release fails, or pool counts do not return
+to their initial values. Acquisition and release errors still produce the
+summary and leak check. Run bench without other pool users for meaningful leak counts.
