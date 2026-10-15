@@ -127,12 +127,32 @@ saved state after any device changes; do not continue to launch.
    remain unused by the guest; add a separate root port and `--vfio` argument
    for each companion that the guest needs.
 
-3. With the documented Linux build prerequisites installed, run
-   `cargo xflowey restore-packages` then `cargo build -p openvmm --release`
-   from the submodule directory. See
+3. With the documented Linux build prerequisites installed, run the following
+   from the clean, pinned `openvmm/` submodule directory on x86-64 Linux. Do
+   not run concurrently with NVX's patch-applying build commands. See
    [the pinned build guide, lines 14-38][build-guide].
-   The commands in step 4 also run from that submodule directory and assume
-   Cargo's default target directory (no `CARGO_TARGET_DIR` override).
+
+   **`openvmm/target/release/openvmm` belongs to NVX.** Building the bare pin
+   there would replace NVX's patched/downloaded binary and invalidate its
+   recorded executable hash. This standalone experiment deliberately does not
+   apply NVX's patches and must never supply NVX artifacts. Both Cargo commands
+   below use a new, dedicated target directory; the explicit target triple
+   also avoids inheriting a different build target.
+
+   ```bash
+   (
+   set -euo pipefail
+   CARGO_TARGET_DIR=$(mktemp -d "$PWD/../openvmm-vfio-target.XXXXXX")
+   export CARGO_TARGET_DIR
+   printf 'Standalone target directory: %s\n' "$CARGO_TARGET_DIR"
+   cargo xflowey restore-packages
+   cargo build -p openvmm --release --target x86_64-unknown-linux-gnu
+   printf 'Standalone executable: %s/x86_64-unknown-linux-gnu/release/openvmm\n' "$CARGO_TARGET_DIR"
+   )
+   ```
+
+   Keep the printed executable path for step 4. This directory is separate
+   from NVX's target and provenance files; do not copy its binary over them.
    Use a separate general-purpose x86-64 guest kernel/initramfs with ACPI,
    PCI/PCIe, PCI MSI, PCI MMCONFIG, serial console and initramfs support.
    For `nvidia-smi`, include matching NVIDIA kernel modules, firmware and
@@ -140,13 +160,16 @@ saved state after any device changes; do not continue to launch.
    here; the NVX microVM kernel is not reusable unchanged.
 
 4. Launch the standard machine, with no emulated guest IOMMU. Set `BDF` to
-   the same GPU inspected and bound in step 2, even in a fresh shell:
+   the same GPU inspected and bound in step 2. Replace `OPENVMM` with the
+   absolute executable path printed in step 3, even in the same shell:
 
    ```bash
    (
    set -euo pipefail
    BDF=0000:01:00.0
-   sudo ./target/release/openvmm --machine standard --hypervisor kvm \
+   OPENVMM=/absolute/path/to/openvmm-vfio-target.XXXXXX/x86_64-unknown-linux-gnu/release/openvmm
+   test -x "$OPENVMM"
+   sudo "$OPENVMM" --machine standard --hypervisor kvm \
      --pcie-root-complex rc0,high_mmio=64G --pcie-root-port rc0:rp0 \
      --vfio host="$BDF",port=rp0 \
      --kernel /path/to/vmlinux --initrd /path/to/initrd \
@@ -201,8 +224,8 @@ saved state after any device changes; do not continue to launch.
 
 VFIO guests cannot save/restore or hot-plug devices according to
 [the upstream limitations, lines 328-332][vfio-limitations]. Sharing the
-OpenVMM executable therefore does not imply sharing NVX's microVM lifecycle
-or snapshot contract.
+OpenVMM codebase therefore does not imply sharing NVX's executable, microVM
+lifecycle or snapshot contract.
 
 ## Measured cloud prerequisite failure
 
@@ -371,7 +394,7 @@ so guest NVIDIA enumeration, driver initialization and CUDA remain unverified.
 [vfio-implementation]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/vm/devices/pci/vfio_assigned_device/src/lib.rs#L4-L15
 [vfio-resolver]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/vm/devices/pci/vfio_assigned_device/src/resolver.rs#L70-L105
 [vfio-overview]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/Guide/src/user_guide/openvmm/vfio.md#L1-L33
-[nvx-kernel]: https://github.com/agent-next/nvx/blob/f932d6fd9eef426a8ce44ef63c7b6a4814fa5684/kernel/config-microvm#L913
+[nvx-kernel]: https://github.com/microsoft/nvx/blob/3486790ea38a1addda9a9145f27627392192ff0d/kernel/config-microvm#L913
 [mmio-defaults]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/openvmm/openvmm_entry/src/cli_args.rs#L1271-L1278
 [cold-boot-assignment]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/openvmm/openvmm_core/src/worker/dispatch.rs#L3510-L3516
 [mmio-exhaustion]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/vm/devices/pci/pci_resource_assignment/src/lib.rs#L173-L186
