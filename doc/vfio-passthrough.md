@@ -28,6 +28,10 @@ The NVX guest kernel is also unsuitable:
 
 This is a source-derived recipe, not a claim of successful NVIDIA driver
 initialization. It does not use the NVX microVM launcher or its snapshot path.
+Run the recipe blocks in Bash. Each block that enables strict error handling
+runs in a subshell, so a failure stops that block without changing the parent
+shell's options or closing the terminal. Stop on failure and restore from the
+saved state after any device changes; do not continue to launch.
 
 1. Use a Linux host with working KVM and an enabled IOMMU (VT-d/AMD-Vi).
    A cloud VM must expose both nested virtualization and a usable virtual
@@ -48,9 +52,11 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
    members are idle, stop their users (including `nvidia-persistenced` if
    active), and disable GPU persistence mode before release.
 
-   In a Bash shell, replace the example BDF and inspect the group and BARs:
+   Replace the example BDF with the same GPU address in each block in steps
+   2 and 4. Blocks do not share shell variables. Inspect the group and BARs:
 
    ```bash
+   (
    set -euo pipefail
    BDF=0000:01:00.0
    GROUP=$(readlink -e "/sys/bus/pci/devices/$BDF/iommu_group")
@@ -60,6 +66,7 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
        lspci -Dnnk -s "${dev##*/}"
        sudo lspci -vv -s "${dev##*/}"
    done
+   )
    ```
 
    Check each `Region` size and whether it is 32-bit or 64-bit. The A10
@@ -79,6 +86,12 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
    if preparation or launch fails:
 
    ```bash
+   (
+   set -euo pipefail
+   BDF=0000:01:00.0
+   GROUP=$(readlink -e "/sys/bus/pci/devices/$BDF/iommu_group")
+   test -d "$GROUP/devices"
+   members=("$GROUP"/devices/*)
    STATE=$(mktemp -d "$PWD/vfio-state.XXXXXX")
    printf 'Restore state: %s\n' "$STATE"
    for dev in "${members[@]}"; do
@@ -105,6 +118,7 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
    done < "$STATE/drivers.tsv"
    test -c "/dev/vfio/${GROUP##*/}"
    ls -l "/dev/vfio/${GROUP##*/}"
+   )
    ```
 
    This extends the [upstream binding steps, lines 63-97][vfio-binding]
@@ -125,15 +139,20 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
    userspace tools. These guest-image requirements are proposed, untested
    here; the NVX microVM kernel is not reusable unchanged.
 
-4. Launch the standard machine, with no emulated guest IOMMU:
+4. Launch the standard machine, with no emulated guest IOMMU. Set `BDF` to
+   the same GPU inspected and bound in step 2, even in a fresh shell:
 
-   ```sh
+   ```bash
+   (
+   set -euo pipefail
+   BDF=0000:01:00.0
    sudo ./target/release/openvmm --machine standard --hypervisor kvm \
      --pcie-root-complex rc0,high_mmio=64G --pcie-root-port rc0:rp0 \
      --vfio host="$BDF",port=rp0 \
      --kernel /path/to/vmlinux --initrd /path/to/initrd \
      --cmdline 'console=ttyS0' --com1 console \
      --memory 4GB --processors 2
+   )
    ```
 
    This follows [the upstream CLI, lines 99-120][vfio-launch], with the
@@ -143,13 +162,16 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
 
 5. After OpenVMM exits and releases all VFIO handles, restore **every**
    member, even after a failed bind or boot. Use the state directory printed
-   in step 2 (`STATE=/absolute/path/to/vfio-state.XXXXXX` if using a new
-   Bash shell). Clear `driver_override` with a newline, not a zero-byte write,
+   in step 2: replace the `STATE` placeholder below, including in the same
+   Bash shell. Clear `driver_override` with a newline, not a zero-byte write,
    before restoring each saved driver. A GPU originally using `nvidia`
    returns explicitly to `nvidia`; an originally unbound member stays unbound.
 
    ```bash
+   (
    set -euo pipefail
+   STATE=/absolute/path/to/vfio-state.XXXXXX
+   test -r "$STATE/drivers.tsv"
    while IFS=$'\t' read -r bdf driver; do
        dev="/sys/bus/pci/devices/$bdf"
        if test -L "$dev/driver"; then
@@ -157,7 +179,7 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
        fi
        printf '\n' | sudo tee "$dev/driver_override" >/dev/null
        if test "$driver" != -; then
-           sudo modprobe "$driver"
+           test -d "/sys/bus/pci/drivers/$driver"
            printf '%s\n' "$bdf" | sudo tee "/sys/bus/pci/drivers/$driver/bind" >/dev/null
            test "$(basename "$(readlink -e "$dev/driver")")" = "$driver"
        else
@@ -165,7 +187,13 @@ initialization. It does not use the NVX microVM launcher or its snapshot path.
        fi
        lspci -Dnnk -s "$bdf"
    done < "$STATE/drivers.tsv"
+   )
    ```
+
+   The original drivers normally remain loaded. Check their registered sysfs
+   directories rather than passing driver names to `modprobe`: for example,
+   the `nvidia-gpu` driver belongs to module `i2c_nvidia_gpu`. If a directory
+   is missing, reload the actual module for that driver before retrying.
 
    Confirm `nvidia-smi` works on the host, then restore any services and
    persistence setting you changed. If rebinding fails, keep the state and
@@ -257,8 +285,9 @@ All done.
 The original bind program's body was not retained in the raw log. This
 equivalent Python harness makes its recorded sysfs writes reproducible,
 including errors on close; the JSON below is the **original captured output**.
-This was a deliberate negative diagnostic on a disposable VM. The normal recipe above
-must stop when the IOMMU group is absent, rather than repeat this unbind:
+This was a deliberate negative diagnostic on a disposable VM. The normal
+recipe above must stop when the IOMMU group is absent, rather than repeat
+this unbind:
 
 ```bash
 python3 - <<'PY'
