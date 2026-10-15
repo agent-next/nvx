@@ -3,8 +3,10 @@
 import argparse
 import contextlib
 import io
+import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -18,6 +20,7 @@ import nvx  # noqa: E402
 from nvx_tools import (  # noqa: E402
     benchmark,
     common,
+    control_session,
     microvm_tests,
     release,
     sandbox_lifecycle,
@@ -25,7 +28,7 @@ from nvx_tools import (  # noqa: E402
 )
 
 
-class WarmpoolRegressionTests(unittest.TestCase):
+class PoolFixture(unittest.TestCase):
     def make_pool(self, count: int) -> Path:
         root = Path(tempfile.mkdtemp(prefix="nvx-pool-regression-"))
         self.addCleanup(shutil.rmtree, root)
@@ -33,6 +36,8 @@ class WarmpoolRegressionTests(unittest.TestCase):
             (root / f"entry-{index}").mkdir()
         return root
 
+
+class WarmpoolRegressionTests(PoolFixture):
     def test_new_claim_of_old_snapshot_survives_prune(self) -> None:
         pool = self.make_pool(1)
         os.utime(pool / "entry-0", (100, 100))
@@ -62,6 +67,15 @@ class WarmpoolRegressionTests(unittest.TestCase):
             warmpool.acquire_entries(pool, 2)
         self.assertEqual(len(warmpool.pool_entry_paths(pool)), 2)
         self.assertEqual(warmpool.pool_claimed_paths(pool), [])
+
+    def test_rename_permission_failure_is_not_pool_exhaustion(self) -> None:
+        pool = self.make_pool(1)
+        with (
+            patch.object(warmpool.os, "rename", side_effect=PermissionError("rename")),
+            self.assertRaisesRegex(PermissionError, "rename"),
+        ):
+            warmpool.acquire_entries(pool, 1)
+        self.assertEqual(len(warmpool.pool_entry_paths(pool)), 1)
 
     def test_release_rejects_paths_outside_pool_and_unclaimed_entries(self) -> None:
         pool = self.make_pool(1)
@@ -459,6 +473,7 @@ class SetupSubmoduleRegressionTests(unittest.TestCase):
             ) as run:
                 release.ensure_openvmm_source(root)
             self.assertIn("--recursive", run.call_args.args[0])
+            self.assertNotIn("--depth", run.call_args.args[0])
 
     def test_windows_release_binary_is_preserved_and_init_is_recursive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -498,3 +513,313 @@ class SetupSubmoduleRegressionTests(unittest.TestCase):
             ):
                 release.ensure_openvmm_source(root)
             self.assertEqual(binary.read_bytes(), b"release")
+
+
+class CpuSelectionValidationTests(unittest.TestCase):
+    def test_unset_default_keeps_i9_eight_vcpu_benchmark_valid(self) -> None:
+        representatives = set(range(0, 16, 2)) | set(range(16, 32))
+        with (
+            patch.dict(os.environ, clear=True),
+            patch.object(
+                benchmark, "physical_cpu_representatives", return_value=representatives
+            ),
+            patch.object(benchmark, "cpu_frequency_classes") as frequencies,
+        ):
+            args = nvx.parse_args(["benchmark", "--processors", "8"])
+            self.assertEqual(benchmark.parse_cpu_set(args.cpus), representatives)
+            benchmark.validate_benchmark_cpu_set(
+                benchmark.parse_cpu_set(args.cpus), args.processors
+            )
+            frequencies.assert_not_called()
+
+    def test_explicit_cpus_and_help_never_read_frequencies(self) -> None:
+        with (
+            patch.dict(os.environ, {"NVX_CPU_CLASS": "performance"}),
+            patch.object(benchmark, "cpu_frequency_classes") as frequencies,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            args = nvx.parse_args(["benchmark", "--cpus", "0-15"])
+            self.assertEqual(args.cpus, "0-15")
+            for argv in (["--help"], ["benchmark", "--help"], ["warmpool", "--help"]):
+                with self.assertRaises(SystemExit) as exit_status:
+                    nvx.parse_args(argv)
+                self.assertEqual(exit_status.exception.code, 0)
+            frequencies.assert_not_called()
+
+    def test_unknown_class_is_rejected_in_both_filters_and_cli(self) -> None:
+        with (
+            patch.dict(os.environ, {"NVX_CPU_CLASS": "perfomance"}),
+            patch.object(benchmark, "cpu_frequency_classes") as frequencies,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            for action in (
+                lambda: benchmark.apply_hybrid_cpu_filter({0, 1}),
+                nvx.apply_hybrid_process_affinity,
+            ):
+                with self.assertRaisesRegex(common.ScriptError, "NVX_CPU_CLASS"):
+                    action()
+            self.assertEqual(nvx.main(["benchmark", "--cpus", "0-15"]), 1)
+            self.assertEqual(nvx.main(["verify"]), 1)
+            self.assertIn("NVX_CPU_CLASS", stderr.getvalue())
+            frequencies.assert_not_called()
+
+    def test_default_all_and_homogeneous_class_behavior(self) -> None:
+        for preference in ("", "all", "performance", "efficiency"):
+            with (
+                self.subTest(preference=preference),
+                patch.dict(os.environ, {"NVX_CPU_CLASS": preference}),
+                patch.object(
+                    benchmark, "cpu_frequency_classes", return_value={4_000_000: {0, 1}}
+                ) as frequencies,
+            ):
+                self.assertEqual(benchmark.apply_hybrid_cpu_filter({0, 1}), {0, 1})
+                self.assertEqual(
+                    frequencies.call_count, int(preference not in ("", "all"))
+                )
+
+
+class StartupTimeoutValidationTests(unittest.TestCase):
+    def test_first_endpoint_wait_is_capped_by_caller_timeout(self) -> None:
+        with (
+            patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": "8"}),
+            patch.object(sandbox_lifecycle, "_start_once") as start,
+        ):
+            sandbox_lifecycle.start(Path("state"), 5)
+            start.assert_called_once_with(Path("state"), 5, endpoint_wait_s=5)
+
+    def test_attach_keeps_full_timeout_after_short_endpoint_wait(self) -> None:
+        stream_type = (
+            control_session._NamedPipeStream
+            if os.name == "nt"
+            else control_session._SocketStream
+        )
+        with (
+            patch.object(stream_type, "connect", return_value=MagicMock()) as connect,
+            patch.object(control_session.time, "monotonic", return_value=100),
+            patch.object(control_session.ControlSession, "_write_outer") as write,
+            patch.object(
+                control_session.ControlSession,
+                "_read_outer",
+                return_value=(control_session.OUTER_READY, b"x" * 16, 1, 0, b""),
+            ) as read,
+        ):
+            with control_session.ControlSession.connect(
+                Path("endpoint"), b"x" * 32, 60, endpoint_timeout=8
+            ):
+                pass
+            connect.assert_called_once_with(Path("endpoint"), 8)
+            self.assertEqual(write.call_args.args[-1], 160)
+            read.assert_called_once_with(160)
+
+    def test_first_wait_rejects_nonfinite_environment_values(self) -> None:
+        for raw in ("nan", "inf", "-inf"):
+            with (
+                patch.dict(os.environ, {"NVX_START_FIRST_WAIT_S": raw}),
+                self.assertRaises(common.ScriptError),
+            ):
+                sandbox_lifecycle._start_first_wait_s()
+
+
+class PoolInputValidationTests(PoolFixture):
+    def test_every_numeric_cli_option_rejects_zero_negative_and_nonfinite(self) -> None:
+        options = {
+            "fill": ("--size", "--memory-mib", "--timeout", "--processors"),
+            "acquire": ("--count",),
+            "prune": ("--ttl-s",),
+            "bench": ("--workers", "--duration-s", "--timeout"),
+        }
+        for operation, flags in options.items():
+            for flag in flags:
+                for value in ("0", "-1", "nan", "inf", "-inf"):
+                    with (
+                        self.subTest(operation=operation, flag=flag, value=value),
+                        contextlib.redirect_stderr(io.StringIO()),
+                        self.assertRaises(SystemExit) as exit_status,
+                    ):
+                        nvx.parse_args(
+                            [
+                                "warmpool",
+                                operation,
+                                "--pool-dir",
+                                "pool",
+                                f"{flag}={value}",
+                            ]
+                        )
+                    self.assertEqual(exit_status.exception.code, 2)
+
+    def test_direct_prune_and_acquire_reject_nonpositive_values(self) -> None:
+        pool = self.make_pool(1)
+        for value in (0, -1):
+            with self.assertRaises(common.ScriptError):
+                warmpool.acquire_entries(pool, value)
+            with self.assertRaises(common.ScriptError):
+                warmpool.prune_claims(pool, value)
+        self.assertEqual(len(warmpool.pool_entry_paths(pool)), 1)
+
+    def test_refill_preserves_existing_pool_shape_and_claims(self) -> None:
+        pool = self.make_pool(1)
+        manifest = {"processors": 1, "memory_mib": 128, "backend": "kvm"}
+        warmpool.write_manifest(pool, manifest)
+        claimed = warmpool.acquire_entries(pool, 1)[0]
+        args = argparse.Namespace(
+            pool_dir=pool,
+            nvx_dir=pool,
+            openvmm_dir=pool,
+            size=1,
+            memory_mib=256,
+            processors=2,
+            backend="mshv",
+            timeout=1,
+        )
+        with (
+            patch.object(
+                warmpool, "_require_artifacts", return_value=(pool, pool, pool)
+            ),
+            patch.object(warmpool, "capture_snapshot") as capture,
+            self.assertRaisesRegex(common.ScriptError, "empty pool directory"),
+        ):
+            warmpool.command_fill(args)
+        capture.assert_not_called()
+        self.assertEqual(warmpool.read_manifest(pool), manifest)
+        self.assertTrue(claimed.is_dir())
+
+    def test_failed_fill_keeps_shape_and_only_publishes_completed_captures(
+        self,
+    ) -> None:
+        pool = self.make_pool(0)
+        args = argparse.Namespace(
+            pool_dir=pool,
+            nvx_dir=pool,
+            openvmm_dir=pool,
+            size=2,
+            memory_mib=128,
+            processors=2,
+            backend="kvm",
+            timeout=1,
+        )
+        calls = 0
+
+        def capture(_command: list[str], entry: Path, **_kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            entry.mkdir()
+            if calls == 2:
+                raise OSError("capture failed")
+
+        with (
+            patch.object(
+                warmpool, "_require_artifacts", return_value=(pool, pool, pool)
+            ),
+            patch.object(warmpool, "capture_snapshot", side_effect=capture),
+            patch.object(warmpool, "_process_affinity", return_value={0, 1}),
+            patch.object(warmpool, "pool_class_frequencies", return_value=[]),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(OSError, "capture failed"),
+        ):
+            warmpool.command_fill(args)
+        self.assertEqual(warmpool.read_manifest(pool)["processors"], 2)
+        self.assertEqual(warmpool.read_manifest(pool)["entries"], 1)
+        self.assertEqual(len(warmpool.pool_entry_paths(pool)), 1)
+        self.assertEqual(list(pool.glob("capturing-*")), [])
+
+    def test_bench_acquire_and_release_errors_still_report_and_check_leaks(
+        self,
+    ) -> None:
+        for phase in ("acquire", "release"):
+            with self.subTest(phase=phase):
+                pool = self.make_pool(1)
+                warmpool.write_manifest(pool, {"processors": 1, "backend": "kvm"})
+                args = argparse.Namespace(
+                    pool_dir=pool,
+                    nvx_dir=pool,
+                    openvmm_dir=pool,
+                    workers=1,
+                    duration_s=1,
+                    timeout=1,
+                )
+                operation = "acquire_entries" if phase == "acquire" else "release_entry"
+                with (
+                    patch.object(warmpool, "validate_pool_class"),
+                    patch.object(
+                        warmpool, "_require_artifacts", return_value=(pool, pool, pool)
+                    ),
+                    patch.object(warmpool, operation, side_effect=OSError(phase)),
+                    patch.object(warmpool.time, "monotonic", side_effect=[0, 0, 0, 2]),
+                    patch.object(warmpool, "benchmark", return_value={"p50_ms": 1.0}),
+                    contextlib.redirect_stdout(io.StringIO()) as output,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    if phase == "release":
+                        with self.assertRaisesRegex(
+                            common.ScriptError, "leak detected"
+                        ):
+                            warmpool.command_bench(args)
+                    else:
+                        self.assertEqual(warmpool.command_bench(args), 1)
+                self.assertIn("failures=1", output.getvalue())
+                self.assertIn("leaked claims", output.getvalue())
+                self.assertIn(f"{phase} failed", stderr.getvalue())
+
+    def test_invalid_manifest_fields_fail_cleanly(self) -> None:
+        pool = self.make_pool(0)
+        for fields in (
+            {"processors": True},
+            {"processors": 3},
+            {"memory_mib": 0},
+            {"backend": "whp"},
+            {"cpu_class_frequencies_khz": "4000000"},
+            {"cpu_class_frequencies_khz": [None]},
+        ):
+            warmpool.write_manifest(pool, fields)
+            with self.assertRaises(common.ScriptError):
+                warmpool.read_manifest(pool)
+        (pool / warmpool.POOL_MANIFEST).write_text("{broken")
+        with self.assertRaises(common.ScriptError):
+            warmpool.read_manifest(pool)
+
+
+class ExecdInputValidationTests(unittest.TestCase):
+    def test_request_limit_including_last_chunk_and_eof(self) -> None:
+        limit = sandbox_lifecycle.EXECD_MAX_REQUEST_BYTES
+        for size in (limit - 1, limit, limit + 1, limit + 65_535):
+            for ending in (b"\n", b""):
+                with self.subTest(size=size, ending=ending):
+                    data = io.BytesIO(b"x" * size + ending)
+                    connection = MagicMock()
+                    connection.recv.side_effect = data.read
+                    if size > limit:
+                        with self.assertRaisesRegex(common.ScriptError, "1 MiB"):
+                            sandbox_lifecycle._execd_read_request(connection)
+                    else:
+                        self.assertEqual(
+                            len(sandbox_lifecycle._execd_read_request(connection)), size
+                        )
+
+    def test_timeout_bounds_and_deep_json_are_client_errors(self) -> None:
+        for timeout in (-1, True, 1.5, 0x100000000, 10**1000):
+            raw = json.dumps({"cmd": ["/bin/true"], "timeout_ms": timeout}).encode()
+            with self.assertRaisesRegex(common.ScriptError, "timeout_ms"):
+                sandbox_lifecycle._execd_parse_request(raw)
+        for raw in (b"[" * 2000 + b"]" * 2000, b'{"timeout_ms":' + b"9" * 5000 + b"}"):
+            with self.assertRaises(common.ScriptError):
+                sandbox_lifecycle._execd_parse_request(raw)
+        for timeout in (0, 0xFFFFFFFF):
+            raw = json.dumps({"cmd": ["/bin/true"], "timeout_ms": timeout}).encode()
+            self.assertEqual(
+                sandbox_lifecycle._execd_parse_request(raw), (("/bin/true",), timeout)
+            )
+
+    @unittest.skipIf(os.name == "nt", "execd requires Unix sockets")
+    def test_sigterm_handler_is_restored_on_all_exit_paths(self) -> None:
+        previous = signal.getsignal(signal.SIGTERM)
+        for error in (
+            common.ScriptError("startup"),
+            RuntimeError("serve"),
+            SystemExit(0),
+        ):
+            with (
+                patch.object(sandbox_lifecycle, "_exec_daemon", side_effect=error),
+                self.assertRaises(type(error)),
+            ):
+                sandbox_lifecycle.exec_daemon(Path("state"), Path("socket"), timeout=1)
+            self.assertEqual(signal.getsignal(signal.SIGTERM), previous)

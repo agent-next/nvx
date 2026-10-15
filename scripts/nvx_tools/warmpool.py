@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
 import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
@@ -34,6 +35,8 @@ from nvx_tools.benchmark import (
     capture_snapshot,
     cpu_frequency_classes,
     cpu_frequency_clusters,
+    positive_float,
+    positive_int,
     snapshot_restore_command,
     workload_boot_command,
 )
@@ -52,9 +55,20 @@ ENTRY_PREFIX = "entry-"
 CLAIMED_PREFIX = "claimed-"
 
 
+class PoolExhausted(ScriptError):
+    """No available entry remains after racing claimers."""
+
+
+def _require_positive(name: str, value: float) -> None:
+    if not math.isfinite(value) or value <= 0:
+        raise ScriptError(f"{name} must be finite and greater than zero")
+
+
 def pool_entry_paths(pool_dir: Path) -> list[Path]:
     return sorted(
-        p for p in pool_dir.iterdir() if p.is_dir() and p.name.startswith(ENTRY_PREFIX)
+        p
+        for p in pool_dir.iterdir()
+        if not p.is_symlink() and p.is_dir() and p.name.startswith(ENTRY_PREFIX)
     )
 
 
@@ -62,23 +76,43 @@ def pool_claimed_paths(pool_dir: Path) -> list[Path]:
     return sorted(
         p
         for p in pool_dir.iterdir()
-        if p.is_dir() and p.name.startswith(CLAIMED_PREFIX)
+        if not p.is_symlink() and p.is_dir() and p.name.startswith(CLAIMED_PREFIX)
     )
 
 
-def write_manifest(pool_dir: Path, fields: dict[str, object]) -> None:
+def write_manifest(
+    pool_dir: Path, fields: Mapping[str, object], *, exclusive: bool = False
+) -> None:
     manifest = pool_dir / POOL_MANIFEST
-    manifest.write_text(json.dumps(fields, indent=2, sort_keys=True) + "\n")
+    with manifest.open("x" if exclusive else "w", encoding="utf-8") as output:
+        output.write(json.dumps(dict(fields), indent=2, sort_keys=True) + "\n")
 
 
 def read_manifest(pool_dir: Path) -> dict[str, Any]:
     manifest = pool_dir / POOL_MANIFEST
     if not manifest.is_file():
         raise ScriptError(f"{pool_dir} is not a pool: missing {POOL_MANIFEST}")
-    value = json.loads(manifest.read_text())
+    try:
+        value = json.loads(manifest.read_text())
+    except (OSError, UnicodeError, ValueError, RecursionError) as error:
+        raise ScriptError(f"cannot read pool manifest: {error}") from error
     if not isinstance(value, dict):
         raise ScriptError("pool manifest must be a JSON object")
-    return cast(dict[str, Any], value)
+    fields = cast(dict[str, Any], value)
+    for name in ("processors", "memory_mib"):
+        if name in fields and (type(fields[name]) is not int or fields[name] <= 0):
+            raise ScriptError(f"pool manifest has invalid {name}")
+    if "processors" in fields and fields["processors"] not in (1, 2, 4, 8):
+        raise ScriptError("pool manifest has unsupported processors")
+    if "backend" in fields and fields["backend"] not in ("kvm", "mshv"):
+        raise ScriptError("pool manifest has invalid backend")
+    tag = fields.get("cpu_class_frequencies_khz", [])
+    if not isinstance(tag, list) or any(
+        type(frequency) is not int or frequency <= 0
+        for frequency in cast(list[object], tag)
+    ):
+        raise ScriptError("pool manifest has invalid CPU class frequencies")
+    return fields
 
 
 def _process_affinity() -> set[int]:
@@ -132,6 +166,7 @@ def validate_pool_class(pool_dir: Path) -> None:
 
 def acquire_entries(pool_dir: Path, count: int) -> list[Path]:
     """Claim exactly ``count`` entries, returning partial claims on failure."""
+    _require_positive("count", count)
     claimed: list[Path] = []
     try:
         for _ in range(count):
@@ -142,18 +177,26 @@ def acquire_entries(pool_dir: Path, count: int) -> list[Path]:
                 )
                 try:
                     os.rename(entry, claimed_path)
-                except OSError:
+                except FileNotFoundError:
                     continue  # raced with another claimer; try the next entry
                 claimed.append(claimed_path)
                 break
             else:
-                raise ScriptError(
+                raise PoolExhausted(
                     f"pool exhausted: requested {count}, acquired {len(claimed)}, "
                     f"{len(pool_entry_paths(pool_dir))} entries remain"
                 )
-    except BaseException:
+    except BaseException as error:
+        rollback_errors: list[str] = []
         for path in claimed:
-            release_entry(pool_dir, path)
+            try:
+                release_entry(pool_dir, path)
+            except Exception as rollback_error:
+                rollback_errors.append(f"{path.name}: {rollback_error}")
+        if rollback_errors:
+            raise ScriptError(
+                "failed to return partial claims: " + "; ".join(rollback_errors)
+            ) from error
         raise
     return claimed
 
@@ -175,6 +218,7 @@ def release_entry(pool_dir: Path, claimed: Path) -> Path:
 
 def prune_claims(pool_dir: Path, ttl_s: float, *, now: float | None = None) -> int:
     """Delete claims older than the TTL; returns how many were removed."""
+    _require_positive("ttl-s", ttl_s)
     now = time.time() if now is None else now
     removed = 0
     for claimed in pool_claimed_paths(pool_dir):
@@ -210,8 +254,27 @@ def _require_artifacts(nvx_dir: Path, openvmm_dir: Path) -> tuple[Path, Path, Pa
 
 
 def command_fill(args: argparse.Namespace) -> int:
+    for name in ("size", "memory_mib", "timeout"):
+        _require_positive(name, getattr(args, name))
     kernel, initrd, executable = _require_artifacts(args.nvx_dir, args.openvmm_dir)
     args.pool_dir.mkdir(parents=True, exist_ok=True)
+    if any(args.pool_dir.iterdir()):
+        raise ScriptError("fill requires an empty pool directory; use a new --pool-dir")
+    manifest: dict[str, object] = {
+        "version": 1,
+        "cpu_affinity": sorted(_process_affinity()),
+        "cpu_class_frequencies_khz": pool_class_frequencies(),
+        "memory_mib": args.memory_mib,
+        "processors": args.processors,
+        "backend": args.backend,
+        "entries": 0,
+    }
+    try:
+        write_manifest(args.pool_dir, manifest, exclusive=True)
+    except FileExistsError as error:
+        raise ScriptError(
+            "pool is already being filled; use a new --pool-dir"
+        ) from error
     boot = workload_boot_command(
         executable,
         args.backend,
@@ -221,27 +284,25 @@ def command_fill(args: argparse.Namespace) -> int:
         "quiet loglevel=0",
         processors=args.processors,
     )
-    for index in range(args.size):
-        entry = args.pool_dir / f"{ENTRY_PREFIX}{uuid.uuid4().hex[:8]}"
-        print(f"capture {index + 1}/{args.size} -> {entry.name}", flush=True)
-        capture_snapshot(
-            [*boot, "--snapshot-destination", str(entry)],
-            entry,
-            timeout=args.timeout,
-            processors=args.processors,
-        )
-    write_manifest(
-        args.pool_dir,
-        {
-            "version": 1,
-            "cpu_affinity": sorted(_process_affinity()),
-            "cpu_class_frequencies_khz": pool_class_frequencies(),
-            "memory_mib": args.memory_mib,
-            "processors": args.processors,
-            "backend": args.backend,
-            "entries": len(pool_entry_paths(args.pool_dir)),
-        },
-    )
+    try:
+        for index in range(args.size):
+            entry = args.pool_dir / f"{ENTRY_PREFIX}{uuid.uuid4().hex[:8]}"
+            capturing = args.pool_dir / f"capturing-{uuid.uuid4().hex}"
+            print(f"capture {index + 1}/{args.size} -> {entry.name}", flush=True)
+            try:
+                capture_snapshot(
+                    [*boot, "--snapshot-destination", str(capturing)],
+                    capturing,
+                    timeout=args.timeout,
+                    processors=args.processors,
+                )
+                capturing.rename(entry)
+            finally:
+                if capturing.is_dir():
+                    shutil.rmtree(capturing)
+    finally:
+        manifest["entries"] = len(pool_entry_paths(args.pool_dir))
+        write_manifest(args.pool_dir, manifest)
     print(f"pool filled: {len(pool_entry_paths(args.pool_dir))} entries", flush=True)
     return 0
 
@@ -276,6 +337,8 @@ def command_prune(args: argparse.Namespace) -> int:
 
 
 def command_bench(args: argparse.Namespace) -> int:
+    for name in ("workers", "duration_s", "timeout"):
+        _require_positive(name, getattr(args, name))
     validate_pool_class(args.pool_dir)
     manifest = read_manifest(args.pool_dir)
     _, _, executable = _require_artifacts(args.nvx_dir, args.openvmm_dir)
@@ -294,12 +357,18 @@ def command_bench(args: argparse.Namespace) -> int:
         while time.monotonic() < deadline:
             try:
                 claimed = acquire_entries(args.pool_dir, 1)[0]
-            except ScriptError:
+            except PoolExhausted:
                 # every entry is claimed by another worker; retry shortly
                 with lock:
                     exhaust_waits += 1
                 time.sleep(0.002)
                 continue
+            except Exception as error:
+                with lock:
+                    failures += 1
+                print(f"acquire failed: {error!r}", file=sys.stderr, flush=True)
+                return
+            release_failed = False
             try:
                 command = snapshot_restore_command(
                     executable,
@@ -326,12 +395,20 @@ def command_bench(args: argparse.Namespace) -> int:
                     failures += 1
                 print(f"restore failed: {error!r}", file=sys.stderr, flush=True)
             finally:
-                release_entry(args.pool_dir, claimed)
+                try:
+                    release_entry(args.pool_dir, claimed)
+                except Exception as error:
+                    with lock:
+                        failures += 1
+                    print(f"release failed: {error!r}", file=sys.stderr, flush=True)
+                    release_failed = True
+            if release_failed:
+                return
 
     started = time.monotonic()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         list(pool.map(worker, range(args.workers)))
-    elapsed = time.monotonic() - started
+    elapsed = max(time.monotonic() - started, 1e-9)
 
     samples_ms.sort()
     p50 = samples_ms[len(samples_ms) // 2] if samples_ms else float("nan")
@@ -362,11 +439,11 @@ def configure_parser(parser: argparse.ArgumentParser, repo_root: Path) -> None:
 
     fill = subparsers.add_parser("fill", help="capture snapshots into the pool")
     shared(fill)
-    fill.add_argument("--size", type=int, default=4)
-    fill.add_argument("--memory-mib", type=int, default=128)
+    fill.add_argument("--size", type=positive_int, default=4)
+    fill.add_argument("--memory-mib", type=positive_int, default=128)
     fill.add_argument("--processors", type=int, choices=(1, 2, 4, 8), default=1)
     fill.add_argument("--backend", choices=("kvm", "mshv"), default="kvm")
-    fill.add_argument("--timeout", type=float, default=120.0)
+    fill.add_argument("--timeout", type=positive_float, default=120.0)
     fill.set_defaults(handler=command_fill)
 
     status = subparsers.add_parser("status", help="show pool manifest and counts")
@@ -375,7 +452,7 @@ def configure_parser(parser: argparse.ArgumentParser, repo_root: Path) -> None:
 
     acquire = subparsers.add_parser("acquire", help="atomically claim pool entries")
     shared(acquire)
-    acquire.add_argument("--count", type=int, default=1)
+    acquire.add_argument("--count", type=positive_int, default=1)
     acquire.set_defaults(handler=command_acquire)
 
     release = subparsers.add_parser(
@@ -387,16 +464,16 @@ def configure_parser(parser: argparse.ArgumentParser, repo_root: Path) -> None:
 
     prune = subparsers.add_parser("prune", help="delete claims older than the TTL")
     shared(prune)
-    prune.add_argument("--ttl-s", type=float, required=True)
+    prune.add_argument("--ttl-s", type=positive_float, required=True)
     prune.set_defaults(handler=command_prune)
 
     bench = subparsers.add_parser(
         "bench", help="sustained acquire/restore/release oracle"
     )
     shared(bench)
-    bench.add_argument("--duration-s", type=float, default=60.0)
-    bench.add_argument("--workers", type=int, default=4)
-    bench.add_argument("--timeout", type=float, default=60.0)
+    bench.add_argument("--duration-s", type=positive_float, default=60.0)
+    bench.add_argument("--workers", type=positive_int, default=4)
+    bench.add_argument("--timeout", type=positive_float, default=60.0)
     bench.set_defaults(handler=command_bench)
 
 

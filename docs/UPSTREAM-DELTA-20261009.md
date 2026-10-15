@@ -1,4 +1,4 @@
-# Upstream delta: agent-next/nvx `prod/hybrid-cpu-affinity` vs microsoft/nvx — 2026-10-09
+# Upstream delta: agent-next/nvx vs microsoft/nvx, 2026-10-09
 
 This is a historical comparison. The
 [10-14 sync](UPSTREAM-SYNC-20261014.md) supersedes its open compatibility questions:
@@ -8,10 +8,10 @@ Current ordinary commands apply CPU-class affinity only when explicitly requeste
 **Method.** Upstream remote added as `upstream` (https://github.com/microsoft/nvx.git) and
 fetched 2026-10-09. microsoft/nvx has **no `main`/`master` branch**; its default branch is
 `dev`, so `upstream/dev` is the comparison line throughout. Merge-base of
-`prod/hybrid-cpu-affinity` and `upstream/dev`:
+the historical fork tip and `upstream/dev`:
 
 - merge-base: `fc6fea5c0d6a4627c40b11174b47f18e04542d3a` ("Merge pull request #311 from
-  microsoft/code-documentation/benchmark-warmups-default-20261002-…", 2026-10-02)
+  the benchmark-warmups change", 2026-10-02)
 - upstream ahead: **537 commits** (446 non-merge + **91 merges**: 89 PR merges, PRs
   #66–#442, plus 2 non-PR "Merge NVX dev with…" syncs), tip `33bd2fe5` =
   `v0.1.0-dev.60b22d98647d-1-g33bd2fe5`, 55 dev-release tags since the fork point
@@ -169,13 +169,6 @@ start now report `ScriptError` (`87406b00`, #399); nvx-exit 32-bit wrap pinned
   management RPC lives in the OpenVMM submodule and cannot restore snapshots
   containing sandbox blocks (`doc/design/current-limits.md:22`) (unverified beyond
   the repo-side docs).
-- Unmerged branches signal more format churn coming:
-  `esaurez/streamed-snapshot-preprofile-20261006` (immutable streamed distro
-  snapshot attachments; filesystem-only workload restores without process identity),
-  `esaurez/nvx-snapshot-image-slots-20261007` (merges generation-bound storage with
-  microVM image slots), `esaurez/nvx-image-slots-20261005` (bind-once image slots,
-  "ABI 3"), `esaurez/microvm-state-control`, `esaurez/snapshot-restore-dev-20261007`
-  — none merged into `dev` as of 2026-10-09.
 
 ### 1.6 Sandbox one-shot path
 
@@ -197,7 +190,7 @@ start now report `ScriptError` (`87406b00`, #399); nvx-exit 32-bit wrap pinned
 
 ### 1.7 nvxhost / edge backend (#418)
 
-PR #418 (merge `c90c60b2`, branch `esaurez/nvxhost-edge-backend`, merged 2026-10-08,
+PR #418 (merge `c90c60b2`, merged 2026-10-08,
 +7526/−299, 5 commits): `82d944ab` (OpenVMM submodule pin for RAM-backed overlays),
 `e8030bfb` (Linux process runs until its last thread exits: `src/openvmm/platform/linux.rs`,
 `src/openvmm/process.rs`), `28ecbb5a` (data model moved to a new `aci_edge_sandboxes/model/`
@@ -254,11 +247,8 @@ immutable proxy env. An MXC `StatefulSandboxBackend` mapping is documented
 (`aci_edge_sandboxes/README.md:739`) with a proof-of-concept `nvx_backend` adapter not
 yet wired into MXC's wire contract.
 
-**Sibling `esaurez/*nvxhost*` branches** (`edge-nvxhost-proxy`/`nvxhost-edge-proxy`,
-`*-fsnet`, `*-denied-aliases`, `*-pre-time-abi`, `nvxhost-edge-host-cpu-profile`) look
-pending but their content was folded into #418 — verified via `log -S` on the README
-sections; they are history, not pending work. Actually-open next work:
-`esaurez/microvm-state-control`, the image-slot and streamed-snapshot branches (§1.5).
+The proxy, filesystem/network, denied-alias and host-profile documentation
+is included in #418, verified via `log -S` on the README sections.
 
 ### 1.8 Breaking changes (caller-facing)
 
@@ -295,7 +285,7 @@ sections; they are history, not pending work. Actually-open next work:
 
 ---
 
-## 2. Patches on `prod/hybrid-cpu-affinity` vs upstream
+## 2. Historical fork patches vs upstream
 
 The branch contains 13 commits after the fork point (tip `07adc613`):
 
@@ -451,6 +441,5 @@ The time ABI (#325), CPU profiles (#394/#435), and edge backend (#418) overlap
 with the affinity, warm-pool, and execd changes in `scripts/nvx.py`,
 `sandbox_lifecycle.py`, and `benchmark.py`. Upstream #323 supersedes the
 process-tree cleanup test patch. At the inspected upstream revision there is
-no warm-pool manager or persistent exec daemon. The unmerged image-slot and
-streamed-snapshot branches described in §1.5 contain additional snapshot
-layout changes; they are not part of the inspected `dev` tree.
+no warm-pool manager or persistent exec daemon. Unmerged experiments are
+outside the scope of this comparison of the inspected `dev` tree.

@@ -1522,7 +1522,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     verify = subparsers.add_parser("verify", help="verify source and submodule inputs")
     verify.set_defaults(handler=command_verify)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command == "benchmark":
+        from nvx_tools.benchmark import (
+            apply_hybrid_cpu_filter,
+            cpu_class_preference,
+            physical_cpu_representatives,
+        )
+
+        cpu_class_preference()
+        if args.cpus is None:
+            args.cpus = ",".join(
+                str(cpu)
+                for cpu in sorted(
+                    apply_hybrid_cpu_filter(physical_cpu_representatives())
+                )
+            )
+    return args
 
 
 def apply_hybrid_process_affinity(command: str = "") -> None:
@@ -1533,7 +1549,9 @@ def apply_hybrid_process_affinity(command: str = "") -> None:
     This is a placement preference, not a snapshot compatibility requirement.
     ``benchmark`` manages its own per-process latency-measurement affinity.
     """
-    preference = os.environ.get("NVX_CPU_CLASS", "").strip().lower()
+    from nvx_tools.benchmark import apply_hybrid_cpu_filter, cpu_class_preference
+
+    preference = cpu_class_preference()
     if (
         sys.platform != "linux"
         or command == "benchmark"
@@ -1541,8 +1559,6 @@ def apply_hybrid_process_affinity(command: str = "") -> None:
     ):
         return
     try:
-        from nvx_tools.benchmark import apply_hybrid_cpu_filter
-
         current = os.sched_getaffinity(0)
         restricted = apply_hybrid_cpu_filter(current)
         if restricted and restricted != current:
@@ -1552,9 +1568,9 @@ def apply_hybrid_process_affinity(command: str = "") -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    apply_hybrid_process_affinity(args.command)
     try:
+        args = parse_args(argv)
+        apply_hybrid_process_affinity(args.command)
         result = args.handler(args)
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)

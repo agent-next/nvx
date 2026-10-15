@@ -2643,6 +2643,56 @@ class _PortExclusionSockets:
 
 class MicrovmTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "linux", "requires Linux CPU affinity")
+    def test_snapshot_class_matrix_respects_caller_affinity_and_failure_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for original in ({0}, {0, 16}):
+                with (
+                    self.subTest(original=original),
+                    patch.object(
+                        microvm_tests,
+                        "_frequency_class_representatives",
+                        return_value=({0, 2}, {16, 17}),
+                    ),
+                    patch.object(
+                        microvm_tests.os, "sched_getaffinity", return_value=original
+                    ),
+                    patch.object(microvm_tests.os, "sched_setaffinity") as affinity,
+                    patch.object(
+                        microvm_tests,
+                        "capture_snapshot",
+                        side_effect=RuntimeError("capture failed"),
+                    ) as capture,
+                ):
+                    if original == {0}:
+                        microvm_tests.run_snapshot_class_matrix(
+                            root,
+                            root,
+                            root,
+                            "kvm",
+                            memory_mib=128,
+                            timeout=1,
+                            output_dir=root,
+                        )
+                        affinity.assert_not_called()
+                        capture.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                            microvm_tests.run_snapshot_class_matrix(
+                                root,
+                                root,
+                                root,
+                                "kvm",
+                                memory_mib=128,
+                                timeout=1,
+                                output_dir=root,
+                            )
+                        self.assertEqual(
+                            [call.args[1] for call in affinity.call_args_list],
+                            [{0}, original],
+                        )
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux CPU affinity")
     def test_snapshot_class_matrix_selects_host_profile_and_restores_affinity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

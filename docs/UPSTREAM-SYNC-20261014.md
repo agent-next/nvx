@@ -5,9 +5,9 @@
 Runtime target: microsoft/nvx `dev` at **4acf7eb0bb73b88cfb5a01bb6043592af1e96c61**,
 release `v0.1.0-dev.4acf7eb0bb73`, OpenVMM gitlink
 `7f225e2cd635bbd1e1839e587e659996433396c8`.
-The resumed product branch also includes upstream's data-only child
+This sync also includes upstream's data-only child
 `c073ebcd`, which updates performance CSVs without changing runtime inputs.
-No fork history was rewritten. Both sync branches are additive.
+No fork history was rewritten.
 
 Comparison since the previous analysis: `33bd2fe5..4acf7eb0`, not the old
 fork's much larger merge-base delta. The old analysis is historical:
@@ -24,7 +24,7 @@ the inspected upstream tree, not that every issue was searched.
 
 | Original SHA | Patch | Decision | Evidence and implementation |
 | --- | --- | --- | --- |
-| ec38aa01 | Hybrid affinity / NVX_CPU_CLASS | Rewrite | Placement is opt-in for ordinary commands (`performance` or `efficiency`), preserving SMT siblings; the default applies no affinity. Benchmark pinning is for latency measurement. Upstream CPU profiles (16237e29, 00f8884d, PRs #394/#435) supersede the historical cross-class rejection: both auto and intel.host.v1 restored across P/E successfully. |
+| ec38aa01 | Hybrid affinity / NVX_CPU_CLASS | Rewrite | CPU-class placement is opt-in (`performance` or `efficiency`); unset, empty, or `all` preserves the default in both ordinary commands and benchmarks. Ordinary commands preserve SMT siblings; explicit benchmark `--cpus` overrides class selection. Upstream CPU profiles (16237e29, 00f8884d, PRs #394/#435) supersede the historical cross-class rejection: both auto and intel.host.v1 restored across P/E successfully. |
 | a4811e5e | Provenance fixture isolation | Keep | Fixture repositories use an explicit nondefault branch for reproducible commits; retained as 6d890682. |
 | ac82a417 | setup-submodule | Keep | Upstream release installs a binary into the uninitialized submodule directory; no preservation helper there. Retained as 5f0fd1a0; usage added in cc53b463. |
 | fa60c840 | Wait for async process-tree kills in tests | Drop | Upstream df532ce2 (fixes microsoft/nvx #320) waits for killed descendants and repairs the same oracles. |

@@ -740,8 +740,6 @@ def ensure_openvmm_source(repo_root: Path) -> None:
                 "update",
                 "--init",
                 "--recursive",
-                "--depth",
-                "1",
                 "openvmm",
             ],
             cwd=repo_root,

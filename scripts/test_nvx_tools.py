@@ -16785,7 +16785,14 @@ class SandboxTests(unittest.TestCase):
             processes[1].terminate.assert_not_called()
             self.assertEqual(
                 [connect.args[2] for connect in connects.call_args_list],
-                [8.0, 10],
+                [10, 10],
+            )
+            self.assertEqual(
+                [
+                    connect.kwargs["endpoint_timeout"]
+                    for connect in connects.call_args_list
+                ],
+                [8.0, None],
             )
             session.ping.assert_called_once_with(10)
             self.assertIn("full timeout", stderr.getvalue())
@@ -16838,6 +16845,7 @@ class SandboxTests(unittest.TestCase):
             self.skipTest("execd requires Unix sockets")
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
+            client.settimeout(5)
             client.connect(os.fspath(socket_path))
             client.sendall(request + b"\n")
             response = bytearray()
@@ -16850,6 +16858,7 @@ class SandboxTests(unittest.TestCase):
         finally:
             client.close()
 
+    @unittest.skipIf(os.name == "nt", "execd requires Unix sockets")
     def test_execd_serves_requests_on_one_session_until_vm_dies(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -16890,44 +16899,42 @@ class SandboxTests(unittest.TestCase):
             ):
                 worker = threading.Thread(target=serve)
                 worker.start()
-                deadline = time.monotonic() + 5
-                while not socket_path.exists():
-                    self.assertLess(time.monotonic(), deadline)
-                    time.sleep(0.01)
-                self.assertEqual(os.stat(socket_path).st_mode & 0o777, 0o600)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not socket_path.exists():
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(0.01)
+                    self.assertEqual(os.stat(socket_path).st_mode & 0o777, 0o600)
 
-                response = self._execd_request(
-                    socket_path,
-                    json.dumps(
-                        {"cmd": ["/bin/sh", "-c", "echo hi"], "timeout_ms": 30000}
-                    ).encode("utf-8"),
-                )
-                self.assertEqual(
-                    response,
-                    {"rc": 0, "out": "hello", "err": "warn", "b64": False},
-                )
-                session.exec.assert_called_once_with(
-                    ("/bin/sh", "-c", "echo hi"),
-                    timeout_ms=30000,
-                    response_timeout=60.0,
-                )
+                    response = self._execd_request(
+                        socket_path,
+                        json.dumps(
+                            {"cmd": ["/bin/sh", "-c", "echo hi"], "timeout_ms": 30000}
+                        ).encode("utf-8"),
+                    )
+                    self.assertEqual(
+                        response,
+                        {"rc": 0, "out": "hello", "err": "warn", "b64": False},
+                    )
+                    session.exec.assert_called_once_with(
+                        ("/bin/sh", "-c", "echo hi"),
+                        timeout_ms=30000,
+                        response_timeout=60.0,
+                    )
 
-                response = self._execd_request(
-                    socket_path,
-                    json.dumps({"cmd": ["/bin/cat"]}).encode("utf-8"),
-                )
-                self.assertEqual(
-                    response["rc"],
-                    1,
-                )
-                self.assertTrue(response["b64"])
-                self.assertEqual(base64.b64decode(response["out"]), b"\xff")
+                    response = self._execd_request(
+                        socket_path,
+                        json.dumps({"cmd": ["/bin/cat"]}).encode("utf-8"),
+                    )
+                    self.assertEqual(response["rc"], 1)
+                    self.assertTrue(response["b64"])
+                    self.assertEqual(base64.b64decode(response["out"]), b"\xff")
 
-                response = self._execd_request(socket_path, b"not json")
-                self.assertIn("error", response)
-
-                running[0] = False
-                worker.join(timeout=10)
+                    response = self._execd_request(socket_path, b"not json")
+                    self.assertIn("error", response)
+                finally:
+                    running[0] = False
+                    worker.join(timeout=10)
 
             self.assertEqual(len(failure), 1)
             self.assertIsInstance(failure[0], common.ScriptError)
@@ -16935,16 +16942,21 @@ class SandboxTests(unittest.TestCase):
             self.assertFalse(socket_path.exists())
             self.assertFalse(worker.is_alive())
 
+    @unittest.skipIf(os.name == "nt", "execd requires Unix sockets")
     def test_execd_refuses_to_start_when_sandbox_is_not_running(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             socket_path = root / "execd.sock"
             state = root / "state"
             state.mkdir()
-            with self.assertRaisesRegex(common.ScriptError, "not running"):
+            with (
+                patch.object(sandbox_lifecycle.signal, "signal"),
+                self.assertRaisesRegex(common.ScriptError, "not running"),
+            ):
                 sandbox_lifecycle.exec_daemon(state, socket_path, timeout=5)
             self.assertFalse(socket_path.exists())
 
+    @unittest.skipIf(os.name == "nt", "execd requires Unix sockets")
     def test_execd_exits_when_the_vm_is_already_gone(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -16954,6 +16966,7 @@ class SandboxTests(unittest.TestCase):
             self._execd_state(state)
             context = MagicMock()
             with (
+                patch.object(sandbox_lifecycle.signal, "signal"),
                 patch.object(
                     sandbox_lifecycle,
                     "_process_running",

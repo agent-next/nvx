@@ -34,9 +34,11 @@ affinity at all.
 - `cpu_frequency_classes()` groups logical CPUs by `cpuinfo_max_freq`; shared clustering merges frequencies
   within 10% (turbo-favored cores of one type report slightly different maxima and must not
   split a class).
-- `apply_hybrid_cpu_filter()` restricts the benchmark default affinity set to the
-  performance class on hybrid parts. `NVX_CPU_CLASS=efficiency` selects the E-core class,
-  `NVX_CPU_CLASS=all` restores the old behavior.
+- `apply_hybrid_cpu_filter()` leaves the benchmark default affinity unchanged
+  unless `NVX_CPU_CLASS=performance` or `efficiency` explicitly selects a class.
+  Unset, empty, or `all` means no filtering. Explicit `--cpus` takes precedence,
+  and unknown class values are rejected. Frequency files are read only when
+  class selection is used, never while building the argument parser.
 - `nvx.py` binds its own process (inherited by children) to the selected class for
   non-benchmark commands only when `NVX_CPU_CLASS=performance` or `efficiency`
   is explicitly set. It keeps all available logical CPUs in that class, including
@@ -62,6 +64,7 @@ existence is used as the source-present gate). Use `nvx.py setup-submodule` afte
 download: it preserves the platform-specific release binary while recursively
 initializing the pinned source and nested submodules, then restores the binary
 even if initialization fails.
+Like `init`, this uses a full recursive clone, not a shallow checkout.
 
 ## 3. Measured numbers (128 MiB guest, 1 vCPU, Alpine, p50 of 5)
 
@@ -150,9 +153,9 @@ of starts, ~30s each, occasionally a hard fail) is the endpoint never accepting:
 `TimeoutError: managed control endpoint did not become available`. Waiting the
 full `--timeout` (default 60s) for a boot that is already stalled wastes the
 whole window, so `sandbox start` now bounds the first attempt's
-`ControlSession.connect` window — the endpoint wait plus the attach handshake
-that shares that timeout — to ~8s (`NVX_START_FIRST_WAIT_S`, default `8`; the
-post-connect readiness ping still gets the full timeout). On the endpoint-unavailable
+endpoint-availability wait to the smaller of `--timeout` and
+`NVX_START_FIRST_WAIT_S` (default `8` seconds). The attach handshake and
+post-connect readiness ping each retain the full caller timeout. On the endpoint-unavailable
 `TimeoutError` the failed process is torn down by the same cleanup path as any
 other start failure (runtime/capability/socket state unlinked, process
 terminated), then one retry boots a fresh process with the full timeout; a
@@ -162,6 +165,9 @@ each outer attempt is one short probe plus at most one full-timeout boot, and a
 single start call never runs more than one live OpenVMM process. Other
 `TimeoutError`s (e.g. `managed control response timed out` after the endpoint
 accepted) are not in this class and still propagate without a retry.
+`--timeout` is a per-stage timeout, not an overall wall-clock deadline:
+each outer attempt may include a short endpoint probe and a full-timeout retry,
+plus attach, ping, lifecycle-lock waiting and failed-process cleanup.
 
 ## 8. Persistent exec daemon (`sandbox execd`)
 

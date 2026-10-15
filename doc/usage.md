@@ -314,6 +314,12 @@ requires `build/vmlinux` (with `--debug-kernel`, `build/vmlinux-debug` and its
 `build/vmlinux-debug.config`), the selected initramfs, and
 `openvmm/target/release/openvmm[.exe]`.
 
+The default `snapshot-class-matrix` scenario checks same- and cross-class
+restores using the host CPU profile on Linux hybrid hosts. It temporarily
+restricts the process to each class within the caller's original CPU affinity
+and restores that affinity even after failure. It skips on other platforms,
+single-class hosts, or when the caller's affinity excludes either class.
+
 ### `doctor`
 
 ```text
@@ -680,10 +686,13 @@ not prove the guest command stopped; do not launch an overlapping fallback exec.
 
 The daemon requires a running sandbox and exits nonzero if the VM dies.
 While it holds the control channel, external operations such as `sandbox stop`
-time out. Stop the daemon first by sending SIGTERM to its recorded PID, then
+time out. Stop the daemon first by sending SIGTERM to the PID your process
+supervisor recorded when launching it (or use Ctrl+C in its foreground terminal), then
 stop the sandbox. Normal exit and SIGTERM remove the socket. SIGKILL bypasses
 cleanup; after confirming that daemon PID has exited, remove the stale socket
 before restarting. `execd` is unsupported on Windows.
+The daemon does not write a PID file. Requests are limited to 1 MiB before
+the newline; `timeout_ms` must be an integer from 0 through 4294967295.
 
 ## CPU profiles
 
@@ -816,6 +825,13 @@ python3 scripts/nvx.py benchmark [OPTIONS]
 | `--output-dir PATH` | none | Write canonical workload logs to a directory. |
 | `--scratch-dir PATH` | system temporary directory | Select an existing directory for temporary snapshots, guest RAM backing, and workload files. |
 | `--keep-kvm-stage` | off | Keep temporary staged KVM benchmark binaries. |
+
+With `NVX_CPU_CLASS` unset, empty, or `all`, the default `--cpus` selects
+one logical CPU per physical core without class filtering.
+`NVX_CPU_CLASS=performance` or `efficiency` opts into filtering that default
+to the selected frequency class. An explicit `--cpus` takes precedence.
+Unknown `NVX_CPU_CLASS` values are rejected. Every selected set, including
+an opt-in filtered default, must satisfy the vCPU count plus host reserve.
 
 Measured counts must be at least 1; warmups may be zero, and timeouts must be greater than zero.
 Every suite but `phase2`, which boots no microVM, refuses a host before it
@@ -1115,7 +1131,13 @@ python3 scripts/nvx.py warmpool fill [-h] --pool-dir POOL_DIR
 
 Captures `--size` snapshots and writes `pool.json` with the guest shape,
 backend and placement metadata. Kernel, initramfs and OpenVMM artifacts must
-already exist. Keep the pool on a filesystem supporting atomic directory rename.
+already exist. Fill requires a new or empty directory and never overwrites
+an existing pool, even if its entries are all claimed or expired. Use a new
+pool directory to change shape or replenish capacity. Only completed captures
+become available entries; a failed fill keeps its manifest and completed entries.
+Keep the pool on a filesystem supporting atomic directory rename.
+Size, memory, count, workers, durations, TTLs and timeouts must be positive;
+floating-point durations, TTLs and timeouts must also be finite.
 
 #### `warmpool status`
 
@@ -1163,7 +1185,7 @@ not snapshots whose capture-time directory mtime is old. Unknown timestamp
 formats are left untouched. This is destructive expiration, not automatic
 recovery to the available pool. It does not check whether a caller is alive or
 renew leases: choose a TTL longer than the longest restore/use period, and do
-not prune claims still in use. Expired snapshots must be replenished with fill.
+not prune claims still in use. Replace an exhausted pool by filling a new directory.
 
 #### `warmpool bench`
 
@@ -1176,4 +1198,6 @@ python3 scripts/nvx.py warmpool bench [-h] --pool-dir POOL_DIR
 
 Workers repeatedly acquire, restore and release for the requested duration.
 The command reports latency, failures, pool-exhaustion waits and leaked claims.
-It fails if any restore fails or pool counts do not return to their initial values.
+It fails if acquisition, restore, or release fails, or pool counts do not return
+to their initial values. Acquisition and release errors still produce the
+summary and leak check. Run bench without other pool users for meaningful leak counts.
