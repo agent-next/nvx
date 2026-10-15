@@ -64,6 +64,7 @@ python scripts\nvx.py run
 - [Setup](doc/setup.md) - Instructions for setting up your environment.
 - [Build](doc/build.md) - Instructions for building NVX.
 - [Run](doc/run.md) - Instructions for running NVX.
+- [Whole-device GPU passthrough](doc/vfio-passthrough.md) - Experimental standard-machine VFIO recipe and the NVX microVM boundary.
 - [Benchmark](doc/benchmarks.md) - Instructions for benchmarking NVX.
 - [Command-line reference](doc/usage.md) - Complete `scripts/nvx.py` command and option reference.
 - [Rust API](aci_edge_sandboxes/README.md) - The `aci_edge_sandboxes` crate for driving the sandbox lifecycle from Rust.
