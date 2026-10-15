@@ -32,6 +32,8 @@ Run the recipe blocks in Bash. Each block that enables strict error handling
 runs in a subshell, so a failure stops that block without changing the parent
 shell's options or closing the terminal. Stop on failure and restore from the
 saved state after any device changes; do not continue to launch.
+The [documentation regression checks](vfio-passthrough-tests.md) run these
+blocks against fake sysfs without root, hardware access or a Cargo build.
 
 1. Use a Linux host with working KVM and an enabled IOMMU (VT-d/AMD-Vi).
    A cloud VM must expose both nested virtualization and a usable virtual
@@ -59,6 +61,7 @@ saved state after any device changes; do not continue to launch.
    (
    set -euo pipefail
    BDF=0000:01:00.0
+   [[ $BDF =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]]
    GROUP=$(readlink -e "/sys/bus/pci/devices/$BDF/iommu_group")
    test -d "$GROUP/devices"
    members=("$GROUP"/devices/*)
@@ -89,6 +92,7 @@ saved state after any device changes; do not continue to launch.
    (
    set -euo pipefail
    BDF=0000:01:00.0
+   [[ $BDF =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]]
    GROUP=$(readlink -e "/sys/bus/pci/devices/$BDF/iommu_group")
    test -d "$GROUP/devices"
    members=("$GROUP"/devices/*)
@@ -103,19 +107,36 @@ saved state after any device changes; do not continue to launch.
        fi
        printf '%s\t%s\n' "${dev##*/}" "$driver" >> "$STATE/drivers.tsv"
    done
+   mapfile -t rows < "$STATE/drivers.tsv"
+   test "${#rows[@]}" -gt 0
+   declare -A seen=()
+   for row in "${rows[@]}"; do
+       IFS=$'\t' read -r bdf driver <<< "$row"
+       [[ $bdf =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ &&
+          $driver =~ ^(-|[a-zA-Z0-9_][a-zA-Z0-9_.-]*)$ &&
+          $row = "$bdf"$'\t'"$driver" ]] || {
+           printf 'Invalid saved state entry: %q\n' "$row" >&2; exit 1;
+       }
+       [[ -z ${seen[$bdf]+yes} ]] || {
+           printf 'Duplicate saved BDF: %s\n' "$bdf" >&2; exit 1;
+       }
+       seen[$bdf]=yes
+   done
    sudo modprobe vfio-pci
    sudo modprobe vfio_iommu_type1
-   while IFS=$'\t' read -r bdf driver; do
+   for row in "${rows[@]}"; do
+       IFS=$'\t' read -r bdf driver <<< "$row"
        dev="/sys/bus/pci/devices/$bdf"
        printf '%s\n' vfio-pci | sudo tee "$dev/driver_override" >/dev/null
        if test -L "$dev/driver"; then
            printf '%s\n' "$bdf" | sudo tee "$dev/driver/unbind" >/dev/null
        fi
-   done < "$STATE/drivers.tsv"
-   while IFS=$'\t' read -r bdf driver; do
+   done
+   for row in "${rows[@]}"; do
+       IFS=$'\t' read -r bdf driver <<< "$row"
        printf '%s\n' "$bdf" | sudo tee /sys/bus/pci/drivers/vfio-pci/bind >/dev/null
        test "$(basename "$(readlink -e "/sys/bus/pci/devices/$bdf/driver")")" = vfio-pci
-   done < "$STATE/drivers.tsv"
+   done
    test -c "/dev/vfio/${GROUP##*/}"
    ls -l "/dev/vfio/${GROUP##*/}"
    )
@@ -167,6 +188,7 @@ saved state after any device changes; do not continue to launch.
    (
    set -euo pipefail
    BDF=0000:01:00.0
+   [[ $BDF =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]]
    OPENVMM=/absolute/path/to/openvmm-vfio-target.XXXXXX/x86_64-unknown-linux-gnu/release/openvmm
    test -x "$OPENVMM"
    sudo "$OPENVMM" --machine standard --hypervisor kvm \
@@ -185,7 +207,7 @@ saved state after any device changes; do not continue to launch.
 
 5. After OpenVMM exits and releases all VFIO handles, restore **every**
    member, even after a failed bind or boot. Use the state directory printed
-   in step 2: replace the `STATE` placeholder below, including in the same
+   in step 2: replace the `STATE` placeholder below, even in the same
    Bash shell. Clear `driver_override` with a newline, not a zero-byte write,
    before restoring each saved driver. A GPU originally using `nvidia`
    returns explicitly to `nvidia`; an originally unbound member stays unbound.
@@ -195,21 +217,53 @@ saved state after any device changes; do not continue to launch.
    set -euo pipefail
    STATE=/absolute/path/to/vfio-state.XXXXXX
    test -r "$STATE/drivers.tsv"
-   while IFS=$'\t' read -r bdf driver; do
+   mapfile -t rows < "$STATE/drivers.tsv"
+   test "${#rows[@]}" -gt 0
+   declare -A seen=()
+   for row in "${rows[@]}"; do
+       IFS=$'\t' read -r bdf driver <<< "$row"
+       [[ $bdf =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ &&
+          $driver =~ ^(-|[a-zA-Z0-9_][a-zA-Z0-9_.-]*)$ &&
+          $row = "$bdf"$'\t'"$driver" ]] || {
+           printf 'Invalid saved state entry: %q\n' "$row" >&2; exit 1;
+       }
+       [[ -z ${seen[$bdf]+yes} ]] || {
+           printf 'Duplicate saved BDF: %s\n' "$bdf" >&2; exit 1;
+       }
+       seen[$bdf]=yes
+   done
+   failed=0
+   for row in "${rows[@]}"; do
+       IFS=$'\t' read -r bdf driver <<< "$row"
        dev="/sys/bus/pci/devices/$bdf"
        if test -L "$dev/driver"; then
-           printf '%s\n' "$bdf" | sudo tee "$dev/driver/unbind" >/dev/null
+           if ! printf '%s\n' "$bdf" | sudo tee "$dev/driver/unbind" >/dev/null; then
+               printf 'Unbind failed: %s\n' "$bdf" >&2
+               failed=1
+           fi
        fi
-       printf '\n' | sudo tee "$dev/driver_override" >/dev/null
+       if ! printf '\n' | sudo tee "$dev/driver_override" >/dev/null; then
+           printf 'Override clear failed: %s\n' "$bdf" >&2
+           failed=1
+           continue
+       fi
        if test "$driver" != -; then
-           test -d "/sys/bus/pci/drivers/$driver"
-           printf '%s\n' "$bdf" | sudo tee "/sys/bus/pci/drivers/$driver/bind" >/dev/null
-           test "$(basename "$(readlink -e "$dev/driver")")" = "$driver"
-       else
-           test ! -L "$dev/driver"
+           if ! test -d "/sys/bus/pci/drivers/$driver" ||
+              ! printf '%s\n' "$bdf" | sudo tee "/sys/bus/pci/drivers/$driver/bind" >/dev/null ||
+              ! test "$(basename "$(readlink -e "$dev/driver")")" = "$driver"; then
+               printf 'Driver restore failed: %s -> %s\n' "$bdf" "$driver" >&2
+               failed=1
+           fi
+       elif test -L "$dev/driver"; then
+           printf 'Expected unbound device: %s\n' "$bdf" >&2
+           failed=1
        fi
-       lspci -Dnnk -s "$bdf"
-   done < "$STATE/drivers.tsv"
+       if ! lspci -Dnnk -s "$bdf"; then
+           printf 'Inspection failed: %s\n' "$bdf" >&2
+           failed=1
+       fi
+   done
+   exit "$failed"
    )
    ```
 
@@ -217,6 +271,12 @@ saved state after any device changes; do not continue to launch.
    directories rather than passing driver names to `modprobe`: for example,
    the `nvidia-gpu` driver belongs to module `i2c_nvidia_gpu`. If a directory
    is missing, reload the actual module for that driver before retrying.
+   Restoration attempts every validated member, reports individual failures
+   and exits non-zero if any operation failed. Keep the state, resolve the
+   reported errors and rerun step 5; a non-zero result is not a recovered host.
+   Both preparation and restoration validate the complete saved-state snapshot
+   before any privileged writes. Do not edit that state or run competing
+   device-management operations during the experiment.
 
    Confirm `nvidia-smi` works on the host, then restore any services and
    persistence setting you changed. If rebinding fails, keep the state and
