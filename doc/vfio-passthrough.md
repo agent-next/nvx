@@ -179,13 +179,12 @@ or snapshot contract.
 ## Measured cloud prerequisite failure
 
 A dedicated Lambda on-demand A10 VM, running Ubuntu kernel
-`6.8.0-60-generic`, was probed on 2026-10-15. The following selected commands
-and captured output come from the W19 evidence: `probe.sh`,
-`remote-probe.log` and `remote-vfio-bind.log`. They ran as root **inside the
-cloud VM**, not inside an OpenVMM guest. Commands from the two probe passes
-are grouped here for readability; output values are not synthesized.
+`6.8.0-60-generic`, was probed on 2026-10-15. The selected commands below ran
+as root **inside the cloud VM**, not inside an OpenVMM guest. Commands and
+original captured output from the two probe passes are grouped here for
+readability; output values are not synthesized.
 
-The KVM program is reproduced verbatim from `probe.sh`:
+The original KVM probe program:
 
 ```bash
 systemd-detect-virt
@@ -212,6 +211,28 @@ kvm
 0
 ```
 
+Kernel support and firmware/device checks from those same probe passes:
+
+```bash
+grep -E '^CONFIG_(IOMMU_SUPPORT|INTEL_IOMMU|AMD_IOMMU|VFIO|VFIO_PCI|VFIO_IOMMU_TYPE1)=' "/boot/config-$(uname -r)"
+ls -l /sys/firmware/acpi/tables/DMAR /sys/firmware/acpi/tables/IVRS
+ls -l /sys/bus/pci/devices/0000:06:00.0/iommu_group
+```
+
+Captured stdout and stderr (interleaved stderr is separated for readability):
+
+```text
+CONFIG_VFIO=m
+CONFIG_VFIO_IOMMU_TYPE1=m
+CONFIG_VFIO_PCI=m
+CONFIG_IOMMU_SUPPORT=y
+CONFIG_AMD_IOMMU=y
+CONFIG_INTEL_IOMMU=y
+ls: cannot access '/sys/firmware/acpi/tables/DMAR': No such file or directory
+ls: cannot access '/sys/firmware/acpi/tables/IVRS': No such file or directory
+ls: cannot access '/sys/bus/pci/devices/0000:06:00.0/iommu_group': No such file or directory
+```
+
 For the bind diagnostic, the idle GPU originally used `nvidia`; its compute
 process query returned no rows. The probe loaded `vfio-pci` and
 `vfio_iommu_type1`, stopped `nvidia-persistenced`, and disabled persistence:
@@ -235,9 +256,8 @@ All done.
 
 The original bind program's body was not retained in the raw log. This
 equivalent Python harness makes its recorded sysfs writes reproducible,
-including errors on close; the JSON below is the **original captured output**,
-not output invented by or rerun for this documentation update. This was a
-deliberate negative diagnostic on a disposable VM. The normal recipe above
+including errors on close; the JSON below is the **original captured output**.
+This was a deliberate negative diagnostic on a disposable VM. The normal recipe above
 must stop when the IOMMU group is absent, rather than repeat this unbind:
 
 ```bash
@@ -279,7 +299,7 @@ PY
 {"driver_symlink_exists": false, "driver": null, "iommu_group_exists": false}
 ```
 
-Kernel corroboration, with the full filtered output captured in the bind log:
+Kernel corroboration, with the full captured bind-pass filtered output:
 
 ```text
 $ dmesg | grep -Ei 'vfio|06:00.0|DMAR|IOMMU' | tail -30
@@ -298,6 +318,10 @@ $ dmesg | grep -Ei 'vfio|06:00.0|DMAR|IOMMU' | tail -30
 [   52.122000] vfio-pci: probe of 0000:06:00.0 failed with error -22
 [   52.122048] vfio-pci: probe of 0000:06:00.0 failed with error -22
 ```
+
+This bind-pass filter is not a comprehensive AMD IOMMU check. The missing
+DMAR/IVRS tables are established by the explicit firmware checks above,
+not by the absence of messages from this filter.
 
 The cloud VM's kernel had `CONFIG_INTEL_IOMMU=y` and `CONFIG_VFIO_PCI=m`,
 but no ACPI DMAR/IVRS tables or GPU `iommu_group` link. With unsafe
@@ -318,7 +342,7 @@ so guest NVIDIA enumeration, driver initialization and CUDA remain unverified.
 [vfio-implementation]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/vm/devices/pci/vfio_assigned_device/src/lib.rs#L4-L15
 [vfio-resolver]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/vm/devices/pci/vfio_assigned_device/src/resolver.rs#L70-L105
 [vfio-overview]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/Guide/src/user_guide/openvmm/vfio.md#L1-L33
-[nvx-kernel]: https://github.com/agent-next/nvx/blob/042a611bac05f416df206d6e5ca943e631a9ded9/kernel/config-microvm#L913
+[nvx-kernel]: https://github.com/agent-next/nvx/blob/f932d6fd9eef426a8ce44ef63c7b6a4814fa5684/kernel/config-microvm#L913
 [mmio-defaults]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/openvmm/openvmm_entry/src/cli_args.rs#L1271-L1278
 [cold-boot-assignment]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/openvmm/openvmm_core/src/worker/dispatch.rs#L3510-L3516
 [mmio-exhaustion]: https://github.com/nanvix/openvmm/blob/7f225e2cd635bbd1e1839e587e659996433396c8/vm/devices/pci/pci_resource_assignment/src/lib.rs#L173-L186
