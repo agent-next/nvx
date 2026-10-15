@@ -202,7 +202,6 @@ class WarmpoolRegressionTests(PoolFixture):
             ),
             patch.object(warmpool, "workload_boot_command", return_value=["openvmm"]),
             patch.object(warmpool, "capture_snapshot", side_effect=capture) as captures,
-            patch.object(warmpool, "_process_affinity", return_value={0, 1}),
             patch.object(warmpool, "pool_class_frequencies", return_value=[4_000_000]),
             contextlib.redirect_stdout(io.StringIO()),
         ):
@@ -224,6 +223,26 @@ class WarmpoolRegressionTests(PoolFixture):
 
 @unittest.skipUnless(sys.platform == "linux", "requires Linux CPU affinity")
 class ProcessAffinityRegressionTests(unittest.TestCase):
+    def test_requested_class_outside_affinity_fails_without_repinning(self) -> None:
+        for preference, current in (
+            ("performance", {2, 3}),
+            ("efficiency", {0, 1}),
+        ):
+            with (
+                self.subTest(preference=preference),
+                patch.dict(os.environ, {"NVX_CPU_CLASS": preference}),
+                patch.object(
+                    benchmark,
+                    "cpu_frequency_classes",
+                    return_value={6_000_000: {0, 1}, 4_200_000: {2, 3}},
+                ),
+                patch.object(os, "sched_getaffinity", return_value=current),
+                patch.object(os, "sched_setaffinity") as set_affinity,
+                self.assertRaisesRegex(common.ScriptError, "no candidate CPU"),
+            ):
+                nvx.apply_hybrid_process_affinity()
+            set_affinity.assert_not_called()
+
     def test_default_and_all_do_not_change_affinity(self) -> None:
         for preference in ("", "all"):
             with (
@@ -767,6 +786,7 @@ class PoolInputValidationTests(PoolFixture):
             patch.object(
                 warmpool, "_require_artifacts", return_value=(pool, pool, pool)
             ),
+            patch.object(warmpool, "pool_class_frequencies", return_value=[]),
             patch.object(warmpool, "capture_snapshot") as capture,
             self.assertRaisesRegex(common.ScriptError, "empty pool directory"),
         ):
@@ -803,7 +823,6 @@ class PoolInputValidationTests(PoolFixture):
                 warmpool, "_require_artifacts", return_value=(pool, pool, pool)
             ),
             patch.object(warmpool, "capture_snapshot", side_effect=capture),
-            patch.object(warmpool, "_process_affinity", return_value={0, 1}),
             patch.object(warmpool, "pool_class_frequencies", return_value=[]),
             contextlib.redirect_stdout(io.StringIO()),
             self.assertRaisesRegex(OSError, "capture failed"),

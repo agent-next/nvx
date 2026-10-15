@@ -39,8 +39,8 @@ affinity at all.
   Unset, empty, or `all` means no filtering. Explicit `--cpus` takes precedence,
   and unknown class values are rejected. Selecting a hybrid class with no
   candidate CPUs raises an error rather than falling back to mixed classes.
-  Frequency files are read only when
-  class selection is used, never while building the argument parser.
+  Frequency files are read only when class selection is used, never while
+  building the argument parser.
 - `nvx.py` binds its own process (inherited by children) to the selected class for
   non-benchmark commands only when `NVX_CPU_CLASS=performance` or `efficiency`
   is explicitly set. It keeps all available logical CPUs in that class, including
@@ -146,8 +146,7 @@ terminated), then one retry boots a fresh process with the full timeout only
 when that timeout exceeds the first endpoint wait. When the first window already
 uses the full timeout, there is no redundant retry. A second endpoint timeout
 propagates honestly. A single start call never runs more than one live OpenVMM
-process. Other
-`TimeoutError`s (e.g. `managed control response timed out` after the endpoint
+process. Other `TimeoutError`s (e.g. `managed control response timed out` after the endpoint
 accepted) are not in this class and still propagate without a retry.
 `--timeout` is a per-stage timeout, not an overall wall-clock deadline:
 a start may include a short endpoint probe and a full-timeout retry,
